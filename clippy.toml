@@ -1,0 +1,15 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+# テストは MCP サーバーとは別のプロセス (テストバイナリ) で動くので、JSON-RPC の stdout を汚さない。
+allow-print-in-tests = true
+# lib は binary のための内部用で、安定した API を約束しない (crate doc に明記)。
+# 公開 API の互換性を理由に黙る lint (unnecessary_wraps など) も pub な項目に効かせる。
+avoid-breaking-exported-api = false
+# std の Mutex / RwLock は panic で poison になり、以後そのロックを取る呼び出しがすべて失敗する。
+# サーバーは panic を捕まえて動き続けるので、poison の無いロックを使う (要件 R-ERR-1)。
+disallowed-types = [
+  { path = "std::sync::Mutex", reason = "poison がある。parking_lot か tokio::sync のロックを使う (要件 R-ERR-1)" },
+  { path = "std::sync::RwLock", reason = "poison がある。parking_lot か tokio::sync のロックを使う (要件 R-ERR-1)" },
+]

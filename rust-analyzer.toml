@@ -1,0 +1,10 @@
+# NOTE: `files.exclude` はここに書けない (global 節の設定で、workspace の rust-analyzer.toml は受け付けない)。
+# NOTE: `check.command` もここでは効かない (flycheck はこのファイルを読まない。rust-analyzer 1.99.0 で確認)。
+# どちらも .vscode/settings.json に書く。
+
+[imports.granularity]
+enforce = true
+
+[rustfmt]
+# NOTE: nightly で整形する (理由は rustfmt.toml の冒頭、`--edition` の件は同ファイルの `edition` の行)。
+overrideCommand = ["rustfmt", "+nightly"]

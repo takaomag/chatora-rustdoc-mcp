@@ -1,0 +1,28 @@
+# NOTE: unstable オプションを使うので nightly の rustfmt で整形する (`cargo +nightly fmt`)。
+# stable の `cargo fmt` は unstable オプションを警告付きで無視し、結果が nightly と食い違う。
+# rust-analyzer も nightly で整形する (rust-analyzer.toml の `rustfmt.overrideCommand`)。
+# 既定値と同じオプションは書かない (max_width だけは例外。下記)。
+
+# rust-analyzer の `overrideCommand` 経由では `--edition` が渡らないので、ここにも書く。
+edition = "2024"
+newline_style = "Unix"
+
+# 既定値 (100) と同じだが、.editorconfig の max_line_length と VS Code の rulers に揃えていることを示すために書く。
+max_width = 100
+
+imports_granularity = "Crate"
+imports_layout = "HorizontalVertical"
+group_imports = "StdExternalCrate"
+reorder_impl_items = true
+
+match_block_trailing_comma = true
+use_field_init_shorthand = true
+condense_wildcard_suffixes = true
+overflow_delimited_expr = true
+hex_literal_case = "Lower"
+float_literal_trailing_zero = "Always"
+
+format_code_in_doc_comments = true
+normalize_doc_attributes = true
+
+format_macro_matchers = true

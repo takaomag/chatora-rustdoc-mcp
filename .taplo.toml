@@ -1,0 +1,50 @@
+include = ["**/*.toml"]
+
+exclude = [
+  "target/**",
+]
+
+[formatting]
+column_width = 100
+align_comments = false
+array_auto_collapse = false
+
+# スキーマは catalog を経由せず直に指す (taplo 0.10.0 では catalog の読み込みが壊れている。0.11 以降で再確認)。
+# Cargo.toml のスキーマは、0.10.0 が別ファイルへの `$ref` を辿らないため、参照先を埋め込んだものを
+# `.taplo/update-schemas.py` で作って置く。schemastore の更新は自動では入らないので、ときどき作り直す。
+# 残りは https で引くのでネットワークが要る。`taplo lint` はリポジトリのルートで実行する。
+[[rule]]
+include = ["**/Cargo.toml"]
+
+[rule.schema]
+path = "./.taplo/schemas/cargo.json"
+
+[[rule]]
+include = ["**/.cargo/config.toml"]
+
+[rule.schema]
+path = "https://www.schemastore.org/cargo-config.json"
+
+[[rule]]
+include = ["**/rustfmt.toml", "**/.rustfmt.toml"]
+
+[rule.schema]
+path = "https://www.schemastore.org/rustfmt.json"
+
+[[rule]]
+include = ["**/rust-toolchain.toml"]
+
+[rule.schema]
+path = "https://www.schemastore.org/rust-toolchain.json"
+
+[[rule]]
+include = ["**/.config/nextest.toml"]
+
+[rule.schema]
+path = "https://nexte.st/schemas/repo-config.json"
+
+[[rule]]
+include = ["**/.taplo.toml", "**/taplo.toml"]
+
+[rule.schema]
+path = "https://www.schemastore.org/taplo.json"

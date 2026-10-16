@@ -1,0 +1,91 @@
+{
+  "editor.formatOnSave": true,
+  "editor.formatOnPaste": false,
+  "editor.formatOnType": false,
+  // `target` は root のものだけに限る (`src/target/` のようなモジュールを巻き込まない。watcherExclude と search.exclude も同じ)。
+  // ユーザー設定の `**/target` はオブジェクトとして合成されるので、false で打ち消す。
+  "files.exclude": {
+    "**/target": false,
+    "target": true
+  },
+  "files.readonlyInclude": {
+    "**/Cargo.lock": true
+  },
+  "files.trimFinalNewlines": true,
+  "files.watcherExclude": {
+    "**/target/**": false,
+    "target/**": true,
+    "tmp/**": true
+  },
+  "search.exclude": {
+    "**/target": false,
+    "target": true,
+    "tmp/**": true
+  },
+  // csv / tsv の言語 ID は rainbow-csv 拡張が提供する (無ければ [csv] と [tsv] は効かない)。
+  "[csv]": {
+    "files.trimFinalNewlines": false
+  },
+  "[diff]": {
+    "files.trimFinalNewlines": false
+  },
+  "[markdown]": {
+    "editor.wordWrap": "on"
+  },
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.rulers": [
+      100
+    ]
+  },
+  "[shellscript]": {
+    "editor.defaultFormatter": "mkhl.shfmt"
+  },
+  "[toml]": {
+    "editor.defaultFormatter": "tamasfe.even-better-toml"
+  },
+  "[tsv]": {
+    "files.trimFinalNewlines": false
+  },
+  // shfmt は**パーサ・プリンタ系のフラグ (`-i` `-ci` `-s` `-ln` など) を 1 つでも渡されると .editorconfig を無視する**。
+  // ユーザー設定に `-i 4 -ci` 等が入っていると indent も shell_variant も .editorconfig が効かなく
+  // なるので、空配列で打ち消して .editorconfig を唯一の source of truth にする。
+  "shfmt.executableArgs": [],
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.files.exclude": [
+    "tmp"
+  ],
+  "shellcheck.useWorkspaceRootAsCwd": true,
+  "cSpell.ignorePaths": [
+    "/target/**",
+    "**/Cargo.lock",
+    "**/.git/objects/**",
+    "/.taplo/schemas/**",
+    "/doc/rustdoc-mcp-survey.md"
+  ],
+  "cSpell.words": [
+    "chatora",
+    "clippy",
+    "codegen",
+    "doctest",
+    "fallibles",
+    "idents",
+    "Magoori",
+    "mkhl",
+    "MSRV",
+    "nextest",
+    "pathbuf",
+    "println",
+    "rustc",
+    "rustdoc",
+    "RUSTDOCFLAGS",
+    "rustup",
+    "shellcheck",
+    "shfmt",
+    "supertrait",
+    "tamasfe",
+    "taplo",
+    "Uninit",
+    "writeln"
+  ]
+}

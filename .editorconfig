@@ -1,0 +1,84 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.{rs,py,java,kt,kts,groovy,c,h,cpp,hpp,cs,swift,php,pl,ps1,psm1,zig,gradle,bzl}]
+indent_size = 4
+
+[{BUILD,BUILD.bazel,WORKSPACE,WORKSPACE.bazel}]
+indent_size = 4
+
+[*.rs]
+max_line_length = 100
+
+[*.rst]
+indent_size = 3
+
+[{Makefile,makefile,GNUmakefile,*.mk,*.mak}]
+indent_style = tab
+indent_size = 4
+
+[*.go]
+indent_style = tab
+indent_size = 4
+
+[{go.mod,go.sum}]
+indent_style = tab
+indent_size = 4
+
+[{.gitconfig,*.gitconfig,.gitmodules}]
+indent_style = tab
+indent_size = 4
+
+[{Dockerfile,Dockerfile.*,*.dockerfile,Containerfile,Containerfile.*,*.containerfile}]
+indent_size = 2
+
+[*.{service,target,socket,timer,mount,path,slice}]
+indent_size = 2
+
+[{CMakeLists.txt,*.cmake}]
+indent_size = 2
+
+[*.{rb,scala,ex,exs,hs,lua,vim,xml,svg,xsd,xsl,plist,proto,tf,tfvars,hcl,nix,tex,bib,vue,svelte,astro}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+max_line_length = off
+
+[*.{patch,diff}]
+trim_trailing_whitespace = false
+insert_final_newline = false
+
+[*.snap]
+trim_trailing_whitespace = false
+
+[*.{csv,tsv}]
+trim_trailing_whitespace = false
+
+[*.{pem,crt,cer,key,pub,gpg,asc}]
+trim_trailing_whitespace = false
+insert_final_newline = false
+
+[{*.lock,*.min.js,*.min.css,*.map,*.ipynb}]
+insert_final_newline = false
+trim_trailing_whitespace = false
+
+[*.{bat,cmd,ps1}]
+end_of_line = crlf
+
+[{*.sh,*.bash,*.bats,*.sh.example}]
+shell_variant = bash
+binary_next_line = true
+switch_case_indent = true
+simplify = false
+function_next_line = false
+
+[*.bats]
+shell_variant = bats

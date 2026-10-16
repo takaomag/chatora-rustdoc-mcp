@@ -1,0 +1,22 @@
+{
+  "recommendations": [
+    "EditorConfig.EditorConfig",
+    "tamasfe.even-better-toml",
+    "mkhl.shfmt",
+    "rust-lang.rust-analyzer",
+    "timonwong.shellcheck",
+    "streetsidesoftware.code-spell-checker",
+    // "redhat.vscode-yaml",
+    // "ms-azuretools.vscode-containers",
+    // "sqlfluff.vscode-sqlfluff",
+    "mechatroner.rainbow-csv",
+    "DavidAnson.vscode-markdownlint"
+  ],
+  "unwantedRecommendations": [
+    "bungcip.better-toml",
+    "foxundermoon.shell-format",
+    "rust-lang.rust",
+    "matklad.rust-analyzer",
+    "ms-azuretools.vscode-docker"
+  ]
+}

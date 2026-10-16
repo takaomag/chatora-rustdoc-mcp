@@ -1,0 +1,154 @@
+[package]
+name = "chatora-rustdoc"
+version = "0.1.0"
+authors = ["Takao Magoori <takaomag@users.noreply.github.com>"]
+description = "MCP server that looks up version-accurate Rust API documentation from rustdoc JSON"
+keywords = ["rustdoc", "mcp", "documentation", "llm", "agent"]
+categories = ["development-tools"]
+repository = "https://github.com/takaomag/chatora-rustdoc"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+edition = "2024"
+rust-version = "1.99"
+publish = true
+# gitignore 形式。先頭の `/` で package root に固定する (無いと任意の深さに一致する)。
+# Cargo.toml / Cargo.lock は書かなくても cargo が同梱する (README.md も `readme` の指定で同梱されるが、明示しておく)。
+# THIRD-PARTY-NOTICES (要件 R-DIST-4) を作ったら足す。`include_str!` で埋め込むファイル (説明文・skill・アイコン) も、`/src` の外に置いたら足す (要件 R-DIST-1)。
+include = ["/src", "/README.md", "/LICENSE-*"]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+debug = false
+strip = "symbols"
+debug-assertions = false
+overflow-checks = false
+lto = "fat"
+# 既定値だが明示する。サーバーは panic を呼び出し単位で捕まえて動き続ける (要件 R-ERR-1) ので abort にしない。
+panic = "unwind"
+incremental = false
+codegen-units = 1
+
+[lints.rust]
+future_incompatible = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+absolute_paths_not_starting_with_crate = "deny"
+ambiguous_negative_literals = "deny"
+closure_returning_async_block = "deny"
+deref_into_dyn_supertrait = "deny"
+dropping_copy_types = "deny"
+dropping_references = "deny"
+for_loops_over_fallibles = "deny"
+forgetting_copy_types = "deny"
+forgetting_references = "deny"
+impl_trait_redundant_captures = "deny"
+invalid_from_utf8 = "deny"
+invalid_nan_comparisons = "deny"
+invalid_value = "deny"
+let_underscore_drop = "deny"
+macro_use_extern_crate = "deny"
+map_unit_fn = "deny"
+meta_variable_misuse = "deny"
+missing_copy_implementations = "deny"
+missing_debug_implementations = "deny"
+non_ascii_idents = "deny"
+non_contiguous_range_endpoints = "deny"
+non_fmt_panics = "deny"
+noop_method_call = "deny"
+overlapping_range_endpoints = "deny"
+path_statements = "deny"
+private_bounds = "deny"
+private_interfaces = "deny"
+redundant_imports = "deny"
+redundant_lifetimes = "deny"
+renamed_and_removed_lints = "deny"
+single_use_lifetimes = "deny"
+suspicious_double_ref_op = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unconditional_recursion = "deny"
+unfulfilled_lint_expectations = "deny"
+unit_bindings = "deny"
+unknown_lints = "deny"
+unnameable_test_items = "deny"
+unnameable_types = "deny"
+unnecessary_transmutes = "deny"
+unreachable_patterns = "deny"
+unreachable_pub = "deny"
+unused_comparisons = "deny"
+unused_import_braces = "deny"
+unused_lifetimes = "deny"
+unused_macro_rules = "deny"
+unused_must_use = "deny"
+unused_qualifications = "deny"
+useless_ptr_null_checks = "deny"
+missing_docs = "warn"
+unsafe_code = "warn"
+# bin の crate からは、lib だけが使う依存も「未使用」に見える。その分は main.rs で
+# `use dep as _;` と列挙して黙らせる (allow で lint ごと切らない)。
+unused_crate_dependencies = "warn"
+
+[lints.clippy]
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+multiple_crate_versions = "allow"
+# nursery の redundant_pub_crate は rustc の unreachable_pub (deny) と逆を求めるので切る。
+redundant_pub_crate = "allow"
+dbg_macro = "deny"
+doc_markdown = "deny"
+error_impl_error = "deny"
+exit = "deny"
+# `serve` (MCP over stdio) の間、stdout は JSON-RPC 専用 (要件 R-SEC-1)。`print!` / `println!` を禁じる。
+# CLI の出力は `writeln!(io::stdout().lock(), …)?` で書く。パイプが閉じられても (`… | head`) panic せずエラーを返せる。
+# この形は lint に掛からないので、serve の経路から呼ばないこと。
+print_stdout = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+arithmetic_side_effects = "warn"
+assertions_on_result_states = "warn"
+create_dir = "warn"
+expect_used = "warn"
+filetype_is_file = "warn"
+indexing_slicing = "warn"
+infinite_loop = "warn"
+integer_division = "warn"
+# HashMap / HashSet の反復順はインスタンスごとに (同じプロセス内でも) 変わる。応答や検索結果の順序を決定的にする (要件 R-OUT-4)。
+# この lint が拾うのは `for` ループだけで、`.iter()` / `.keys()` からの `collect` などは拾わない。
+iter_over_hash_type = "warn"
+let_underscore_must_use = "warn"
+lossy_float_literal = "warn"
+map_err_ignore = "warn"
+mem_forget = "warn"
+multiple_unsafe_ops_per_block = "warn"
+panic = "warn"
+pathbuf_init_then_push = "warn"
+rc_buffer = "warn"
+redundant_type_annotations = "warn"
+# 子モジュールを持つモジュールは `foo/mod.rs` にする (`foo.rs` + `foo/` を禁じる。子の無い `foo.rs` は可)
+self_named_module_files = "warn"
+str_to_string = "warn"
+string_slice = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unused_result_ok = "warn"
+unused_trait_names = "warn"
+unwrap_in_result = "warn"
+unwrap_used = "warn"
+verbose_file_reads = "warn"
+wildcard_enum_match_arm = "warn"
+
+# rustdoc の lint は deny にしない。deny だと `cargo doc` が error で止まり、docs.rs のビルドも
+# 同じ仕組みで落ちうる。警告は CI の `RUSTDOCFLAGS="-D warnings"` の rustdoc で止める (要件 R-DIST-1)。
+# 既定で warn のもの (broken_intra_doc_links など) は書かない。missing_crate_level_docs は
+# rustc の missing_docs が crate doc の欠落も拾うので不要。
+[lints.rustdoc]
+unescaped_backticks = "warn"

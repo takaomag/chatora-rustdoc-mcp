@@ -1,0 +1,11 @@
+[toolchain]
+channel = "stable"
+# minimal プロファイルで、rustfmt を入れない (整形は nightly の rustfmt で行う。理由は rustfmt.toml の冒頭)。
+# プロファイルは新たに導入するときだけ効くので、既に rustfmt が入っている環境では残る。
+profile = "minimal"
+components = [
+  "rust-src",
+  "rust-analyzer",
+  "clippy",
+  "llvm-tools",
+]

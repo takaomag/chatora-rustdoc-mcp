@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+*.[cC][mM][dD] text eol=crlf
+*.[bB][aA][tT] text eol=crlf
+*.[pP][sS]1    text eol=crlf
+
+# diff の hunk ヘッダに関数名・見出しを出す (git 組み込みのドライバ)
+*.rs diff=rust
+*.md diff=markdown
+*.py diff=python
+
+# `.taplo/update-schemas.py` が生成するファイル。GitHub の PR で diff を既定で畳む
+/.taplo/schemas/** linguist-generated=true

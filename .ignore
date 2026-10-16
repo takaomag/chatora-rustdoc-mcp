@@ -1,0 +1,2 @@
+# `.taplo/update-schemas.py` が生成するファイル。git では管理するが、検索 (rg / VS Code) には出さない
+/.taplo/schemas/
