@@ -388,6 +388,22 @@ pub fn read_std_json(cache: &Cache, docs: &StdDocs, krate: StdCrate) -> io::Resu
     }
 }
 
+/// The SHA-256 of the JSON of `krate` in `docs`, from the digest written next to it.
+///
+/// # Errors
+///
+/// Returns an error when the digest is missing or cannot be read.
+pub fn std_json_sha256(cache: &Cache, docs: &StdDocs, krate: StdCrate) -> io::Result<Box<str>> {
+    let path = docs.dir.join(format!("{}.json.sha256", krate.as_str()));
+    let digest = cache.read_file(&path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} is missing", path.display()),
+        )
+    })?;
+    Ok(String::from_utf8_lossy(digest.trim_ascii()).into())
+}
+
 /// The summary of the manifest, from the cache if it was fetched within the hour, or else fetched
 /// again. If fetching fails, an older one from the cache, with a warning.
 async fn summary(

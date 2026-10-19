@@ -469,6 +469,18 @@ C1b も 3 つに分けた: C1b-1 (版・target・provenance)、C1b-2 (プロジ�
 - 扱っていないこと: `cargo metadata` の初回の依存の取得で時間がかかるときの待ち方 (R-WS-6 の `status: building` は M2)。オフラインモードの設定
 - テスト: workspace の選び方 (既定・`project`・外・複数)。stdio の結合テストで、合成の workspace を `CLAUDE_PROJECT_DIR` にして member を引くと `local_build_required`、外の workspace を `project` で指すと `no_record`。stdio のテストのサーバーは、プロジェクトを指定しないときは `CLAUDE_PROJECT_DIR` を消してキャッシュのディレクトリで動かす (このリポジトリを読まないように)
 
+#### C1b-3 (2026-10-20)
+
+- `get_item` で std・core・alloc・proc_macro・test を引けるようにした (R-STD-1・R-STD-6)。B8 の `std_json::choose` で手元の nightly か dist を選び、`across::follow` で std の仲間をたどる (`std::vec::Vec` → `alloc::vec::Vec`。warnings に「re-export を、その crate で示した」旨を出す)
+  - 手元の nightly を使ってよいかの基準 (プロジェクトの toolchain の版) は、既定のプロジェクト (workspace が 1 つのとき) のルートで `rustc -vV` を実行して取る (`RUSTUP_AUTO_INSTALL=0`)
+  - std に `version` を渡されたら無視して warnings に書く (std は crates.io の版を持たない)
+- アーカイブ: std の各 crate の JSON を、初回だけ解析してアーカイブにする (`load::archive_of`)。鍵は、dist の JSON なら横の SHA-256、手元の nightly ならコミットハッシュから作ったもの (sysroot のファイルはコミットごとに変わらないので、96 MB の core.json を毎回読んでハッシュしない)。アーカイブのヘッダの照合から形式の版を外した (元の SHA-256 が形式を決めるので。先に形式を知らなくても開ける)。既存のアーカイブはヘッダの配置が変わって合わなくなり、作り直される
+- provenance: `source: "std"`、`toolchain` (rustc の版とコミット)、`std_from` (`dist`・`local` と理由)。std の `resolved_from` は出さない。std の JSON の `crate_version` は `1.101.0-nightly\t(コミット\t日付)` の形で semver として読めないので、toolchain の release を版にし、要求との比較もしない (`ItemRequest` に `Origin` (docs.rs か std か) を持たせた)
+- std の定義位置 (`/rustc/<コミット>/library/…`) には、「パッケージの外」の警告を出さず、rust-lang/rust の GitHub のそのコミットの URL を付ける
+- 解決の順を変えた: 「公開パス → 定義パス → 親の型のメンバー」から「公開パス → 親の型のメンバー → 定義パス」へ。nightly の std はメソッドも定義パス (`paths`) に載せていて、`Vec::push` が親も `impl` も無い単独の item として返っていたため。モジュールの下の item はメンバーにならないので、結果が変わるのはメンバーだけ (R-PR-1 の手順に足すこと。M1 の終わり)
+- 実際のサーバーで確かめた (このホストの nightly には rust-docs-json が無いので dist): `std::vec::Vec`・`std::vec::Vec::push` (alloc)、`std::collections::HashMap::insert` (std)、`core::option::Option::map`、版を渡した std、無いパス。初回はアーカイブ作りで約 1.5 秒、2 回目からは約 0.1 秒
+- テスト: 解決の順 (定義パスにも載ったメンバー)、std の名前の判定、std のソースの URL への変換、鍵付きのアーカイブを一度だけ作ること。std を通しで引くテストは `tests/std_dist.rs` (ignored。CI の testdata ジョブで動く)
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

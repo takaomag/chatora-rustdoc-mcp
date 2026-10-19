@@ -30,6 +30,7 @@ use rmcp::{
 
 use crate::data::{
     cache::{Cache, CacheError},
+    dist::Dist,
     docs_rs::DocsRs,
     sparse_index::SparseIndex,
     target,
@@ -181,6 +182,7 @@ pub async fn serve() -> Result<(), ServeError> {
     let server = Server {
         tools: Arc::new(tool::ToolState {
             docs_rs: DocsRs::new()?,
+            dist: Dist::new()?,
             index: SparseIndex::new(cache.clone())?,
             host,
             cache,

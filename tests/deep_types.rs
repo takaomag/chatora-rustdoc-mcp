@@ -15,7 +15,7 @@ use chatora_rustdoc_mcp::{
     },
     query::{
         across::Indexed,
-        get_item::{ItemRequest, ResolvedFrom, get_item},
+        get_item::{ItemRequest, Origin, ResolvedFrom, get_item},
         view::CrateView,
     },
     task::THREAD_STACK_SIZE,
@@ -138,8 +138,10 @@ fn a_type_nested_up_to_the_limit_is_rendered_and_freed() {
                 name: &name,
                 version: &version,
                 path: "deep::f",
-                resolved_from: ResolvedFrom::Explicit,
-                project_from: None,
+                origin: Origin::DocsRs {
+                    resolved_from: ResolvedFrom::Explicit,
+                    project_from: None,
+                },
                 target: None,
             })
             .expect("deep::f is found");

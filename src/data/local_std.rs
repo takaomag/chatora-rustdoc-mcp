@@ -103,6 +103,18 @@ pub async fn local_std(
     })
 }
 
+/// The release of the toolchain that `rustc` is in `dir`, where the project's
+/// `rust-toolchain.toml` applies (requirement R-STD-1), or `None` if it cannot be run there without
+/// installing anything.
+pub async fn rustc_release(dir: &Path) -> Option<Version> {
+    let version = tool::output(dir, "rustc", &["-vV"])
+        .await
+        .inspect_err(|why| tracing::debug!(%why, "the project's rustc could not be run"))
+        .ok()?;
+    let release = parse_rustc_version(&version)?.release;
+    Version::parse(&release).ok()
+}
+
 /// Reads the JSON of `krate` from `local`.
 ///
 /// # Errors

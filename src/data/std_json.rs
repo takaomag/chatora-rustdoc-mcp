@@ -1,7 +1,11 @@
 //! Where the rustdoc JSON of std comes from: the nightly toolchain installed here, or the
 //! distribution server (requirements R-STD-1 and R-STD-6).
 
-use std::{borrow::Cow, io, path::Path};
+use std::{
+    borrow::Cow,
+    io,
+    path::{Path, PathBuf},
+};
 
 use semver::Version;
 
@@ -46,6 +50,73 @@ impl StdJson {
             #[cfg(feature = "local")]
             Self::Local(local) => local_std::read_local_std_json(local, krate),
             Self::Dist(docs) => dist::read_std_json(cache, docs, krate),
+        }
+    }
+
+    /// Where the archive of `krate` is kept, and the key of its JSON: the SHA-256 that is next to
+    /// the JSON unpacked from the distribution server, or, for the nightly installed here, one
+    /// made from its commit, which its files do not outlive. So the JSON is read only to make the
+    /// archive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the digest of the JSON cannot be read.
+    pub fn archive_key(&self, cache: &Cache, krate: StdCrate) -> io::Result<(PathBuf, Box<str>)> {
+        match self {
+            #[cfg(feature = "local")]
+            Self::Local(local) => {
+                let dir = cache
+                    .dir()
+                    .join("std")
+                    .join("local")
+                    .join(&*local.rustc.commit_hash)
+                    .join(local.rustc.host.as_str());
+                let key = super::cache::sha256_hex(
+                    format!("rustc {} {}", local.rustc.commit_hash, krate.as_str()).as_bytes(),
+                );
+                Ok((dir, key.into()))
+            },
+            Self::Dist(docs) => Ok((docs.dir.clone(), dist::std_json_sha256(cache, docs, krate)?)),
+        }
+    }
+
+    /// The toolchain, as the first line of `rustc -vV` gives it.
+    #[must_use]
+    pub fn toolchain(&self) -> Cow<'_, str> {
+        match self {
+            #[cfg(feature = "local")]
+            Self::Local(local) => Cow::Owned(format!(
+                "rustc {} ({} {})",
+                local.rustc.release,
+                local
+                    .rustc
+                    .commit_hash
+                    .get(..9)
+                    .unwrap_or(&local.rustc.commit_hash),
+                local.rustc.commit_date
+            )),
+            Self::Dist(docs) => Cow::Owned(format!("rustc {}", docs.nightly.version)),
+        }
+    }
+
+    /// The release of the toolchain (`1.101.0-nightly`).
+    #[must_use]
+    pub fn release(&self) -> Option<Version> {
+        let release = match self {
+            #[cfg(feature = "local")]
+            Self::Local(local) => &*local.rustc.release,
+            Self::Dist(docs) => docs.nightly.version.split(' ').next().unwrap_or_default(),
+        };
+        Version::parse(release).ok()
+    }
+
+    /// `dist` or `local`, for the provenance.
+    #[must_use]
+    pub const fn source(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "local")]
+            Self::Local(_) => "local",
+            Self::Dist(_) => "dist",
         }
     }
 }

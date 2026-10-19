@@ -34,6 +34,10 @@ const MAGIC: [u8; 8] = *b"CHRDMCPA";
 /// that mmap gives.
 const HEADER_LEN: usize = 128;
 
+/// Where the format version is in the header, after the magic number, the schema, the rkyv series,
+/// the layout and the SHA-256.
+const FORMAT_AT: usize = 84;
+
 /// The layout options of rkyv that the archives use: little endian, 32-bit relative pointers
 /// (rkyv's defaults).
 const LAYOUT: u32 = 1;
@@ -46,7 +50,8 @@ const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub struct Header {
     /// The version of the schema of what is archived, changed with its types.
     pub schema: u32,
-    /// The format version of the source.
+    /// The format version of the source. It is recorded but not compared when an archive is
+    /// opened, as the SHA-256 of the source decides it.
     pub format_version: u32,
     /// The SHA-256 of the source, in lowercase hex.
     pub source_sha256: Box<str>,
@@ -67,8 +72,8 @@ impl Header {
             &major.to_le_bytes(),
             &minor.to_le_bytes(),
             &LAYOUT.to_le_bytes(),
-            &self.format_version.to_le_bytes(),
             digest,
+            &self.format_version.to_le_bytes(),
         ];
         let mut at: usize = 0;
         for field in fields {
@@ -155,7 +160,11 @@ where
             return Ok(None);
         };
         let mmap = map(&file)?;
-        if mmap.get(..HEADER_LEN) != Some(&expected[..]) {
+        // The format version is recorded but not compared: the source's SHA-256 decides it, and a
+        // caller that has only the SHA-256 does not know it.
+        let matches =
+            |range: std::ops::Range<usize>| mmap.get(range.clone()) == expected.get(range);
+        if !(matches(0..FORMAT_AT) && matches(FORMAT_AT.saturating_add(4)..HEADER_LEN)) {
             tracing::debug!(path = %path.display(), "an archive with another header is made again");
             return Ok(None);
         }
@@ -251,7 +260,10 @@ mod tests {
                 .expect("opened")
                 .is_some()
         };
-        assert!(!open(&header(60)), "another format");
+        assert!(
+            open(&header(60)),
+            "the format is not compared: the source decides it"
+        );
         let mut other = header(61);
         other.source_sha256 = "cd".repeat(32).into();
         assert!(!open(&other), "another source");

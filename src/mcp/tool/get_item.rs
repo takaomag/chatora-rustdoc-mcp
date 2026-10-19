@@ -4,7 +4,7 @@
 
 #[cfg(feature = "local")]
 use std::borrow::Cow;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use rmcp::model::{CallToolResult, JsonObject, Tool, ToolAnnotations};
 use semver::Version;
@@ -26,15 +26,17 @@ use crate::{
         archive::Mapped,
         cache::Cache,
         crate_name::CrateName,
+        dist::{DistError, StdCrate},
         docs_rs::FetchError,
         rustdoc_json::ParseError,
         sparse_index::IndexError,
+        std_json::{self, Chosen},
         target::TargetTriple,
         version::{NoVersion, VersionSpec},
     },
     query::{
-        across::Indexed,
-        get_item::{GetItemError, ItemRequest, ResolvedFrom, get_item},
+        across::{self, Indexed},
+        get_item::{GetItemError, ItemRequest, Origin, ResolvedFrom, get_item},
         load,
         view::CrateView,
     },
@@ -154,7 +156,7 @@ fn output_schema() -> JsonObject {
             "provenance": {
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "enum": ["docs.rs"] },
+                    "source": { "type": "string", "enum": ["docs.rs", "std"] },
                     "crate": { "type": "string" },
                     "version": { "type": "string" },
                     "resolved_from": {
@@ -164,6 +166,15 @@ fn output_schema() -> JsonObject {
                     "project_from": {
                         "type": "string",
                         "enum": ["argument", "CLAUDE_PROJECT_DIR", "cwd"],
+                    },
+                    "toolchain": { "type": "string" },
+                    "std_from": {
+                        "type": "object",
+                        "properties": {
+                            "source": { "type": "string", "enum": ["dist", "local"] },
+                            "reason": { "type": "string" },
+                        },
+                        "required": ["source", "reason"],
                     },
                     "target": { "type": "string" },
                     "format_version": { "type": "integer" },
@@ -577,6 +588,9 @@ fn same_crate_name(a: &str, b: &str) -> bool {
 /// Looks the item up in the archive of the crate, or else loads the JSON of the crate and archives
 /// it first, on a blocking thread, since parsing a large crate takes a large part of a second.
 pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
+    if let Some(krate) = std_crate(&arguments.name) {
+        return execute_std(arguments, krate, state).await;
+    }
     let target = arguments
         .target
         .clone()
@@ -702,6 +716,207 @@ async fn recover(
     })
 }
 
+/// The crate of std that `name` is, if it is one (requirement R-STD-1).
+fn std_crate(name: &CrateName) -> Option<StdCrate> {
+    StdCrate::from_name(&name.as_str().to_ascii_lowercase().replace('-', "_"))
+}
+
+/// Looks the item up in std, core, alloc, `proc_macro` or test: in the JSON of the nightly
+/// installed here or of the distribution server (requirements R-STD-1 and R-STD-6), following
+/// re-exports between them (`std::vec::Vec` is `alloc::vec::Vec`).
+async fn execute_std(
+    arguments: Arguments,
+    krate: StdCrate,
+    state: Arc<ToolState>,
+) -> CallToolResult {
+    let target = arguments
+        .target
+        .clone()
+        .unwrap_or_else(|| state.host.triple.clone());
+    let mut warnings: Vec<Box<str>> = Vec::new();
+    if arguments.version.is_some() {
+        warnings.push(
+            "std has no versions on crates.io, so the version is ignored; std is that of a nightly \
+             toolchain"
+                .into(),
+        );
+    }
+    let at_least = project_toolchain(&state).await;
+    let chosen = match std_json::choose(
+        &state.cache,
+        &state.dist,
+        state.cache.dir(),
+        &target,
+        &state.host.triple,
+        at_least.as_ref(),
+    )
+    .await
+    {
+        Ok(chosen) => chosen,
+        Err(error) => return dist_error(krate, &error),
+    };
+    warnings.extend(chosen.warnings.iter().cloned());
+    let request = Request {
+        name: arguments.name,
+        version: chosen
+            .json
+            .release()
+            .unwrap_or_else(|| Version::new(0, 0, 0)),
+        project_from: None,
+        path: with_lib_name(krate.as_str(), &arguments.path),
+        resolved_from: ResolvedFrom::Latest,
+        target,
+    };
+    let cache = state.cache.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let looked_up = look_up_std(&cache, &chosen, &request);
+        (looked_up, request)
+    });
+    match task.await {
+        Ok(((looked_up, through), request)) => {
+            if let [asked, .., found] = through.as_slice() {
+                warnings.push(
+                    format!("{asked} is a re-export of {found}, shown from its crate").into(),
+                );
+            }
+            finish(looked_up, &request, &warnings)
+        },
+        Err(error) => {
+            let error = crate::task::resume_if_panic(error);
+            tracing::error!(%error, "the get_item lookup in std did not finish");
+            shutting_down()
+        },
+    }
+}
+
+/// The release of the project's toolchain, which a nightly installed here must not be older than
+/// to be used for std (requirement R-STD-1). `None` without a single default workspace, or when
+/// its toolchain cannot be run without installing it.
+#[cfg(feature = "local")]
+async fn project_toolchain(state: &ToolState) -> Option<Version> {
+    let project = state.project.as_ref()?;
+    let [workspace] = &*project.workspaces else {
+        return None;
+    };
+    data::local_std::rustc_release(&workspace.root).await
+}
+
+/// Without local features, no toolchain is run.
+#[cfg(not(feature = "local"))]
+#[expect(
+    clippy::unused_async,
+    reason = "the same signature as with local features, where it runs rustc"
+)]
+async fn project_toolchain(_state: &ToolState) -> Option<Version> {
+    None
+}
+
+/// Follows `request.path` through the crates of std in `chosen`, archiving each the first time,
+/// and looks the item up where it is. Returns the result and the paths it went through.
+fn look_up_std(
+    cache: &Cache,
+    chosen: &Chosen,
+    request: &Request,
+) -> (Result<Value, Failure>, Vec<Box<str>>) {
+    let mut loaded: HashMap<StdCrate, Arc<Mapped<Indexed>>> = HashMap::new();
+    let mut failed = None;
+    let load = |name: &str| {
+        let krate = StdCrate::from_name(name)?;
+        if let Some(mapped) = loaded.get(&krate) {
+            return Some(Arc::clone(mapped));
+        }
+        let archived = chosen
+            .json
+            .archive_key(cache, krate)
+            .map_err(load::LoadError::Read)
+            .and_then(|(dir, key)| {
+                load::archive_of(cache, &dir, krate.as_str(), &key, || {
+                    chosen.json.read(cache, krate)
+                })
+            });
+        match archived {
+            Ok(mapped) => {
+                let mapped = Arc::new(mapped);
+                loaded.insert(krate, Arc::clone(&mapped));
+                Some(mapped)
+            },
+            Err(error) => {
+                tracing::warn!(krate = krate.as_str(), error = %ErrorChain(&error), "the JSON of std could not be loaded");
+                failed = Some(error);
+                None
+            },
+        }
+    };
+    let Some(followed) = across::follow(&request.path, load) else {
+        let failure = match failed {
+            Some(load::LoadError::Parse(error)) => Failure::Parse(error),
+            Some(load::LoadError::Archive(error) | load::LoadError::Read(error)) => {
+                Failure::Archive(error)
+            },
+            None => Failure::Archive(std::io::Error::other("std could not be loaded")),
+        };
+        return (Err(failure), Vec::new());
+    };
+    let view = CrateView::new(followed.krate.get());
+    // The crate where the item is (alloc for `std::vec::Vec`), at the version its JSON says.
+    let name = view
+        .item(view.root())
+        .and_then(|root| root.name.as_deref())
+        .and_then(|name| name.parse::<CrateName>().ok())
+        .unwrap_or_else(|| request.name.clone());
+    let version = view
+        .crate_version()
+        .and_then(|version| Version::parse(version).ok())
+        .unwrap_or_else(|| request.version.clone());
+    let toolchain = chosen.json.toolchain();
+    let looked_up = get_item(&view, ItemRequest {
+        name: &name,
+        version: &version,
+        path: &followed.path,
+        origin: Origin::Std {
+            toolchain: &toolchain,
+            std_from: chosen.json.source(),
+            why: &chosen.why,
+        },
+        target: Some(request.target.as_str()),
+    })
+    .map_err(Failure::Item)
+    .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize));
+    (looked_up, followed.through)
+}
+
+/// The tool error for std that the distribution server could not give (requirement R-STD-6).
+fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
+    let message = format!(
+        "the rustdoc JSON of {} could not be had: {}",
+        krate.as_str(),
+        ErrorChain(error)
+    );
+    let (code, reason, retryable): (&str, Option<&str>, bool) = match error {
+        DistError::Network(_) | DistError::Status { .. } => ("network_error", None, true),
+        DistError::Certificate(_) | DistError::Manifest(_) => ("network_error", None, false),
+        DistError::NotAvailable { .. } => ("docs_unavailable", Some("no_json"), false),
+        DistError::TooLarge { .. } => ("docs_unavailable", Some("too_large"), false),
+        DistError::ChecksumMismatch | DistError::Archive(_) => {
+            ("docs_unavailable", Some("corrupt"), true)
+        },
+        DistError::Cache(_) => ("internal_error", None, false),
+    };
+    let mut body = json!({
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+        "suggestions": [
+            "install rust-docs-json for a nightly toolchain: rustup component add rust-docs-json \
+             --toolchain nightly",
+        ],
+    });
+    if let (Some(reason), Some(body)) = (reason, body.as_object_mut()) {
+        body.insert("reason".to_owned(), json!(reason));
+    }
+    error_result(&body)
+}
+
 /// Looks the item up in the archive of the crate in `dir`, on a blocking thread. `Some(Ok(_))`
 /// with the result when the archive is there, `Some(Err(_))` with the arguments when it is not (or
 /// cannot be read, which is logged), and `None` if the runtime is shutting down.
@@ -748,7 +963,9 @@ impl Lookup {
             let looked_up = load::archive_json(&cache, &dir, &json)
                 .map_err(|error| match error {
                     load::LoadError::Parse(error) => Failure::Parse(error),
-                    load::LoadError::Archive(error) => Failure::Archive(error),
+                    load::LoadError::Archive(error) | load::LoadError::Read(error) => {
+                        Failure::Archive(error)
+                    },
                 })
                 .and_then(|mapped| look_up_in(&mapped, &arguments));
             (looked_up, arguments, json)
@@ -856,8 +1073,10 @@ fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Request) -> Result<Value, Fa
         name: &arguments.name,
         version: &arguments.version,
         path: &arguments.path,
-        resolved_from: arguments.resolved_from,
-        project_from: arguments.project_from,
+        origin: Origin::DocsRs {
+            resolved_from: arguments.resolved_from,
+            project_from: arguments.project_from,
+        },
         target: Some(arguments.target.as_str()),
     })
     .map_err(Failure::Item)
@@ -1074,6 +1293,15 @@ mod tests {
     }
 
     #[test]
+    fn the_crates_of_std_are_told_by_name() {
+        let krate = |name: &str| std_crate(&name.parse().expect("a crate name"));
+        assert_eq!(krate("std"), Some(StdCrate::Std));
+        assert_eq!(krate("proc-macro"), Some(StdCrate::ProcMacro));
+        assert_eq!(krate("Core"), Some(StdCrate::Core));
+        assert_eq!(krate("tokio"), None);
+    }
+
+    #[test]
     fn the_head_of_a_path_is_written_as_code_writes_it() {
         assert_eq!(
             &*with_lib_name("serde_json", "Serde-Json::Value"),
@@ -1159,7 +1387,10 @@ mod tests {
             ResolvedFrom,
             Source,
             SourceLocation,
+            StdFrom,
         };
+
+        let some_str = || Some("x");
 
         let some = || Some(Box::<str>::from("x"));
         let many = || Box::from([Box::<str>::from("x")]);
@@ -1168,8 +1399,13 @@ mod tests {
                 source: Source::DocsRs,
                 name: "x",
                 version: "1.0.0".into(),
-                resolved_from: ResolvedFrom::Explicit,
+                resolved_from: Some(ResolvedFrom::Explicit),
                 project_from: Some("cwd"),
+                toolchain: some_str(),
+                std_from: Some(StdFrom {
+                    source: "dist",
+                    reason: "x",
+                }),
                 target: "x",
                 format_version: 61,
             },

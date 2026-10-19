@@ -265,17 +265,21 @@ impl ArchivedPathIndex {
         let Some(key) = normalize(path) else {
             return Resolution::NotFound;
         };
-        if let Some(resolution) = self.lookup(&key) {
+        if let Some(resolution) = self.lookup_public(&key) {
             return resolution;
         }
         // An item in an `impl` has no path of its own: find the parent, then the member in it.
-        let Some((parent, member)) = key.rsplit_once("::") else {
-            return Resolution::NotFound;
-        };
-        match self.lookup(parent) {
-            Some(Resolution::Item(parent)) => find_member(view, parent, member),
-            _ => Resolution::NotFound,
+        // This comes before the definition paths, which list the methods of some crates (std):
+        // found as a member, an item keeps its parent and `impl`.
+        if let Some((parent, member)) = key.rsplit_once("::")
+            && let Some(Resolution::Item(parent)) = self.lookup(parent)
+        {
+            let found = find_member(view, parent, member);
+            if found != Resolution::NotFound {
+                return found;
+            }
         }
+        self.lookup_definition(&key).unwrap_or(Resolution::NotFound)
     }
 
     /// Where `path` goes on in another crate: the longest prefix of `path` that re-exports an
@@ -326,12 +330,21 @@ impl ArchivedPathIndex {
     /// Looks `key` up as a public path, a re-export from another crate, then a definition path.
     /// An item of this crate comes before a re-export at the same path ([`Self::hidden_reexport`]).
     fn lookup(&self, key: &str) -> Option<Resolution> {
+        self.lookup_public(key)
+            .or_else(|| self.lookup_definition(key))
+    }
+
+    /// Looks `key` up as a public path, then a re-export from another crate.
+    fn lookup_public(&self, key: &str) -> Option<Resolution> {
         if let Some(ids) = self.by_public_path.get(key) {
             return Some(one_or_ambiguous(ids));
         }
-        if let Some(reexport) = self.external_reexport(key) {
-            return Some(Resolution::ExternalReexport(reexport));
-        }
+        self.external_reexport(key)
+            .map(Resolution::ExternalReexport)
+    }
+
+    /// Looks `key` up as a definition path of this crate.
+    fn lookup_definition(&self, key: &str) -> Option<Resolution> {
         self.by_definition_path
             .get(key)
             .map(|ids| one_or_ambiguous(ids))
@@ -1041,6 +1054,29 @@ mod tests {
             Some("core::option::Option")
         );
         assert_eq!(continued("std::collections::HashMap"), None);
+    }
+
+    #[test]
+    fn a_member_with_a_definition_path_is_found_as_a_member() {
+        // The std of a nightly lists methods among its definition paths.
+        let krate = krate(
+            vec![
+                module(0, "c", &[1]),
+                structure(1, "S", &[2]),
+                an_impl(2, 1, None, &[3]),
+                assoc_const(3, "get"),
+            ],
+            &[(1, 0, "c::S"), (3, 0, "c::S::get")],
+        );
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        assert_eq!(
+            view.index().resolve(&view, "c::S::get"),
+            Resolution::Member {
+                parent: Id(1),
+                member: Id(3),
+            }
+        );
     }
 
     #[test]

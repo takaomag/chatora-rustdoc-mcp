@@ -32,12 +32,31 @@ pub struct ItemRequest<'a> {
     pub version: &'a Version,
     /// The path of the item, starting with the crate name (`tokio::sync::Mutex::lock`).
     pub path: &'a str,
-    /// How the version was chosen.
-    pub resolved_from: ResolvedFrom,
-    /// Where the project that decided the version came from, if one did (§7.3).
-    pub project_from: Option<&'static str>,
+    /// Where the data comes from, and how the version was chosen.
+    pub origin: Origin<'a>,
     /// The target asked for, to warn when the data is for another.
     pub target: Option<&'a str>,
+}
+
+/// Where the data comes from, for the provenance (§7.3).
+#[derive(Debug, Clone, Copy)]
+pub enum Origin<'a> {
+    /// docs.rs, at a version chosen as `resolved_from` says.
+    DocsRs {
+        /// How the version was chosen.
+        resolved_from: ResolvedFrom,
+        /// Where the project that decided the version came from, if one did.
+        project_from: Option<&'static str>,
+    },
+    /// The std of a nightly toolchain (requirement R-STD-1).
+    Std {
+        /// The toolchain, as `rustc -vV` gives it on its first line.
+        toolchain: &'a str,
+        /// `dist` or `local`.
+        std_from: &'static str,
+        /// Why that one was used.
+        why: &'a str,
+    },
 }
 
 /// The result of `get_item` (the common shape of §7.3).
@@ -65,16 +84,33 @@ pub struct Provenance<'a> {
     pub name: &'a str,
     /// The version in the JSON, or the requested one if the JSON has none.
     pub version: Cow<'a, str>,
-    /// How the version was chosen.
-    pub resolved_from: ResolvedFrom,
+    /// How the version was chosen. Not for std.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_from: Option<ResolvedFrom>,
     /// Where the project that decided the version came from: `argument`, `CLAUDE_PROJECT_DIR` or
     /// `cwd` (requirement R-MCP-3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_from: Option<&'static str>,
+    /// The toolchain that std is from (requirement R-STD-1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toolchain: Option<&'a str>,
+    /// Where std came from: `dist` (the Rust distribution server) or `local` (the nightly
+    /// toolchain installed here), and why (requirement R-STD-1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub std_from: Option<StdFrom<'a>>,
     /// The target the JSON was built for.
     pub target: &'a str,
     /// The rustdoc JSON format.
     pub format_version: u32,
+}
+
+/// Where std came from, and why.
+#[derive(Debug, Serialize)]
+pub struct StdFrom<'a> {
+    /// `dist` or `local`.
+    pub source: &'static str,
+    /// Why that one was used.
+    pub reason: &'a str,
 }
 
 /// The source that returned the data (§7.3).
@@ -83,6 +119,9 @@ pub enum Source {
     /// The rustdoc JSON that docs.rs built.
     #[serde(rename = "docs.rs")]
     DocsRs,
+    /// The rustdoc JSON of std that a nightly toolchain ships.
+    #[serde(rename = "std")]
+    Std,
 }
 
 /// How the version was chosen (§7.3).
@@ -283,7 +322,11 @@ impl<'a> Query<'a> {
     fn provenance(&mut self) -> Provenance<'a> {
         let view = self.view;
         let requested = self.request.version;
-        let version = if let Some(version) = view.crate_version() {
+        let version = if let Origin::Std { .. } = self.request.origin {
+            // std writes its version with the commit (`1.101.0-nightly\t(b6eeb93c9\t…)`); the
+            // toolchain's release is what the caller gave.
+            Cow::Owned(requested.to_string())
+        } else if let Some(version) = view.crate_version() {
             // Compared as versions, so that the requested one is not formatted to compare it.
             if Version::parse(version).ok().as_ref() != Some(requested) {
                 self.warnings.push(Cow::Owned(format!(
@@ -319,12 +362,40 @@ impl<'a> Query<'a> {
                  were not followed, so a path may not be found",
             ));
         }
+        let (source, resolved_from, project_from, toolchain, std_from) = match self.request.origin {
+            Origin::DocsRs {
+                resolved_from,
+                project_from,
+            } => (
+                Source::DocsRs,
+                Some(resolved_from),
+                project_from,
+                None,
+                None,
+            ),
+            Origin::Std {
+                toolchain,
+                std_from,
+                why,
+            } => (
+                Source::Std,
+                None,
+                None,
+                Some(toolchain),
+                Some(StdFrom {
+                    source: std_from,
+                    reason: why,
+                }),
+            ),
+        };
         Provenance {
-            source: Source::DocsRs,
+            source,
             name: self.request.name.as_str(),
             version,
-            resolved_from: self.request.resolved_from,
-            project_from: self.request.project_from,
+            resolved_from,
+            project_from,
+            toolchain,
+            std_from,
             target,
             format_version: view.format_version(),
         }
@@ -495,12 +566,29 @@ impl<'a> Query<'a> {
         } else {
             format!("{}-{}", span.begin.0, span.end.0)
         };
+        // std is built from the rust repository at a commit: `/rustc/<commit>/library/…`.
+        if let Origin::Std { .. } = self.request.origin {
+            let url = std_source(file).map(|(commit, path)| {
+                let anchor = if span.begin.0 == span.end.0 {
+                    format!("L{}", span.begin.0)
+                } else {
+                    format!("L{}-L{}", span.begin.0, span.end.0)
+                };
+                format!("https://github.com/rust-lang/rust/blob/{commit}/{path}#{anchor}").into()
+            });
+            return Some(SourceLocation {
+                file,
+                lines: lines.into(),
+                url,
+            });
+        }
         if !in_package {
             self.warnings.push(Cow::Owned(format!(
                 "{file} is outside the package, so the definition has no docs.rs URL"
             )));
         }
-        let url = in_package.then(|| {
+        let on_docs_rs = matches!(self.request.origin, Origin::DocsRs { .. });
+        let url = (in_package && on_docs_rs).then(|| {
             let version: &dyn fmt::Display = match self.view.crate_version() {
                 Some(version) => &version.to_owned(),
                 None => self.request.version,
@@ -594,6 +682,14 @@ impl<'a> Query<'a> {
             |(owner, _)| format!("{name} in {}", self.renderer.signature(owner)).into(),
         )
     }
+}
+
+/// The commit and the path in the rust repository of a file of std, which rustdoc writes as
+/// `/rustc/<commit>/library/alloc/src/vec/mod.rs`.
+fn std_source(file: &str) -> Option<(&str, &str)> {
+    let (commit, path) = file.strip_prefix("/rustc/")?.split_once('/')?;
+    (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some((commit, path))
 }
 
 /// `values` as a boxed slice of boxed strings.
@@ -733,6 +829,17 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn std_sources_are_in_the_rust_repository() {
+        let commit = "b6eeb93c992027a03e1fd120b6652546396b142c";
+        assert_eq!(
+            std_source(&format!("/rustc/{commit}/library/alloc/src/vec/mod.rs")),
+            Some((commit, "library/alloc/src/vec/mod.rs"))
+        );
+        assert_eq!(std_source("/rustc/short/library/x.rs"), None);
+        assert_eq!(std_source("src/lib.rs"), None);
+    }
     use crate::{
         data::rustdoc_json::ParsedCrate,
         query::view::tests::{archive, archived},
@@ -979,8 +1086,10 @@ mod tests {
             name: &name,
             version: &version,
             path,
-            resolved_from: ResolvedFrom::Explicit,
-            project_from: None,
+            origin: Origin::DocsRs {
+                resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
+            },
             target: None,
         }))
     }
@@ -1081,8 +1190,10 @@ mod tests {
             name: &name,
             version: &version,
             path: "my_crate::sync::Mutex",
-            resolved_from: ResolvedFrom::Explicit,
-            project_from: None,
+            origin: Origin::DocsRs {
+                resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
+            },
             target: None,
         })
         .expect("found");

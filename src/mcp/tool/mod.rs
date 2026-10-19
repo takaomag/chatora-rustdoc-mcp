@@ -23,7 +23,13 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 
-use crate::data::{cache::Cache, docs_rs::DocsRs, sparse_index::SparseIndex, target::HostTarget};
+use crate::data::{
+    cache::Cache,
+    dist::Dist,
+    docs_rs::DocsRs,
+    sparse_index::SparseIndex,
+    target::HostTarget,
+};
 #[cfg(feature = "local")]
 use crate::data::{metadata::Resolver, project::DefaultProject};
 
@@ -34,6 +40,8 @@ pub(super) struct ToolState {
     pub(super) cache: Cache,
     /// The docs.rs client.
     pub(super) docs_rs: DocsRs,
+    /// The client of the Rust distribution server, for std (requirement R-STD-6).
+    pub(super) dist: Dist,
     /// The crates.io sparse index, for the versions of crates.
     pub(super) index: SparseIndex,
     /// The host target, the default target of the documentation (requirement R-TG-1).

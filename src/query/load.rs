@@ -22,6 +22,9 @@ pub enum LoadError {
     /// The crate could not be archived, not even in memory.
     #[error("the crate could not be archived")]
     Archive(#[source] io::Error),
+    /// The JSON could not be read.
+    #[error("the rustdoc JSON could not be read")]
+    Read(#[source] io::Error),
 }
 
 /// Where the archive of the JSON in `format` with `sha256` is kept, in its directory `dir`. The
@@ -83,6 +86,52 @@ pub fn archive_json(cache: &Cache, dir: &Path, json: &[u8]) -> Result<Mapped<Ind
     Mapped::in_memory(&indexed).map_err(LoadError::Archive)
 }
 
+/// The archive of the JSON of the crate `stem` in the cache directory `dir`, made the first time.
+///
+/// It is keyed by `source`: the SHA-256 of the JSON, or another id of 64 hex digits that changes
+/// with it. Without it, the JSON that `json` reads is parsed, indexed and archived there (the std
+/// of a nightly, requirement R-STD-1).
+///
+/// # Errors
+///
+/// Returns an error when the JSON cannot be read or parsed, or the crate cannot be archived.
+pub fn archive_of(
+    cache: &Cache,
+    dir: &Path,
+    stem: &str,
+    source: &str,
+    json: impl FnOnce() -> io::Result<Box<[u8]>>,
+) -> Result<Mapped<Indexed>, LoadError> {
+    let short = source.get(..16).unwrap_or(source);
+    let path = dir.join(format!("{stem}.{short}.v{ARCHIVE_SCHEMA}.rkyv"));
+    // The format is not compared when an archive is opened.
+    let opened = Mapped::open(cache, &path, &header(0, source.into()));
+    match opened {
+        Ok(Some(mapped)) => return Ok(mapped),
+        Ok(None) => {},
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "an archive could not be read");
+        },
+    }
+    let json = json().map_err(LoadError::Read)?;
+    let parsed = rustdoc_json::parse(&json)?;
+    drop(json);
+    let header = header(parsed.krate.format_version, source.into());
+    let indexed = Indexed::new(parsed);
+    match archive::write(cache, &path, &header, &indexed)
+        .and_then(|()| Mapped::open(cache, &path, &header))
+    {
+        Ok(Some(mapped)) => return Ok(mapped),
+        Ok(None) => {
+            tracing::warn!(path = %path.display(), "an archive just written does not check out");
+        },
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "the archive could not be written");
+        },
+    }
+    Mapped::in_memory(&indexed).map_err(LoadError::Archive)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +165,26 @@ mod tests {
                 .map(|path| path.joined())
                 .as_deref(),
             Some("c")
+        );
+    }
+
+    #[test]
+    fn an_archive_keyed_by_its_source_is_made_once() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let source = "cd".repeat(32);
+        let mut reads = 0;
+        for _ in 0..2 {
+            let mapped = archive_of(&cache, dir.path(), "std", &source, || {
+                reads += 1;
+                Ok(Box::from(JSON))
+            })
+            .expect("archived");
+            assert_eq!(CrateView::new(mapped.get()).crate_version(), Some("1.0.0"));
+        }
+        assert_eq!(
+            reads, 1,
+            "the second time, the archive is opened without the JSON"
         );
     }
 
