@@ -20,9 +20,10 @@ pub enum LoadError {
     /// It was not cached, and fetching it from docs.rs failed.
     #[error(transparent)]
     Fetch(#[from] FetchError),
-    /// The cached file exists but could not be read.
-    #[error("the cached rustdoc JSON could not be read")]
-    CacheRead(#[source] std::io::Error),
+    /// The cached file exists but could not be read, or the blocking task that uses the cache was
+    /// cancelled (when the runtime shuts down).
+    #[error("the cache of rustdoc JSON could not be used")]
+    Cache(#[source] std::io::Error),
 }
 
 /// Returns the rustdoc JSON of `name` at exactly `version` for the docs.rs default target: from
@@ -38,23 +39,29 @@ pub async fn docs_rs_json(
     docs_rs: &DocsRs,
     name: &CrateName,
     version: &Version,
-) -> Result<Vec<u8>, LoadError> {
+) -> Result<Box<[u8]>, LoadError> {
     // The cache is read and written on a blocking thread, so that tens of megabytes of disk I/O do
     // not hold up the async workers.
     let cached = {
         let (cache, name, version) = (cache.clone(), name.clone(), version.clone());
         blocking(move || cache.read_docs_rs_json(&name, &version)).await
     }
-    .map_err(LoadError::CacheRead)?;
+    .map_err(LoadError::Cache)?;
     if let Some(json) = cached {
         return Ok(json);
     }
     let json = docs_rs.fetch_rustdoc_json(name, version).await?;
-    let written = {
+    // The JSON moves to the blocking thread and comes back, so that tens of megabytes are not
+    // copied.
+    let (json, written) = {
         let (cache, name, version) = (cache.clone(), name.clone(), version.clone());
-        let json = json.clone();
-        blocking(move || cache.write_docs_rs_json(&name, &version, &json)).await
-    };
+        blocking(move || {
+            let written = cache.write_docs_rs_json(&name, &version, &json);
+            Ok((json, written))
+        })
+        .await
+    }
+    .map_err(LoadError::Cache)?;
     if let Err(error) = written {
         tracing::warn!(%name, %version, %error, "failed to write the rustdoc JSON to the cache");
     }

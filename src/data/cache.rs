@@ -42,7 +42,7 @@ pub enum CacheError {
     /// The environment variable holds a relative path. The server's working directory depends on
     /// how it was started, so a relative path would point somewhere unpredictable.
     #[error("{DIR_ENV_VAR} must be an absolute path, but it is {0:?}")]
-    RelativeDir(PathBuf),
+    RelativeDir(Box<Path>),
     /// The home directory, under which the default cache directory is, could not be found.
     #[error("the home directory could not be found to place the cache")]
     NoHome(#[source] etcetera::HomeDirError),
@@ -92,14 +92,14 @@ impl Cache {
         &self,
         name: &CrateName,
         version: &Version,
-    ) -> io::Result<Option<Vec<u8>>> {
+    ) -> io::Result<Option<Box<[u8]>>> {
         let path = self.docs_rs_json_path(name, version);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 tracing::warn!(path = %path.display(), "ignoring a symlink in the cache");
                 Ok(None)
             },
-            Ok(_) => fs::read(&path).map(Some),
+            Ok(_) => fs::read(&path).map(|json| Some(json.into_boxed_slice())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
@@ -132,7 +132,7 @@ fn root_dir(
         return if dir.is_absolute() {
             Ok(dir)
         } else {
-            Err(CacheError::RelativeDir(dir))
+            Err(CacheError::RelativeDir(dir.into_boxed_path()))
         };
     }
     let dir = os_cache_dir().map_err(CacheError::NoHome)?.join(APP_DIR);

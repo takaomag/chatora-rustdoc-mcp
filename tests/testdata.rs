@@ -47,7 +47,7 @@ fn entries() -> Vec<Entry> {
 }
 
 /// Reads the JSON of `entry` from the cache and checks that it is the one in the list.
-fn cached_json(cache: &Cache, entry: &Entry) -> Vec<u8> {
+fn cached_json(cache: &Cache, entry: &Entry) -> Box<[u8]> {
     let (name, version) = (&entry.name, &entry.version);
     let json = cache
         .read_docs_rs_json(name, version)

@@ -117,7 +117,7 @@ impl DocsRs {
     }
 
     /// Fetches the rustdoc JSON of `name` at exactly `version`, built for the docs.rs default
-    /// target, and returns it decompressed.
+    /// target, and returns it decompressed. It holds no spare capacity.
     ///
     /// # Errors
     ///
@@ -127,7 +127,7 @@ impl DocsRs {
         &self,
         name: &CrateName,
         version: &Version,
-    ) -> Result<Vec<u8>, FetchError> {
+    ) -> Result<Box<[u8]>, FetchError> {
         // Both parts are validated, so they cannot change the shape of the URL.
         let url = format!("{}/crate/{name}/{version}/json", self.base_url);
         let mut response = self
@@ -153,7 +153,7 @@ impl DocsRs {
             }
             body.extend_from_slice(&chunk);
         }
-        decompress(body, MAX_BYTES)
+        decompress(body, MAX_BYTES).map(Vec::into_boxed_slice)
     }
 }
 
@@ -308,7 +308,7 @@ mod tests {
             .fetch_rustdoc_json(&name, &version)
             .await
             .expect("fetches");
-        assert_eq!(json, JSON);
+        assert_eq!(&*json, JSON);
         let request = request.recv().expect("the server saw the request");
         assert!(
             request.starts_with("GET /crate/serde/1.0.228/json HTTP/1.1\r\n"),
