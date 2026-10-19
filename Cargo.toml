@@ -22,7 +22,7 @@ const_format = "0.2.36"
 rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-tokio = { version = "1.53.3", features = ["rt-multi-thread"] }
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter"] }
 
@@ -160,6 +160,3 @@ wildcard_enum_match_arm = "warn"
 # rustc の missing_docs が crate doc の欠落も拾うので不要。
 [lints.rustdoc]
 unescaped_backticks = "warn"
-
-[dev-dependencies]
-tokio = { version = "1.53.3", features = ["macros", "rt"] }

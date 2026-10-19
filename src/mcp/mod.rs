@@ -1,6 +1,7 @@
 //! Frontend layer: the MCP server. MCP types appear only in this module.
 
 mod echo;
+mod sleep;
 
 use std::borrow::Cow;
 
@@ -101,9 +102,11 @@ impl ServerHandler for Server {
                 None,
             ))
         } else {
-            Ok(ListToolsResult::with_all_items(vec![echo::tool()])
-                .with_ttl_ms(LIST_TTL_MS)
-                .with_cache_scope(CacheScope::Public))
+            Ok(
+                ListToolsResult::with_all_items(vec![echo::tool(), sleep::tool()])
+                    .with_ttl_ms(LIST_TTL_MS)
+                    .with_cache_scope(CacheScope::Public),
+            )
         };
         std::future::ready(result)
     }
@@ -111,7 +114,7 @@ impl ServerHandler for Server {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         // Only an unknown tool is a JSON-RPC error; bad arguments are tool errors (requirement R-ARG-1).
         match request.name.as_ref() {
@@ -120,6 +123,10 @@ impl ServerHandler for Server {
                 Ok(run_tool(async move { echo::call(arguments.as_ref()) })
                     .await
                     .into())
+            },
+            sleep::NAME => match sleep::parse(request.arguments.as_ref()) {
+                Ok(seconds) => Ok(run_tool(sleep::call(seconds, context)).await.into()),
+                Err(error) => Ok(error.into()),
             },
             name => Err(ErrorData::invalid_params(
                 format!("unknown tool: {name}"),
