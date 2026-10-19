@@ -25,6 +25,7 @@ use rmcp::{
         ProtocolVersion,
         ServerCapabilities,
         ServerConfig,
+        SubscriptionFilter,
     },
     service::{QuitReason, RequestContext, RoleServer, ServerInitializeError},
     transport::stdio,
@@ -88,6 +89,16 @@ impl ServerHandler for Server {
         )
         .with_ttl_ms(LIST_TTL_MS)
         .with_cache_scope(CacheScope::Public)))
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        _requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        // Accept `subscriptions/listen` with no notifications: the server declares none
+        // (requirement R-MCP-16). `None` would make rmcp answer -32601. The default `listen` holds
+        // the subscription until it is cancelled.
+        Some(SubscriptionFilter::default())
     }
 
     fn list_tools(
