@@ -132,7 +132,74 @@ Q-30 の内訳:
 
 ### 6.1 M0a
 
-(未着手)
+#### A1・A2 (2026-10-19)
+
+環境: rustc・cargo 1.99.1 (stable)、rmcp 3.5.1、tokio 1.53.3。Claude Code からはまだ呼んでいない (A3)。挙動は、生の JSON-RPC を流す結合テスト [tests/stdio.rs](../tests/stdio.rs) と、`src/mcp/mod.rs` の単体テストで固定した。
+
+**決めたこと** (§3.3 の D1・D3 を含む)
+
+- D1: ツールは rmcp のマクロを使わず、`ServerHandler` の `list_tools`・`call_tool` を手で実装した。D3: `serve` の引数は手で解析した。D2 (仮のキャッシュと `outputSchema`) は A4 以降
+- バイナリ名を `chatora-rustdoc-mcp` (`src/bin/chatora-rustdoc-mcp.rs`) にした。パッケージ名と lib の crate 名は `chatora-rustdoc` のまま。serverInfo の `name` もバイナリ名にそろえた (要件の §14 の v0.17 (作成中) に記録済み)
+- lib は層 (`data`・`query`・`mcp`) と、層をまたぐ `logging` に分けた。tokio の runtime はバイナリで作り、lib の `mcp::serve` は async にした
+- `mcp::serve` のエラーは thiserror の `ServeError` で返す。セッションのタスクの panic はエラーにせず、`resume_unwind` で投げ直す (不具合を終了コード 101 で伝えるため)。ツール 1 回分の panic は、逆に `internal_error` の結果に変える (R-ERR-1)
+- ログは tracing で stderr に出す。絞り込みは環境変数 `CHATORA_RUSTDOC_LOG__FILTER` (設定キー `log.filter` に当たる。既定 `info`、誤った指定は無視する)
+- `initialize` の拒否の `message` は const_format で組み立てる。const_format とその依存 3 つのライセンスは Zlib で、M5 の cargo-deny (R-DIST-4) で許可の一覧に入れる必要がある
+- 仮のツールは `echo` (配線の確認) と `sleep` (進捗通知とキャンセルの確認。A3 でも使う) の 2 つ。どちらも A8 で消す
+- エラー本文の `request_id` (R-ERR-2) は、ログと対応付ける R-OBS-1 と一緒に M1 で入れる
+
+**確かめたこと**
+
+| 要件 | 結果 |
+| --- | --- |
+| R-MCP-14・R-MCP-5 `server/discover` | `supportedVersions: ["2026-07-28"]`、`capabilities: {"tools":{}}`、`ttlMs: 3600000`、`cacheScope: "public"`、serverInfo を返す。rmcp の既定 (`ttlMs: 0`・`private`) は `discover` の上書きで直した |
+| R-MCP-5 `tools/list` | 同じキャッシュの指定を付けた。`cursor` 付きの要求は `-32602`。ツールは決まった順で返す |
+| R-MCP-2 `initialize` | `-32022`、独自の `message` (対応する版と Claude Code v2.1.292 以降が要ること)、`data` の `requested`・`supported`。rmcp はその後セッションを終え、プロセスは終了コード 1 で終わる (受け入れる。下記) |
+| R-MCP-2 その他 | `_meta` を欠く要求は `-32602`。セッション開始後の `ping` と `logging/setLevel` は `-32601`。どれも rmcp の既定のままで要件どおり |
+| R-ARG-1・R-ERR-2・R-OUT-1 | 知らないツール名だけが `-32602`。引数の誤りは `isError: true` のツールの結果で、`content[0].text` が自己完結した JSON (`code`・`message`・`retryable`・`suggestions`)。`structuredContent` は付けない。成功は `CallToolResult::structured` で `structuredContent` と同じ JSON の text |
+| R-ERR-1 | rmcp は要求ごとのタスクの panic で応答を送らない (`service.rs:1603`)。ツールを別のタスクで動かして `JoinError` を `internal_error` の結果に変えた |
+| R-WS-6 | token があるときだけ `notifications/progress` を送れる。`notifications/cancelled` (`_meta` の有無によらない) で `context.ct` が cancel され、rmcp はその要求の応答を捨てる。キャンセル後も他の要求には応答する |
+| R-MCP-16 `subscriptions/listen` | rmcp は `accepted_subscription_filter` が `None` (既定) だと `-32601` を返す。空のフィルターを返すようにし、ack (`subscriptionId` は要求の id、`notifications` は空) を返して保持するようにした。stdio でサーバーが終わるのはクライアントが stdin を閉じたときかシグナルだけなので、「つながったままサーバーから閉じる」場面は v1 では起きない (仕様のページ間の食い違いは M6 の HTTP で扱う) |
+| R-SEC-1 | stdout の各行が単独の JSON-RPC のメッセージであることを、結合テストのすべての出力で確かめている |
+
+**rmcp の挙動で、要件と違うが受け入れるもの** (ハンドラからは変えられない。`tests/stdio.rs` の `rmcp_deviations_from_the_requirements` で固定し、rmcp が変われば気付けるようにした)
+
+- セッション開始前の `ping` (`_meta` なし) に空の結果を返す (R-MCP-2 は `-32601`)。rmcp の受信ループが直接答えている
+- `arguments` がオブジェクトでない `tools/call` に `-32601` を返す (R-ARG-1 は `-32602`)。要求の逆直列化の失敗が method not found になる
+- `initialize` を拒んだ後にプロセスが終わる。古いクライアントは拒まれた後に続けられないので、実害は無い
+- `_meta` で対応外の版を名乗った要求への `-32022` の `message` は rmcp の固定の文言 (R-MCP-2 が独自の `message` を求めるのは `initialize` だけ)
+
+**ほかに分かったこと**
+
+- 応答は要求の順に返るとは限らない (rmcp が要求ごとのタスクで処理するため)。テストは id で対応付ける
+- rmcp は受けた通知を INFO で中身ごとログに出す。量が問題になれば、ログの既定を `info,rmcp=warn` などにする
+- stdin の EOF を受けると、rmcp は処理中の要求の応答を最大 5 秒待ってから終わる (`service.rs:1762`。listen を保持したまま、または `sleep 30` の最中に閉じると 5.2 秒、listen をキャンセルしてから閉じると 0.4 秒)
+
+**SDK の比較** (A2 の途中で、rmcp の手当てが多いので代替を調べた。scratchpad で最小の stdio サーバーを作り、同じ JSON-RPC を流した)
+
+| 観点 | rmcp 3.5.1 | tower-mcp 0.24.0 | rust-mcp-sdk 2.0.0 | pmcp 2.22.7 |
+| --- | --- | --- | --- | --- |
+| stdio で 2026-07-28 | ○ | ○ | ○ | × (`server/discover` でプロセスが終わる) |
+| ツールの panic | 応答なし (自前で包む) | `.catch_panics()` で `isError` | 応答なし | 応答なし。以後の要求にも応答しない |
+| キャンセル後に応答しない (R-WS-6 の MUST) | ○ | ○ | × | × |
+| `initialize` の `message` | 上書きできる | 固定 | 上書きできる | 固定 (`-32602`) |
+| `server/discover` のキャッシュの指定 | 設定できる | 0・private に固定 | 設定できる | — |
+| `_meta` を欠く要求 | `-32602` | `-32602` | `-32601` | `-32602` |
+| 文字列の `arguments` | `-32601` | ハンドラに届く | `-32601` | ハンドラに届く |
+| 規模 (2026-10-19) | 約 3,700 万 DL。公式の SDK | 約 3.5 万 DL。7 か月で破壊的な minor が 16 回 | 約 32 万 DL。最終リリースは 53 日前 | 約 13 万 DL |
+
+turbomcp (alpha 版) と turul-mcp-server (約 2,500 DL) は比べる前に外した。結論として rmcp を続ける。tower-mcp は panic の仕組みと引数の扱いが良いが、R-MCP-5・R-MCP-2 を満たせず、更新のたびに互換性が壊れる頻度が高い。rust-mcp-sdk はキャンセル後の MUST を満たせない。
+
+**M1・M2 への申し送り**
+
+- M1: `request_id` (R-ERR-2・R-OBS-1)。`outputSchema` と応答の骨格の確定 (R-OUT-9。D2)
+- M2: stdin の EOF でローカルビルドを止める処理を自前で持つ (rmcp の 5 秒の待ちの間も子の cargo が動き続けるため。R-WS-6)。シグナル (SIGINT・SIGTERM) の扱いも同時に決める
+
+**v0.17 で要件に反映すること**
+
+- R-DIST-3 の設定の表に `log.filter` を足す
+- §10 の SDK の行に、上の比較を根拠として足す (推しは rmcp のまま)
+- R-MCP-2・R-ARG-1 に、rmcp の挙動で受け入れる違いを書く
+- R-MCP-16 に、stdio では「サーバーから閉じる」場面が起きないことを書く
 
 ### 6.2 M0b
 
