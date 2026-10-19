@@ -102,7 +102,7 @@ impl DefaultProject {
             Some(dir) => (PathBuf::from(dir), ProjectFrom::ClaudeProjectDir),
             None => (cwd?, ProjectFrom::Cwd),
         };
-        let dir = fs::canonicalize(&dir).unwrap_or(dir);
+        let dir = dunce::canonicalize(&dir).unwrap_or(dir);
         let mut workspaces = if dir.join("Cargo.toml").is_file() {
             readable_workspace(&dir, None).into_iter().collect()
         } else {
@@ -169,7 +169,7 @@ fn find_workspace(path: &Path, boundary: Option<&Path>) -> Result<Workspace, Pro
     }
     let dir = manifest
         .parent()
-        .map(|dir| fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
+        .map(|dir| dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
         .unwrap_or_default();
     let parsed = read_manifest(&manifest)?;
     if parsed.workspace.is_some() {
@@ -178,7 +178,7 @@ fn find_workspace(path: &Path, boundary: Option<&Path>) -> Result<Workspace, Pro
     if let Some(root) = parsed.package.and_then(|package| package.workspace) {
         let root = dir.join(root);
         return Ok(Workspace {
-            root: fs::canonicalize(&root).unwrap_or(root),
+            root: dunce::canonicalize(&root).unwrap_or(root),
         });
     }
     // As Cargo does, the first workspace above that does not exclude the package decides: it is
@@ -397,7 +397,7 @@ mod tests {
     }
 
     fn root(dir: &tempfile::TempDir, relative: &str) -> PathBuf {
-        fs::canonicalize(dir.path().join(relative)).expect("the directory exists")
+        dunce::canonicalize(dir.path().join(relative)).expect("the directory exists")
     }
 
     const PACKAGE: &str = "[package]\nname = \"p\"\nversion = \"0.1.0\"\n";

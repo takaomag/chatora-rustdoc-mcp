@@ -7,6 +7,8 @@ use std::{error::Error as _, ffi::OsString};
 // tests and examples, which the binary's test build sees too.
 use const_format as _;
 use derive_more as _;
+#[cfg(feature = "local")]
+use dunce as _;
 use elsa as _;
 use etcetera as _;
 #[cfg(test)]

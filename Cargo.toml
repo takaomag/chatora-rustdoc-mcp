@@ -21,12 +21,14 @@ default = ["local"]
 # プロジェクトの文脈を要する機能 (cargo・rustc の起動、ローカルビルド) をまとめる (要件 R-ARCH-2)。
 # `--no-default-features` では、cargo を起動するコードも build.rs を実行するコードもバイナリに入らない。
 # 子プロセス (`rustc -vV`・cargo) を起動するので tokio の `process` を、`cargo metadata` の結果を
-# 共有するので tokio の `sync` を足す。
-local = ["tokio/process", "tokio/sync"]
+# 共有するので tokio の `sync` を足す。cargo の出すパスと比べるので、Windows でも `\\?\` の付かない
+# 形に正規化する dunce を足す。
+local = ["tokio/process", "tokio/sync", "dep:dunce"]
 
 [dependencies]
 const_format = "0.2.36"
 derive_more = { version = "2.1.1", default-features = false, features = ["display", "as_ref"] }
+dunce = { version = "1.0.5", optional = true }
 elsa = "1.11.2"
 etcetera = "0.11.0"
 lzma-rust2 = { version = "0.23.0", default-features = false, features = [

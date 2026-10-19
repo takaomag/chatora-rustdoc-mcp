@@ -13,3 +13,7 @@ disallowed-types = [
   { path = "std::sync::Mutex", reason = "poison がある。parking_lot か tokio::sync のロックを使う (要件 R-ERR-1)" },
   { path = "std::sync::RwLock", reason = "poison がある。parking_lot か tokio::sync のロックを使う (要件 R-ERR-1)" },
 ]
+# Windows の `fs::canonicalize` は `\\?\C:\…` の形を返し、cargo の出すパス (`C:\…`) と一致しない。
+disallowed-methods = [
+  { path = "std::fs::canonicalize", reason = 'Windows では \\?\ の付いた形になり、cargo のパスと比べられない。dunce::canonicalize を使う' },
+]

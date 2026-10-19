@@ -161,6 +161,7 @@ version = "0.1.0"
 dependencies = [
  "const_format",
  "derive_more",
+ "dunce",
  "elsa",
  "etcetera",
  "insta",
