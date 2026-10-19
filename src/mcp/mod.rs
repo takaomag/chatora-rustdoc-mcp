@@ -1,6 +1,7 @@
 //! Frontend layer: the MCP server. MCP types appear only in this module.
 
 mod echo;
+mod probe_result;
 mod sleep;
 
 use std::borrow::Cow;
@@ -113,11 +114,13 @@ impl ServerHandler for Server {
                 None,
             ))
         } else {
-            Ok(
-                ListToolsResult::with_all_items(vec![echo::definition(), sleep::definition()])
-                    .with_ttl_ms(LIST_TTL_MS)
-                    .with_cache_scope(CacheScope::Public),
-            )
+            Ok(ListToolsResult::with_all_items(vec![
+                echo::definition(),
+                probe_result::definition(),
+                sleep::definition(),
+            ])
+            .with_ttl_ms(LIST_TTL_MS)
+            .with_cache_scope(CacheScope::Public))
         };
         std::future::ready(result)
     }
@@ -134,6 +137,12 @@ impl ServerHandler for Server {
                 Ok(run_tool(async move { echo::execute(arguments.as_ref()) })
                     .await
                     .into())
+            },
+            probe_result::NAME => match probe_result::parse_arguments(request.arguments.as_ref()) {
+                Ok(is_error) => Ok(run_tool(async move { probe_result::execute(is_error) })
+                    .await
+                    .into()),
+                Err(error) => Ok(error.into()),
             },
             sleep::NAME => match sleep::parse_arguments(request.arguments.as_ref()) {
                 Ok(seconds) => Ok(run_tool(sleep::execute(seconds, context)).await.into()),

@@ -254,7 +254,11 @@ fn tools_list_is_cacheable_and_not_paginated() {
         .iter()
         .map(|tool| &tool["name"])
         .collect();
-    assert_eq!(names, [&json!("echo"), &json!("sleep")]);
+    assert_eq!(names, [
+        &json!("echo"),
+        &json!("probe_result"),
+        &json!("sleep")
+    ]);
     assert_eq!(result["ttlMs"], 3_600_000);
     assert_eq!(result["cacheScope"], "public");
     assert_eq!(server.response(2)["error"]["code"], -32602);
