@@ -533,6 +533,40 @@ R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52�
 
 実験のスクリプトと合成の workspace は [poc/m0b/](../poc/m0b/) にある (共通の設定は `env.sh`、手順は README)。「実際の workspace」はこのリポジトリ (Cargo.lock に 242 パッケージ、member のビルドで 186 unit)。
 
+#### B1 (2026-10-19)
+
+環境は B2 と同じ (stable 1.99.1、nightly 1.101.0-nightly 2026-10-17)。スクリプトは [poc/m0b/b1-rustc-bootstrap/run.sh](../poc/m0b/b1-rustc-bootstrap/run.sh)。どれも stable の `cargo rustdoc … -- -Z unstable-options --output-format json` で、1 つの target dir の中で順に実行した。
+
+**`RUSTC_BOOTSTRAP` を見る依存**: このリポジトリの 242 パッケージのうち、build.rs が `cargo:rerun-if-env-changed=RUSTC_BOOTSTRAP` を出すのも、build.rs のソースで `RUSTC_BOOTSTRAP` に触れるのも、**proc-macro2** (1.0.107) と **thiserror** (2.0.21) の 2 つだけだった。どちらも自分の crate 名が値に入っていると nightly の機能を有効にする (proc-macro2 は `proc_macro_span`・`proc_macro_span_file`・`proc_macro_span_location`・`wrap_proc_macro`、thiserror は `error_generic_member_access`)。
+
+**作り直しの範囲**:
+
+| 値の決め方 | member (コールド) | 依存の文書化 | その後の member |
+| --- | --- | --- | --- |
+| crate ごとに変える (`chatora_rustdoc_mcp` → `serde` → … ) | 24.0 s (186 unit) | serde 4.0 s・thiserror 3.2 s (各 5 unit) | 12.3〜12.4 s (58 unit) |
+| 固定 (`chatora_rustdoc_mcp,serde,thiserror,tokio`) | 22.9 s | serde 0.25 s・tokio 0.85 s・thiserror 0.17 s (各 1 unit) | 0.56 s (1 unit) |
+| 文書化した依存の名前を足していく | 23.7 s | serde 4.0 s・thiserror 3.3 s (各 5 unit) | 10.4 s (54 unit) |
+| 解決結果の全 crate 名 (238 名、2,806 文字) に固定 | 23.5 s | thiserror 0.17 s・serde 0.24 s (各 1 unit) | 0.54 s (1 unit) |
+| member の値と、値なしの `cargo check --workspace --all-targets` で target dir を共有 | check 24.0 s (208 unit) | — | 切り替えるたびに 12.2〜12.9 s (58〜65 unit) |
+
+- 値が変わると proc-macro2 の build.rs がやり直され、proc-macro2 → quote・syn → すべての proc-macro → それを使う crate (serde・thiserror・tracing・tokio まで) の 54〜65 unit が作り直される。値を固定すれば、やり直すのは文書化する crate の rustdoc の 1 unit だけ
+- 値なしのビルドと target dir を共有すると、行き来するたびに同じ範囲が作り直される (R-WS-2 の専用 target dir の裏付け)
+
+**文書の違い** (JSON は、キーを並べ替え、target dir の絶対パスを含む `external_crates[].path` を除いてから比べた。そのままでは map の並び順と絶対パスで毎回違う):
+
+- member の JSON は、crate ごと・固定・足していく・`cargo check` と共有、のどの値でも同一だった。値に `thiserror` が入って thiserror が nightly の経路でコンパイルされても、member の文書は変わらない
+- 値を解決結果の全 crate 名にすると、member の JSON のうち 4 item (thiserror の `#[from]` が生成する `impl From` など、derive が生成した impl) の span の列だけが変わった (例: 13〜17 列 → 11〜18 列)。proc-macro2 が `proc_macro_span` を有効にし、derive が返す span がより正確になるため。中身はほかに変わらない
+- thiserror の JSON は、stable + `RUSTC_BOOTSTRAP` (どの値でも同一) と docs.rs (形式 61) で item 単位で一致した。nightly (1.101、これも形式 61) とは、属性 1 つの表記 (`CfgAttrTrace`) だけが違った
+
+**決めたこと (Q-12)**:
+
+- ローカルビルドの既定は、プロジェクトの toolchain (stable) + crate 名を指定した `RUSTC_BOOTSTRAP` とする (R-WS-8 の候補を確定)
+- 値は、プロジェクトの専用 target dir ごとに、**依存の解決結果のすべての lib・proc-macro の crate 名 (member を含む) を辞書順に並べたもの**に固定する。値は Cargo.lock と member の構成が変わらない限り変わらないので、作り直しは文書化する crate だけになり、target dir も 1 つで済む。自分の名前で nightly の機能を調べる依存 (proc-macro2・thiserror) は nightly の経路でコンパイルされ、derive が生成した item の span の列が少し変わる (docs.rs と同じ側になる)。その経路でビルドが壊れたときに、member の名前だけの値でやり直すかは M2 で決める
+- 値 (のダイジェスト) を R-WS-4 の鮮度の鍵に入れる (値で文書の span が変わることを確かめたため)
+- 依存の多い公開の workspace は足さない (作り直しは proc-macro2 から広がる仕組みで、workspace によらない)
+
+**v0.17 で要件に反映すること**: Q-12 を決定にし、R-WS-8 の「値を安定させる」の案を上の方式に改める。R-WS-8 の「影響範囲を絞るため crate 名を指定する」は、値が全 crate 名になるので意味が変わる。`RUSTC_BOOTSTRAP=1` との違いは、cargo 自身の `-Z` (cargo は値が `1` のときだけ受ける。B2) と、build script (crate 名は `build_script_build`) に効かないことだけになる、と書き直す。R-WS-4 の鍵に値のダイジェストを足す。
+
 #### B2 (2026-10-19)
 
 環境: stable 1.99.1 (2026-10-13)・cargo 1.99.1、nightly 1.101.0-nightly (2026-10-17)・cargo 1.101.0-nightly (2026-10-12)、host x86_64-unknown-linux-gnu、12 コア。スクリプトは [poc/m0b/b2-doc-vs-rustdoc/](../poc/m0b/b2-doc-vs-rustdoc/) の `run.sh` (このリポジトリ) と `dup.sh` (同名で版の違う依存。`dup-ws/` は itoa 0.4.8 と 1.0.18 に通常の依存として依存する)。どのケースも専用の target dir で、コールドとウォームを測った。
