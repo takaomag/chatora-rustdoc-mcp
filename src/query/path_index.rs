@@ -20,6 +20,13 @@ use rustdoc_types::{Crate, Id, Impl, Item, ItemEnum, Type, Use, Visibility};
 /// refer to each other could otherwise go on without end.
 const MAX_DEPTH: usize = 256;
 
+/// How many times one module is walked at most, once for each path that reaches it (requirement
+/// R-PR-3). Re-exports of a module under several names multiply the paths of everything below
+/// it, so a crate can make the number of paths grow exponentially with the depth of its modules.
+/// In the 20 crates of testdata/docs-rs-json.txt, no module was reached more than twice
+/// (2026-10-19).
+const MAX_MODULE_VISITS: usize = 64;
+
 /// A path that can be `use`d: the crate name, then module and item names.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PublicPath(Box<[Box<str>]>);
@@ -87,6 +94,8 @@ pub struct PathIndex {
     external_reexports: HashMap<Box<str>, ExternalReexport>,
     /// Glob re-exports from other crates.
     external_globs: Box<[ExternalGlob]>,
+    /// Some paths were not followed because a module was reached too many times.
+    incomplete: bool,
 }
 
 /// What a path refers to.
@@ -133,6 +142,8 @@ impl PathIndex {
             external_reexports: Vec::new(),
             external_globs: Vec::new(),
             on_stack: HashSet::new(),
+            visits: HashMap::new(),
+            incomplete: false,
         };
         walker.record(krate.root, vec![crate_name]);
         walker.visit_module(krate.root, &[crate_name], 0);
@@ -185,6 +196,7 @@ impl PathIndex {
             by_definition_path,
             external_reexports,
             external_globs,
+            incomplete: walker.incomplete,
         }
     }
 
@@ -199,6 +211,14 @@ impl PathIndex {
     #[must_use]
     pub fn public_paths(&self, id: Id) -> &[PublicPath] {
         self.paths_of.get(&id).map_or(&[], |paths| paths)
+    }
+
+    /// Whether some public paths were not followed, because a module was reached through more
+    /// paths than the index follows (64). An item may then lack some of its public paths, even
+    /// its canonical one, since modules are walked depth first.
+    #[must_use]
+    pub const fn is_incomplete(&self) -> bool {
+        self.incomplete
     }
 
     /// Glob re-exports from other crates that this index does not expand.
@@ -262,6 +282,10 @@ struct Walker<'a> {
     external_globs: Vec<(Vec<&'a str>, &'a str)>,
     /// The modules being walked, to stop at a cycle.
     on_stack: HashSet<Id>,
+    /// How many times each module has been walked.
+    visits: HashMap<Id, usize>,
+    /// A module was reached more than [`MAX_MODULE_VISITS`] times.
+    incomplete: bool,
 }
 
 impl<'a> Walker<'a> {
@@ -270,9 +294,16 @@ impl<'a> Walker<'a> {
     }
 
     fn visit_module(&mut self, module: Id, prefix: &[&'a str], depth: usize) {
-        if depth > MAX_DEPTH || !self.on_stack.insert(module) {
+        if depth > MAX_DEPTH || self.on_stack.contains(&module) {
             return;
         }
+        let visits = self.visits.entry(module).or_default();
+        if *visits >= MAX_MODULE_VISITS {
+            self.incomplete = true;
+            return;
+        }
+        *visits = visits.saturating_add(1);
+        self.on_stack.insert(module);
         if let Some(Item {
             inner: ItemEnum::Module(contents),
             ..
@@ -994,6 +1025,38 @@ mod tests {
     }
 
     #[test]
+    fn modules_reexported_in_many_ways_are_walked_a_bounded_number_of_times() {
+        // Module `l{i}` re-exports `l{i-1}` as both `a` and `b`, so `l0` and its struct `S` have
+        // 2^40 paths from the root through `l40`.
+        const LAYERS: u32 = 40;
+        let module_id = |layer: u32| 10 + layer;
+        let mut items = vec![
+            module(0, "c", &[module_id(LAYERS)]),
+            module(module_id(0), "l0", &[1]),
+            structure(1, "S", &[]),
+        ];
+        for layer in 1..=LAYERS {
+            let (a, b) = (1000 + 2 * layer, 1001 + 2 * layer);
+            items.push(module(module_id(layer), &format!("l{layer}"), &[a, b]));
+            for (id, name) in [(a, "a"), (b, "b")] {
+                items.push(reexport(
+                    id,
+                    "super::lower",
+                    name,
+                    Some(module_id(layer - 1)),
+                    false,
+                ));
+            }
+        }
+        let krate = krate(items, &[]);
+        let index = PathIndex::build(&krate);
+        assert!(index.is_incomplete());
+        let paths_of_s = index.public_paths(Id(1));
+        assert_ne!(paths_of_s, []);
+        assert!(paths_of_s.len() <= MAX_MODULE_VISITS);
+    }
+
+    #[test]
     fn a_reexport_as_underscore_adds_no_path() {
         // `pub mod x { pub struct T; } pub mod prelude { pub use crate::x::T as _; }`, as with
         // `tracing_subscriber::prelude`.
@@ -1008,6 +1071,7 @@ mod tests {
             &[],
         );
         let index = PathIndex::build(&krate);
+        assert!(!index.is_incomplete());
         assert_eq!(paths(&index, 2), ["c::x::T"]);
         assert_eq!(index.resolve(&krate, "c::prelude::_"), Resolution::NotFound);
     }

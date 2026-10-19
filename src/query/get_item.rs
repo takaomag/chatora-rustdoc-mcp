@@ -293,6 +293,12 @@ impl<'a> Query<'a> {
                 krate.format_version
             )));
         }
+        if self.index.is_incomplete() {
+            self.warnings.push(Cow::Borrowed(
+                "this crate re-exports its modules through too many paths; some public paths \
+                 were not followed, so a path may not be found",
+            ));
+        }
         Provenance {
             source: Source::DocsRs,
             name: self.request.name.as_str(),
