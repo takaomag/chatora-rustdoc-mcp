@@ -1,4 +1,4 @@
-//! Runs the server binary over stdio and checks its JSON-RPC behavior (`doc/m0-plan.md`, A2-6).
+//! Runs the server binary over stdio and checks its JSON-RPC behavior (`doc/m0-plan.md`, A2).
 //!
 //! Every test starts a server process of its own. Responses may arrive in any order, because rmcp
 //! handles each request in a task of its own, so they are matched by id.

@@ -12,5 +12,5 @@ rustdoc_processor = "=0.1.2"
 semver = "1.0.28"
 serde_json = "1.0.154"
 
-# A standalone project: keep it out of the chatora-rustdoc-mcp package.
+# A standalone project, with a Cargo.lock and a target/ of its own.
 [workspace]

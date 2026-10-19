@@ -114,7 +114,7 @@ doc_dep growing.2-serde "${MEMBER},serde" "${SERDE}"
 doc_dep growing.3-thiserror "${MEMBER},serde,thiserror" "${THISERROR}"
 doc_member growing.4-member "${MEMBER},serde,thiserror"
 
-# 2d. Members only for the members' target dir, and a plain `cargo check` in the same target dir.
+# 2d. The members' value, in a target dir shared with a plain `cargo check` (no value).
 clean_target_dir b1-with-check
 use_target_dir b1-with-check
 log "## the members' value, sharing the target dir with plain cargo check"
@@ -123,8 +123,8 @@ doc_member with-check.2-member "${MEMBER}"
 check with-check.3-check ""
 doc_member with-check.4-member "${MEMBER}"
 
-# 2e. Every crate name in the resolve (members and the lib and proc-macro targets of all
-# dependencies), fixed for the target dir: the value changes only with Cargo.lock.
+# 2e. Every crate name in the resolve (the lib and proc-macro targets of every package, members
+# included), fixed for the target dir: the value changes only with Cargo.lock.
 ALL="$(cargo +stable metadata --format-version 1 --locked | jq -r '
   [.packages[].targets[] | select(.kind | index("lib") or index("rlib") or index("proc-macro"))
     | .name | gsub("-"; "_")] | unique | join(",")')"
@@ -136,9 +136,8 @@ doc_dep all.2-thiserror "${ALL}" "${THISERROR}"
 doc_dep all.3-serde "${ALL}" "${SERDE}"
 doc_member all.4-member "${ALL}"
 log "  cfgs set by build scripts that watch RUSTC_BOOTSTRAP:"
-{ grep -rh --include=output 'rustc-cfg' \
-  $(grep -rl --include=output 'rerun-if-env-changed=RUSTC_BOOTSTRAP' "${CARGO_BUILD_BUILD_DIR}") ||
-  true; } | sort -u | sed 's/^/    /' | tee -a "${LOG}" >&2
+{ grep -rlZ --include=output 'rerun-if-env-changed=RUSTC_BOOTSTRAP' "${CARGO_BUILD_BUILD_DIR}" |
+  xargs -0 -r grep -h 'rustc-cfg' || true; } | sort -u | sed 's/^/    /' | tee -a "${LOG}" >&2
 
 # 3. The documentation. The JSON is compared after sorting its keys and dropping the paths of
 # external crates, which name the target dir.

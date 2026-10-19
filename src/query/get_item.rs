@@ -170,7 +170,8 @@ pub struct ReexportOf {
 /// Where an item is defined.
 #[derive(Debug, Serialize)]
 pub struct SourceLocation<'a> {
-    /// The file, relative to the package root.
+    /// The file as the span gives it: relative to the package root when the file is in the
+    /// package.
     pub file: &'a str,
     /// The first and last lines (`434-466`), or the one line (`301`).
     pub lines: Box<str>,
@@ -730,24 +731,6 @@ mod tests {
         Type::Primitive(name.to_owned())
     }
 
-    /// The crate `my-crate` 1.2.3:
-    ///
-    /// ```text
-    /// pub mod sync {
-    ///     mod mutex {
-    ///         /// A lock.
-    ///         ///
-    ///         /// More.
-    ///         #[must_use]
-    ///         pub struct Mutex { pub inner: u8, /* private */ }
-    ///         impl Mutex { #[deprecated(since = "1.1.0")] pub fn lock(&self) -> u8 }
-    ///     }
-    ///     pub use mutex::Mutex;
-    /// }
-    /// pub use sync::Mutex;
-    /// #[non_exhaustive] pub enum E { A, B }
-    /// pub use other::Thing;
-    /// ```
     /// `#[must_use] pub struct Mutex { pub inner: u8, /* private */ }`, documented.
     fn mutex_struct() -> Item {
         Item {
@@ -807,6 +790,24 @@ mod tests {
         }
     }
 
+    /// The crate `my-crate` 1.2.3:
+    ///
+    /// ```text
+    /// pub mod sync {
+    ///     mod mutex {
+    ///         /// A lock.
+    ///         ///
+    ///         /// More.
+    ///         #[must_use]
+    ///         pub struct Mutex { pub inner: u8, /* private */ }
+    ///         impl Mutex { #[deprecated(since = "1.1.0")] pub fn lock(&self) -> u8 }
+    ///     }
+    ///     pub use mutex::Mutex;
+    /// }
+    /// pub use sync::Mutex;
+    /// #[non_exhaustive] pub enum E { A, B }
+    /// pub use other::Thing;
+    /// ```
     fn parsed() -> ParsedCrate {
         let variant = |id, name| {
             item(

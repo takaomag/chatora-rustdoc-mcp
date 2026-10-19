@@ -19,8 +19,8 @@ JSON_ARGS=(-- -Z unstable-options --output-format json)
 log() { printf '%s\n' "$*" | tee -a "${LOG}" >&2; }
 
 # Runs `cargo +<toolchain> <subcommand> --message-format=json <args>...` in the current target dir
-# and logs its time, exit status, units, fresh units, and the JSON files its messages name:
-# `run_once <label> <toolchain> <subcommand> <args>...`. RUSTC_BOOTSTRAP passes through.
+# and logs its time, exit status, and how many units, fresh units and JSON files its messages
+# name: `run_once <label> <toolchain> <subcommand> <args>...`. RUSTC_BOOTSTRAP passes through.
 run_once() {
   local label="$1" toolchain="$2" subcommand="$3"
   shift 3
@@ -37,7 +37,7 @@ run_once() {
   ' "${OUT}/${label}.jsonl" | tee -a "${LOG}" >&2
 }
 
-# The rustdoc JSON files in the current target dir and build dir.
+# Logs how many rustdoc JSON files are in the current target dir and build dir.
 list_json() {
   { find "${CARGO_TARGET_DIR}" "${CARGO_BUILD_BUILD_DIR}" \
     \( -path '*/doc/*.json' -o -path '*/out/*.json' \) -not -path '*/fingerprint/*' \
@@ -76,7 +76,8 @@ run_case doc-dep nightly doc -Z unstable-options --output-format json -p "${DEP}
 # 3. Every dependency of the workspace at once (only cargo doc can do this in one command).
 run_case doc-all nightly doc -Z unstable-options --output-format json --target "${HOST}"
 
-# 4. Two versions of one crate (syn 2 and 3 are both in Cargo.lock).
+# 4. Two versions of one crate (syn 2 and 3 are both in Cargo.lock). Only proc-macros use them,
+# so cargo panics when `-p` names them (B7-9); dup.sh covers two versions that `-p` can name.
 run_case doc-syn-both nightly doc -Z unstable-options --output-format json -p syn@2.0.119 \
   -p syn@3.0.9 --no-deps --target "${HOST}"
 for f in $(find "${CARGO_TARGET_DIR}" "${CARGO_BUILD_BUILD_DIR}" -name 'syn.json' 2>/dev/null || true); do

@@ -1,11 +1,11 @@
 //! Reading `format_version` before the whole rustdoc JSON is parsed, to choose the shim
 //! (requirement R-FV-3).
 //!
-//! rustdoc writes `format_version` as the last member of the top-level object (checked on formats
-//! 46 to 61 in `testdata/docs-rs-json.txt`), so it is first read from the end of the JSON, which
-//! takes the same time for any size. If the JSON does not end with it, the whole JSON is scanned.
-//! The value is checked again when the whole JSON is parsed (A6), so a misread cannot pick the
-//! wrong shim silently.
+//! rustdoc writes `format_version` as the last member of the top-level object (checked on every
+//! format in `testdata/docs-rs-json.txt`: 46, 48, 53 to 57, 60 and 61), so it is first read from
+//! the end of the JSON, which takes the same time for any size. If the JSON does not end with it,
+//! the whole JSON is scanned. The value is checked again when the whole JSON is parsed
+//! ([`super::rustdoc_json::parse`]), so a misread cannot pick the wrong shim silently.
 
 /// Why `format_version` could not be read.
 #[derive(Debug, thiserror::Error)]

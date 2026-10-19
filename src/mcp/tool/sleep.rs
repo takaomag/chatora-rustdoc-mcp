@@ -79,7 +79,8 @@ pub(super) fn parse_arguments(
 }
 
 /// Sleeps one second at a time, sending a progress notification after each second when the
-/// request has a progress token, and stops as soon as the request is cancelled (requirement R-WS-6).
+/// request has a progress token, and stops as soon as the request is cancelled (requirement
+/// R-WS-6).
 pub(super) async fn execute(seconds: u32, context: RequestContext<RoleServer>) -> CallToolResult {
     let progress_token = context.meta.get_progress_token();
     for elapsed in 1..=seconds {
@@ -91,7 +92,6 @@ pub(super) async fn execute(seconds: u32, context: RequestContext<RoleServer>) -
                 return super::tool_error("cancelled", "the request was cancelled", false, &[]);
             },
         }
-        // Progress is sent only when the client asked for it with a token.
         if let Some(token) = &progress_token {
             let progress = ProgressNotificationParam::new(token.clone(), f64::from(elapsed))
                 .with_total(f64::from(seconds))

@@ -5,9 +5,10 @@
 # `--cfg docsrs` given to its final rustdoc only (requirement R-WS-1), first on stable with
 # RUSTC_BOOTSTRAP as B1 decided, then on nightly. A failure is retried without `--cfg docsrs`.
 #
-# Results go to work/b4/<toolchain>.tsv (crate, result, seconds, first error) and a summary to
-# work/b4/log.txt. Results: ok, docsrs-only (fails only with --cfg docsrs), fails (fails either
-# way), cargo-panic (cargo panicked, as with -p on a dependency that only proc-macros use).
+# Results go to work/b4/<toolchain>.tsv (crate, result, seconds of the last attempt, first error
+# with --cfg docsrs) and a summary to work/b4/log.txt. Results: ok, docsrs-only (fails only with
+# --cfg docsrs), fails (fails either way), cargo-panic (cargo panicked, as with -p on a dependency
+# that only proc-macros use).
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
 
 OUT="${WORK}/b4"

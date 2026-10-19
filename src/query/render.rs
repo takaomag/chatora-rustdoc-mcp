@@ -1,9 +1,10 @@
-//! Rendering rustdoc's type trees as Rust code (requirements R-OUT-2 and R-SH-1).
+//! Rendering rustdoc's type trees as Rust code (requirement R-OUT-2).
 //!
 //! A signature is shown as one line of Rust, not as the JSON tree, which is several times larger.
 //! Types of this crate are written with their canonical path. Types of other crates are written as
-//! rustdoc gives them until M1 indexes those crates too (R-PR-4). The where clauses, the fields of
-//! a struct and the variants of an enum are rendered separately, one string each (R-OUT-2).
+//! rustdoc gives them until M1 indexes those crates too (R-PR-4). The where clauses, the named
+//! fields of a struct and the variants of an enum are rendered separately, one string each
+//! (R-OUT-2).
 
 use std::borrow::Cow;
 
@@ -75,7 +76,8 @@ impl<'a> Renderer<'a> {
         self.warnings
     }
 
-    /// The declaration of `item` as Rust, without its where clause, body, fields or variants:
+    /// The declaration of `item` as Rust, without its where clause, body, named fields or variants
+    /// (the fields of a tuple struct or of a variant are part of it):
     /// `pub async fn lock(&self) -> MutexGuard<'_, T>`, `pub struct Mutex<T: ?Sized>`. A
     /// `macro_rules!` macro is shown with its rules, as rustdoc gives them.
     #[must_use]

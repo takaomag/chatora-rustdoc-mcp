@@ -1,6 +1,6 @@
 # 追っている Claude Code の Issue
 
-- 最終更新: 2026-10-16
+- 最終更新: 2026-10-19 (#79944・#86032 の 2.1.303 での確認を足した。Issue の状態は 2026-10-16 のもの)
 - 目的: このプロジェクトの要件・README が前提にしている Claude Code の不具合を 1 か所にまとめる。直ったときに、どこを直せばよいかが分かるようにする。ask のルールの効き方の実測もここに置く (requirements.md の R-SEC-2 から参照している)
 - 状態は最終更新の時点のもの。確かめるときは `gh issue view <番号> --repo anthropics/claude-code` を使う
 
@@ -9,8 +9,8 @@
 | [#95741](https://github.com/anthropics/claude-code/issues/95741) | `bypassPermissions` で ask のルールが効かない | open | 2026-10-16 に MCP ツールでの再現をコメントし、👍 を付けた ([コメント](https://github.com/anthropics/claude-code/issues/95741#issuecomment-6211249052)) | README の Security の表と案内、requirements.md の R-SEC-2 (「README に書くこと」の許可ルールの書き方)、この文書の「ask のルールの効き方」、セキュリティの一覧ページ (A2 の cons とまとめ) |
 | [#83766](https://github.com/anthropics/claude-code/issues/83766) | auto モードで ask のルールが効かない | open | 2026-10-16 に、VS Code の auto でだけ起きる (端末の auto では確認が出る) ことをコメントし、👍 を付けた ([コメント](https://github.com/anthropics/claude-code/issues/83766#issuecomment-6211249684)) | 同上 |
 | [#98256](https://github.com/anthropics/claude-code/issues/98256) | VS Code 拡張が elicitation を宣言するのに、確認画面を出さず `decline` を返す | open | 2026-10-16 に VS Code の `/bug` で報告し、2.1.301 での再現をコメントし、👍 を付けた ([コメント](https://github.com/anthropics/claude-code/issues/98256#issuecomment-6207252759))。端末では確認画面が出て、headless は即座に `cancel` を返す | なし (v0.14 で確認をやめたので、今の要件には影響しない。requirements.md の §14 の v0.14 とセキュリティの一覧ページの F にある記述は経緯として残す。MRTR で確認を求め直すときに再確認する) |
-| [#79944](https://github.com/anthropics/claude-code/issues/79944) | `structuredContent` があると、text の content がモデルに渡らない | open | なし (2.1.301 で再現を確かめた) | requirements.md の R-OUT-1 (§7.1。出力の形式の前提) と、それを理由にする R-OUT-8 (`resource_link` に頼らない)、§11.1 の Q-1、§13 の Issue の行、付録 A の Claude Code の行 |
-| [#86032](https://github.com/anthropics/claude-code/issues/86032) | エラーの結果で `structuredContent` が捨てられる | open | なし (2.1.301 で確かめた。text のブロックは改行でつないで渡る) | requirements.md の R-ERR-2、R-OUT-1 (エラーの結果に `structuredContent` を付けない理由)、§11.1 の Q-1、§13 の Issue の行、付録 A の Claude Code の行 |
+| [#79944](https://github.com/anthropics/claude-code/issues/79944) | `structuredContent` があると、text の content がモデルに渡らない | open | なし (2.1.301 と 2.1.303 (2026-10-19。M0 の A9) で再現を確かめた) | requirements.md の R-OUT-1 (§7.1。出力の形式の前提) と、それを理由にする R-OUT-8 (`resource_link` に頼らない)、§11.1 の Q-1、§13 の Issue の行、付録 A の Claude Code の行 |
+| [#86032](https://github.com/anthropics/claude-code/issues/86032) | エラーの結果で `structuredContent` が捨てられる | open | なし (2.1.301 で確かめた。text のブロックは改行でつないで渡る。2.1.303 (2026-10-19。M0 の A9) では、エラーの text がモデルの側で `<error>…</error>` に囲まれて見えた) | requirements.md の R-ERR-2、R-OUT-1 (エラーの結果に `structuredContent` を付けない理由)、§11.1 の Q-1、§13 の Issue の行、付録 A の Claude Code の行 |
 
 ## ask のルールの効き方 (#95741・#83766)
 

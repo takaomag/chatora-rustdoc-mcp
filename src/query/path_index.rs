@@ -59,7 +59,7 @@ impl fmt::Display for PublicPath {
 pub struct ExternalReexport {
     /// The path in this crate.
     pub path: PublicPath,
-    /// The id of the item, found in `Crate::paths`.
+    /// The id of the item, which is not in this crate's `index`.
     pub target: Id,
     /// The definition path of the item in its crate, from `Crate::paths`, if it is there.
     pub definition: Option<PublicPath>,
@@ -181,7 +181,7 @@ impl PathIndex {
     }
 
     /// The canonical path of `id`: among its public paths, one that does not rename the item,
-    /// then the shortest, then the first in order (requirement R-PR-2).
+    /// then the shortest, then the first in lexicographic order (requirement R-PR-2).
     #[must_use]
     pub fn canonical_path(&self, id: Id) -> Option<&PublicPath> {
         self.public_paths(id).first()
@@ -275,7 +275,8 @@ impl<'a> Walker<'a> {
         }
         match &item.inner {
             ItemEnum::Use(reexport) => self.visit_use(reexport, prefix, depth),
-            // rustdoc strips a module that is not reachable by its own path.
+            // A stripped module is not public API. Items re-exported from it are reached through
+            // their `use`.
             ItemEnum::Module(contents) if contents.is_stripped => {},
             ItemEnum::Module(_) => {
                 let Some(path) = item.name.as_deref().map(|name| extended(prefix, name)) else {
@@ -388,7 +389,7 @@ fn extended<'a>(prefix: &[&'a str], name: &'a str) -> Vec<&'a str> {
 }
 
 /// The paths of an item without duplicates, the canonical one first (requirement R-PR-2): paths
-/// that do not rename the item, then shorter paths, then in order.
+/// that do not rename the item, then shorter paths, then in lexicographic order.
 fn canonical_first(paths: Vec<Vec<&str>>, name: Option<&str>) -> Box<[PublicPath]> {
     let renames = |path: &[&str]| path.last().copied() != name;
     let mut paths = paths;
@@ -861,7 +862,7 @@ mod tests {
 
     #[test]
     fn two_items_at_the_same_path_are_ambiguous() {
-        // A function and a macro may share a name.
+        // A struct and a macro may share a name.
         let krate = krate(
             vec![
                 module(0, "c", &[1, 2]),

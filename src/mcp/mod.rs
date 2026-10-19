@@ -36,11 +36,12 @@ use crate::data::{
 /// Protocol versions this server implements (requirement R-MCP-2).
 const SUPPORTED_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
 
-/// Name shown to MCP clients in `serverInfo`. Keep it equal to the binary name (`src/bin/chatora-rustdoc-mcp.rs`):
-/// `CARGO_BIN_NAME` is not set when compiling the library.
+/// Name shown to MCP clients in `serverInfo`. Keep it equal to the binary name
+/// (`src/bin/chatora-rustdoc-mcp.rs`): `CARGO_BIN_NAME` is not set when compiling the library.
 const SERVER_NAME: &str = "chatora-rustdoc-mcp";
 
-/// Message of the error for `initialize`, the only hint an old client can show (requirement R-MCP-2).
+/// Message of the error for `initialize`, the only hint an old client can show (requirement
+/// R-MCP-2).
 const INITIALIZE_REJECTED_MESSAGE: &str = const_format::concatcp!(
     SERVER_NAME,
     " supports only MCP 2026-07-28, which has no initialize handshake. Use a client that speaks \
@@ -185,7 +186,8 @@ pub async fn serve() -> Result<(), ServeError> {
             Ok(_) => Ok(()),
         },
 
-        // The client closed stdin after `server/discover` only.
+        // The client closed stdin before the session started, for example after only
+        // `server/discover`.
         Err(ServerInitializeError::ConnectionClosed(_)) => Ok(()),
 
         Err(error) => Err(ServeError::Initialize(Box::new(error))),

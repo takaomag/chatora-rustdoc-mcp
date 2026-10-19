@@ -500,10 +500,10 @@ Claude Code で Rust を書くときに効く順に並べています。
 - **docs.rs はリリースごとに、実際にビルドされた形式の JSON しか配らない。** 再ビルドされたリリースだけは古い形式も残ります。最古では形式 46 が実在します (tokio 1.45.1)。**形式 47 は欠番で存在しません** (rustdoc-types の CHANGELOG)。形式 46 を読める MCP 実装は maan2003 (§4 Tier C) だけで、ferritin の下限は 48、ほかの主要な実装はさらに狭い範囲しか読めません。形式の移行コードとしては migrate_rustdoc_json (41〜50、開発版は 53 まで) があります。
 - **rustdoc JSON の `paths` は定義パス (private module を含む) を持つ。** これを使えるパスとして見せる実装 (dmvk、syphar、possdog、ferritin の表示) は、LLM が `use` できないパスを示します。
 - **調べたローカルビルド型の多く (jbr・snowmead・cratedex・MasYaaz・KevinT3Hu) は、鮮度判定を誤っている。** 「JSON があれば新しい」とみなすか、見るファイルの範囲を誤っています。
-- **読める形式を固定した実装が多く、リリースが形式の変化に遅れると利用者の手元で壊れる。** syphar (57)、JLFN (60)、ruskel のリリース版 (57、main は 61)、snowmead (57)、46ki75 (56・57) がそうです。形式番号と日付 (master に入った日) は、57 が 2025-11-21、58 が 2026-05-31、59 が 2026-06-24、60 が 2026-06-28、61 が 2026-07-28 です。stable の 1.97 / 1.98 はそれぞれ 57 / 60 を出すと推定され、1.99 が 61 を出すことは手元で確認しました (次項)。
+- **読める形式を固定した実装が多く、リリースが形式の変化に遅れると利用者の手元で壊れる。** syphar (57)、JLFN (60)、ruskel のリリース版 (57、main は 61)、snowmead (57)、46ki75 (56・57) がそうです。形式番号と日付 (master に入った日) は、57 が 2025-11-21、58 が 2026-05-31、59 が 2026-06-24、60 が 2026-06-28、61 が 2026-07-28 です。stable の 1.97 / 1.98 はそれぞれ 57 / 60 を出すと推定され (後に rust のソースのタグで確かめた。requirements.md の R-WS-8)、1.99 が 61 を出すことは手元で確認しました (次項)。
 - **stable の rustdoc でも JSON を出せる。** `RUSTC_BOOTSTRAP=<crate 名>` (パッケージ名ではなく、アンダースコアの crate 名。副作用は requirements.md の R-WS-8) を付けると、stable 1.99 の rustdoc が形式 61 の JSON を出しました (2026-10-14 に手元で確認)。cargo-semver-checks は本番でこの方式 (`RUSTC_BOOTSTRAP=1`) を使っています。nightly を必須とするローカルビルド型の前提は、絶対ではありません。ただし std の JSON (`rust-docs-json`) は nightly にしかありません (stable と beta の manifest では `available = false`)。
 - **std の stability は形式 58 以降の JSON に入っている** (`Item::stability`、59 で `const_stability`、60 で `default_unstable`)。それでも stability を表示する実装は見つかりませんでした。なお unstable には tracking issue の番号も reason も入っていません。
-- **依存の feature をフラグで再現する方式は成り立たない。** workspace 外のパッケージに `--features` を渡すと cargo が拒否します (KevinT3Hu の方式)。逆に、workspace のルートからフラグなしで `cargo rustdoc -p <依存>` を実行すれば、workspace で統合された feature が効きます (2026-10-14 に手元で確認)。ただし統合されるのは通常の依存の辺の feature だけで、dev / build 依存だけが有効にする feature は効きません (requirements.md の R-FT-3)。
+- **依存の feature をフラグで再現する方式は成り立たない。** workspace 外のパッケージに `--features` を渡すと cargo が拒否します (KevinT3Hu の方式)。逆に、workspace のルートからフラグなしで `cargo rustdoc -p <依存>` を実行すれば、workspace で統合された feature が効きます (2026-10-14 に手元で確認)。ただし統合されるのは通常の依存の辺の feature だけで、dev / build 依存だけが有効にする feature は効きません (requirements.md の R-FT-3)。なお、resolver 2 以上では `-p` で名指しすると cargo が panic する依存 (dev・build・ほかの target でだけ使うものと、proc-macro からしか使われないもの) があることが、後に M0 で分かりました (requirements.md の R-WS-5)。
 - **安全性**: ローカルビルド型は依存の build.rs と proc-macro を実行しますが、Claude Code の Bash のサンドボックスは MCP サーバーを覆いません。docs.rs はネットワーク無し・読み取り専用のサンドボックスでビルドしているので、「registry の crate は docs.rs から取り、ビルドするのは workspace だけ」にすると危険を小さくできます。ただし workspace を rustdoc にかけると、その依存もすべて check されるので、依存の build.rs と proc-macro はやはり実行されます。パスや引数を検証しない実装も多く、cargo-doc-mcp (任意のファイルを読める。コードからの推定) と MasYaaz (SQL インジェクション) は実害につながる形です。
 - **MCP への準拠はまちまち。** `isError` を正しく使う実装は少数 (gnufood、ruskel、46ki75 など) で、syphar と mmgeorge は失敗を JSON-RPC のプロトコルエラーで返します。`structuredContent` と `outputSchema` まで揃っているのは gnufood と vexxvakan くらいです。
 - **LLM による評価 (eval) を持つ実装は 1 つも無い。** 説明文の質を機械的に検査しているのは syphar (150 語以内、戻り値の記述) だけです。
@@ -519,7 +519,7 @@ Claude Code で Rust を書くときに効く順に並べています。
 
 ## 9. 検証の限界
 
-- **どのサーバーもローカルにインストールして動かしていない。** 機能の記述は README・ソースコード・レジストリ API に基づきます。主要な実装 (jbr、syphar、dmvk、possdog、snowmead、cratedex、KevinT3Hu、MasYaaz、Xevion、ruskel など。ほかに requirements.md の参考実装の cargo-public-api) は、二次調査でソースを精読して挙動を確かめました。ホスト版への問い合わせは、下の三次調査の項を参照。
+- **どのサーバーもローカルにインストールして動かしていない。** 機能の記述は README・ソースコード・レジストリ API に基づきます。主要な実装 (jbr、syphar、dmvk、possdog、snowmead、cratedex、KevinT3Hu、MasYaaz、Xevion、ruskel など。ほかに requirements.md の参考実装の cargo-public-api) は、二次調査でソースを精読して挙動を確かめました。ホスト版への問い合わせは、下の二次調査と三次調査の項を参照。
 - 実行して確かめていない点: dmvk の std 非対応と、KevinT3Hu が rustdoc-types の形式変更で壊れていること (どちらもソースからの推定)。§5.1 の各セル (ferritin のエラーの扱いを除く) と、cargo-doc-mcp の任意のファイルの読み取り (§4 Tier D) も同様。
 - 二次調査では次も実データで確かめました: docs.rs の JSON の形式 (46・53・54・56・57・60・61)、ホスト版 ferritin の出力サイズと応答。
 - syphar が docs.rs の主要メンテナであることは、`rust-lang/docs.rs` のコントリビューター 1 位 (1,194 commits、2026-10-14) であることで確認しました。
@@ -558,6 +558,10 @@ Claude Code で Rust を書くときに効く順に並べています。
 ---
 
 ## 11. 改訂履歴
+
+### 2026-10-19 (後の調べの注記)
+
+- §7: 依存の feature の所見に、resolver 2 以上では `-p` で名指しできない依存があること (M0) を、形式の所見に、1.97・1.98 の形式を後で確かめたことを注記した。調べた時点の記述は変えていない
 
 ### 2026-10-15 (要件 v0.13 のレビューによる整理)
 

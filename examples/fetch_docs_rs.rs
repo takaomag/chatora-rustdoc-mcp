@@ -8,7 +8,7 @@
 //! For each `crate@version`, it prints one tab-separated line: the crate and version, the
 //! `format_version`, the size, the sha256, where the JSON came from (`cache` or `docs.rs`), and the
 //! cache path. With `CHATORA_RUSTDOC_MCP_LOG__FILTER=debug`, the log also shows how many zstd
-//! layers were decompressed.
+//! layers a download had.
 
 #![expect(
     unused_crate_dependencies,

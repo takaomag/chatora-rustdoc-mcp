@@ -2,6 +2,7 @@ include = ["**/*.toml"]
 
 exclude = [
   "target/**",
+  "poc/**/work/**",
 ]
 
 [formatting]

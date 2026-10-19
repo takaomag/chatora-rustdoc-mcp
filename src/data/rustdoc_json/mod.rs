@@ -1,10 +1,10 @@
 //! Parsing rustdoc JSON of any supported format into the latest `rustdoc_types` (requirements
 //! R-FV-1 to R-FV-9).
 //!
-//! The format, read ahead from the end of the JSON (A5), chooses the types to deserialize into:
-//! the latest types for format 57 and from 61, and shims that differ from them only where a change
-//! broke reading, for 54 to 56 and for 58 to 60. The JSON is parsed once, as a stream, without
-//! going through `serde_json::Value`. Formats before 54 come in M1.
+//! The format, read ahead from the end of the JSON ([`format_version::read`]), chooses the types to
+//! deserialize into: the latest types for format 57 and from 61, and shims that differ from them
+//! only where a change broke reading, for 54 to 56 and for 58 to 60. The JSON is parsed once, as a
+//! stream, without going through `serde_json::Value`. Formats before 54 come in M1.
 
 mod v54_to_56;
 mod v58_to_60;

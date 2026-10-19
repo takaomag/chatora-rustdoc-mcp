@@ -4,7 +4,7 @@
 
 ## 仕組み
 
-- `.mcp.json` で、このディレクトリのサーバーを `chatora-rustdoc-mcp` という名前で登録する (利用者の設定には登録しない)
+- `.mcp.json` で、`run-server.sh` を `chatora-rustdoc-mcp` という名前で登録する (利用者の設定には登録しない)
 - `.claude/settings.json` で、そのサーバーを有効にし、ツールの呼び出しを許可する
 - `run-server.sh` は `../../target/debug/chatora-rustdoc-mcp serve` を起動し、やりとりを `logs/` に写す
   - `<時刻>-<PID>.in.jsonl`: Claude Code から受けた行

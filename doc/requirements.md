@@ -1,7 +1,7 @@
-# chatora-rustdoc-mcp 要件定義 (ドラフト v0.17)
+# chatora-rustdoc-mcp 要件定義 (ドラフト v0.18)
 
-- 作成日: 2026-10-13 (v0.1) / 最終改訂: 2026-10-19 (v0.17)
-- 状態: たたき台。既存実装の精読と 2026-10-14 の再検証 (調査文書の三次調査)、M0 (PoC) の結果 ([m0-plan.md](m0-plan.md) の §6) を反映済み。採らなかった候補の良い点は付録 B、根拠は付録 A、経緯は §14。残る未決事項 (§11.2) を PoC・eval・実測で詰めてから v1.0 にする
+- 作成日: 2026-10-13 (v0.1) / 最終改訂: 2026-10-19 (v0.18)
+- 状態: たたき台。既存実装の精読と 2026-10-14 の再検証 (調査文書の三次調査)、M0 (PoC) の結果 ([m0-plan.md](m0-plan.md) の §6) と、その後のレビューの決定 (v0.18) を反映済み。採らなかった候補の良い点は付録 B、根拠は付録 A、経緯は §14。残る未決事項 (§11.2) を PoC・eval・実測で詰めてから v1.0 にする
 - 前提資料: [rustdoc-mcp-survey.md](rustdoc-mcp-survey.md) (既存の Rust ドキュメント系 MCP の調査)
 - 主な参考実装:
   - [rustdoc-mcp / ferritin (jbr)](https://github.com/jbr/ferritin)
@@ -23,12 +23,12 @@
 
 | 叩き台の項目 | 判定 | コメント |
 | --- | --- | --- |
-| ツール数は多いほうが良い | **修正** | 数そのものに価値は無い。**「LLM の問い 1 種類にツール 1 個」という粒度**と、ツール同士が重ならないことが本質。Claude Code は MCP ツールを遅延ロード (tool search) するので、ツールが多くてもコンテキスト代は小さい。代わりに、名前と説明文で探されたときに迷わないことが必要 (§6)。tool search を持たないクライアント向けに、主要なツールだけを出す構成を M5 で検討する (R-MCP-12) |
+| ツール数は多いほうが良い | **修正** | 数そのものに価値は無い。**「LLM の問い 1 種類にツール 1 個」という粒度**と、ツール同士が重ならないことが本質。Claude Code は MCP ツールを遅延ロード (tool search) するので、ツールが多くてもコンテキスト代は小さい。代わりに、名前と説明文で探されたときに迷わないことが必要 (§6)。tool search を持たないクライアント向けに、主要なツールだけを出す構成は将来検討する (R-MCP-12。v0.18) |
 | 説明文を「LLM がどう問うか」基準で書き、否定ルールを入れる | 妥当 | 採用する。説明文は 2,048 文字以内にし、冒頭に要点を置く (Claude Code の現行の上限は 4,096 文字。§6.2) |
 | ソース表示 / trait implementors | 妥当・要補足 | implementors の**範囲**を決める必要がある。既存実装はどれも定義元 crate 内だけで、依存グラフ全体の逆引きは先行例が無い (§5.6) |
 | feature flags / changelog / examples / README を個別ツールで | 妥当・要補足 | feature は**プロジェクトで有効か**まで突き合わせる。rustdoc JSON には cfg の専用フィールドが無いので、属性文字列の解析と祖先からの継承が要る (§5.4) |
 | re-export 解決 (crate をまたぐものを含む) | 妥当・要補足 | rustdoc JSON の `paths` は**定義パス** (private module を含む) なので、そのまま見せると LLM が使えない `use` を書く。公開パスの索引を自前で作る必要がある (§5.5) |
-| target triple の考慮とフォールバック | 妥当・要補足 | フォールバック先の具体的な triple まで provenance に載せる (R-TG-2) |
+| target triple の考慮とフォールバック | 妥当・要補足 | docs.rs では別の target の文書で代用しない (R-TG-1。v0.18)。フォールバックするとき (std など) は、実際の triple まで provenance に載せる (R-TG-2) |
 | バージョンを勝手に差し替えない | 妥当 | すべての成功応答に provenance を載せ (R-OUT-9)、データ本体から読んだ値と要求値を突き合わせる (§7.3) |
 | 出力は構造化 JSON | 妥当・要補足 | 構造化 JSON で良い。ただし Claude Code ではその JSON がそのままプロンプトになるので、**シグネチャは Rust のコード文字列**にし、何を出さないかを決める (§7) |
 | impl / trait の検索 | 妥当・要補足 | 「X で何が呼べるか」には trait メソッド・Deref 先・プリミティブ型まで含める。既存実装はどれも `Vec::iter` を引けない (§5.6) |
@@ -55,7 +55,7 @@
 
 ## 1. 目的
 
-Claude Code (および他の MCP クライアント) が Rust のコードを書くときに、**記憶ではなく実際の定義**に基づいて API を使えるようにする。そのために、次のドキュメントを、正確なバージョンで、トークン効率よく、構造化された形で引ける MCP サーバーを作る。
+MCP 2026-07-28 を話すクライアント (主に Claude Code) が Rust のコードを書くときに、**記憶ではなく実際の定義**に基づいて API を使えるようにする。そのために、次のドキュメントを、正確なバージョンで、トークン効率よく、構造化された形で引ける MCP サーバーを作る。他のクライアントは、MCP の最新版に追いついたものから使える (R-MCP-2。v0.18)。
 
 - そのプロジェクトが実際に使っている依存 crate
 - 自分の workspace の crate
@@ -126,7 +126,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 | canonical 形式 | サーバーが内部で扱う唯一の形式。ビルド時に依存する最新の `rustdoc-types` が定義する形式 (R-FV-1)。正準パス (canonical path) とは別の概念 |
 | shim | 旧形式 JSON のうち、読み取り互換性を壊す変更があった部分だけを受けるための型定義 |
 | 定義パス (definition path) | rustdoc JSON の `paths` に入っているパス。定義された場所を指し、**private module を含みうる** (例: `axum::json::Json`、`tokio::net::tcp::stream::TcpStream`) |
-| 正準パス (canonical path) | ユーザーが `use` できる公開パスのうち、次の順で選んだ 1 つ: hidden・unstable なモジュールを通るものを除く → 改名 (`as`) の無いものを優先 → 最短 → 辞書順 |
+| 正準パス (canonical path) | ユーザーが `use` できる公開パスのうち、次の順で選んだ 1 つ: hidden・unstable なモジュールを通るものを除く → 改名 (`as`) の無いものを優先 → 最短 (セグメントの数。v0.18) → 辞書順。公開パスの無い workspace member の item は、crate 内でのパスと可視性で示す (R-PR-2。v0.18) |
 | ホスト版 | 公開サーバーとして動く版。「ferritin のホスト版」は ferritin が公開している MCP サーバー。本サーバーのホスト版は §9.10 の将来構想 |
 | 任意 (要件の印) | 実装しなくても、その段階 (M) の完了条件を満たす。既定で無効という意味ではない |
 | プロジェクト | Cargo の workspace (workspace に属さない単独の package はその package)。専用 target dir の単位 (R-MCP-3) |
@@ -144,12 +144,12 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 | --- | --- | --- | --- |
 | std / core / alloc / proc_macro / test | nightly の `rust-docs-json` コンポーネント | static.rust-lang.org の dist から `rust-docs-json` のアーカイブだけを直接取る (R-STD-6) | stable には無い。docs.rs も std の JSON は配っていない (404)。ソース表示には `rust-src` を使う |
 | workspace member | ローカルビルド (`--document-private-items`) | 再ビルド中は直近に成功した JSON (stale と明示。失敗したときは `build_failed`) | §5.10 |
-| crates.io の依存 crate | docs.rs の rustdoc JSON | ローカルビルド | docs.rs に JSON が無いとき (2025-05-23 より前のビルドは R-DS-3、docs.rs でのビルド失敗は R-DS-6、非対応の形式は R-FV-4) の代替。Cargo.lock に無い版と、実際のビルド target 以外の target での文書 (R-MCP-3) と、`-p` で名指しできない依存 (R-WS-5) は、docs.rs に無ければ外のツールで作る (R-WS-10) |
+| crates.io の依存 crate | docs.rs の rustdoc JSON | ローカルビルド | docs.rs に JSON が無いとき (2025-05-23 より前のビルドは R-DS-3、docs.rs でのビルド失敗は R-DS-6、非対応の形式は R-FV-4、求める target の JSON が無いときは R-TG-1。v0.18) と、Cargo.lock の `checksum` が sparse index の `cksum` と一致しないとき (R-VR-2。v0.18) の代替。Cargo.lock に無い版と、実際のビルド target 以外の target での文書 (R-MCP-3) と、`-p` で名指しできない依存 (R-WS-5) は、docs.rs に無ければ外のツールで作る (R-WS-10) |
 | path / git / 非公開レジストリの依存 | ローカルビルド | なし | docs.rs には存在しない |
 | 引数 `git` で指した git リポジトリの crate | ローカルビルド (仮のプロジェクトの git 依存として。R-WS-5) | なし | 外のツールでだけビルドする (R-WS-10) |
 | 依存ではない任意の crate | docs.rs の rustdoc JSON | ローカルビルド (外のツールで、仮のプロジェクトに。R-WS-5) | docs.rs に JSON が無いとき、照会のツールは `docs_unavailable` を返して外のツールを案内する (R-WS-10) |
 
-- R-DS-1: 公開 crate は docs.rs から取るのを既定とする (確定)。依存 crate を常にローカルビルドする方式は、先行実装で遅さと MSRV 失敗のため撤回されている。ローカルビルドを優先するモードは設定で選べるようにする
+- R-DS-1: 公開 crate は docs.rs から取るのを既定とする (確定)。プロジェクトの依存で docs.rs を使う条件は R-VR-2 (取得元と checksum の照合。v0.18)。依存 crate を常にローカルビルドする方式は、先行実装で遅さと MSRV 失敗のため撤回されている。ローカルビルドを優先するモードは設定で選べるようにする
 - R-DS-2 取得手順:
   1. まず形式番号の無い URL `/crate/{name}/{version}/[{target}/]json` を取る。返るのはそのリリースの直近のビルドの形式 (再ビルドされていれば最も新しい形式)
   2. `format_version` を R-FV-3 のとおり先読みする
@@ -158,10 +158,10 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 - R-DS-4 展開: **先頭が zstd のマジックナンバー (`28 B5 2F FD`) である限り展開を繰り返す**。初期のビルドには二重に zstd 圧縮され `content-type: text/plain` で配られるものがある。content-type を信用しない。展開の段数に上限を設け、それを超えるものは壊れているとみなす (初期値は 3 段。v0.16)
 - R-DS-5: docs.rs の `status.json` の `doc_status` は HTML のビルド成功を表すだけで、JSON の有無ではない。JSON の有無はその URL を実際に確かめて判断し、`rustdoc_json: available | missing | unsupported_format` として別に返す
 - R-DS-6 docs.rs の JSON の URL の扱い (docs.rs のソース `rust-lang/docs.rs@cca98f22` と実測で確認):
-  - 形は `/crate/{name}/{ver}/[{target}/]json[/{fmt}][.gz|.zst]`。`{ver}` には `latest` と semver 要件も使える。正規でない版指定は 302 で完全な版にリダイレクトされる。`latest` はリダイレクトされず 200 が返り、本文の `crate_version` を見ないと実際の版が分からない。このため `latest` の URL は使わず、R-VR-3 で解決した完全な版の URL で取る (R-VR-3 と docs.rs の latest の食い違いを避ける)
+  - 形は `/crate/{name}/{ver}/[{target}/]json[/{fmt}][.gz|.zst]`。`{ver}` には `latest` と semver 要件も使える。正規でない版指定は 302 で完全な版にリダイレクトされる。ただし build metadata 付きの版を持つ crate では、302 にならず 200 で別の版が返ることがある (2026-10-19 に、zstd-sys の `2.1.0` で `2.1.2+zstd.1.5.7` が返ることを確かめた。版の頼み方は R-VR-1、返った版の照合は R-VR-4。v0.18)。`latest` はリダイレクトされず 200 が返り、本文の `crate_version` を見ないと実際の版が分からない。このため `latest` の URL は使わず、R-VR-3 で解決した完全な版の URL で取る (R-VR-3 と docs.rs の latest の食い違いを避ける)
   - 既定の圧縮は zstd。`.gz` を付ければ gzip で取れる
   - 不明な target や形式は 404、形式番号として解析できない値は 400。版として解析できない値も 400。HTML のビルドに失敗したリリースは JSON も 404
-  - 404 は「crate や版が存在しない」と「JSON が無い」を区別しない (M0 で確かめた)。`crate_not_found`・`version_not_found` (§8) は crates.io の sparse index (R-VR-4) で存在を確かめて分ける (M1。v0.17)
+  - 404 は「crate や版が存在しない」と「JSON が無い」を区別しない (M0 で確かめた)。`crate_not_found`・`version_not_found` (§8) は crates.io の sparse index (R-VR-6) で存在を確かめて分ける (M1。v0.17)
   - `ETag` があり `If-None-Match` を処理する (完全な版の JSON は不変なので、通常は取り直さない)
   - レート制限のヘッダや公式の文書は見当たらない。R-NW-2 の作法 (重複抑止・再試行の制限) で控えめに使う
 
@@ -182,7 +182,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 
 - R-FV-1: canonical 形式には、依存として使える最新の `rustdoc-types` を使う (2026-10-13 時点で 0.61.0、形式 61)
 - R-FV-2: 読み取り互換性を壊した変更ごとに typed shim を用意する。shim は `Crate` から変更されたフィールドまでの経路にある構造体だけを写し、残りは canonical の型を使う。形式 54 未満の `attrs: Vec<String>` は捨てずに解析し、形式 54 以降に該当する variant があればそれに写し、無いものと解析できないものは `Attribute::Other(String)` にする。文字列のまま残すと、derive の分類 (R-TI-2)、must_use / non_exhaustive の表示 (R-SH-6)、`api_diff` の分類 (R-AD-2) が黙って失敗し、形式をまたぐ比較で `must_use_changed` などを誤検出するため。写す範囲は M1 で形式 46〜53 のテストデータを見て決める (例: `#[automatically_derived]`、`#[must_use]`、`#[non_exhaustive]`、`#[repr(...)]`。v0.16)
-  - 形式 54〜61 の shim (M0 で実装した。54〜57・60・61 は docs.rs の実データで、58〜60 の `Stability` の写しは手作りの JSON でだけ確かめた (`stability` を持つ JSON は std くらいで、M1 で std の JSON で確かめる)。v0.17): 54〜56 は `ExternalCrate::path` (57 で追加された必須フィールド) が無いので空のパスを入れ、「不明」として扱う。54 の `Attribute::Other("#[macro_export]")` は、55 で追加された `Attribute::MacroExport` に写す (rustdoc-types 0.55 の更新履歴は `MacroUse` と書いているが、型は `MacroExport`)。58〜60 は `Stability::level` の平らな表現を、61 の入れ子の表現に写す
+  - 形式 54〜61 の shim (M0 で実装した。54〜57・60・61 は docs.rs の実データで確かめ、58〜60 の `Stability` の写しは手作りの JSON でだけ確かめた (`stability` を持つ JSON は std くらいで、M1 で std の JSON で確かめる)。v0.17): 54〜56 は `ExternalCrate::path` (57 で追加された必須フィールド) が無いので空のパスを入れ、「不明」として扱う。54 の `Attribute::Other("#[macro_export]")` は、55 で追加された `Attribute::MacroExport` に写す (rustdoc-types 0.55 の更新履歴は `MacroUse` と書いているが、型は `MacroExport`)。58〜60 は `Stability::level` の平らな表現を、61 の入れ子の表現に写す
 - R-FV-3: パースの前に `format_version` だけを先読みして、使う shim を静的に決める。先読みは、本文の末尾からのバイト走査を主にし (`format_version` は、M0 で docs.rs から取った形式 46・48・53〜57・60・61 のすべてで最後のフィールドだった)、読めなければ全体の走査に落とす。全体の走査も R-FV-8 に従い、ネストの深さに上限を設けない。全体を解析した後に、本文の値と先読みの値を照合し、違えばエラーにする (M0 で決定。v0.17)
 - R-FV-4: **対応範囲の下限は 46** とする (Q-4)
   - docs.rs には形式 46 (tokio 1.45.1、2025-05-24 ビルド) が実在し、48・53・54・55・56・57・60・61 も確認済み (49〜52・58・59 は M0 で取った版には無かった。v0.17)
@@ -202,58 +202,62 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 
 - R-VR-1 明示指定:
   - `x.y.z[-pre][+build]` は完全一致として扱う (docs.rs の URL の意味に合わせる。Cargo の `^` ではない)。この違いはツール説明文に明記する (ferritin は `@1.2.3` を caret として扱うので、移行するユーザーが混乱しうる)
+  - build metadata: `2.1.0` と書かれたら、sparse index に build metadata だけが違う版が 1 つあれば、その版 (`2.1.0+zstd.1.5.7` など) に解決する。docs.rs には、sparse index で解決した build metadata 込みの版で頼む (R-DS-6。v0.18)
+  - 明示した版と取得元: 明示した版がプロジェクトで解決された版 (R-VR-2) と一致すれば、プロジェクトの取得元 (git・patch・path・member) のものを返し、crates.io の同じ版とは別物でありうる旨を warnings に書く。一致しなければ crates.io (docs.rs) のその版を返す (v0.18)
   - `^1` / `~1.2` / `1` などの semver 要件も受ける。解決した結果は provenance に `resolved_from: "explicit_req"` として載せる
   - `latest` / `newest` (大文字小文字・前後空白を無視) は `*` の別名とする
   - **解析できない指定は `invalid_argument` エラーにする**。黙って `*` にしない
   - `0.8.9` が完全一致になることを回帰テストで固定する (caret 扱いで実害が出た先例がある)
 - R-VR-2 Cargo.lock:
   - プロジェクトの `cargo metadata` の resolve を使う。Cargo.lock を直接パースしない (path / git / patch / replace / workspace を cargo に解決させるため)
-  - 例外として、`cargo metadata` が失敗したとき (オフラインモードで手元に `.crate` が無いとき、git の依存の取得に失敗したときなど。`cargo metadata` は Cargo.lock があっても、他の OS 用を含む全依存の `.crate` を取得する。2026-10-14 に確認。v0.15) は、docs.rs の crate の照会を止めないよう Cargo.lock を直接読み、`resolved_from: "cargo_lock_raw"` で区別して warnings に書く。この経路ではローカルビルドしない (範囲を判定できないため。R-MCP-3)。`cargo metadata` の失敗を `build_failed`・`fetch_failed`・`offline_miss` として返すのは (R-WS-7)、ローカルビルドを要する照会だけで、版の解決は Cargo.lock の直読みで続け、失敗の分類を warnings に書く (v0.17)。使うパッケージの範囲、同名の複数版の絞り方、warnings の中身は M1 で決める (v0.16)
+  - 例外として、`cargo metadata` が失敗したとき (オフラインモードで手元に `.crate` が無いとき、git の依存の取得に失敗したときなど。`cargo metadata` は Cargo.lock があっても、他の OS 用を含む全依存の `.crate` を取得する。2026-10-14 に確認。v0.15) は、docs.rs の crate の照会を止めないよう Cargo.lock を直接読み、`resolved_from: "cargo_lock_raw"` で区別して warnings に書く。この経路ではローカルビルドしない (範囲を判定できないため。R-MCP-3)。`cargo metadata` の失敗を `build_failed`・`fetch_failed`・`offline_miss`・`lockfile_outdated` として返すのは (R-WS-7・下の `--locked`)、ローカルビルドを要する照会だけで、版の解決は Cargo.lock の直読みで続け、失敗の分類を warnings に書く (v0.17)。Cargo.lock が古いときは、版が古いかもしれない旨と更新の案内も warnings に書く。Cargo.lock が無ければ直読みもできないので、プロジェクトの版の解決を要する照会は `lockfile_outdated` を返す (v0.17)。使うパッケージの範囲、同名の複数版の絞り方、warnings の中身は M1 で決める (v0.16)
   - パッケージは**名前ではなく package id で索引する**。同名の複数バージョンを共存させる
   - **同じ crate が複数バージョンある場合は、黙って選ばない**。対象のプロジェクト (R-MCP-3) の member から直接依存しているものが 1 つに決まれば、それを使う。決まらなければ `ambiguous_version` を返し、候補と各々を使っている依存元を添える
   - バージョンの大小は semver で比べる。文字列比較をしない (`"0.9.0" > "0.10.0"` になる)
-  - docs.rs から取ってよいのは `source` が crates.io のパッケージだけ (docs.rs は crates.io の crate しか扱わない)。path / git / workspace のパッケージは、同名の crates.io の crate と取り違えないようローカルビルドに回す
-  - `cargo metadata` は毎回起動しなくてよいが、`cargo update` など入力が変わったら必ず作り直す。キャッシュするかとキーの構成は M1 で所要時間を測って決める (キーの候補: Cargo.lock、workspace のルートと各 member の Cargo.toml、`.cargo/config.toml`、workspace 外の path 依存の Cargo.toml の内容ダイジェスト。v0.16)
-  - **ユーザーの Cargo.lock を書き換えない**。`cargo metadata` も `cargo rustdoc` も、Cargo.lock が無いか古いと解決し直して書き込み、ネットワークで index を取りに行く。プロジェクトの文脈で cargo を呼ぶときは常に `--locked` を付ける。Cargo.lock が無いか古ければ、cargo は stderr に `because --locked was passed` を含むエラーを出して終了する (どちらも 2026-10-14 に確認)。これを `lockfile_outdated` として返し、利用者かエージェントが Bash で Cargo.lock を更新するよう案内する (文面は §8)。オフラインモードでは `--offline` も付ける。R-WS-5 の仮のプロジェクトは、キャッシュの下にあるサーバー自身のものなので対象外 (そこでの解決はネットワークを使い、オフラインモードでは `offline_miss` にする)
+  - docs.rs から取ってよいのは `source` が crates.io のパッケージで、かつ Cargo.lock の `checksum` が sparse index の `cksum` と一致するものだけ (docs.rs は crates.io の crate しか扱わない。一致すれば、ソースの置き換え (vendor など) の中身が crates.io と同じだと分かる。v0.18)。path / git / workspace のパッケージは、同名の crates.io の crate と取り違えないようローカルビルドに回す。checksum が一致しないものもローカルビルド (M2) に回す (v0.18)。`[source.crates-io] replace-with` (directory source) では、`cargo metadata` の source は crates.io のまま、`manifest_path` だけが vendor を指した (2026-10-19 に確認。ソースの読み方は R-SC-2)
+  - `cargo metadata` は毎回起動しなくてよいが、`cargo update` など入力が変わったら必ず作り直す。キャッシュするかとキーの構成は M1 で所要時間を測って決める (キーの候補: Cargo.lock、workspace のルートと各 member の Cargo.toml、`.cargo/config.toml` (cargo の設定の合成の規則に依る。R-WS-2)、workspace 外の path 依存の Cargo.toml の内容ダイジェスト、`members` の glob の展開結果 (v0.18)。v0.16)
+  - **ユーザーの Cargo.lock を書き換えない**。`cargo metadata` も `cargo rustdoc` も、Cargo.lock が無いか古いと解決し直して書き込み、ネットワークで index を取りに行く。プロジェクトの文脈で cargo を呼ぶときは常に `--locked` を付ける。Cargo.lock が無いか古ければ、cargo は stderr に `because --locked was passed` を含むエラーを出して終了する (どちらも 2026-10-14 に確認)。これを `lockfile_outdated` として返し (返す照会の範囲は上の例外のとおり。v0.17)、利用者かエージェントが Bash で Cargo.lock を更新するよう案内する (文面は §8)。オフラインモードでは `--offline` も付ける。R-WS-5 の仮のプロジェクトは、キャッシュの下にあるサーバー自身のものなので対象外 (そこでの解決はネットワークを使い、オフラインモードでは `offline_miss` にする)
 - R-VR-3 latest:
-  - yanked と pre-release を除いた最大のバージョン (sparse index の `yanked` を見る)。docs.rs からはこの版の完全な URL で取る (R-DS-6)
+  - yanked と pre-release を除いた最大のバージョン (sparse index の `yanked` を見る)。docs.rs からはこの版の完全な URL で取る (R-DS-6)。全版が pre-release のときと、全版が yanked のときの latest は M1 で決める (v0.18)
   - プロジェクトの依存でない crate なら、`resolved_from: "latest"` と「プロジェクトの依存ではない」旨を載せる
-- R-VR-4 差し替え禁止: 解決したバージョンのデータが取れなくても、別のバージョンで代用しない。`docs_unavailable` を返し、JSON がある近くのバージョンを候補として添える
+- R-VR-4 差し替え禁止: 解決したバージョンのデータが取れなくても、別のバージョンで代用しない。`docs_unavailable` を返し、JSON がある近くのバージョンを候補として添える。返った JSON の `crate_version` が解決した版と違えば、その JSON を使わず、キャッシュにも書かない (R-DS-6 の 200 で別の版が返る場合。v0.18)
 - R-VR-5 crate をまたぐ参照 (§5.5) にも同じ規則を適用する
 - R-VR-6 バージョン一覧の取得には crates.io の sparse index (`index.crates.io`) を優先する。結果は TTL 付きでキャッシュする (§9.3)。日次の名前一覧などを使う場合は鮮度を provenance に載せ、そこに無いことを「存在しない」と扱わない
 
 ### 5.4 target / features / cfg
 
 - R-TG-1 target の既定値:
-  - ローカルビルドでは、プロジェクトの `build.target` (`.cargo/config.toml`。配列なら先頭の要素を既定にして warnings と provenance に出し、ほかの要素は `target` 引数で指す。v0.16)、なければホストの target
-  - ホストの target は実行時に `rustc -vV` から取る (サーバーをビルドしたときの target ではない。実行ファイルのパスを指定していれば R-WS-1 で決めた rustc で)。ローカルビルドで `--target` を省くか (R-WS-1) の判定には、これではなく、ビルドに使う toolchain の `rustc -vV` の host を使う (v0.17)。プロジェクトのディレクトリではなく中立のディレクトリ (キャッシュの下) で実行する。ホストの target はプロジェクトの設定によらないため
+  - ローカルビルドでは、プロジェクトの `build.target` (`.cargo/config.toml` など、cargo が実際に読む設定。R-WS-1。配列なら先頭の要素を既定にして warnings と provenance に出し、ほかの要素は `target` 引数で指す。v0.16。配列の並びは cargo の設定の合成の規則で決まる。R-WS-2。v0.18)、なければホストの target
+  - ホストの target は実行時に `rustc -vV` から取る (サーバーをビルドしたときの target ではない。実行ファイルのパスを指定していれば R-WS-1 で決めた rustc で)。ホストの target はプロジェクトの設定によらないので、プロジェクトのディレクトリではなく中立のディレクトリ (キャッシュの下) で実行する。ローカルビルドで `--target` を省くかの判定には、これではなく、ビルドに使う toolchain の `rustc -vV` の host を使う (R-WS-1。v0.17)
     - 中立のディレクトリでの `rustc -vV` は、rustup に既定の toolchain が無い環境では失敗する (2026-10-16 に確かめた)。取れずに代わりの値を使ったときは warnings に書く。代わりの値の取り方 (既定のプロジェクトのルートでやり直す、サーバーのビルド時の target を使う、musl を gnu に読み替える、など) は M1 で決める (v0.16)
-  - ローカルビルドの前に、使う toolchain の sysroot に `lib/rustlib/<target>` があるかを見て、無ければ cargo を起動せずに `toolchain_missing` を返す (rustup の環境なら `rustup target add` を案内する。rustup の無い環境では rustup のコマンドを案内しない)。このディレクトリの有無が rustup の一覧と一致し、無い target で cargo を起動すると依存のビルドの途中で失敗することを M0 で確かめた (Q-30。v0.17)
+  - ローカルビルドの前に、使う toolchain の sysroot に `lib/rustlib/<target>` があるかを見て、無ければ cargo を起動せずに `toolchain_missing` を返す (rustup の環境なら `rustup target add` を案内する。rustup の無い環境では rustup のコマンドを案内しない)。このディレクトリの有無が rustup の一覧と一致し、無い target で cargo を起動すると依存のビルドの途中で失敗することを M0 で確かめた (Q-30。v0.17)。host の target のディレクトリは rustc の component だけでもできるので、host の `rust-std` の有無は `lib/rustlib/<host>/lib` に libcore があるかで見る (v0.18)
   - 独自の target で std を自分で作るプロジェクト (`build.target` が target の JSON 仕様 (`.json`) のもの、cargo の設定に `[unstable] build-std` があるもの) は v1 では対応しない。cargo を起動せずに `docs_unavailable` (`reason: target_unsupported`) を返し、member は利用者が手元で作る方法を案内する。docs.rs の照会は、その crate の docs.rs での既定 target にフォールバックして R-TG-2 のとおり明示する。JSON の仕様は、今の cargo では stable でも nightly でも `cargo tree` からして unstable な指定を求め、文書化には `-Z build-std` も要る (M0 で確かめた。m0-plan.md の §6.2 の B7-8。v0.17)。上の sysroot の判定は、これらに当たらない構成だけで行う
-  - docs.rs では、プロジェクトの `build.target` (なければホストの target) でビルドされた版があればそれ、なければその crate の docs.rs での既定 target (`default-target`。未指定なら `targets` の先頭、どちらも無ければ `x86_64-unknown-linux-gnu`)
-  - docs.rs が既定でビルドする target は 5 つ (`DEFAULT_TARGETS`: `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`aarch64-apple-darwin`、`x86_64-pc-windows-msvc`、`i686-pc-windows-msvc`)。crate は `[package.metadata.docs.rs]` の `targets` / `default-target` / `additional-targets` で変えられる。**`x86_64-apple-darwin` は既定に入っていない**ので、Intel Mac のホストではほとんどの crate でフォールバックが起きる前提で作る
-- R-TG-2: target をフォールバックした場合は、**実際に使われた triple** (JSON の `target.triple` から読む。Q-13) を provenance に載せ、warnings に明示する。R-TG-1 で選んだ target で 404 だったことはディスクに記録し、次回の無駄な試行を省く
+  - docs.rs では、求める target (プロジェクトの `build.target`、なければホストの target) でビルドされた JSON だけを使い、**別の target の文書で代用しない** (独自の target のプロジェクトだけは例外。R-TG-2。v0.18)。その JSON が docs.rs に無いとき、既定のプロジェクトの依存はローカルビルドするのを既定にする (M2 から。照会のツールがビルドする範囲は R-MCP-3)。M2 までの M1 の間は、`docs_unavailable` (`reason: no_target_json`。§8) を返す (v0.18)
+  - docs.rs がビルドする target (公式の告知 <https://blog.rust-lang.org/2026/04/04/docsrs-only-default-targets>): 2026-05-01 からは、`[package.metadata.docs.rs]` に `targets` を書いていない crate を、既定の target (`default-target`、無ければ `x86_64-unknown-linux-gnu`) だけでビルドする。対象は新しいリリースとビルドし直しで、それより前のリリースは 5 つの target (`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`aarch64-apple-darwin`、`x86_64-pc-windows-msvc`、`i686-pc-windows-msvc`。Apple の既定は 2025-10-16 の告知で `aarch64-apple-darwin` になった) のまま。2026-10-19 に、tokio 1.52.0 は確かめた 3 つの target のどれも 200、1.53.3 は Linux 以外が 404 だった。crate は `targets` / `default-target` / `additional-targets` で変えられる。したがって、x86_64 Linux 以外のホスト (Mac・Windows など) では、新しいリリースの多くでホストの target の JSON が無い前提で作る (v0.18)
+- R-TG-2: target をフォールバックした場合 (std の R-STD-1・R-STD-6 と、R-TG-1 の独自の target のプロジェクトでの docs.rs の照会。それ以外の docs.rs の照会では代用しない。R-TG-1。v0.18) は、**実際に使われた triple** (JSON の `target.triple` から読む。Q-13) を provenance に載せ、warnings に明示する。R-TG-1 で選んだ target で 404 だったことはディスクに記録し、次回の無駄な試行を省く
 - R-FT-1: docs.rs の JSON は、どの feature でビルドしたかを記録していない。`.crate` 内の `Cargo.toml` の `[package.metadata.docs.rs]` (`all-features` / `features` / `no-default-features`) から求めて provenance に載せる。あわせて「docs.rs のビルドで偽だった cfg の item は JSON に存在しない」旨を必要に応じて warnings に出す
 - R-FT-2 **item ごとの有効 cfg を求める** (Q-3):
   - rustdoc JSON には cfg の専用フィールドが無い。情報は `Attribute::Other` の文字列としてだけ残る
   - 子 item には親の cfg が付かない (`axum::extract::ws` モジュールには cfg があるが、その中の `WebSocket` の `attrs` は空)
-  - したがって、**有効 cfg = その item 自身の cfg ∧ 公開パス上の全祖先モジュールの cfg ∧ re-export の連鎖上の各 `Use` の cfg** として求める。公開パスが複数あれば、正準パスの有効 cfg を出し、`also_reexported_at` (R-SR-4) の各パスには、正準パスと違う場合だけそのパスの有効 cfg を添える
+  - したがって、**有効 cfg = その item 自身の cfg ∧ 関連 item なら親 (impl ブロック・trait) の cfg ∧ 公開パス上の全祖先モジュールの cfg ∧ re-export の連鎖上の各 `Use` の cfg** として求める (関連 item の親は v0.18 で足した)。公開パスが複数あれば、正準パスの有効 cfg を出し、`also_reexported_at` (R-SR-4) の各パスには、正準パスと違う場合だけそのパスの有効 cfg を添える
   - 情報源の優先順:
     1. `#[doc(cfg(...))]` (形式 46〜61 で表記が安定している)
-    2. cfg の痕跡 (trace) 属性。**表記は format_version ではなく実際の文字列の形で判別する**。同じ形式 57 の中でも変化している (`#[<cfg>(...)]`、`#[<cfg_trace>(...)]`、`#[attr = CfgTrace([NameValue { ... }])]` の 3 系統を確認済み。同じ形式 61 でも、stable 1.99 と nightly 1.101 で属性の表記が違うものがあった (`CfgAttrTrace`。M0 の B1。Q-14))。現行の表記は `span: lib.rs:10:7: 10:20 (#0)` のようにファイルパスと位置を含むので、解析はこれを読み飛ばせるようにする
+    2. cfg の痕跡 (trace) 属性。**表記は format_version ではなく実際の文字列の形で判別する**。同じ形式 57 の中でも変化している (`#[<cfg>(...)]`、`#[<cfg_trace>(...)]`、`#[attr = CfgTrace([NameValue { ... }])]` の 3 系統を確認済み。同じ形式 61 でも、stable 1.99 と nightly 1.101 で属性の表記が違うものがあった (`CfgAttrTrace`。M0 の B1。Q-14。v0.17))。現行の表記は `span: lib.rs:10:7: 10:20 (#0)` のようにファイルパスと位置を含むので、解析はこれを読み飛ばせるようにする
     3. (任意) `.crate` のソースを `syn` で解析した `#[cfg(...)]`。ソースの item と JSON の item の対応づけが要り重いので、v1 は 1・2 と `cfg_source: unknown` で受け、eval で取りこぼしを測ってから採否を決める (v0.16)
   - 出力: `required_features` (`any` / `all` / `not` の構造を保つ)、`other_cfg` (`tokio_unstable`、`target_os` など)、`cfg_source` (`doc_cfg` / `cfg_trace` / `inherited` / `source_parse` / `unknown`)、`enabled_in_project`、`enabled_in_dev_only`
+  - `enabled_in_project` は `true` / `false` / `unknown` の 3 値にする。feature 以外の cfg (`tokio_unstable` など。docs.rs の `rustdoc-args`・`rustc-args` の `--cfg` で有効にされるもの) が条件にある item は、プロジェクトで有効か分からないので `unknown` とし、条件の cfg を添える (v0.18)
   - `enabled_in_project` は、実際のビルド target (R-TG-1) での通常のビルド (dev-dependency を除く) の feature の組で判定する。dev-dependency の経路でだけ有効なものは `enabled_in_project: false`・`enabled_in_dev_only: true` で示す (出荷するコードで使えない API を「有効」と言わず、テストでは使えると分かるように。確認なしでビルドする範囲 (R-MCP-3) が dev を含むこととは別の基準。v0.15。resolver 2 以上では、dev だけの依存はローカルビルドの範囲から除く。R-WS-5)。組の得方は R-FT-3。`enabled_in_dev_only` は、resolver 2 以上では `-e normal,dev` の組と `-e normal` の組の差で求める。resolver 1 では dev の feature も通常のビルドに統合されるので、常に `false` になる (v0.17)
   - `#[doc(auto_cfg(hide(...)))]` を尊重する
   - **cfg が見つからないことを「feature 不要」と断定しない**。判断できなければ `cfg_source: unknown` とする
-  - **一覧系の各項目にも付ける**: `list_module`・`search_items`・`list_methods`・`list_impls`・`list_implementors` の各項目に (`detail=brief` でも)、必要な feature の 1 行の要約 (例: `feature: sync`、`feature: any(rt, rt-multi-thread)`) と `enabled_in_project` (dev の経路でだけ有効なら `enabled_in_dev_only` も) を付ける。「どの feature で有効か」に `get_item` を追加で呼ばずに答えるため (groxide の `[feature: sync]`、truesight の `#[cfg(feature = …)] pub fn …` の 1 行表記に倣う)。feature が不要な項目には付けない
+  - **一覧系の各項目にも付ける**: `list_module`・`search_items`・`list_methods`・`list_impls`・`list_implementors` の各項目に (`detail=brief` でも)、必要な feature の 1 行の要約 (例: `feature: sync`、`feature: any(rt, rt-multi-thread)`) と `enabled_in_project` (dev の経路でだけ有効なら `enabled_in_dev_only` も。`unknown` なら条件の cfg の注記も。v0.18) を付ける。「どの feature で有効か」に `get_item` を追加で呼ばずに答えるため (groxide の `[feature: sync]`、truesight の `#[cfg(feature = …)] pub fn …` の 1 行表記に倣う)。feature が不要な項目には付けない
 - R-FT-3 ローカルビルドの feature (Q-10):
   - **workspace member**: プロジェクトの通常のビルドで有効な feature の組を `--no-default-features --features ...` で再現する (その組の得方は下記)。その member の Cargo.toml に `[package.metadata.docs.rs]` の `features`・`all-features`・`no-default-features` があれば、その組で文書化する (文書のための組をプロジェクトが Cargo.toml で決められるように。docs.rs と同じ書き方。v0.14)。`enabled_in_project` (R-FT-2) は、この場合も通常のビルドの組で判定する。照会のツールは、この組で確認なしにビルドする範囲を広げない (R-MCP-3)。その組でビルドが壊れたら (相互排他の feature や、システムライブラリの要る optional の依存など)、通常のビルドの組でやり直して warnings に書く。通常の組の範囲に無い依存が増えるときの扱いと、壊れた組を記録して次から使わないかは M2 で決める (v0.16)。metadata から読んだ feature 名も R-SEC-4 で検証する
-  - **依存 crate**: feature のフラグを**渡さない**。workspace のルートから `cargo rustdoc -p <dep>@<ver>` を実行すれば、workspace で統合された feature が効く (2026-10-14 に確認: path 依存 b の `#[cfg(feature = "x")]` の item が、member a が有効にした feature x のとおりに出力された)。ただし統合されるのは**通常の依存の辺**の feature だけで、dev-dependency や build-dependency だけが有効にする feature は効かない (resolver 2。2026-10-14 に確認)
+  - **依存 crate**: feature のフラグを**渡さない**。workspace のルートから `cargo rustdoc -p <dep>@<ver>` を実行すれば、workspace で統合された feature が効く (2026-10-14 に確認: path 依存 b の `#[cfg(feature = "x")]` の item が、member a が有効にした feature x のとおりに出力された)。ただし統合されるのは**通常の依存の辺**の feature だけで、dev-dependency や build-dependency だけが有効にする feature は効かない (resolver 2。2026-10-14 に確認)。どの組で作られたかは、予測せずに下記のとおり記録する (v0.18)
   - 依存 crate に `--features` や `--no-default-features` を渡すと、cargo は `cannot specify features for packages outside of workspace` で失敗する (KevinT3Hu の実装はこの方式で、依存の生成が毎回失敗している)
   - `--all-features` を既定にしない (相互排他の feature がある crate で壊れる)
   - 要求した feature と実際に使った feature の両方を provenance に載せる。**`features_effective` と `enabled_in_project` (R-FT-2) を `cargo metadata` の `resolve.nodes[].features` から取ってはならない**。これは dev・build・target 別の依存の feature まで統合した値で、通常のビルドより多い (dev-dependency だけが有効にする feature が入る)。workspace member を `--features <resolve.nodes の値>` で再現すると、同じ理由で通常のビルドより多い feature で文書を作ってしまう
-  - 通常のビルドの feature の組は `cargo tree --workspace --target <target> -e normal -f '{p} [{f}]'` で得る (target は実際のビルド target。R-TG-1)。この組は、`cargo rustdoc --lib` が実際にビルドに使う組と、resolver 1 でも 2 でも一致する (M0 の実測は `--target <host>` を付けて行った。付けない形での再確認は M2。Q-31)。target ごとの依存・build-dependency・dev-dependency で feature が分かれる場合も、ビルドにはこの組を使う (Q-20。M0 で決定。v0.17。member の `[package.metadata.docs.rs]` があればそちらを使うのは上記のとおり)。dev-dependency の feature は `--all-targets` のビルドにだけ混ざり、build-dependency の feature は host 向けの別の unit にだけ効く (resolver 2)
+  - **文書の feature の組は、ビルドしたときの cargo の `compiler-artifact` のメッセージの `features` を正として記録する** (`features_effective`)。事前に予測しない (Q-20。v0.18 で改めた)。M0 の B3 で決めた「`cargo tree --workspace --target <t> -e normal` の組は、`cargo rustdoc --lib` が実際にビルドに使う組と一致する」は、member が 1 つの workspace でしか成り立たない: member a・b が依存 shared の別の feature を使うと、`cargo tree --workspace` は `[x,y]`、a の文書化は `[x]` になる (2026-10-19 に確認)。workspace の中の path 依存は暗黙の member になり、自身の既定の組で作られる。`default-members` もある。これらでの確認は Q-31
+  - **`enabled_in_project` (R-FT-2) は、全 member を統合した組で判定する**: `cargo tree --workspace --target <target> -e normal -f '{p} [{f}]'` で得る (target は実際のビルド target。R-TG-1。M0 の実測は `--target <host>` を付けて行った。付けない形での再確認は M2。Q-31)。target ごとの依存・build-dependency・dev-dependency で feature が分かれる場合も、この組で判定する (v0.18)。dev-dependency の feature は `--all-targets` のビルドにだけ混ざり、build-dependency の feature は host 向けの別の unit にだけ効く (resolver 2)
 
 ### 5.5 パスの解決と re-export
 
@@ -264,7 +268,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - プリミティブ型とそのメソッド (`slice::sort_by`、`str::len`、`f64::sqrt`)
   - `crate@version::path`
   - 任意 (LLM がその形で問うかを eval で見て採否を決める。受けない形は `invalid_argument` で書き方を案内する。v0.16): trait 修飾のパス (`<Vec<T> as IntoIterator>::into_iter`)、docs.rs の URL、パスの区切りごとの rustdoc の区別子 (`struct@Foo`、`fn@foo`、`mod@x` など、intra-doc link と同じ書き方。名前だけでは曖昧なものを区別する。ferritin の `resolver.rs` に倣う)
-  - crate 名のハイフンとアンダースコアは同一視する (`tokio-util` と `tokio_util`)。crate 名の比較と索引のキーを正規化して吸収する
+  - **crate の名前** (v0.18): `crate` 引数 (と `crate@version::path` の crate) は、パッケージ名とコードに書く名前 (lib 名・依存の改名) の両方を受け、文脈で解く。プロジェクトの文脈があれば、`cargo metadata` の依存の名前 (extern の名前) からパッケージに解き、パッケージ名でも引ける。両方に当たれば候補を返す。文脈が無ければパッケージ名として crates.io を引く (`-` と `_`、大文字と小文字の違いは sparse index で正規化する。`tokio-util` と `tokio_util`)。path の先頭は lib 名 (JSON のルートの名前) に合わせ、パッケージ名と lib 名が違えば provenance に両方出す。キャッシュの鍵も正規化した名前にする (R-CA-2)
   - 解決の手順: 公開パス索引 (R-PR-2) で見つからなければ定義パス (`paths`) で引く。それでも無ければ、親を同じ手順 (公開パス索引 → 定義パス) で引いてから、子を impl・trait・enum の中でたどる (`paths` に載らない impl の中の item 用。ferritin の 2 段のフォールバック。v0.17)
 - R-PR-2 **公開パス索引**: ルートモジュールから `Module.items` と `Use` item (glob・非 glob・crate をまたぐもの) をたどって、item ごとの公開パスの集合を作る
   - `paths` の定義パスを、使えるパスとして見せてはならない (private module を含みうる。dmvk の Issue #5 や、umbrella crate で引けない問題の根本原因)
@@ -272,21 +276,25 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - 公開パスを持たない型が公開シグネチャに現れる場合は `unnameable` として示す
   - `pub use Trait as _;` は名前を作らないので、公開パスにしない (`prelude::_` は `use` できない。M0 で rustdoc_processor との突き合わせで見つけた。どの glob で trait がスコープに入るかを情報として持つかは M1 で決める。v0.17)
   - std の item は公開窓口のパス (`std::iter::Iterator`) で示す。`core::iter::traits::iterator::Iterator` や `alloc::vec::Vec` を見せない
+  - **no_std** (v0.18。M4): 既定のプロジェクトの member が `#![no_std]` なら、std の窓口ではなく core・alloc のパスで示し、std にしか無い item にはその旨を付ける。判定は member のルート (crate root) の属性で行う。作るのは primitive と Deref を扱う M4
+  - **private item のパス** (v0.18。M2): workspace の member の item は、公開パスが無ければ crate 内でのパス (`crate::a::b::Item`) と可視性 (`pub(crate)` など) を示す (検索での扱いは R-SR-4)
 - R-PR-3 `Use` の解決順 (ferritin の実績のある順序):
   1. `id` が無い → プリミティブ型の re-export。種類付きのパス索引で引く (無視すると `bool` や `str` で無関係な crates.io の crate を読みに行く)
   2. `id` がこの crate の `index` にある → その item
   3. `id` が `paths` にある → crate をまたぐ参照。定義パスの逆引き索引で解決する
   4. `source` 文字列は最後の手段 (先頭がローカルの別名でありうる)
   - 循環検出とともに深さの上限 (目安 256) を設ける。glob で互いを re-export しあう crate 群でスタックが溢れた先例がある
+  - 公開パス索引 (R-PR-2) の作成には、深さだけでなく経路の数 (または作業量) にも上限を設ける。経路の組み合わせが爆発しうるため (M0 のコードは 20KB の JSON で 24 秒・5.4GB を使った。2026-10-19 に実測。v0.18)
   - glob re-export は crate 内のものを再帰的に展開する。crate 外の glob は、相手の JSON がキャッシュにあるか取得できればサーバー側で展開する。展開できなければ `unexpanded_external_globs: [{prefix, source_crate, source_version}]` として返し、次に呼ぶべきツールを hints に示す
   - `#[doc(hidden)]` の item は既定で隠す。`#[doc(inline)]` / `#[doc(no_inline)]` を正しく扱う
 - R-PR-4 crate をまたぐ参照: 参照先 crate のバージョンは、プロジェクトの依存グラフを最優先にし、決まらなければ `external_crates[*].html_root_url` (docs.rs のビルドは `https://docs.rs/axum-macros/0.5.1/x86_64-unknown-linux-gnu/` のように、crates.io の名前・版・target を含む。M0 で確かめた。v0.17) を使う。起点 (その問い合わせで最初に引いた crate) と参照元のどちらの `html_root_url` を先に見るかは M1 で実際の crate を見て決める (v0.16)。どれでも決まらなければ latest で解決し、版を推定した旨を warnings に明示する。決めた版のデータが取れない場合は R-VR-4 に従う
   - `html_root_url` は crates.io の名前と crate 内部の名前 (`sha1` と `sha-1` など) の両方で索引する
+  - std の私的な依存 (sysroot の hashbrown など) は `ExternalCrate::path` で見分け、crates.io の同名の crate と取り違えない。形式 54〜56 は `path` が無い (R-FV-2) ので見分けられない (v0.18)
   - ローカルビルドの JSON は版付きの `html_root_url` を持たないことが多いので、ローカル crate からの参照では依存グラフが必須
   - crate をまたぐ re-export を引かれたら、行き先 (`crate@版` と定義パス) と、行き先を引く次の呼び出しを示す hint を返す (M0 で実装し、Claude Code がそれに従って行き先を引けた。行き先の中身まで返すかは M1 で決める。v0.17)
 - R-PR-5 (任意。M4): docs.rs がビルドに使った依存のバージョン (`html_root_url` や span のパスから分かる) とプロジェクトの Cargo.lock の版が違う場合、その依存から来た item (inline された re-export や blanket impl) に warnings を付ける。それまでは、docs.rs 由来の文書は docs.rs のビルド時の依存で作られている旨を provenance で示すだけにする。span のパスから版が分かるかは M4 で確かめる (v0.16)。docs.rs の JSON の自分の item の span は package root からの相対パスで版を含まない (M0 で確かめた。v0.17)
 - R-PR-6: 1 回の問い合わせで同じ crate の異なるバージョンが必要になった場合は、黙って片方に寄せず warnings で知らせる
-- R-PR-7: パスが曖昧な場合 (同名の item が複数) は候補一覧を返す。型のメンバー (`Type::member`) は、固有の impl → trait の impl → blanket impl の段の順に探し、先に見つかった段で決める (同じ段に複数あれば候補一覧。M0 の実装。初期案。v0.17)。見つからない場合は、まず別の解決経路 (trait 経由・Deref 経由・re-export・同名の別モジュール) を試し、それでも無ければ `did_you_mean` を返す。**候補には類似度の下限を設け、無関係な候補を出すくらいなら候補なしにする**。編集距離はバイトではなく文字で数え、ASCII 以外の名前で閾値が狂わないことを回帰テストで固定する (dmvk はバイト長と文字数を取り違えている)
+- R-PR-7: パスが曖昧な場合 (同名の item が複数) は候補一覧を返す。型のメンバー (`Type::member`) は、固有の impl → trait の impl → blanket impl の段の順に探し、先に見つかった段で決める (同じ段に複数あれば候補一覧。M0 の実装。初期案。v0.17)。探すときは、impl の `for` がその型であることを確かめる (rustdoc の `Struct.impls` などには、その型が trait の型引数に現れる impl も入る)。持ち主の impl の探索は決定的にする (R-OUT-4。v0.18)。見つからない場合は、まず別の解決経路 (trait 経由・Deref 経由・re-export・同名の別モジュール) を試し、それでも無ければ `did_you_mean` を返す。**候補には類似度の下限を設け、無関係な候補を出すくらいなら候補なしにする**。編集距離はバイトではなく文字で数え、ASCII 以外の名前で閾値が狂わないことを回帰テストで固定する (dmvk はバイト長と文字数を取り違えている)
 - R-PR-8: 再帰の深いパス解決・型の描画は、大きなスタック (目安 16MB) を持つ専用のスレッドで行うか、明示的なスタックを使う反復に書き換える。非同期ランタイムのワーカーの既定のスタックで深い再帰をしない (ferritin は 16MB のワーカーで走らせている)
 
 ### 5.6 trait / impl / メソッド解決
@@ -295,8 +303,8 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - 固有メソッド
   - trait メソッド (どの trait 由来か、`use` が必要か、required / provided か)。上書きされていない default メソッドも含める
   - blanket impl 由来のメソッド (汎用 trait 由来のものの出し方は R-SH-4)
-  - **Deref 先のメソッド** (`String` → `str`、`Vec<T>` → `[T]`。連鎖も追う。M4)
-  - プリミティブ型の固有メソッドは core / alloc / std に分かれて定義されているので、すべてを合わせて返す (M4)
+  - **Deref 先のメソッド** (`String` → `str`、`Vec<T>` → `[T]`。連鎖も追う)
+  - プリミティブ型の固有メソッドは core / alloc / std に分かれて定義されているので、すべてを合わせて返す (`#![no_std]` の member でのパスと印は R-PR-2。v0.18)
   - 固有メソッドと trait 由来のメソッドは M1、Deref 先とプリミティブは M4 で作る (v0.16)
   - `get_item` でも `Type::method` をこれらすべての経路で解決する。見つからない場合は、どの経路を探したかをエラーに含める
 - R-TI-2 `list_impls`: 型が実装している trait を返す
@@ -323,8 +331,8 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - 引数 `fields` で照合する欄 (`name` / `alias` / `docs` / `path`) を選べるようにする。既定はすべて (ruskel の `search_spec` に倣う。`signature` の欄は下のシグネチャ検索を入れたときに足す。v0.16)
   - **crate に同梱された散文の検索** (M4 で検討。任意): crate の README と `docs/` の散文を検索できるようにする (rust-knowledge-mcp に倣う)
   - **シグネチャを対象にした検索** (M4 で検討。任意): 引数や戻り値の型で探す (例: 「`Result<Vec<u8>>` を返す関数」。ruskel の `search_spec: signature` に倣う)
-- R-SR-2 範囲: crate 1 つ / workspace のみ / workspace + 直接依存 / 依存グラフ全体。**既定は workspace + 直接依存**。`search.scope = crate` を既定にしたとき、crate の引数が無ければ `invalid_argument` にする。初回は範囲の crate の取得が要り、R-WS-6 の時間の上限で `partial` (R-SR-5) になりうる。起動時の先取りの設定 (R-CA-6) で避けられることを hints で示す
-- R-SR-3 順位付け (ferritin の調整済みの方式を基本とする。原則は、名前の完全一致を上位にする、最後の語を前方一致で展開しない、並びを決定的にする、の 3 つ。下の数値と、段の順・減点する語・被参照数・量子化は初期案で、M1 の eval (R-QA-6) で決める。v0.16):
+- R-SR-2 範囲: crate 1 つ / workspace のみ / workspace + 直接依存 / 依存グラフ全体。**既定は workspace + 直接依存**。`search.scope = crate` を既定にしたとき、crate の引数が無ければ `invalid_argument` にする。初回は範囲の crate の取得が要り、時間の上限 (ビルドを待つ R-WS-6 の上限と、1 リクエストの R-ARCH-6 の上限) で `partial` (R-SR-5) になりうる。起動時の先取りの設定 (R-CA-6) で避けられることを hints で示す
+- R-SR-3 順位付け (ferritin の調整済みの方式を基本とする。原則は、名前の完全一致を上位にする、最後の語を前方一致で展開しない、並びを決定的にする、の 3 つ。下の数値と、段の順・減点する語・被参照数・量子化は初期案で、M1 で仮に決め、M5 の eval (R-QA-6) で調整する。v0.16):
   - BM25 (k1 = 1.2、b = 0)、Lucene 型の IDF (負にならない)、検索対象の crate 全体での統計
   - 重み: item 名 20、ドキュメントの第 1 段落 3、残り 1。祖先のパス名を距離に応じて 3 / 2 / 1 で加える (`hashmap insert` で `HashMap::insert` が引ける)。コードブロックは索引しない
   - トークン化: CamelCase (頭字語を含む)・snake_case・kebab-case・`::` で分割し、複合語そのものも残す
@@ -333,9 +341,9 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - 正準パスを優先し、`__`・`_private`・`internal` を含むパスを減点する
   - 被参照数 (intra-doc link の入次数) を権威として掛ける
   - 同点はスコアを量子化したうえで crate 名・パスで並べ、決定的にする
-- R-SR-4 結果: item ごとに重複を除き、正準パスで示す (他の公開パスは `also_reexported_at`)。`#[doc(hidden)]`・private module・unstable を通るパスは既定で除く。数値の rustdoc Id は出さない
+- R-SR-4 結果: item ごとに重複を除き、正準パスで示す (他の公開パスは `also_reexported_at`)。`#[doc(hidden)]`・private module・unstable を通るパスは既定で除く。ただし自分の workspace の crate を検索するときだけ、既定で private な item も含める (crate 内でのパスと可視性で示す。R-PR-2。M2。v0.18)。数値の rustdoc Id は出さない
   - 既定の件数は固定値で切らず、**スコアの落差で自動的に打ち切る** (ferritin の `rustdoc-mcp/src/tools/search.rs:103-116` に倣う。初期値は、最上位の 5% 未満、直前の半分未満、すでに返した結果のスコアの累積が全ヒットのスコアの合計の 30% を超えた、のいずれかで切る。少なくとも 1 件は返す)。`limit` を指定したらそれに従う。打ち切った場合も `page` (R-OUT-3) で続きを取れるようにする
-- R-SR-5 範囲内にビルド中・失敗・未取得の crate (既定のプロジェクトの外で `build_external_docs` の記録が無いものを含む) がある場合は `partial: true` と該当 crate・理由を warnings に載せる。0 件を「存在しない」と誤読させない
+- R-SR-5 範囲内にビルド中・失敗・未取得の crate (既定のプロジェクトの外で `build_external_docs` の記録が無いものを含む) がある場合は `partial: true` を付け、欠けた crate ごとの状態と理由は provenance の `sources` に載せる (R-OUT-9)。warnings には、欠けた crate の数と内訳の要約を 1 行だけ書く (同じ情報を 2 回返さず、warnings だけを読むモデルにも欠けを伝えるため。v0.17)。0 件を「存在しない」と誤読させない
   - 0 件のときは、item 名との編集距離による `did_you_mean` を、R-PR-7 と同じ類似度の下限付きで返す (綴りの誤りを許す。possdog の fuzzy 検索と snowmead の Tantivy の FuzzyTermQuery の利点を、0 件のときに限って取り込む)
 - R-SR-6 crate そのものを探す検索は別ツール (`search_crates`) に分ける。説明文とキーワードには語幹処理をかけ、語ごとの得点は名前・説明・キーワードの**最大値**をとる (合計すると有名 crate が上位から落ちる)。0 件のときは「語を減らす・言い換える」案内を返す
   - 選定の材料は、検索の API の応答 (DL 数・説明・リポジトリ。1 回で返る) と、結果ごとの sparse index (最新安定版・最終リリース日・MSRV) から作り、結果ごとに API を呼ばない。被依存数は `search_crates` では返さず、`crate_metadata` で返す (crate ごとに API が要り、R-NW-1 の間隔で結果の件数の秒数だけ待たせるため)
@@ -344,17 +352,17 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 
 - R-SC-1: item の span から該当範囲を返す。前後に何行付けるかは指定できる
 - R-SC-2: ソースの取得元
-  - 依存 crate: `$CARGO_HOME/registry/src` の、そのパッケージの source id に対応するディレクトリに既にあればそれを優先し (別のレジストリの同名同版を使わない。git の依存は `$CARGO_HOME/git/checkouts`)、無ければ `.crate` アーカイブ (static.crates.io) を取得・展開してキャッシュする (docs.rs の crate も同じ)
-  - std: std の JSON と同じ toolchain (同じ commit-hash。R-STD-6 で取ったものなら同じ dist の日付) の `rust-src` から読み、span の `/rustc/<hash>/library/…` をそこへ写し替える。版の合う `rust-src` が手元に無ければ導入コマンド付きの `toolchain_missing` を返し、別の版のソースを返さない (行がずれて別の箇所を読むため)。dist の manifest の `[pkg.rust-src.target."*"]` (2026-10-14 に確認) から sha256 を検証して取得する経路は任意とする (v0.16)
+  - 依存 crate: プロジェクトの依存のソースは、常に `cargo metadata` の `manifest_path` のディレクトリから読む (`$CARGO_HOME/registry/src` のそのパッケージの source id のディレクトリ、git の依存の `$CARGO_HOME/git/checkouts`、ソースの置き換え (vendor など) の場所。別のレジストリの同名同版を使わない。vendor もそのまま当たる。R-VR-2。v0.18)。`cargo metadata` を使えないとき (R-VR-2 の Cargo.lock の直読み) と依存でない crate は、`$CARGO_HOME/registry/src` のそのパッケージの source id のディレクトリに既にあればそれを使い、無ければ `.crate` アーカイブ (static.crates.io) を取得・展開してキャッシュする
+  - std: std の JSON と同じ toolchain (同じ commit-hash。R-STD-6 で取ったものなら同じ dist の日付) の `rust-src` から読み、span の `/rustc/<hash>/library/…` をそこへ写し替える。版の合う `rust-src` が手元に無ければ、既定で、JSON と同じ日付の dist から `rust-src` を取り (manifest の `[pkg.rust-src.target."*"]` (2026-10-14 に確認) の sha256 で検証し、下の展開の上限を付ける)、キャッシュに置く (v0.16 の「任意」を v0.18 で既定にした)。それでも取れなければ導入コマンド付きの `toolchain_missing` を返し、別の版のソースを返さない (行がずれて別の箇所を読むため)
   - workspace: そのままのファイル
-  - docs.rs の span のパス: 自分の item は package root からの相対パス (`src/sync/mutex.rs`。M0 で確かめた) なので、その crate のソースのディレクトリに付ける。依存から inline された item などでビルドホストの絶対パス (`/opt/rustwide/cargo-home/registry/src/*/<name>-<ver>/...`) が入る場合は、crate 名と版に写し替える (確かめていない。v0.17)
+  - docs.rs の span のパス: 自分の item は package root からの相対パス (`src/sync/mutex.rs`。M0 で確かめた) なので、その crate のソースのディレクトリに付ける。依存から inline された item などでは、ビルドホストの絶対パス (`/opt/rustwide/cargo-home/registry/src/<index>/<name>-<ver>/…`) が入る (tokio 1.53.3 の JSON に 356 件あることを 2026-10-19 に確かめた。v0.18)。これは crate 名と版に写し替える。`<name>-<ver>` の分解は一意でない (名前にも `-` と数字が入る) ので、Cargo.lock の名前と版で照合する (v0.18)
   - static.crates.io から取得した `.crate` は、sparse index の `cksum` (sha256) と照合し、合わなければ破棄して `network_error` (`retryable: true`) を返す
   - アーカイブ (`.crate` の tar.gz、R-STD-6 の tar.xz、R-AU-3 の OSV の zip) の展開では、絶対パスや `..` を含むエントリ、symlink・hardlink・デバイスのエントリを拒否し、展開先をキャッシュの下のそのアーカイブ用のディレクトリに限る。展開後の総サイズ (`limits.extract_max_size`。R-NW-3 と共通) とファイル数 (初期値は 10 万。v0.16) に上限を設け、超えたら部分的な展開を消す。`.crate` と std のアーカイブは `docs_unavailable` (`reason: too_large`) を返し、OSV の zip は前回のミラーを使って `audit_dependencies` を続け、warnings に書く (v0.15)
   - `stale: true` の workspace の JSON の span でソースを読むときは、行がずれうる旨を warnings に出す
 - R-SC-3: macro が生成した item は span が無いか、macro の呼び出し位置を指す。その旨を明示する
 - R-SC-4: **読めるのは既知のソースルートの下の、パッケージの中身だけ**。span のファイル名が絶対パスや `..` を含む場合も、正規化してソースルートと照合してから読む。manifest 由来のパス (`readme`、`[[example]].path`、`build`) も同様に検証する。manifest 由来のパスと span は、その crate 自身のソースルートとだけ照合する (第三者の crate の `readme = "../../<別のプロジェクト>/.env"` のように、他のルートの下を指させない)
-  - **パッケージの中身** (v0.14): workspace と path 依存では、ターゲット (build script を含む) のソースのディレクトリの `.rs`、前回のビルドの dep-info に載った入力ファイル (`include_str!` で読むものなど。R-WS-4)、`Cargo.toml`、manifest が指す readme と example だけ。registry と git の依存では、`.crate` (git なら checkout) に入っているファイルだけ。std は `rust-src` の中だけ。ドットファイル (`.env` など) は除き、`readme` は文書の拡張子 (`.md`・`.markdown`・`.txt`・`.rst`・`.adoc`) のものだけを受ける。Claude Code の Read の deny やサンドボックスの読み取りの制限を、このサーバー経由ですり抜けさせないため (rust-analyzer や LSP のツールはファイルの中身をエージェントに返さないので、このサーバーにしか無い経路になる)
-  - symlink は、行き先をたどった実際のパスで判定する。実際のパスが既知のソースルート (問い合わせの対象のプロジェクトの workspace のルートと path 依存のルート、`$CARGO_HOME/registry/src` のそのパッケージの source id のディレクトリの `<name>-<ver>` と `$CARGO_HOME/git/checkouts` の対象の crate、展開した `.crate`、`rust-src`) の中なら読み (workspace の中の正当な symlink は読める)、外を指していれば読まずに理由を返す (第三者のリポジトリ・git の依存・crate に入っている、`~/.ssh/id_rsa` などを指す symlink で読み出させない)
+  - **パッケージの中身** (v0.14): workspace と path 依存では、ターゲット (build script を含む) のソースのディレクトリの `.rs`、前回のビルドの dep-info に載った入力ファイル (`include_str!` で読むものなど。R-WS-4)、`Cargo.toml`、manifest が指す readme と example だけ。registry と git の依存では、`.crate` (git なら checkout) に入っているファイルだけ。std は `rust-src` の中だけ。ドットファイル (`.env` など) は除き、`readme` は文書の拡張子 (`.md`・`.markdown`・`.txt`・`.rst`・`.adoc`) のものだけを受ける (workspace から継承した `readme` と、拡張子の無い `README` の扱いは M2 で決める。v0.18)。Claude Code の Read の deny やサンドボックスの読み取りの制限を、このサーバー経由ですり抜けさせないため (rust-analyzer や LSP のツールはファイルの中身をエージェントに返さないので、このサーバーにしか無い経路になる)
+  - symlink は、行き先をたどった実際のパスで判定する。実際のパスが既知のソースルート (問い合わせの対象のプロジェクトの workspace のルートと path 依存のルート、`$CARGO_HOME/registry/src` のそのパッケージの source id のディレクトリの `<name>-<ver>` と `$CARGO_HOME/git/checkouts` の対象の crate、依存の `manifest_path` のディレクトリ (vendor を含む。R-SC-2。v0.18)、展開した `.crate`、`rust-src`) の中なら読み (workspace の中の正当な symlink は読める)、外を指していれば読まずに理由を返す (第三者のリポジトリ・git の依存・crate に入っている、`~/.ssh/id_rsa` などを指す symlink で読み出させない)
   - 開くのは判定した実際のパスにする。判定と開く間に symlink を差し替える攻撃への対策 (`openat2` の `RESOLVE_BENEATH` など) は設けない (差し替えには手元で動くプロセスが要り、それができるエージェントはファイルを直接読めるので。v0.14)
   - 展開した `.crate` の中 (R-SC-2) とキャッシュの中 (R-CA-4) の symlink は拒否する (サーバーが作る場所で、symlink が入る正当な理由が無い)
 - R-SC-5: 長いソースは既定で切り詰め、`truncated` を返す (目安 2 万文字)
@@ -381,15 +389,16 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 - R-WS-1 生成コマンドの基本形 (M0 で確かめた。toolchain の選び方は R-WS-8。v0.17):
 
   ```text
-  [RUSTC_BOOTSTRAP=<crate>[,<crate>…]] cargo [+<toolchain>] rustdoc --locked [--offline] -p <name>@<version> (--lib | --bin <bin>) [--target <target>] \
+  [RUSTC_BOOTSTRAP=<crate>[,<crate>…]] cargo [+<toolchain>] rustdoc --locked [--offline] -j <jobs> -p <package id> (--lib | --bin <bin>) [--target <target>] \
       --message-format=json -- -Z unstable-options --output-format json [--cfg docsrs] [--document-private-items] [--document-hidden-items]
   ```
 
-  - `+<toolchain>` は、サーバーが自分で選んだ toolchain (nightly など。R-WS-8) のときだけ付ける。プロジェクトの toolchain では付けず、rustup にカレントディレクトリ (R-WS-2) から決めさせる。rustup の無い環境では付けない (v0.17)
-  - `--target` は、target (R-TG-1 で決めた値か、照会・外のツールで指した値) が host と違うときと、プロジェクトに `build.target` があるときに付ける。target が host で `build.target` も無いときは付けない (Q-30。M0 で決定。v0.17)。「`build.target` がある」は、cargo が実際に読む設定 (カレントディレクトリから祖先と `$CARGO_HOME` のすべての `config.toml`、環境変数 `CARGO_BUILD_TARGET`) で判断する。host は、ビルドに使う toolchain の `rustc -vV` の host とする (R-TG-1 の中立のディレクトリの値とは違いうる)。`--target` を省いたビルドでは、JSON の `target.triple` を記録の target と照合し、違えば warnings を出して実際の値で記録する。R-TG-1 で代わりの値を使ったときは省かない。理由: `--target` を付けると、`RUSTFLAGS` と `build.rustflags` が host 向けの build script と proc-macro に効かなくなり、それらが生成する item が利用者の普段のビルド (`--target` なし) と違ってくる (M0 で確かめた)。`RUSTFLAGS` は rustc にだけ効き、文書化する crate の rustdoc にはどちらでも効かない。`build.target` が配列だと、`--target` の無い `cargo rustdoc` は `extra arguments to rustdoc can only be passed to one target` で失敗する (2026-10-16 に実測)
-  - 出力は、`--target` を付けたときは `<target dir>/<triple>/doc/`、付けないときは `<target dir>/doc/` に出る。proc-macro の crate は `--target` を付けても host 用に作られ、JSON は `<target dir>/doc/` に、`target.triple` は host で出る (cargo の artifact のメッセージの `filenames` も空。2026-10-16 のレビューで確認)。他の target での文書化では、proc-macro の member は host の文書として記録する (v0.15)
+  - `+<toolchain>` は、サーバーが自分で選んだ toolchain (nightly など。R-WS-8) のときだけ付ける。プロジェクトの toolchain では付けず、rustup にカレントディレクトリ (R-WS-2) から決めさせる。rustup の無い環境では付けない (v0.17)。子の cargo には `RUSTUP_TOOLCHAIN` を渡さず (サーバーが toolchain を選んだときは `+<toolchain>` で指す)、外したことをログに出す。rustup の挙動は M2 で実測する (v0.18)
+  - `-j` を付けて、ビルドの並列度を抑える。初期値はコア数の半分で、M2 で測って決める。設定 `build.jobs` で変えられる (v0.18)
+  - `--target` は、target (R-TG-1 で決めた値か、照会・外のツールで指した値) が host と違うときと、プロジェクトに `build.target` があるときに付ける。target が host で `build.target` も無いときは付けない (Q-30。M0 で決定。v0.17)。「`build.target` がある」は、cargo が実際に読む設定 (カレントディレクトリから祖先と `$CARGO_HOME` のすべての `config.toml`、環境変数 `CARGO_BUILD_TARGET`。合成の規則は R-WS-2。v0.18) で判断する。host は、ビルドに使う toolchain の `rustc -vV` の host とする (R-TG-1 の中立のディレクトリの値とは違いうる)。`--target` を省いたビルドでは、JSON の `target.triple` を記録の target と照合し、違えば warnings を出して実際の値で記録する。R-TG-1 で代わりの値を使ったときは省かない。理由: `--target` を付けると、`RUSTFLAGS` と `build.rustflags` が host 向けの build script と proc-macro に効かなくなり、それらが生成する item が利用者の普段のビルド (`--target` なし) と違ってくる (M0 で確かめた)。`RUSTFLAGS` は rustc にだけ効き、文書化する crate の rustdoc にはどちらでも効かない。`build.target` が配列だと、`--target` の無い `cargo rustdoc` は `extra arguments to rustdoc can only be passed to one target` で失敗する (2026-10-16 に実測)
+  - 出力は、`--target` を付けたときは `<target dir>/<triple>/doc/`、付けないときは `<target dir>/doc/` に出る (v0.17)。proc-macro の crate は `--target` を付けても host 用に作られ、JSON は `<target dir>/doc/` に、`target.triple` は host で出る (cargo の artifact のメッセージの `filenames` も空。2026-10-16 のレビューで確認)。他の target での文書化では、proc-macro の member は host の文書として記録する (v0.15)
   - `RUSTDOCFLAGS` は使わない。すべての crate に効いて fingerprint を変えるうえ、プロジェクトの `build.rustdocflags` を上書きする
-  - `-p` には版付きの pkgid を渡す (同名の複数版で曖昧にならないように)
+  - `-p` には、取得元まで含む package id の形 (`cargo metadata` の package id) を渡す (同名の複数版や、取得元の違う同名同版で曖昧にならないように。v0.18)
   - `--lib` / `--bin` は `cargo metadata` のターゲット情報から選ぶ。lib を持たない crate と proc-macro crate も扱う
   - 出力ファイルの場所は、パッケージ名ではなく**ターゲット名** (`[lib] name`) から求める
   - **lib と bin の crate 名が同じだと、JSON は同じファイルに出て、後のビルドが上書きする** (パッケージ `my-app` の lib と bin はどちらも `target/doc/my_app.json`)。bin の rustdoc は lib を HTML でも文書化する副作用があり、cargo は `output filename collision` を警告する (2026-10-14 に確認)。ターゲットごとに 1 回ずつビルドし、終わるたびに JSON を作業用ディレクトリからキャッシュへ移す (R-WS-6)
@@ -397,20 +406,21 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
     - 1 crate の所要時間は同じくらい。2 回目は `cargo doc` が全部 fresh で速く (`cargo rustdoc` は文書化する crate の rustdoc を毎回やり直す)、依存をまとめて文書化できる (146 crate で 38 秒)。cargo#16773 以降、JSON は unit ごとに `build/<pkg>/<hash>/out/<name>.json` に出て、`target/doc/` へ uplift される
     - **同名で版の違う依存は、片方しか文書化されない**: 両方を `-p` で指すと `document output filename collision` で失敗し、`-p` なしだと古い方が警告なしに飛ばされる (2026-10-14 の「別々のファイルに出る」は、2026-10-19 の nightly cargo では再現しなかった)
     - **R-WS-8 の既定 (crate 名を指定した `RUSTC_BOOTSTRAP`) と両立しない**。使うには nightly の cargo か、プロセス全体への `RUSTC_BOOTSTRAP=1` が要る (stable の cargo は、crate 名を指定すると「`-Z` は nightly の Cargo でしか受けない」と拒否する。2026-10-14 に確認)
-  - `--cfg docsrs` は、既定で、文書化する crate の最終の rustdoc にだけ渡す (Q-11。docs.rs と同じ。`#[doc(cfg(...))]` が JSON に残り、R-FT-2 の第 1 の情報源が使える)。渡してビルドが壊れたら (`docsrs` のときだけ使う nightly の機能の改名など)、渡さずにやり直し、warnings に書く。設定で常に渡さないこともできる。壊れた crate を記録して次から渡さないか (案: 版と toolchain を鍵に記録する。groxide の `docsrs-failures.json` と同じ考え方。M0 で測ったやり直しの頻度は、このリポジトリの依存 136 個中 1 個で、原因は `--cfg docsrs` を前提にした crate 自身の feature がプロジェクトの組で有効でないことだった。v0.17) と、workspace member の `[package.metadata.docs.rs]` の `rustdoc-args` から `--cfg` を取り出して渡すか (案: `--cfg <値>` と `--cfg=<値>` の形だけを、cfg の文法に合うものに限って渡す。v0.14) は M2 で決める (v0.16)
-  - cargo・rustdoc・rustc の実行ファイルは `rustup run` 経由のほか、設定で絶対パスを指定できるようにする (Nix・distro の cargo。rustc は `rustc -vV` に使う。R-TG-1・R-WS-8)。rustc と rustdoc のパスは子の cargo に `RUSTC`・`RUSTDOC` として渡す。パスを指定したときは toolchain を切り替えず (R-WS-8 の nightly への切り替えをしない)、出る形式が対応範囲の外なら `unsupported_format` を返し、rustup のコマンドを案内しない。一部だけ指定されたら、残りは同じディレクトリから探す (rustc と rustdoc は同じ toolchain でないと、依存のメタデータが読めず `E0786` で壊れる。cargo は別の toolchain でもよい。M0 で確かめた)。見つからなければ、起動時にログで知らせ (SessionStart の hook でも知らせるかは R-DIST-5 で M5 に決める)、照会ではエラーにする。rustup が無くパスも指定しない環境 (Nix など) では、PATH の cargo・rustc・rustdoc を使い、toolchain を切り替えない (Q-30。M0 で決定。v0.17)
+  - `--cfg docsrs` は、既定で、文書化する crate の最終の rustdoc にだけ渡す (Q-11。docs.rs と同じ。`#[doc(cfg(...))]` が JSON に残り、R-FT-2 の第 1 の情報源が使える)。渡してビルドが壊れたら (`docsrs` のときだけ使う nightly の機能の改名など)、渡さずにやり直し、warnings に書く。設定で常に渡さないこともできる。壊れた crate を記録して次から渡さないか (案: 版と toolchain を鍵に記録する。groxide の `docsrs-failures.json` と同じ考え方。M0 で測ったやり直しの頻度は、このリポジトリの依存のうち文書化できた 136 個中 1 個で、原因は `--cfg docsrs` を前提にした crate 自身の feature がプロジェクトの組で有効でないことだった。v0.17。ただしこれは新しい版だけの標本で、削除された `doc_auto_cfg` を使う版 (`#![cfg_attr(docsrs, feature(doc_auto_cfg))]`) が手元の registry に 82/1,588 あり、`--cfg docsrs` を渡すと E0557 で壊れる。2026-10-19 に確認。v0.18) と、workspace member の `[package.metadata.docs.rs]` の `rustdoc-args` から `--cfg` を取り出して渡すか (案: `--cfg <値>` と `--cfg=<値>` の形だけを、cfg の文法に合うものに限って渡す。v0.14) は M2 で決める (v0.16)
+  - cargo・rustdoc・rustc の実行ファイルは `rustup run` 経由のほか、設定で絶対パスを指定できるようにする (Nix・distro の cargo。rustc は `rustc -vV` に使う。R-TG-1・R-WS-8)。rustc と rustdoc のパスは子の cargo に `RUSTC`・`RUSTDOC` として渡す。パスを指定したときは toolchain を切り替えず (R-WS-8 の nightly への切り替えをしない)、出る形式が対応範囲の外なら `unsupported_format` を返し、rustup のコマンドを案内しない。一部だけ指定されたら、残りは同じディレクトリから探す (rustc と rustdoc は同じ toolchain でないと、依存のメタデータが読めず `E0786` で壊れる。cargo は別の toolchain でもよい。M0 で確かめた)。この規則は、版の接尾辞が付く配布物 (`rustc-1.80` など) では別の toolchain を拾いうる。symlink の解釈とあわせて Q-31 で決める (v0.18)。見つからなければ、起動時にログで知らせ (SessionStart の hook でも知らせるかは R-DIST-5 で M5 に決める)、照会ではエラーにする。rustup が無くパスも指定しない環境 (Nix など) では、PATH の cargo・rustc・rustdoc を使い、toolchain を切り替えない (Q-30。M0 で決定。v0.17)
 - R-WS-2: **専用の `CARGO_TARGET_DIR`** をキャッシュの下に workspace ごとに作り、**永続化する** (依存のコンパイル結果を再利用するため)。ユーザーの `target/` は使わない (cargo・rust-analyzer とのロック競合、別の toolchain の生成物の混入)。中間生成物の場所 (`build.build-dir`) も `CARGO_BUILD_BUILD_DIR` で同じ専用の場所に向ける (プロジェクトの `.cargo/config.toml` の `build-dir` は `CARGO_TARGET_DIR` では上書きされず、プロジェクトの中に書かれる。2026-10-15 に実測)。ビルドごとの使い捨て dir も使わない (毎回コールドビルドになる)
   - 使えない target dir (止めなかった子孫がいるもの。R-WS-6) は使わず、別の名前で作り直す。古い方は GC で消す。名前の決め方とほかのプロセスへの伝え方は Q-29 (v0.16)
   - **子プロセスの cargo・rustc を起動するディレクトリ**: cargo と rustup は、`.cargo/config(.toml)` と `rust-toolchain(.toml)` をカレントディレクトリから祖先へ探し、`--manifest-path` はこの探索に効かない (2026-10-15 に実測)。そこで次のように決める
     - プロジェクトの文脈で起動するときは、カレントディレクトリを workspace のルートにする (利用者が手元で `cargo build` するのと同じ設定が効く)。workspace のルートより上の祖先の設定も効くので、鮮度の鍵 (R-VR-2・R-WS-4) の `.cargo/config.toml` には、cargo が読む全階層の設定 (`$CARGO_HOME` のものを含む) を入れる
+    - **cargo の設定の合成** (v0.18): R-TG-1 の「配列なら先頭を既定」と、鮮度の鍵 (R-WS-4)・`cargo metadata` のキャッシュの鍵 (R-VR-2) の「`.cargo/config.toml` の内容」は、cargo の設定の合成の規則に依る。実測 (cargo 1.99.1、2026-10-19): 配列の `build.target` は全階層で連結され、祖先や `$CARGO_HOME/config.toml` の値が先頭に来る。`CARGO_BUILD_TARGET` は配列の後ろに足される。`include` が stable で効く。拡張子の無い `.cargo/config` も読まれる。member のディレクトリの `.cargo/config.toml` は、ルートから起動すると効かない。読み方は Q-31 で M2 に決める
     - 仮のプロジェクト (R-WS-5)、引数 `git` の取得、ホストの target を調べる `rustc -vV` (R-TG-1) では、カレントディレクトリをキャッシュの下のそのディレクトリにする (祖先の設定の有無は確かめない。共有の場所の下にキャッシュを置かないよう README で案内する。R-SEC-2。v0.14)
-  - 専用の target dir でビルドディレクトリのロックは避けられるが、`~/.cargo` のパッケージキャッシュのロックは rust-analyzer の `cargo metadata` / `cargo check` と共有する。stderr に `Blocking waiting for file lock` が出たら、`status: building` に `building_reason: waiting_for_lock` を付けて返す (stderr の文字列照合の例外。一覧は R-WS-7)
+  - 専用の target dir でビルドディレクトリのロックは避けられるが、`~/.cargo` のパッケージキャッシュのロックは rust-analyzer の `cargo metadata` / `cargo check` と共有する。stderr に `Blocking waiting for file lock` が出たら、`building_reason: waiting_for_lock` を付けて返す (応答の形は R-OUT-9。stderr の文字列照合の例外で、一覧は R-WS-7)。ロックと CPU を rust-analyzer や利用者の cargo と取り合うことと、その対処を README に書く (並列度は R-WS-1 の `-j`。v0.18)
   - `cargo metadata` を毎回起動しないことで (R-VR-2)、ロックを取る回数を減らす。nightly の `-Z fine-grain-locking` は、nightly の cargo を使う経路でだけ使える (既定の stable では cargo の `-Z` を受けない。R-WS-8)。その経路で使うかは、プロセスをまたぐロックを入れる M2 で評価する (M0 では評価しなかった。v0.17)
   - Windows の MAX_PATH (260 文字) を超えないよう、target dir のパスは短く保つ (workspace の識別子はハッシュの短い接頭辞にする)。git worktree や eval の一時ディレクトリごとに target dir が増えすぎないよう、GC (R-CA-5) の対象として最終使用日時で管理する
 - R-WS-3: `--document-private-items` は workspace member のビルドにだけ付ける。応答には可視性 (`pub` / `pub(crate)` / `pub(in path)` / private) を必ず付ける (表示の規則は R-SH-5)
 - R-WS-4 鮮度: **JSON が存在すること・バージョンが同じことを鮮度の根拠にしない** (先行 5 実装がすべてここで誤っている)。内容ダイジェストの鍵は、workspace member だけでなくローカルビルドするすべてのパッケージに適用する (workspace 外の path 依存、git 依存、docs.rs に JSON が無い registry 依存、R-WS-5 の仮のプロジェクト)。path 依存はそのパッケージ自身のソース・dep-info・Cargo.toml も鍵に含める
   - 入力の内容ダイジェストはビルドの前に取り、ビルドの後に dep-info で増えたファイルを足す。ビルドの前より新しい mtime のファイルがあれば、次回は鮮度切れにする (ビルドの間にエージェントが編集した内容を、古い JSON の鍵に入れないため。v0.15)
-  - member ごとに次の入力の**内容ダイジェスト**を鍵にする: `cargo metadata` が示すその member の全ターゲットの `src_path` 配下、`build.rs`、`Cargo.toml`、workspace の `Cargo.lock`、`.cargo/config.toml`、path 依存 (workspace の外にあるものを含む) のソース、feature の組、rustdoc の引数、`RUSTC_BOOTSTRAP` の値 (のダイジェスト。値で derive が生成した item の span が変わることを M0 で確かめた。member には値の全体を、member 以外のパッケージにはその部分木 (そのパッケージと依存先) に現れる crate 名だけの部分集合を入れる。値は解決結果の全 crate 名なので、全体を入れると無関係な依存を足すだけで全部の記録が鮮度切れになるため。R-WS-8。v0.17)、target、**実際に生成に使った toolchain** の `rustc -vV`、子に渡す環境のうちビルドに効く変数 (`RUSTFLAGS`・`RUSTDOCFLAGS`・`CARGO_BUILD_*`・`RUSTC_WRAPPER` など。サーバーの環境は Claude Code の起動時のもので、direnv などでシェルにだけ入る値は含まれない)。feature の組以降は member 以外のパッケージにも適用し、さらに source id、その依存から先の解決結果 (依存先の package id と feature) のダイジェスト、ローカルビルドに効く実効の cargo の設定 (`[source]`・`[patch]`・`build.rustdoc`・`build.rustc`・`build.rustc-wrapper`) のダイジェスト、使った cargo と rustdoc の実行ファイルのパスを入れる (ソースの置き換えや実行ファイルの設定で、別のソースや別の実行ファイルで作った JSON が、他のプロジェクトに配られないように)
+  - member ごとに次の入力の**内容ダイジェスト**を鍵にする: `cargo metadata` が示すその member の全ターゲットの `src_path` 配下、`build.rs`、`Cargo.toml`、workspace の `Cargo.lock`、`.cargo/config.toml` (合成の規則は R-WS-2。v0.18)、path 依存 (workspace の外にあるものを含む) のソース、feature の組、rustdoc の引数、`RUSTC_BOOTSTRAP` の値 (のダイジェスト。値で derive が生成した item の span が変わることを M0 で確かめた。member には値の全体を、member 以外のパッケージにはその部分木 (そのパッケージと依存先) に現れる crate 名だけの部分集合を入れる。値は解決結果の全 crate 名なので、全体を入れると無関係な依存を足すだけで全部の記録が鮮度切れになるため。R-WS-8。v0.17)、target、**実際に生成に使った toolchain** の `rustc -vV`、子に渡す環境のうちビルドに効く変数 (`RUSTFLAGS`・`RUSTDOCFLAGS`・`CARGO_BUILD_*`・`RUSTC_WRAPPER` など。サーバーの環境は Claude Code の起動時のもので、direnv などでシェルにだけ入る値は含まれない)。feature の組以降は member 以外のパッケージにも適用し、さらに source id、その依存から先の解決結果 (依存先の package id と feature) のダイジェスト、ローカルビルドに効く実効の cargo の設定 (`[source]`・`[patch]`・`build.rustdoc`・`build.rustc`・`build.rustc-wrapper`) のダイジェスト、使った cargo と rustdoc の実行ファイルのパスを入れる (ソースの置き換えや実行ファイルの設定で、別のソースや別の実行ファイルで作った JSON が、他のプロジェクトに配られないように)
   - mtime は一次の絞り込みにだけ使う
   - `src_path` 配下だけでは、`include_str!` / `include_bytes!` で読むファイル (`#![doc = include_str!("../README.md")]` など)、`#[path]` で指したファイル、build.rs が生成するコードの変化を拾えないので、前回のビルドの dep-info (cargo が unit ごとに書く `.d` ファイル) に載った入力ファイルも鍵に含める。ただし `cargo rustdoc` は、文書化する crate 自身の dep-info を書かない (依存の check unit だけが書く。2026-10-14 に確認)。rustdoc に `--emit=dep-info` を渡すと、その crate の dep-info (JSON と同じ場所。`--target` を付けたら `<target dir>/<triple>/doc/<crate>.d`、付けなければ `<target dir>/doc/<crate>.d`。R-WS-1。`include_str!` で読んだファイルも入る) が書かれるが、JSON は出なくなり、`--emit` のほかの値は JSON の出力と併用できない (2026-10-16、stable 1.99 + `RUSTC_BOOTSTRAP` で確認)。そのため dep-info は別の呼び出しで取る: 同じ引数 (`--cfg docsrs` を含む) に `--emit=dep-info` を付けて rustdoc をもう一度実行する (M0 で決定。v0.17)。費用はその crate の rustdoc 1 回分 (M0 で member 0.5 秒、tokio 0.9 秒。依存は fresh のまま)。JSON は書き換えないので、JSON を移した後に実行してよい。その crate の `cargo check` の dep-info は、依存なら作り直さずに使えるが、`#[cfg(docsrs)]` のときだけ読むファイルを取りこぼす (tokio では 250 件のうち 5 件) ので使わない
   - ワークスペースのルートの `src/` だけを見る方式は、仮想 workspace で誤る
@@ -421,26 +431,29 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - 照会のツールは、既定のプロジェクトのキャッシュミスのとき暗黙にビルドする (既定のプロジェクトの外は R-MCP-3)。**task ID をポーリングさせる専用ツールは作らない**
   - ビルド中は `notifications/progress` を送る (Claude Code では表示され、アイドルタイムアウトがリセットされる)。送るのは、要求に `_meta.progressToken` があるときだけで、その値を付ける (MUST)。`progress` は単調に増やす (MUST。完了した compile unit の数や経過秒数を使い、`total` は分かるときだけ付ける)。`message` には人が読める状況 (例: `building serde 1.0.219 (12/80)`) を入れる。間隔は 1 秒以上 30 秒以内
   - 進捗通知は、その要求に結果 (`status: building` を含む) かエラーを返した時点、またはキャンセルを受けた時点で止める (MUST)。singleflight で共有するビルドの進捗は、待っている要求ごとに、応答を返すまでの間だけ、その要求の token で送る
-  - 1 リクエストあたりの時間の上限 (`limits.request_timeout_secs`、既定 30 秒。R-ARCH-6) を超えたら待つのをやめ、`status: building` と `retry_after_secs` を返す。古い結果は R-WS-4 のとおり一緒に返す
+  - ビルド (と cargo のロック待ち) を待つ上限 (`build.wait_secs`、既定 10 秒。M2 で測って決める。v0.18 で 30 秒から短くした。理由の 1 つは R-MCP-4) を超えたら待つのをやめて返す。この上限は 1 リクエストあたりの時間の上限 (`limits.request_timeout_secs`、既定 30 秒。R-ARCH-6) より短く、ビルドを待つ間はこちらが先に効く。ビルド以外の処理 (docs.rs からの取得や索引の作成。下記) は R-ARCH-6 の上限で返す。形は R-OUT-9 に従い、古いデータがあれば (R-WS-4) それに `stale_reason: rebuilding` と `retry_after_secs` を付け、無ければ `status: building` と `retry_after_secs` を返す (v0.17)
   - Claude Code は tasks 拡張に対応しておらず、2 分を超える呼び出しはバックグラウンドに回されるので、ブロックし続けない
   - 同じ対象への同時のビルドは 1 つにまとめる (singleflight)。**プロセスをまたぐファイルロック** (R-CA-4) も取る (複数の Claude Code セッションが同時に動く)
   - ビルドはサーバー全体のロックを取らず、他の crate への問い合わせを止めない
-  - キャンセルされたら子プロセスを kill する。ただし singleflight で共有しているビルドは、待っている要求がすべてキャンセルされたときだけ kill する。一度 `status: building` か `retry_after_secs` 付きの `partial` (R-OUT-9) を返したビルド (裏で続けるもの。R-WS-10・R-ARCH-6) は切り離した状態とし、キャンセルでは止めない。止まるのは 1 回のビルドの最大時間 (下記) とサーバーの終了だけ (v0.15)。キャンセルされた要求には、以後は結果も進捗通知も送らない (MUST NOT)。未知の ID や応答済みの要求へのキャンセルは無視する。HTTP でのキャンセルの扱いは M6 で決める (v0.16)。サーバーから `notifications/cancelled` を送りうるのは `subscriptions/listen` を閉じるときだけ (扱いは R-MCP-16)
+  - キャンセルされたら子プロセスを kill する。ただし singleflight で共有しているビルドは、待っている要求がすべてキャンセルされたときだけ kill する。一度 `retry_after_secs` を付けた応答 (`status: building`、`stale_reason: rebuilding`、`partial`。R-OUT-9。v0.17) を返したビルド (裏で続けるもの。R-WS-10・R-ARCH-6) は切り離した状態とし、キャンセルでは止めない。止まるのは 1 回のビルドの最大時間 (下記) とサーバーの終了だけ (v0.15)。キャンセルされた要求には、以後は結果も進捗通知も送らない (MUST NOT)。未知の ID や応答済みの要求へのキャンセルは無視する。HTTP でのキャンセルの扱いは M6 で決める (v0.16)。サーバーから `notifications/cancelled` を送りうるのは `subscriptions/listen` を閉じるときだけ (扱いは R-MCP-16)
   - 将来の任意 (M6 で検討): tasks 拡張を宣言したクライアントには、ローカルビルドを伴う `tools/call` で task を返してよい。プロトコルの機能なので、「ポーリング用のツールを作らない」方針とは矛盾しない。宣言していないクライアントには `status: building` を返す (v0.16)
-  - 1 回のビルドの最大時間 (`build.timeout_secs`。既定 30 分で、Claude Code の stdio のアイドルの上限に揃える) を超えたら子プロセスを止め、`build_failed` (理由 `timeout`。一時的な失敗。R-WS-7) を返す
+  - 1 回のビルドの最大時間 (`build.timeout_secs`。既定 30 分で、Claude Code の stdio のアイドルの上限に揃える) を超えたら子プロセスを止め、`build_failed` (理由 `timeout`) を返す。毎回超えるものとして、一時的な失敗にせず、決定的な失敗として `refresh` まで固定する (R-WS-7。v0.18)
   - 巨大な crate の docs.rs からの取得と索引の作成にも、同じ進捗通知と `status: building` (`building_reason: indexing`) を適用する。`cargo metadata` の初回の依存の取得 (R-VR-2) も同じ (`building_reason: fetching`)
   - stdio でもリクエストは並行に処理する。JSON の解析や索引の作成など CPU を占める処理は専用のスレッドで行い、キャッシュ済みの問い合わせを止めない。同じ crate の解析は 1 つにまとめる
   - **サーバーの終了時も子プロセスを確実に止める**。Claude Code は Unix では SIGINT → 100ms 後に SIGTERM → さらに 400ms 後に SIGKILL を送り、Windows では stdin を閉じて 300ms 後にプロセスツリーを終了する
     - 子の cargo は Unix では新しいセッション (`setsid`。プロセスグループも新しくなる)、Windows では Job Object (閉じたときに中のプロセスをすべて止める設定) に入れ、stdin の EOF・SIGINT・SIGTERM を受けたらまとめて止める
-    - 子が利用者に尋ねて止まらないようにする: Unix では `setsid` で制御端末を外す (git の資格情報や ssh の host key・パスフレーズの入力が `/dev/tty` を開けずにすぐ失敗する)。`GIT_TERMINAL_PROMPT=0` と `GCM_INTERACTIVE=never` (Windows の Git Credential Manager の画面) を渡し、GUI の askpass も止める (`SSH_ASKPASS`・`GIT_ASKPASS` を外し、`SSH_ASKPASS_REQUIRE=never` を渡す)。制御端末を外しても、デスクトップの環境では git の CLI が `SSH_ASKPASS` のダイアログを出す (M0 で、GitHub の存在しないリポジトリで起きた。GitHub は存在しないリポジトリにも認証を求める。`net.git-fetch-with-cli` の経路では cargo が失敗を `net.retry` の回数だけやり直すので、ダイアログが繰り返し出る)。保存済みの資格情報 (`credential.helper`・ssh-agent) はこれまでどおり使われる。cargo の既定の経路 (libgit2) も、`credential.helper` と ssh-agent だけを試し、人に問い合わせない (cargo 1.99.1 のソースで確かめた。v0.17)。認証で失敗したら (`fetch_failed` の `auth`。R-WS-7)、利用者の端末で資格情報を通すよう案内する (案内の文面は §8)
+    - 子が利用者に尋ねて止まらないようにする: Unix では `setsid` で制御端末を外す (git の資格情報や ssh の host key・パスフレーズの入力が `/dev/tty` を開けずにすぐ失敗する)。`GIT_TERMINAL_PROMPT=0` と `GCM_INTERACTIVE=never` (Windows の Git Credential Manager の画面) を渡し、GUI の askpass も止める (`SSH_ASKPASS`・`GIT_ASKPASS` を外し、`SSH_ASKPASS_REQUIRE=never` を渡す)。制御端末を外しても、デスクトップの環境では git の CLI が `SSH_ASKPASS` のダイアログを出す (M0 で、GitHub の存在しないリポジトリで起きた。GitHub は存在しないリポジトリにも認証を求める。`net.git-fetch-with-cli` の経路では cargo が失敗を `net.retry` の回数だけやり直すので、ダイアログが繰り返し出る)。保存済みの資格情報 (`credential.helper`・ssh-agent) はこれまでどおり使われる。cargo の既定の経路 (libgit2) も、`credential.helper` と ssh-agent だけを試し、人に問い合わせない (cargo 1.99.1 のソースで確かめた。v0.17)。ただし、agent や helper の側が尋ねるもの (1Password・Secretive の SSH agent、macOS のキーチェーンの許可、gnome-keyring) は、これらでは止まらない。このことを README に書く (v0.18)。認証で失敗したら (`fetch_failed` の `auth`。R-WS-7)、利用者の端末で資格情報を通すよう案内する (案内の文面は §8)
     - SIGKILL は捕まえられないので、Linux では子に `PR_SET_PDEATHSIG` を設定し、親が先に死んでも子の cargo が残らない (パッケージキャッシュのロックを持ち続けない) ようにする
     - それでも残る子孫 (`PR_SET_PDEATHSIG` で止まるのは cargo だけで、cargo が起動した rustc や build script は残りうる。macOS にはこの仕組みが無い) は、次回の起動時に片付ける。PID は再利用され、複数のセッションのサーバーが同時に動くので、確かでなければ止めない (無関係なプロセスを止めないことを優先する)。止めなかった子孫がいる target dir は使わない (R-WS-2。残った子孫は target dir のロックを持たないので、ロックが取れても書き続けている場合がある)。記録するもの、照合の規則、子を spawn するスレッド、版の違う記録の扱いは Q-29 で決める (v0.16)
   - ビルドは作業用ディレクトリで行い、成功したものだけを原子的に公開する (失敗したビルドや、終了で中断したビルドがキャッシュヒットにならない)。起動時に、持ち主のプロセスが生きていない作業用ディレクトリを消す
 - R-WS-7 ビルド失敗:
-  - `--message-format=json` の level=error の診断を先頭 N 件付けて `build_failed` を返す。エラーの text は 1 万文字以内 (R-ERR-2) なので、code・message・suggestions・request_id の余地を残して収める。初期値は、N (`build.max_diagnostics`) は 2、1 件は 3,500 文字以内、診断の合計は 8,000 文字以内 (どちらも `content[0].text` の JSON にエスケープした後の長さ) で、M2 で実際の診断を見て決める (v0.16)。診断は `message.rendered` を使い、サニタイズ (R-SEC-7) の後に文字の境界で切る。JSON の診断が無い失敗 (build.rs の失敗など) では、cargo の stderr の末尾を同じ上限で付ける。失敗の判別に stderr の文字列照合を使わない。例外は、R-WS-2 のロック待ち、`requires rustc` と toolchain の未導入 (下記)、R-VR-2 の `--locked` の失敗、下記の git の取得の決定的な失敗と、サーバーが `--offline` を渡したときのキャッシュに無いことによる失敗 (`no matching package named`) だけとする (R-WS-5 の `-p` で失敗する依存は、起動前に判定するので照合しない。v0.17) (いずれも終了コードでは見分けられない。文言の照合はテストで固定する)
+  - `--message-format=json` の level=error の診断を先頭 N 件付けて `build_failed` を返す。エラーの text は 1 万文字以内 (R-ERR-2) なので、code・message・suggestions・request_id の余地を残して収める。初期値は、N (`build.max_diagnostics`) は 2、1 件は 3,500 文字以内、診断の合計は 8,000 文字以内 (どちらも `content[0].text` の JSON にエスケープした後の長さ) で、M2 で実際の診断を見て決める (v0.16)。診断は `message.rendered` を使い、サニタイズ (R-SEC-7) の後に文字の境界で切る。JSON の診断が無い失敗 (build.rs の失敗など) では、cargo の stderr の末尾を同じ上限で付ける。失敗の判別に stderr の文字列照合を使わない。例外は、R-WS-2 のロック待ち、`requires rustc` と toolchain の未導入 (下記)、R-VR-2 の `--locked` の失敗、下記の git の取得の決定的な失敗、下記のオフラインでキャッシュに無いことによる失敗、cargo の stderr の `(signal: 9, SIGKILL` (cargo の子が殺された。一時的な失敗。v0.18) だけとする (R-WS-5 の `-p` で失敗する依存は、起動前に判定するので照合しない。v0.17)。いずれも終了コードでは見分けられない。文言は M2 でテストに固定する (v0.18)
   - **ビルド失敗を「存在しない」に畳み込まない**。「存在しない」としてキャッシュしない (ferritin の `NotAvailable` の誤り)。path / git の依存で黙って docs.rs に切り替えない。直近に成功した JSON があっても常に `build_failed` を返す (古い結果で壊れていることを隠さない)
   - 失敗は 2 種類に分ける
-    - **一時的な失敗**: 終了の仕方で分かるものだけ。シグナルによる終了 (OOM killer など) と、サーバーが止めたもの (タイムアウト、中断、ロック待ちの打ち切り)。依存の取得はビルドの前に `cargo fetch --locked` (仮のプロジェクトでは `--locked` なし。R-VR-2) で分けて行い、その失敗も一時的とする。返し方は下の `cargo metadata` の失敗と同じにする (Cargo.toml の誤りや存在しない版も、通信の失敗と同じ終了コード 101 で `cargo fetch` が失敗するので、`network_error` と決めつけない。v0.17)。一時的な失敗は `retryable: true` で返し、R-ERR-3 の一時的な失敗の TTL (目安 30 秒) の間だけ再ビルドを抑える。ただし git の取得で、認証の失敗・リポジトリが無い・rev (ブランチ・タグ・コミット) が無い、のどれかと cargo の文言で判定できたものは、決定的な失敗として `fetch_failed` (`reason` 付き) を返し、下の決定的な失敗と同じく `refresh` までキャッシュする (再試行を繰り返させないため)。判定できなければ一時的な失敗のまま扱う。判定に使う文言は次のとおり (libgit2 と git の CLI で違う。cargo 1.99.1・git 2.56.0 で M0 で確かめた。`cargo fetch`・`cargo metadata`・`cargo tree`・`cargo update` で同じ。文言はテストで固定する): rev が無い → libgit2 は `revision <rev> not found` (通信の失敗を示す `network failure seems to have happened` も一緒に出て、cargo が再試行するので遅いが、`revision … not found` があれば決定的な失敗とする)、CLI は `fatal: remote error: upload-pack: not our ref <rev>` (と cargo の `revision <rev> not found`)。ブランチが無い → libgit2 は `cannot locate remote-tracking branch`、CLI は `fatal: couldn't find remote ref`。リポジトリが無い → `file://` では libgit2 が `failed to resolve path`、CLI が `does not appear to be a git repository`。GitHub の https では、存在しないリポジトリも認証の失敗になる (libgit2 は `failed to authenticate when downloading repository`、CLI は `could not read Username`)。git を取得しうる子 (`cargo fetch`・`cargo metadata`・`cargo tree`・`cargo update`) には `LC_ALL=C` を渡す (git は翻訳があれば地域化する。M0 の環境には翻訳が無く、確かめられなかった) (Q-30。M0 で決定。v0.17)。`cargo metadata` の失敗のうち、既存の例外 (R-VR-2 の `lockfile_outdated`、上の `fetch_failed`) に当たらないものは、決定的な失敗として固定せず、`build_failed` (`retryable: true`) として cargo の診断を添えて返し (v0.16 で R-ERR-2 から `stage` を外したので付けない)、一時的な失敗の TTL (30 秒) だけ抑える。終了コードは Cargo.toml の誤りも通信の失敗も 101 で、見分けるには文言の照合しかないため (M0 で確かめた)。キャッシュに無いことによる失敗 (`no matching package named …`。crate 名の誤りと同じ文言) は、サーバー自身が `--offline` を渡したときだけ `offline_miss` にする (Q-30。M0 で決定。v0.17)
+    - **一時的な失敗**: 終了の仕方で分かるものだけ。シグナルによる終了 (OOM killer など。cargo の子が殺されたときは、上の stderr の文言で分かる) と、サーバーが止めたもの (サーバーの終了による中断、ロック待ちの打ち切り)。ビルドの最大時間の超過 (`timeout`) は決定的な失敗にする (R-WS-6)。キャンセルで止めたビルドは失敗として記録しない (v0.18)。依存の取得はビルドの前に `cargo fetch --locked` (仮のプロジェクトでは `--locked` なし。R-VR-2) で分けて行い、その失敗も一時的とする。一時的な失敗は `retryable: true` で返し、R-ERR-3 の一時的な失敗の TTL (目安 30 秒) の間だけ再ビルドを抑える。git の取得・`cargo metadata`・`cargo fetch`・`--offline` の失敗は次のとおり扱う
+      - **git の取得の決定的な失敗**: 認証の失敗・リポジトリが無い・rev (ブランチ・タグ・コミット) が無い、のどれかと cargo の文言で判定できたものは、決定的な失敗として `fetch_failed` (`reason` 付き) を返し、下の決定的な失敗と同じく `refresh` までキャッシュする (再試行を繰り返させないため)。判定できなければ一時的な失敗のまま扱う。判定に使う文言は次のとおり (libgit2 と git の CLI で違い、取得先でも違う。cargo 1.99.1・git 2.56.0 で M0 で確かめ、`file://` の rev と CLI の認証の文言は 2026-10-19 に足した。`cargo fetch`・`cargo metadata`・`cargo tree`・`cargo update` で同じ): rev が無い → GitHub では、libgit2 は `revision <rev> not found` (通信の失敗を示す `network failure seems to have happened` も一緒に出て、cargo が再試行するので遅いが、`revision … not found` があれば決定的な失敗とする)、CLI は `fatal: remote error: upload-pack: not our ref <rev>` (と cargo の `revision <rev> not found`)。`file://` では libgit2 も CLI も `revspec '<rev>' not found` (v0.18)。ブランチが無い → libgit2 は `cannot locate remote-tracking branch`、CLI は `fatal: couldn't find remote ref`。リポジトリが無い → `file://` では libgit2 が `failed to resolve path`、CLI が `does not appear to be a git repository`。GitHub の https では、存在しないリポジトリも認証の失敗になる (libgit2 は `failed to authenticate when downloading repository`、CLI は `could not read Username`)。CLI の `Authentication failed for` も `auth` にする (v0.18)。git を取得しうる子 (`cargo fetch`・`cargo metadata`・`cargo tree`・`cargo update`) には `LC_ALL=C` を渡す (git は翻訳があれば地域化する。M0 の環境には翻訳が無く、確かめられなかった) (Q-30。M0 で決定。v0.17)
+      - **`cargo metadata`・`cargo fetch` の失敗**: 既存の例外 (R-VR-2 の `lockfile_outdated`、上の `fetch_failed`) に当たらないものは、決定的な失敗として固定せず、`build_failed` (`retryable: true`) として cargo の診断を添えて返し (v0.16 で R-ERR-2 から `stage` を外したので付けない)、一時的な失敗の TTL だけ抑える。Cargo.toml の誤りや存在しない版も通信の失敗と同じ終了コード 101 で失敗し、見分けるには文言の照合しかないため (`network_error` とも決めつけない。M0 で確かめた。v0.17)
+      - **オフラインでキャッシュに無いことによる失敗**: 次の 3 つの文言は、どれも `offline_miss` にする。`no matching package named` (crate 名の誤りと同じ文言)、`attempting to make an HTTP request, but --offline was specified`、`you are in the offline mode (--offline)`。サーバー自身が `--offline` を渡したときだけでなく、利用者の cargo の設定 `net.offline` でオフラインのときも同じ (Q-30。M0 で決定。v0.17。v0.18 で文言と `net.offline` を足した)
     - **決定的な失敗**: それ以外のすべて (JSON の診断を出さない build.rs の失敗も含む。システムライブラリの不足など)。結果 (診断の要約を含む) を R-WS-4 の鍵 (使った toolchain を含む) でキャッシュし、鍵が変わるか、ツールの引数 `refresh` (§6.4) を指定するまでは、再ビルドせずに同じ `build_failed` を `retryable: false` と失敗の時刻付きで返す。hints には「原因 (システムライブラリの不足など) を直したら、照会のツールは `refresh`、外のツールは同じ引数での呼び直しで再試行する」と書く (rustdoc-mcp は失敗したビルドを呼び出しのたびにやり直す)
   - R-WS-8 で選んだ toolchain が使えない場合 (オフラインモードや、rustup の自動導入が失敗した場合) は `toolchain_missing` と導入コマンドを返す (std は R-STD-4)。サーバー自身は `rustup` や `cargo install` で toolchain・コンポーネント・ツールを導入しない (R-STD-6 と R-SC-2 のキャッシュへの取得は除く)
     - rustup は、プロジェクトの `rust-toolchain.toml` が指す未導入の toolchain を既定で自動で導入する (rustup 1.29.1)。サーバーが自動導入を許すのはこれだけ (rust-analyzer や利用者の cargo でも同じく導入されるので、止めても守りにならない。v0.14)。サーバー自身が選ぶ toolchain (R-WS-8 の nightly や日付を固定したもの。`cargo +<toolchain>` にも rustup の自動導入は効く。2026-10-16 に実測) と、オフラインモード (R-CA-7) では、子プロセスに `RUSTUP_AUTO_INSTALL=0` を付けて止め (効くことは 2026-10-15 に確認)、未導入なら `toolchain_missing` を返す。R-CA-8 を実装した場合は、static.rust-lang.org を無効にしたときも同じく止め、ミラーを設定したときは `RUSTUP_DIST_SERVER` も子に渡す (v0.16)
@@ -449,7 +462,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - **既定は、プロジェクトの toolchain (`rust-toolchain.toml`、なければ既定の toolchain) に `RUSTC_BOOTSTRAP=<crate 名>` を付けたもの** (Q-12。M0 で決定。v0.17)。値はパッケージ名ではなく、ターゲットの crate 名 (アンダースコアの形。`[lib] name`) にする。どの crate 名を並べるかは下の「値を安定させる」に従う
     - 実測 (2026-10-14、stable 1.99): rustdoc に `RUSTC_BOOTSTRAP=<crate 名>` を付けると形式 61 の JSON が出る (付けなければ `-Z` が拒否される)。`cargo rustdoc -- -Z…` 経由でも crate 名の指定で成立した: lib、bin、proc-macro crate 自身、build.rs (`rustc-env` と `rustc-cfg`) と依存の proc-macro (derive) を持つ crate、`--document-private-items` 付き。build.rs が設定した cfg の item も、derive が生成した impl も JSON に出た。パッケージ名 (`my-app`) を指定すると失敗する。build.rs が `RUSTC_BOOTSTRAP` を見ない依存は、値を変えても再 check されなかった
     - **値を変えると作り直される依存がある**: proc-macro2・anyhow・thiserror などの build.rs は stable で `cargo:rerun-if-env-changed=RUSTC_BOOTSTRAP` を出すので、値を変えるたびに作り直される (2026-10-14 に確認。proc-macro2 の下には syn と多くの proc-macro がぶら下がる)
-    - **そこで値を安定させる**: 値を変えるたびの作り直しを避け、依存のための値で member の文書が変わらないようにする。利用者の環境に `RUSTC_BOOTSTRAP` があっても常に上書きし、その旨をログに出す。値は、プロジェクトの専用 target dir ごとに、**依存の解決結果のすべての lib・proc-macro の crate 名と member の bin の crate 名を辞書順にカンマでつないだもの**に固定する (Q-12。M0 で決定。v0.17)。値は Cargo.lock と member の構成が変わらない限り変わらないので、作り直すのは文書化する crate の rustdoc だけになり、target dir も 1 つで済む (M0 では、値を変えると proc-macro2 の build.rs から syn と proc-macro を経て 54〜65 unit・10〜13 秒の作り直しが起き、固定すれば 0.2〜0.9 秒だった)。自分の名前で nightly の機能を調べる依存 (proc-macro2・thiserror など) は nightly の経路でコンパイルされ、derive が生成した item の span の列が少し変わる (docs.rs と同じ側になる。それ以外の文書の中身は変わらず、thiserror の文書は docs.rs と一致した)。その経路でビルドが壊れたときに、member の名前だけの値でやり直すかは M2 で決める。案として挙げていた「member の名前の固定の一覧」「依存用の別の target dir と build-dir」「文書化した依存の名前を足していく一覧」は、作り直しが起きるか、target dir が 2 つになるので採らない
+    - **そこで値を安定させる**: 値を変えるたびの作り直しを避け、依存のための値で member の文書が変わらないようにする。利用者の環境に `RUSTC_BOOTSTRAP` があっても常に上書きし、その旨をログに出す。値は、プロジェクトの専用 target dir ごとに、**依存の解決結果のすべての lib (cdylib・staticlib・dylib だけの lib を含む。v0.18)・proc-macro の crate 名と member の bin の crate 名を辞書順にカンマでつないだもの**に固定する (Q-12。M0 で決定。v0.17)。値は Cargo.lock と member の構成が変わらない限り変わらないので、作り直すのは文書化する crate の rustdoc だけになり、target dir も 1 つで済む (M0 では、値を変えると proc-macro2 の build.rs から syn と proc-macro を経て 54〜65 unit・10〜13 秒の作り直しが起き、固定すれば 0.2〜0.9 秒だった)。自分の名前で nightly の機能を調べる依存 (proc-macro2・thiserror など) は nightly の経路でコンパイルされ、利用者の stable のビルドと item が違いうる (v0.18)。M0 の B1 では、derive が生成した item の span の列が少し変わり (docs.rs と同じ側になる)、それ以外の文書の中身は変わらず、thiserror の文書は docs.rs と一致した。ただし B1 で調べたのは 2 crate で、`#[path]` のモジュールを見落とす探し方だった (v0.18)。その経路でビルドが壊れたときに、member の名前だけの値でやり直すかは M2 で決める。案として挙げていた「member の名前の固定の一覧」「依存用の別の target dir と build-dir」「文書化した依存の名前を足していく一覧」は、作り直しが起きるか、target dir が 2 つになるので採らない
     - 実測 (2026-10-16、stable 1.99): `RUSTC_BOOTSTRAP` はカンマ区切りで複数の crate 名を受ける (空白は不可)。member 用の値に依存の名前を足すと、anyhow などがその名前で nightly 用の機能を有効にし、member の文書まで stable と違いうる。build-dir を共有すると中間生成物と fingerprint が共有され、値を切り替えるたびに作り直された。値を固定すれば作り直されないことを確かめた (member `a`・`b` が proc-macro2 に依存する workspace で、`RUSTC_BOOTSTRAP=a,b` のまま `a`・`b`・`a` の順に文書化すると、proc-macro2 のビルドは最初の 1 回だけだった。値を crate ごとに変えると毎回ビルドされた)。bin の crate 名も値に入れる必要がある (`a,b` のままでは `--bin my-app` が `-Z` を拒まれ、`a,b,my_app` で通った)
     - cargo-semver-checks は本番で `RUSTC_BOOTSTRAP=1` を使っている。本サーバーは crate 名を指定する。値が解決結果の全 crate 名になるので、`RUSTC_BOOTSTRAP=1` との違いは、rustc の判定の上では、cargo 自身の `-Z` (cargo は値が `1` のときだけ受ける) と、build script (crate 名は `build_script_build`) に効かないことだけになる (build script が別の crate 名で行う検査用のコンパイルや、値そのものを読む build.rs では違いうる。確かめていない)。cargo の unstable な機能を黙って有効にしないことと、build script の挙動を利用者の普段のビルドとそろえることのために、crate 名の指定を続ける (v0.17)
     - 利点: nightly が不要で、プロジェクトが実際に使う toolchain と同じコンパイラで生成できる (MSRV や新しい構文での失敗が起きない)
@@ -469,21 +482,21 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
     | --- | --- |
     | `project` (既定のプロジェクトの外) | 外の workspace (上記) |
     | `project` (既定のプロジェクト) と `target` | 他の target での文書化。既定は全 member の lib |
-    | `crate` が既定のプロジェクトの依存 (版は Cargo.lock のもの) | `target` が実際のビルド target と違えば、他の target での文書化 (プロジェクトの workspace で)。同じなら照会のツールの範囲なのでビルドしない。ただし `-p` で名指しできない依存 (R-WS-5) は、仮のプロジェクトで文書化する (v0.17)。他の target でだけ使う依存で `target` が無ければ `invalid_argument` |
-    | `project` (既定のプロジェクト) で、`target` が無いか実際のビルド target と同じ | 照会のツールの範囲なのでビルドせず、その旨を返す (v0.16) |
+    | `project` (既定のプロジェクト) で、`target` が無いか実際のビルド target と同じ | 照会のツールの範囲なのでビルドせず、その旨を返す (v0.16。`document_hidden_items` を付けたときを除く。下の行。v0.18) |
+    | `crate` が既定のプロジェクトの依存 (版は Cargo.lock のもの) | `target` が実際のビルド target と違えば、他の target での文書化 (プロジェクトの workspace で)。同じなら照会のツールの範囲なのでビルドしない (`document_hidden_items` を付けたときを除く。下の行。v0.18)。ただし `-p` で名指しできない依存 (R-WS-5) は、仮のプロジェクトで文書化する (v0.17)。他の target でだけ使う依存で `target` が無ければ `invalid_argument` |
     | `crate` が依存でないか、`version` が Cargo.lock に無い | 仮のプロジェクト (R-WS-5。target は引数か host) |
     | `git` と `rev`・`branch`・`tag` のどれかと `crate` | 仮のプロジェクトの git 依存 (R-WS-5) |
-    | どれにも `document_hidden_items` | 付けられる (`api_diff` の比較用)。docs.rs に読める JSON があってもビルドする (R-AD-3) |
+    | どれにも `document_hidden_items` | 付けられる (`api_diff` の比較用)。docs.rs に読める JSON があっても、照会のツールが同じ target でビルドする範囲でも、ビルドする (hidden 付きのビルドは両側とも外のツールが作る。R-AD-3。v0.18) |
 
-  - **他の target での文書化** (依存でない `crate` と `git` の crate も、引数 `target` で他の target を指せる。R-WS-5): 依存は `crate` に版付きの pkgid で指す。member と依存のどちらか決まらなければ `invalid_argument` にする。`target` を省いたら `invalid_argument` を返し、他の target 向けの依存 (`[target.'cfg(…)'.dependencies]` など) なら Cargo.toml の条件 (`cfg(windows)` など) を添える。docs.rs の既定の 5 つの target (R-TG-1) のうち条件に合うものを計算して候補に添えるのは任意とする (v0.16)。依存は、docs.rs にその target の JSON が無ければ、既定のプロジェクトの workspace で `cargo rustdoc -p <crate>@<ver> --target <target>` を実行する (版はプロジェクトの Cargo.lock のもの。Linux で `x86_64-pc-windows-gnu` を指して、Windows でだけ使う依存も、member の `#[cfg(windows)]` の item も文書化でき、JSON の `target.triple` もその target になることを 2026-10-16 に確かめた)。その target の `rust-std` が無ければ (ビルドの前に sysroot の `lib/rustlib/<target>` で判定する。判定できることを M0 で確かめた。R-TG-1。v0.17)、`rustup target add` を添えて `toolchain_missing` を返す (rustup の自動導入は target を入れない。v0.15)
+  - **他の target での文書化** (依存でない `crate` と `git` の crate も、引数 `target` で他の target を指せる。R-WS-5): 依存は `crate` に版付きの pkgid で指す。member と依存のどちらか決まらなければ `invalid_argument` にする。`target` を省いたら `invalid_argument` を返し、他の target 向けの依存 (`[target.'cfg(…)'.dependencies]` など) なら Cargo.toml の条件 (`cfg(windows)` など) を添える。docs.rs がその版でビルドした target (R-TG-1。2026-05-01 以降のリリースは多くが 1 つ。v0.18) のうち条件に合うものを計算して候補に添えるのは任意とする (v0.16)。依存は、docs.rs にその target の JSON が無ければ、既定のプロジェクトの workspace で `cargo rustdoc -p <package id> --target <target>` (R-WS-1) を実行する (版はプロジェクトの Cargo.lock のもの。Linux で `x86_64-pc-windows-gnu` を指して、Windows でだけ使う依存も、member の `#[cfg(windows)]` の item も文書化でき、JSON の `target.triple` もその target になることを 2026-10-16 に確かめた)。その target の `rust-std` が無ければ (ビルドの前に sysroot の `lib/rustlib/<target>` で判定する。判定できることを M0 で確かめた。R-TG-1。v0.17)、`rustup target add` を添えて `toolchain_missing` を返す (rustup の自動導入は target を入れない。v0.15)
   - 鍵: target は照会のツールと同じ規則 (R-TG-1) で決め (他の target での文書化では要求した target)、照会のツールが R-MCP-3 の鍵で引けるようにする。toolchain は R-WS-8 で選び、照会の鍵には入れずに記録と provenance に載せる (R-MCP-3)。応答で、照会に使う鍵 (`crate`・`version`・`git`・`rev`・`project`・`target`。git の `rev` には解決したコミットのハッシュを入れる) と provenance を返す。git の URL は、cargo の `CanonicalUrl` に合わせて正規化してから鍵にする (末尾の `/` を外してから `.git` を外し、github.com の URL は小文字にする)。ただし scheme は書き換えずに鍵に含める (cargo は github.com の URL の scheme を `https` にそろえるが、平文で取った記録を https の照会に返さないため。v0.15)。照会のツールも同じ正規化をしてから引く
-  - 進捗と 1 リクエストあたりの時間の上限は R-WS-6 と同じ。上限を超えたら `status: building` を返し、**ビルドは裏で続ける**。続きは照会のツールで待つよう hints で案内する (外のツールを呼び直すと、利用者が ask を書いていれば呼ぶたびに確認が出るため。v0.15)。docs.rs に読める JSON があるものと、照会のツールが同じ target でビルドする範囲 (R-MCP-3) のものは、ビルドせずにその旨を返す (`document_hidden_items` を付けたときを除く。上の表)
+  - 進捗と、ビルドを待つ上限 (R-WS-6) と 1 リクエストあたりの時間の上限 (R-ARCH-6) は照会のツールと同じ。上限を超えたら `status: building` を返し、**ビルドは裏で続ける**。続きは照会のツールで待つよう hints で案内する (外のツールを呼び直すと、利用者が ask を書いていれば呼ぶたびに確認が出るため。v0.15)。docs.rs に読める JSON があるものと、照会のツールが同じ target でビルドする範囲 (R-MCP-3) のものは、ビルドせずにその旨を返す (`document_hidden_items` を付けたときを除く。上の表)
   - 照会のツールは、外の記録 (ビルドの結果) がまだ無くても進行中なら、`docs_unavailable` ではなく `status: building` と `retry_after_secs` を返す。進行中の印は、持ち主のサーバーが死ねば OS が外すロック (R-CA-4) で表す (PID の再利用を気にせずに判定でき、3 OS で同じに動く)。裏のビルドが失敗したら、その結果 (診断と時刻) も照会の鍵で記録し、照会のツールは `build_failed` を返す (R-WS-7 の鍵には `rustc -vV` が入り、照会のツールは組み立てられないため)。印の取り方 (試し取りの手順、ビルドの枠を待つ間も持つか、git で要求の鍵と解決したコミットの鍵の両方を持つか) は Q-29 で決める (v0.16)
   - glob の展開、R-PR-4 の latest による推定、R-CA-6 の先取りなど、照会のツールの暗黙の取得は docs.rs からだけ取り、外のローカルビルドを起こさない
 
 ### 5.11 std 対応
 
-- R-STD-1: 手元の nightly に `rust-docs-json` があれば、`rustup run <nightly> rustc --print sysroot` の `share/doc/rust/json/` から std / core / alloc / proc_macro / test を読み込む (無ければ R-STD-6)。provenance には `rustc -vV` の全体 (release・commit-hash・commit-date。dist から取った場合はアーカイブの日付) と **target** を載せる。std の JSON は target ごとに中身が違う (`std::os::windows` などがある) ため
+- R-STD-1: 手元の nightly に `rust-docs-json` があれば、`rustup run <nightly> rustc --print sysroot` の `share/doc/rust/json/` から std / core / alloc / proc_macro / test を読み込む (無ければ R-STD-6)。ただし手元の nightly を使うのは、その版がプロジェクトの toolchain の版以上のときだけにし、古ければ dist の新しいもの (R-STD-6) を使う。使ったものと理由を provenance に出す。dist を無効にしていれば、古いものを warnings 付きで使う (v0.18)。provenance には `rustc -vV` の全体 (release・commit-hash・commit-date。dist から取った場合はアーカイブの日付) と **target** を載せる。std の JSON は target ごとに中身が違う (`std::os::windows` などがある) ため
   - `rust-docs-json` が配られていない target (`wasm32-unknown-unknown`、`thumbv7em-none-eabihf` など。配られているのはホストになれる target だけ) では、ホストの target の JSON で代用し、R-TG-2 のとおり実際に使った triple を provenance に載せて warnings で知らせる。core と alloc は target による差が小さいが、std は `std::os` などが食い違い、その target に std が無いこともある旨も warnings に書く
 - R-STD-2: std の item には `Item::stability` (形式 58 以降) と `const_stability` (形式 59 以降) を返す。stable か unstable か、安定化されたバージョン、unstable なら feature 名を含める。**unstable な item と const-unstable なメソッドには必ず印を付ける** (ferritin は印なしで `push` を `const fn` と表示している)
   - 形式 60 以降の `default_unstable` (trait の関数・関連定数・関連型の**既定の実装**が不安定であること) も表示する。「この trait を実装するとき、この default に頼れるか」の判断に要る
@@ -491,13 +504,14 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 - R-STD-3: **ユーザーが使っている toolchain** (`rust-toolchain.toml` か `rustc -vV`) と **MSRV** (`rust-version`) を基準に、次の item に警告を付ける (toolchain の版が分からなければ MSRV だけを基準にする)
   - まだ安定化されていない item
   - 基準より後のバージョンで安定化された item (安定化の版は `Item::stability` から取り (R-STD-2)、該当するリリースの要点を R-RR-1 から引用する)
-- R-STD-4: `rust-docs-json` が手元に無く、R-STD-6 を設定で無効にしているときは、導入コマンド (rustup の環境なら `rustup component add rust-docs-json --toolchain nightly`) を添えた `toolchain_missing` を返す。オフラインモードでキャッシュにも無ければ、`offline_miss` (R-CA-7) に導入コマンドを添える
+- R-STD-4: `rust-docs-json` が手元に無く、R-STD-6 を設定で無効にしているときは、導入コマンド (rustup の環境なら `rustup component add rust-docs-json --toolchain nightly`。v0.17) を添えた `toolchain_missing` を返す。オフラインモードでキャッシュにも無ければ、`offline_miss` (R-CA-7) に導入コマンドを添える
 - R-STD-6 **nightly の toolchain を入れずに std を引く** (ferritin のホスト版は、手元に何も無くても std を引ける。その利点を取り込む):
   - nightly のチャネルの manifest (`https://static.rust-lang.org/dist/channel-rust-nightly.toml`) の `[pkg.rust-docs-json-preview.target.<triple>]` に、`rust-docs-json` 単体のアーカイブの URL と sha256 が載っている (2026-10-14 に確認。x86_64 Linux の xz で約 4.2MB)。これを取得し、**sha256 を検証してから**キャッシュに展開する。manifest の 17 の target は別の target のアーカイブを指している (`x86_64-apple-darwin` が aarch64 のもの、FreeBSD・illumos などが x86_64 Linux のもの。2026-10-15 に確認) ので、R-TG-2 と同じく実際の triple を JSON の `target.triple` から読み、要求と違えば warnings で知らせる
-  - 手元の nightly に `rust-docs-json` があればそちらを優先する (R-STD-1)。どちらを使ったかも provenance に載せる
+  - 手元の nightly に `rust-docs-json` があればそちらを優先する (版が古いときの扱いは R-STD-1)。どちらを使ったかも provenance に載せる
+  - std のソース表示に使う `rust-src` も、手元に合うものが無ければ同じ dist から取る (R-SC-2。v0.18)
   - 既定で有効とし、オフラインモード (R-CA-7) と設定で無効にできる。R-WS-8 の既定 (プロジェクトの toolchain + `RUSTC_BOOTSTRAP`) と組み合わせると、**nightly を一切入れずに**依存・workspace・std を引ける
   - 任意 (M4 で検討。v0.16): ユーザーの stable の版に近い nightly の `rust-docs-json` を選べるようにする (unstable な API の混入を減らす)
-  - manifest の日付が変わったときだけアーカイブを取り直す。manifest の取得には TTL (1h) を付ける (R-CA-3)
+  - manifest の日付が変わったときだけアーカイブを取り直す。manifest の取得には TTL (1h) を付ける
 
 ### 5.12 API 差分 (`api_diff`)
 
@@ -514,9 +528,10 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - 影響なし: `cosmetic` (引数名だけの変更。Rust に名前付き引数は無いので呼び出し側は壊れないが、`len` → `capacity` のように意味の変化の手がかりになる)
   - 分類できない変化は重さを `unknown` にする (推測で Major / Minor を付けない)。cargo-semver-checks 自身も引数の型の変化は検出しない
   - trustfall_rustdoc には依存しない (対応形式が 3 世代だけで、hidden item 込みの JSON を前提にするため)
-- R-AD-3 **docs.rs の JSON だけで見た「削除」は信用しない**。docs.rs の JSON は `#[doc(hidden)]` の item を含まないので、deprecated かつ hidden になっただけの item が消えたように見える (tokio の `TcpSocket::tos` で確認済み)。両側が `--document-hidden-items` 付きのローカルビルドでない限り `removed_or_hidden` (確度 低) として返す。`api_diff` の比較のためにローカルビルドするときは `--document-hidden-items` を付ける (鍵の rustdoc の引数が変わるので、通常の照会のキャッシュとは別になる。R-WS-4)。比較相手の版が Cargo.lock に無く docs.rs に JSON も無ければ、`docs_unavailable` を返して `build_external_docs` (`document_hidden_items`。R-WS-10) を案内する
+- R-AD-3 **docs.rs の JSON だけで見た「削除」は信用しない**。docs.rs の JSON は `#[doc(hidden)]` の item を含まないので、deprecated かつ hidden になっただけの item が消えたように見える (tokio の `TcpSocket::tos` で確認済み)。両側が `--document-hidden-items` 付きのローカルビルドでない限り `removed_or_hidden` (確度 低) として返す。hidden 付きのビルドは、両側とも外のツール (`build_external_docs` の `document_hidden_items`。R-WS-10) が作り、`api_diff` 自身は作らない (v0.18)。鍵の rustdoc の引数が変わるので、通常の照会のキャッシュとは別になる (R-WS-4)。比較相手の版が Cargo.lock に無く docs.rs に JSON も無ければ、`docs_unavailable` を返して `build_external_docs` (`document_hidden_items`) を案内する
 - R-AD-4 正規化と provenance:
   - 両側の provenance を返す。format_version・toolchain・target・feature の組 (docs.rs のものも、ローカルビルドのものも。プロジェクトで統合された組と、仮のプロジェクトの組は違いうる) が違えば warnings を出す (v0.17)
+  - 両側の feature の組が違うとき、片側の組でしか有効にならない item の `removed`・`added` は確度を下げ、Major の判定 (R-AD-2) に使わない (v0.18)
   - toolchain の違いによる見かけの差 (片側にだけある不安定 auto trait、重複した blanket impl) は既定で除く
   - docs.rs のビルドでだけ現れる item (`docsrs` cfg 由来) は、差分に残して印 (`docsrs_only` など) を付ける
 - R-AD-5 応答の形: **変わらなかった項目は返さない**。各項目に確度 (`confidence`。`removed_or_hidden` は low) を付ける。ページングは R-OUT-3 に従う。節の並び (案: 件数の要約 → removed → changed → deprecated → added → cosmetic) と、cosmetic や変化の無い blanket impl を既定で省くかは M4 で決める (v0.16)
@@ -529,7 +544,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 
 ### 5.14 Rust のリリース情報 (`rust_release`)
 
-- R-RR-1: Rust の `RELEASES.md` (GitHub API の contents で `rust-lang/rust` のものを raw で取る。ETag 付きの条件付きリクエストにし、TTL は 24 時間。R-CA-8 を実装した場合は、ミラーと無効化は GitHub API の設定に従う。R-NW-2) を取り込み、1 つの版、最新版、または指定した版より新しいすべての版の要点を返す。既定のブランチの `RELEASES.md` には、リリース日より前に次の版が載りうるので、リリース日が今日以前の版だけを返す (v0.17)。目的は「**学習データより新しい Rust の変更を LLM が追いつけるようにする**」こと
+- R-RR-1: Rust の `RELEASES.md` (GitHub API の contents で `rust-lang/rust` のものを raw で取る。ETag 付きの条件付きリクエストにし、TTL は 24 時間。R-CA-8 を実装した場合は、ミラーと無効化は GitHub API の設定に従う。rate limit の扱いは R-NW-2) を取り込み、1 つの版、最新版、または指定した版より新しいすべての版の要点を返す。既定のブランチの `RELEASES.md` には、リリース日より前に次の版が載りうるので、リリース日が今日以前の版だけを返す (v0.17)。目的は「**学習データより新しい Rust の変更を LLM が追いつけるようにする**」こと
 - R-RR-2: R-STD-3 の警告の引用元としても使う
 
 ---
@@ -541,12 +556,12 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 - R-MCP-1 トランスポート: **v1 は stdio だけを実装する**。Streamable HTTP は、ホスト版か共有キャッシュサーバー (§9.10) を作る段階 (M6 以降) まで実装しない。実装するときも任意の機能とし、自分用の常駐プロセスとして使う場合は localhost に bind する (R-SEC-5)
   - 理由: ローカルで HTTP の利点が最も効くのは、同時に複数のセッションを使うときに 1 プロセスを共有できることだが、ディスクキャッシュはもともとプロジェクトをまたいで共有され (R-CA-1)、mmap したアーカイブのページは OS のページキャッシュでプロセス間でも共有される (R-PF-1)。HTTP で上乗せされるのは、各プロセスの匿名メモリ (解析後の構造体・逆引き索引)、`cargo metadata` の重複、プロセスの起動コストの節約だけで、次の負担に見合わない
   - HTTP で新たに要るもの: プロジェクトの文脈 (R-SEC-5)、常駐プロセスの起動と停止、更新後に古いプロセスが残る版の食い違い、ポートの衝突、複数のクライアントにまたがるメモリの管理と公平性 (R-MEM-1)、SSE で進捗を送る経路とクライアントの切断をビルドのキャンセルにつなぐ処理 (R-WS-6)、トランスポートごとのテスト
-  - Claude Code の時間制限もトランスポートで違う。stdio はアイドル 30 分 (進捗通知でリセット) で、リクエストごとのタイマーが無い。HTTP はアイドル 5 分で、最初の応答バイトまでのタイマー (60 秒以上) がある。R-WS-6 (約 30 秒で `status: building` を返す) はどちらにも収まるように作る
+  - Claude Code の時間制限もトランスポートで違う。stdio はアイドル 30 分 (進捗通知でリセット) で、リクエストごとのタイマーが無い。HTTP はアイドル 5 分で、最初の応答バイトまでのタイマー (60 秒以上) がある。R-WS-6 (ビルドは既定 10 秒、それ以外は R-ARCH-6 の 30 秒で `status: building` を返す。v0.18) はどちらにも収まるように作る
   - 後から HTTP を安く足せるよう、R-MCP-3 と R-ARCH-5 のテストを v1 から持つ
 - R-MCP-2 対象とする仕様と追従の方針 (Q-2):
   - **MCP の最新版だけに対応する**。v1 の時点では **2026-07-28** だけで、2025-11-25 以前の `initialize` の handshake には対応しない。Claude Code の v2 ランタイム (MCP TypeScript SDK 2.0) は、サーバーが 2026-07-28 に対応しているかを尋ね、対応していなければ従来の handshake に戻る。v2 ランタイムを既定で使うのは、feature flag を取得するセッションでは v2.1.232 以降、それ以外のセッション (Bedrock、テレメトリ無効など) では v2.1.274 以降 (Claude Code の MCP の文書)。ただし stdio サーバーとの 2026-07-28 の交渉が全環境で既定になったのは v2.1.292 (CHANGELOG。v2.1.274 の変更は直接接続の HTTP サーバーが対象)。README に書く Claude Code の最低版は v2.1.292 とする。最初の判定への応答が遅いと、7 日間は従来の方式で接続される (v2.1.292 の CHANGELOG) ので、`server/discover` には即座に応える (2026-10-15 に確認)
   - **新しい版が出たら追従する**。追従と、古い版を外すことはリリースノートに書く。2 つの版をどう並べるかは、次の版が出たときに決める (v0.16)
-  - **古い版のクライアント**: stdio の `initialize` には、必須の `_meta` の検査より先にメソッド名で判定して、版の交渉 (下記) と同じ `-32022` を返す (`data.requested` は `initialize` の `protocolVersion`)。`message` に対応する版と、Claude Code なら必要な版を書く (`basic/versioning` の SHOULD。古い版のクライアントには版を上げる仕組みが無く、このエラーが利用者に見える唯一の手がかりになる)。繋がらないのは、Claude Code の古い版、`MCP_PROTOCOL_NEGOTIATION=legacy` / `MCP_SDK_GENERATION=v1` で従来の版に戻した環境、2025-11-25 以前しか話さないクライアント (2026-10-14 時点の Gemini CLI と Codex CLI の既定を含む)。README に、これらが繋がらないことも書く
+  - **古い版のクライアント**: stdio の `initialize` には、必須の `_meta` の検査より先にメソッド名で判定して、版の交渉 (下記) と同じ `-32022` を返す (`data.requested` は `initialize` の `protocolVersion`)。`message` に対応する版と、Claude Code なら必要な版を書く (`basic/versioning` の SHOULD。古い版のクライアントには版を上げる仕組みが無く、このエラーが利用者に見える唯一の手がかりになる)。繋がらないのは、Claude Code の古い版、`MCP_PROTOCOL_NEGOTIATION=legacy` / `MCP_SDK_GENERATION=v1` で従来の版に戻した環境、2025-11-25 以前しか話さないクライアント (2026-10-14 時点の Gemini CLI と Codex CLI の既定を含む)。README に、これらが繋がらないことも書く。あわせて、最初の判定への応答が遅れると Claude Code が 7 日間は従来の方式に戻り、このサーバーにつながらないことも README に書く (戻し方は M5 で確かめる。v0.18)
   - **stdio を直接使えないクライアント** (ChatGPT などリモートの MCP だけを使うもの): 利用者が stdio を中継するトンネルを自分で用意する前提とし、サーバーでは個別に対応しない (M6 の HTTP は共有のための機能で、この目的のものではない。R-MCP-1)。トンネルを通しても、クライアントが最新版を話せなければ繋がらないことを README に書く
   - **版の交渉** (`basic/versioning`): 要求の `_meta["io.modelcontextprotocol/protocolVersion"]` が対応外の版なら、`UnsupportedProtocolVersionError` (`-32022`) を返し、`data.supported` に対応する版 (v1 では `["2026-07-28"]`)、`data.requested` に要求された版を入れる
   - 要求は状態なしで処理し、サーバーから JSON-RPC 要求を送らない (MRTR も使わない。R-SEC-2)。2026-07-28 で削除された `ping`・`logging/setLevel`・`notifications/roots/list_changed` には応じない (要求なら未知のメソッドとして `-32601`)
@@ -555,12 +570,12 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - rmcp 3.5.1 の挙動で、この要件と違うが受け入れるもの (ハンドラからは変えられない。結合テストで固定し、rmcp が変われば気付けるようにする。M0 で確かめた。v0.17): セッション開始前の `_meta` の無い `ping` に空の結果を返す (`-32601` ではない)。`arguments` がオブジェクトでない `tools/call` に `-32601` を返す (R-ARG-1 は `-32602`)。`initialize` を拒んだ後にプロセスが終わる (古いクライアントは拒まれた後に続けられないので実害は無い)。`_meta` で対応外の版を名乗った要求への `-32022` の `message` は rmcp の固定の文言 (独自の `message` を求めるのは `initialize` だけ)
 - R-MCP-3 **セッション状態に頼らない**:
   - 対象のプロジェクトは、ツール引数 `project` (`Cargo.toml` へのパスかディレクトリ) で渡せる。`CLAUDE_PROJECT_DIR` の無い起動のしかたもあるので、**`project` 引数の経路を主経路の 1 つとしてテストする** (環境変数を消した状態の結合テストを持つ)
-  - 省略したら次の順で決める (こうして決まるプロジェクトを既定のプロジェクトと呼ぶ): 環境変数 `CLAUDE_PROJECT_DIR` → プロセスのカレントディレクトリ。どれを使ったかを provenance の `project_from` に載せる (`roots/list` の扱いは下記)
+  - 省略したら次の順で決める (こうして決まるプロジェクトを既定のプロジェクトと呼ぶ): 環境変数 `CLAUDE_PROJECT_DIR` → プロセスのカレントディレクトリ。どれを使ったかを provenance の `project_from` に載せる (`roots/list` の扱いは下記)。worktree (`claude -w`・subagent の worktree) と `--add-dir` で、サーバーが受け取る値と worktree の置き場所は、M2 の前に確かめる (Q-32。v0.18)
   - **プロジェクトの単位は Cargo の workspace** (workspace に属さない単独の package はその package): `project` に member のディレクトリや Cargo.toml を渡しても、それが属する workspace の全体を 1 つのプロジェクトとして扱う。専用 target dir (R-WS-2) は、この単位で決める。workspace のルートは、Cargo.toml を上へ辿り、`package.workspace` と `[workspace]` の `members` / `exclude` を Cargo の規則どおりデータとして読んで決める (member でない上位の workspace は拾わない)
   - 決めたディレクトリに `Cargo.toml` が無ければ、上方向には探さない (無関係な上位の workspace を拾わないため)。代わりに、**直下の子のディレクトリのうち Cargo.toml を持つ workspace を、どれも既定のプロジェクトとして扱う** (rust-analyzer が、開いたフォルダの直下に Cargo.toml が無いときに読み込む範囲と同じ。2026-10-16 に確かめた。v0.14)。照会ではそのどれかを `project` で選び、省略したら、候補が 1 つならそれを使い、複数なら `project_not_found` に候補を添えて返す。ただし候補が複数で `project` が無いときも、std の照会 (どの子の toolchain も使わなかった旨を warnings に書く。R-STD-3) と、版を明示した docs.rs の照会は続ける。版を省いた docs.rs の照会は `project_not_found` にする (プロジェクトの版がありうるのに黙って latest を使わない。G1。v0.16)。直下の子は起動時に一度だけ数え、セッションの途中で増えた子 (エージェントが clone したものなど) は既定のプロジェクトにしない (確認なしにビルドする範囲が勝手に広がらないように。`project` で指せば外のツールの扱いになる。v0.15)。直下の子にも無ければ、プロジェクトを要する処理は `project_not_found` (§8) を返す (docs.rs と std の照会は、プロジェクトの文脈なしで続ける。R-ARCH-3)。2 段以上深い workspace は既定のプロジェクトにならないので、suggestions に、その workspace のディレクトリで Claude Code を開くか `build_external_docs` で指す手段を添える。README にも同じことを書く。`cargo metadata` の起動の仕方は R-WS-2
   - **照会のツールが cargo を起動しビルドするのは、既定のプロジェクトだけ** (v0.14 で決定): 既定のプロジェクト (workspace の全体と、実際のビルド target (`.cargo/config.toml` の `build.target`、無ければホストの target。配列ならそのすべてで、`target` を省いた照会は先頭の要素。R-TG-1) で `cargo check --all-targets` がビルドするその依存。rust-analyzer の既定と同じ範囲で、dev-dependency を含み、他の target 向けの依存を含まない。他の target 向けの依存は、rust-analyzer も利用者の `cargo check` もビルドしないので、このサーバーだけがその build.rs を動かす経路にしない) では、確認なしに cargo を起動し、ローカルビルドをする。それ以外 (R-WS-10 の対象) のコードを動かすのは外のツールだけで、照会のツールはそこで作ったキャッシュを読む。どちらのツールでも、このサーバー自身は確認を求めない。外のツールに確認を出すかは、利用者が Claude Code の許可ルールで決める。理由と README に書くことは R-SEC-2
-    - 範囲の判定は、実際のビルド target ごとに `cargo tree --workspace --target <target> -e normal,build,dev` で得た crate の集合で行う (配列ならその和集合)。cargo は `cargo rustdoc -p` で名指しされた依存を、範囲の外でも作ろうとしうるので、サーバーが判定してから起動する (resolver 1 の workspace では、他の target 用の依存を別の target で作ったり、host 用の build-dependency を build target で作ったりして、どちらの集合にも無い依存の build.rs が動いた。resolver 2 以上では、member から target 向けの通常の辺でたどれない依存 (dev だけ・build だけ・ほかの target だけ・proc-macro の下だけ) を名指しすると cargo が panic する (M0 で確かめた。扱いは R-WS-5。Q-30。v0.17)。「他の target 用の依存もホストの target のまま文書化する」は一般には成り立たない)。
-    - **ローカルビルドしてよい組** (v0.15): 照会のツールがローカルビルドしてよいのは、(package, target) の組が、cargo が `cargo check --all-targets` でその target のために作る単位に含まれるときだけにする。target 用の依存 (通常の依存と dev-dependency) は、要求した target の集合に target 用として現れるときにその target で作り、build-dependency と proc-macro は host 用として現れるときに host で作る。種類 (host 用か target 用か) を判定できないときはローカルビルドせず、docs.rs か外のツールの記録を使う。種類は stable の `cargo tree` で判定する: `-e build` の辺の先と、`(proc-macro)` の印が付いた node の下にある依存が host 用、それ以外が target 用 (`-e normal` の木には proc-macro の依存も出るので、木の上の位置で判断する)。`cargo tree` は package id を出さない (`{p}` は名前・版と、path・git の取得元だけ) ので、名前・版・取得元から `cargo metadata` の package id に対応付ける。nightly の `--unit-graph` (unit ごとの package id・platform・feature を出す) は、nightly と `-Z` が要るので使わない (Q-30。M0 で決定。v0.17)。ただし resolver 2 以上では、`-p` で名指しできない依存 (dev だけ・build だけ・ほかの target だけ・proc-macro の下だけ。R-WS-5) は、照会のツールではローカルビルドせずに `build_unsupported` を返す (外のツールが仮のプロジェクトで作れる。R-WS-5。v0.17)。`cargo tree` の出力に解析できない行があれば、範囲を判定できないものとして扱い (`scope_unknown`)、依存をローカルビルドしない (範囲の判定は、どの build.rs を動かすかを決めるため。v0.17)
+    - 範囲の判定は、実際のビルド target ごとに `cargo tree --workspace --target <target> -e normal,build,dev` で得た crate の集合で行う (配列ならその和集合)。cargo は `cargo rustdoc -p` で名指しされた依存を、範囲の外でも作ろうとしうるので、サーバーが判定してから起動する (resolver 1 の workspace では、他の target 用の依存を別の target で作ったり、host 用の build-dependency を build target で作ったりして、どちらの集合にも無い依存の build.rs が動いた。resolver 2 以上では、member から target 向けの通常の辺でたどれない依存 (dev だけ・build だけ・ほかの target だけ・proc-macro の下だけ) を名指しすると cargo が panic する (M0 で確かめた。扱いは R-WS-5。Q-30。v0.17)。「他の target 用の依存もホストの target のまま文書化する」は一般には成り立たない)
+    - **ローカルビルドしてよい組** (v0.15): 照会のツールがローカルビルドしてよいのは、(package, target) の組が、cargo が `cargo check --all-targets` でその target のために作る単位に含まれるときだけにする。target 用の依存 (通常の依存と dev-dependency) は、要求した target の集合に target 用として現れるときにその target で作り、build-dependency と proc-macro は host 用として現れるときに host で作る。種類 (host 用か target 用か) を判定できないときはローカルビルドせず、docs.rs か外のツールの記録を使う。種類は stable の `cargo tree` で判定する: `-e build` の辺の先と、`(proc-macro)` の印が付いた node の下にある依存が host 用、それ以外が target 用 (`-e normal` の木には proc-macro の依存も出るので、木の上の位置で判断する)。`cargo tree` は package id を出さない (`{p}` は名前・版と、path・git の取得元だけ) ので、名前・版・取得元から `cargo metadata` の package id に対応付ける。nightly の `--unit-graph` (unit ごとの package id・platform・feature を出す) は、nightly と `-Z` が要るので使わない (Q-30。M0 で決定。v0.17)。ただし resolver 2 以上で `-p` で名指しできない依存 (上記。R-WS-5) は、照会のツールではローカルビルドせずに `build_unsupported` を返す (外のツールが仮のプロジェクトで作れる。R-WS-5。v0.17)。`cargo tree` の出力に解析できない行があれば、範囲を判定できないものとして扱い (`scope_unknown`)、依存をローカルビルドしない (範囲の判定は、どの build.rs を動かすかを決めるため。v0.17)
     - **feature の組** (v0.15): 範囲は通常の feature の組で判定する。member の文書化の組 (`[package.metadata.docs.rs]` の `all-features`・`features`。R-FT-3) で通常の組の範囲に無い依存が増えても、照会のツールはその依存を確認なしにビルドしない (増えた optional の依存の build.rs を動かさないため。そのときの文書化の仕方は M2 で決める。v0.16)。docs.rs の組での文書は、外のツールで作れる (R-WS-10)
     - `cargo metadata --filter-platform` は build-dependencies の cfg を build target で評価してしまい、ホストで評価する実際のビルドと食い違うので使わない (2026-10-16 に確認)。版の解決 (R-VR-2) には絞らない `cargo metadata` を使う。範囲を判定できないとき (オフラインで Cargo.lock を直接読む経路など。R-VR-2) は、依存のローカルビルドをしない。`cargo tree` の集合は、`cargo check --all-targets --target <target>` がビルドする crate の集合と一致した (2026-10-16、cargo 1.99.1。ホストと `x86_64-pc-windows-gnu` の 2 つで、通常の依存・target 別の依存・proc-macro とその依存・dev-dependency と target 別の dev-dependency・build-dependency と target 別の build-dependency・依存の build-dependency・使わない optional の依存を持つ workspace で確かめた)。`cargo tree` の出力の形は、stable の cargo 1.99.1 と nightly の cargo 1.101.0 で同一だった (2026-10-19。`-e all`、feature 付き)。形が崩れたら nightly の `--unit-graph` を検討する (v0.15。v0.17)
     - 照会のツールに、実際のビルド target (配列ならそのどれか) と違う `target` が渡されたら、既定のプロジェクトの中でもローカルビルドせず、docs.rs → 外のツールがその target で作った記録 (R-WS-10) の順に探す。std は R-STD-6 の配布物からその target の JSON を取る。どれにも無ければ `docs_unavailable` で外のツールを案内する (`target` 引数で他の target 向けの依存の build.rs を確認なしに動かす抜け道を作らず、他の target の文書も外のツールで作れば見られるようにするため。v0.15)
@@ -571,15 +586,15 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - Claude Code (CLI) が stdio サーバーをどのディレクトリで起動するかは文書化されていない。文書化されているのは `CLAUDE_PROJECT_DIR` を渡すことだけ (Agent SDK の TypeScript 版には `projectConfigRoot` で起動ディレクトリを決める記述がある)
   - **`roots/list` は使わない**: Roots は 2026-07-28 で deprecated になり、新しい実装は対応を足さない (SHOULD NOT)。サーバーから送れるのも MRTR (`InputRequiredResult` を返して再試行させる往復) の中だけになった。仕様は代わりに「ディレクトリはツールの引数や設定で渡せ」としており、`project` 引数を持つ本方針と一致する
   - `set_working_directory` や `register_project` のような方式は採らない (先行実装では、設定前の呼び出しがすべて失敗する)
-- R-MCP-4 annotations (v0.9 で決定):
+- R-MCP-4 annotations (v0.9 で決定。基準を v0.13 で改め、分類を v0.15 で確定):
   - **cargo・rustc を起動しうるツール** (§6.3 のうち `search_crates`・`rust_release` 以外のすべて) には、`readOnlyHint: false`、`destructiveHint: false`、`idempotentHint: true` を付ける (`build_external_docs` だけは、同じ引数で呼び直すと取り直すので `idempotentHint: false`。R-WS-10)。build.rs と proc-macro は任意のコードで、`cargo metadata` も依存を取得してディスクに書き、プロジェクトの設定 (`rustc-wrapper` など) で任意の実行ファイルを動かしうる (R-SEC-2) ので、「環境を変更しない」という定義を保証できないため (v0.13 で基準を「ビルドを起こしうるか」から改めた)
     - ローカルビルドを起こしうるツール (キャッシュに無い workspace の item や、docs.rs に JSON が無い依存を引きうる `crate_overview`・`search_items`・`get_item`・`list_*`・`get_source`・`inspect_features`・`api_diff`、`build_external_docs` など) に加え、ビルドはしないが `cargo metadata` や `rustc -vV` を起動するもの (版を省くと Cargo.lock から版を決める `list_crates`・`resolve_version`・`audit_dependencies`・`crate_metadata`・`readme`・`changelog`・`find_examples` など、std の照会 (R-STD-3 の `rustc -vV`)) を含む
   - **cargo・rustc を起動しないツール** (`search_crates`・`rust_release` の 2 つ) には `readOnlyHint: true` を付ける。ローカル機能を含まない構成 (R-ARCH-2) では、どのツールも cargo を起動しないので、すべて `readOnlyHint: true` にする
   - docs.rs や crates.io に出うるツールには、オフラインモード (R-CA-7) でも `openWorldHint: true` を付ける
   - 採らなかった案: ビルドしうるツールにも `readOnlyHint: true` を付ける案 (照会の感覚に合い、annotations で自動承認するクライアントで確認が出ない) は、定義に反するので採らない。annotations を権限確認に使うクライアントでは照会のたびに確認が出うるが、仕様への正直さを優先する
-  - Claude Code の MCP の文書には readOnlyHint を使う記述が無い。ただし実際には、`readOnlyHint: true` のツールは並列に、`false` のツールは 1 つずつ順に実行される (Agent SDK の文書の記述どおり。CLI 2.1.301 で、1 つのメッセージで 2 つ呼ばせて 2026-10-16 に確かめた)。照会のツールが順に実行されることは受け入れる (キャッシュに当たる照会は数十ミリ秒で、差が出るのは docs.rs から初めて取る crate が複数ある場合くらい。同じ target dir のビルドはもともと cargo のロックで 1 つずつになる。v0.15 で、並列のために `true` を付ける案を改めて退けた)。README に書く許可ルールは R-SEC-2
+  - Claude Code の MCP の文書には readOnlyHint を使う記述が無い。ただし実際には、`readOnlyHint: true` のツールは並列に、`false` のツールは 1 つずつ順に実行される (Agent SDK の文書の記述どおり。CLI 2.1.301 で、1 つのメッセージで 2 つ呼ばせて 2026-10-16 に確かめた)。照会のツールが順に実行されることは受け入れる (キャッシュに当たる照会は数十ミリ秒で、差が出るのは docs.rs から初めて取る crate が複数ある場合くらい。同じ target dir のビルドはもともと cargo のロックで 1 つずつになる。v0.15 で、並列のために `true` を付ける案を改めて退けた)。ただし、ビルドを待つ照会は、同じメッセージの他の呼び出しを待つ間止める。このため、ビルドを待つ上限を短くした (R-WS-6。v0.18)。README に書く許可ルールは R-SEC-2
   - 各ツールが実際に cargo・rustc を起動しうるかと annotations の一致を CI で検査する (R-QA-5)。rustdoc-mcp は、`cargo doc` で書き込むのに `readOnlyHint: true` を付けている
-- R-MCP-5: `tools/list` は毎回同じ順で返す。2026-07-28 で必須になった `ttlMs` (目安 1 時間) と `cacheScope` を、仕様がキャッシュ可能とする結果 (`server/discover`、`tools/list`。R-MCP-13・R-MCP-18 を入れたときのものは M5 で決める。v0.16) に付ける (`server/utilities/caching`)。`tools/call` の結果には付けない。`tools/call` の結果がプロジェクトに依存するかどうかは provenance で示す。`server/discover`・`tools/list` は `"public"`。`tools.profile` と `output.mode` は利用者の設定で起動時に決まり、1 つのプロセスの中ではどの呼び出しにも同じ一覧を返すので、public に合う。Claude Code がセッションをまたいで一覧を保存するのは discovery cache だけで、対象はリモートの HTTP / SSE サーバー、既定では無効、エントリはサーバー単位、有効期限は Claude Code 側の設定 (既定 15 分 / 最大 4 時間) で決まり、`ttlMs` と `cacheScope` を見るという記述は無い (Claude Code の MCP の文書と環境変数の文書で確認。2026-10-15)。stdio のサーバーは毎回一覧を取り直されるので、プロジェクトごとの違いは問題にならない。`serverInfo.version` は `env!("CARGO_PKG_VERSION")` から取る (固定の文字列にしない)。serverInfo は表示とログのためのもので、クライアントがキャッシュを捨てる判断は `ttlMs` と再起動に任せる (仕様は serverInfo で挙動を変えないことを求めている)。`tools/list` はページに分けない (`nextCursor` を返さず、`cursor` 付きの要求は無効なカーソルとして `-32602`)。設定 (`tools.profile`、`output.mode` による `outputSchema` の有無) を変えて一覧が変わる場合は、サーバーの再起動で反映する (README に書く)
+- R-MCP-5: `tools/list` は毎回同じ順で返す。2026-07-28 で必須になった `ttlMs` (目安 1 時間) と `cacheScope` を、仕様がキャッシュ可能とする結果 (`server/discover`、`tools/list`。R-MCP-13・R-MCP-18 を入れたときのものは M5 で決める。v0.16) に付ける (`server/utilities/caching`)。`tools/call` の結果には付けない (プロジェクトに依存するかどうかは provenance で示す)。`server/discover`・`tools/list` は `"public"`。`tools.profile` と `output.mode` は利用者の設定で起動時に決まり、1 つのプロセスの中ではどの呼び出しにも同じ一覧を返すので、public に合う。Claude Code がセッションをまたいで一覧を保存するのは discovery cache だけで、対象はリモートの HTTP / SSE サーバー、既定では無効、エントリはサーバー単位、有効期限は Claude Code 側の設定 (既定 15 分 / 最大 4 時間) で決まり、`ttlMs` と `cacheScope` を見るという記述は無い (Claude Code の MCP の文書と環境変数の文書で確認。2026-10-15)。stdio のサーバーは毎回一覧を取り直されるので、プロジェクトごとの違いは問題にならない。`serverInfo.version` は `env!("CARGO_PKG_VERSION")` から取る (固定の文字列にしない)。serverInfo は表示とログのためのもので、クライアントがキャッシュを捨てる判断は `ttlMs` と再起動に任せる (仕様は serverInfo で挙動を変えないことを求めている)。`tools/list` はページに分けない (`nextCursor` を返さず、`cursor` 付きの要求は無効なカーソルとして `-32602`)。設定 (`tools.profile`、`output.mode` による `outputSchema` の有無) を変えて一覧が変わる場合は、サーバーの再起動で反映する (README に書く)
   - 全結果に `resultType` を付け (このサーバーは `"complete"` だけを返す。R-SEC-2)、結果の `_meta` に `io.modelcontextprotocol/serverInfo` を載せる (SDK が対応していればそれに任せる)
 - R-MCP-6: サーバーの `instructions` には、呼び出し順の連鎖 (`list_crates` / `search_items` → `get_item` → `list_methods` / `list_impls`)、バージョンと target の規則、LSP との境界だけを書く。問いとツールの対応は各ツールの説明文の冒頭に置く (instructions に問いの一覧を詰め込んだ先例は、後で削られている)
 - R-MCP-7: ツール名は動詞と名詞の snake_case にする。説明文の冒頭 1 文に主要な語 (rust、crate、trait、docs) を入れる
@@ -589,12 +604,12 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - serverInfo に `icons` を付けてよい (M5 で検討。任意)。ネットワークの URL を使わない (R-SEC-6)
 - R-MCP-8: 入口になるツール (`get_item`、`search_items` など 2〜3 個) に `_meta["anthropic/alwaysLoad"]` を付けて常に読み込ませるかは、eval で決める (Q-15)
 - R-MCP-9: 1 つの引数の有無で 2 つの別データを切り替える「二役のツール」を作らない (ferritin の `search` は crate の有無で item 検索と crate 探しを切り替え、誤用を防ぐために強い文言を重ねている)
-- R-MCP-10: 入出力の JSON Schema は標準の 2020-12 に従う。符号なし整数は `{type: integer, minimum: 0}` とし、schemars が出す `format: uint64` などの非標準の format を出さない (クライアント側の検証器が警告を出す)
+- R-MCP-10: 入出力の JSON Schema は標準の 2020-12 に従う。他のクライアントへの配慮のうち、ここに挙げるもの (スキーマを素直に保つ) は安く済むので v1 から行う (v0.18。手間のかかるものは R-MCP-12 のように将来に回す)。符号なし整数は `{type: integer, minimum: 0}` とし、schemars が出す `format: uint64` などの非標準の format を出さない (クライアント側の検証器が警告を出す)
   - スキーマのルートに `anyOf` / `oneOf` / `allOf` を置かない (Claude Code は平坦化してしまう)
   - `$ref` は同じスキーマの中の `#/$defs/…` だけにし、外部の URI を参照しない (検証器は外部の `$ref` を辿らない。`basic/index`)
   - 省略可能な引数は `required` から外すだけにし、`Option` を `type: ["string", "null"]` のような null 許容の型で出さない。Gemini / Vertex など、null を含むスキーマを拒む厳しいクライアントでも使えるようにする (possdog は生成したスキーマから `null` を剥がしている)
 - R-MCP-11 **起動を待たせない**: `server/discover` と `tools/list` には、索引の読み込み・`cargo metadata`・ネットワークへのアクセスを待たずに即座に応える。重い準備は最初のツール呼び出しまで遅らせるか、裏で進める。Claude Code の起動タイムアウト (`MCP_TIMEOUT`) は既定で 30 秒
-- R-MCP-12 **ツールの構成を選べるようにする** (M5 で検討): 設定 `tools.profile` で、主要なツールだけを `tools/list` に出す構成を選べるようにする。tool search を持たないクライアントで、ツール定義の固定費を抑えるため (ferritin のホスト版はツール 2 個で負担が最小)。構成に無いツールは、説明文の「代わり」の節 (§6.2) やエラーの案内でも勧めない。`tools/list` の順と内容は構成ごとに決定的にする (R-MCP-5)。入れるツールと既定は eval (R-QA-6) で決める (v0.16)
+- R-MCP-12 **ツールの構成を選べるようにする** (将来。他のクライアント向けで手間がかかるので、v0.18 で M5 から後回しにした): 設定 `tools.profile` で、主要なツールだけを `tools/list` に出す構成を選べるようにする。tool search を持たないクライアントで、ツール定義の固定費を抑えるため (ferritin のホスト版はツール 2 個で負担が最小)。構成に無いツールは、説明文の「代わり」の節 (§6.2) やエラーの案内でも勧めない。`tools/list` の順と内容は構成ごとに決定的にする (R-MCP-5)。入れるツールと既定は eval (R-QA-6) で決める (v0.16)
 - R-MCP-13 **resources** (M5 で検討。任意): item を resource として公開し、Claude Code の `@server:…` で利用者が会話に添付できるようにする。中身は `get_item` の `detail=normal` と同じ。モデルが自分で引くのはツールで足りるので、利用者が明示的に添付する経路としてだけ用意する。URI の形、一覧に出す範囲、キャッシュのヒント、エラーの返し方は M5 で決める (v0.16)
   - 反面教師 (cargo-doc-mcp は `rustdoc://` resource のパスを検証せず、任意のファイルを読める) は次で防ぐ: resource URI はパーセントデコードと正規化の後に crate 名と版を R-SEC-4 で検証し、item のパスは R-PR-1 の item パスとしてだけ解釈してファイルシステムのパスには使わない
 - R-MCP-14 **`server/discover` の中身** (`server/discover`): `supportedVersions` (R-MCP-2 の対応する版。v1 では `["2026-07-28"]`)、`capabilities`、`instructions` (R-MCP-6)、`_meta["io.modelcontextprotocol/serverInfo"]`、`ttlMs`、`cacheScope: "public"` を返す
@@ -652,17 +667,17 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 
 | 引数 | 意味 |
 | --- | --- |
-| `crate` | crate 名。`crate@version` も可 (`version` と両方指定して食い違えば `invalid_argument`)。ハイフンとアンダースコアは同一視する (R-PR-1) |
+| `crate` | crate 名。`crate@version` も可 (`version` と両方指定して食い違えば `invalid_argument`)。パッケージ名とコードに書く名前 (lib 名・依存の改名) の両方を受ける。解き方と正規化は R-PR-1 (v0.18) |
 | `version` | 任意。省略したら §5.3 の順で解決する。semver 要件も受ける |
 | `path` | item のパス (R-PR-1 の形を受ける) |
 | `project` | 任意。省略時の決め方は R-MCP-3。照会のツールで既定のプロジェクトの外を指したときは、`build_external_docs` が記録したものだけを使い、cargo を起動しない (R-MCP-3) |
 | `target` | 任意。省略時は R-TG-1。照会のツールで実際のビルド target (配列ならそのどれか) と違う値を渡すと、ローカルビルドせず docs.rs と外のツールの記録を探す (R-MCP-3)。`build_external_docs` で他の target での文書化をするときは必須 (R-WS-10) |
 | `limit` / `cursor` | ページング (R-OUT-3) |
 | `detail` | `brief` / `normal` / `full` (§7.1) |
-| `git` / `rev` / `branch` / `tag` | `build_external_docs` で git リポジトリの crate を文書化する (`crate` と組み合わせる)。照会のツールでは、そうして作ったものを指す読み取りの鍵としてだけ受ける (R-MCP-3)。`git` はリポジトリの URL。`rev` (コミットのハッシュか `refs/…`)・`branch`・`tag` は cargo の git 依存と同じ意味で、指定できるのは 1 つだけ (どれも省けば既定のブランチ)。cargo の `rev` には、ブランチの名前だけを渡すと失敗する (タグの名前・`refs/heads/…`・短いハッシュは通る。2026-10-16 に実測) ので、引数を分けて cargo の同名のキーに写す。文書化の仕方 (仮のプロジェクトの git 依存なので private item は出さない。feature の既定) は R-WS-5、鍵 (解決したコミットのハッシュ) は R-WS-10。照会のツールに短いハッシュを渡したときの照合は M2 で決める (解決したコミットが古いとみなす時間は R-MCP-3。v0.16)。オフラインモードでキャッシュに無ければ `offline_miss` (R-WS-5、R-SEC-2、R-SEC-4) |
+| `git` / `rev` / `branch` / `tag` | `build_external_docs` で git リポジトリの crate を文書化する (`crate` と組み合わせる)。照会のツールでは、そうして作ったものを指す読み取りの鍵としてだけ受ける (R-MCP-3)。`git` はリポジトリの URL。`rev` (コミットのハッシュか `refs/…`)・`branch`・`tag` は cargo の git 依存と同じ意味で、指定できるのは 1 つだけ (どれも省けば既定のブランチ)。cargo の `rev` には、ブランチの名前だけを渡すと失敗する (タグの名前・`refs/heads/…`・短いハッシュは通る。2026-10-16 に実測) ので、引数を分けて cargo の同名のキーに写す。文書化の仕方 (仮のプロジェクトの git 依存なので private item は出さない。feature の既定) は R-WS-5、鍵 (解決したコミットのハッシュ) は R-WS-10。照会のツールに短いハッシュを渡したときの照合は M2 で決める (解決したコミットが古いとみなす時間は R-MCP-3。v0.16)。オフラインモードでキャッシュに無ければ `offline_miss` (R-VR-2・R-CA-7)。URL と参照名の検証は R-SEC-4、取り込んだリポジトリの設定の扱いは R-SEC-2 |
 | `refresh` | 任意。照会のツールのうち cargo を起動しうるもの (R-MCP-4 の分類) で、その鍵の決定的な失敗の固定 (R-WS-7) を解いて、取得やビルドをし直す。同時ビルド数の上限 (R-SEC-7) はそのまま効く。既定のプロジェクトの外を指したときは無視する (ビルドしないため)。`build_external_docs` には持たせない (同じ引数の呼び直しで解くため。R-WS-10)。成功した結果は作り直さない。決定的な失敗のほかに解く記録 (否定キャッシュ、`--cfg docsrs` の記録など) の一覧は M2 で決める (v0.16) |
 
-- R-ARG-1: 引数の誤り (`inputSchema` に合わない型、必須の引数の欠落、形式の誤ったバージョン、無効なカーソル) は、JSON-RPC の invalid-params ではなく、提案付きのツール結果エラー (`invalid_argument`。§8) として返す (`server/tools` は入力の検証エラーをツールの実行エラーに分類している)。型を厳しくしすぎて入口で弾かない。JSON-RPC の `-32602` にするのは、未知のツール名と、`CallToolRequest` の形に合わない要求 (`name` が無い、`arguments` がオブジェクトでないなど) だけとする (`name` の無い要求への rmcp の応答は M0 で確かめていないので、M1 の結合テストで確かめる。rmcp 3.5.1 は、`arguments` がオブジェクトでない要求に `-32601` を返す。受け入れる違いとして R-MCP-2 に書いた。v0.17)。rmcp の `Parameters<T>` は逆直列化の失敗を `-32602` にするので、引数は JSON のオブジェクトで受けて自前で検証する
+- R-ARG-1: 引数の誤り (`inputSchema` に合わない型、必須の引数の欠落、形式の誤ったバージョン、無効なカーソル) は、JSON-RPC の invalid-params ではなく、提案付きのツール結果エラー (`invalid_argument`。§8) として返す (`server/tools` は入力の検証エラーをツールの実行エラーに分類している)。型を厳しくしすぎて入口で弾かない。JSON-RPC の `-32602` にするのは、未知のツール名と、`CallToolRequest` の形に合わない要求 (`name` が無い、`arguments` がオブジェクトでないなど) だけとする (`name` の無い要求への rmcp の応答は M1 の結合テストで確かめる。`arguments` がオブジェクトでない要求に rmcp 3.5.1 が `-32601` を返すのは、受け入れる違いとして R-MCP-2 に書いた。v0.17)。rmcp の `Parameters<T>` は逆直列化の失敗を `-32602` にするので、引数は JSON のオブジェクトで受けて自前で検証する
 
 ### 6.5 一覧系ツールの絞り込みと展開
 
@@ -677,9 +692,9 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 ### 7.1 方針
 
 - R-OUT-1 **Claude Code の実際の挙動を前提にする** (Q-1):
-  - `structuredContent` があると、モデルには `JSON.stringify(structuredContent)` だけが渡り、text の content は捨てられる (Claude Code 2.0.21 以降。2.1.301 (2026-10-16) と 2.1.303 (2026-10-19。M0) でも同じことを確かめた。Issue #79944 は 2026-10 時点で open。直る可能性があるので CI で再確認し続ける)
+  - `structuredContent` があると、モデルには `JSON.stringify(structuredContent)` だけが渡り、text の content は捨てられる (Claude Code 2.0.21 以降。2.1.301 (2026-10-16) と 2.1.303 (2026-10-19。M0。v0.17) でも同じことを確かめた。Issue #79944 は 2026-10 時点で open。直る可能性があるので、M1 から始める eval (R-QA-6) に確かめるケースを置き、Claude Code の版を上げたときに回す。v0.18)
   - よって **`structuredContent` がそのままプロンプトになる**。モデルが必要とする情報 (provenance、warnings、hints、page、truncated) はすべて `structuredContent` に入れる
-  - `structuredContent` のキーは、応答の構造体のフィールドの順に並べる (R-SH-1 の「シグネチャを散文より先に」の前提)。rmcp の `structuredContent` は `serde_json::Value` で、serde_json の既定の Map はキーを辞書順に並べ替えるので、`preserve_order` を有効にする (M0 で、無効のままでは `docs` が `signature` より前に出た)。`Value` を後から加工するときも順を保つ (`preserve_order` の下の `Map::remove` は最後の要素で穴を埋めて順を崩すので使わない)。キーの順はテストで確かめる (`Value` どうしの比較は順を見ない) (v0.17)
+  - `structuredContent` のキーは、応答の構造体のフィールドの順に並べる (R-SH-1 の「シグネチャを散文より先に」の前提)。rmcp の `structuredContent` は `serde_json::Value` で、serde_json の既定の Map はキーを辞書順に並べ替えるので、`preserve_order` を有効にする (M0 で、無効のままでは `docs` が `signature` より前に出た)。`Value` を後から加工するときも順を保つ (`preserve_order` の下の `Map::remove` は最後の要素で穴を埋めて順を崩すので使わない)。キーの順はテストで確かめる (`Value` どうしの比較は順を見ない。v0.17)
   - structured モードでは、同じ JSON を直列化した text の content も返す (`server/tools` の SHOULD。後方互換のため)。`structuredContent` に無い情報を text にだけ載せてはならない
   - `isError: true` の結果には `structuredContent` を付けず、中身は `content[0].text` で完結させる (R-ERR-2。Claude Code もエラー時は `structuredContent` を見ない)。仕様の `outputSchema` の MUST に、エラーを除く旨の明文は無いが、エラーを schema に収めない意図的な選択とする
   - structured モードでは `outputSchema` を宣言し、`structuredContent` を必ずそれに合わせる (MUST)。`status: building`・各 `detail`・`page` 付き・`partial` の応答もすべて同じ schema に収める。outputSchema のルートに `anyOf` / `oneOf` を置かず、状態による差は省略可能なプロパティで表す (CI での検査は R-QA-5)
@@ -710,7 +725,10 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - `normal` (既定): シグネチャと where 句 (rustdoc は境界の多くを where 句に移すので、入れないと `tokio::spawn` の `F: Future + Send + 'static` が消える。M0 で決定。v0.17)、ドキュメントの第 1 段落 (`docs_truncated` 付き。段階で絞ったことを表し、予算で切り詰めた R-OUT-3 の `truncated` とは別)、残りの節の見出しと行数、fields / variants の文字列、impl の見出し (メンバーなし)
   - `full`: ドキュメント全文 (節ごと)、属性 (生の rustdoc の部分木は返さない。数値の Id を含み (R-OUT-2)、描画した文字列の 8〜17 倍に膨らむため。v0.17)
   - モジュールや crate のルートは散文が大半を占める (tokio::sync では 69%) ので、一覧系では `docs: none` を選べるようにする
-- R-OUT-8 リンクやファイルの場所 (docs.rs の URL、ソースファイルのパス) は `structuredContent` の中の文字列として返す。`get_item` は item の**定義位置** (`source_location`: `file` (正規化したファイルパス)・`lines` (`434-466`、1 行なら `301`)・`url`。docs.rs 由来の crate では、`file` は package root からの相対パス (docs.rs の JSON の span そのまま)、`url` は docs.rs のソースブラウザの URL に行のアンカーを付けたもの (`https://docs.rs/crate/<name>/<version>/source/<file>#434-466`。ソースブラウザも rustdoc のソースページも `#N` と `#N-M` で行を強調表示することを M0 で確かめた。ソースブラウザは span のパスがそのまま使え、src の外のファイルも指せる。v0.17)。手元にソースがあればその絶対パス。span が package root の外 (ビルドの生成物の `OUT_DIR` やビルドホストの絶対パス) なら `url` を付けず、warnings で知らせる) を返し、`get_source` やクライアントのファイル読み取りで直接開けるようにする (possdog の `file:line`、lockdocs の `pkg@ver path:line` の引用に倣う)。`resource_link` ブロックに頼らない (R-OUT-1 により捨てられる)
+- R-OUT-8 リンクやファイルの場所 (docs.rs の URL、ソースファイルのパス) は `structuredContent` の中の文字列として返す。`resource_link` ブロックに頼らない (R-OUT-1 により捨てられる)
+  - `get_item` は item の**定義位置** `source_location` を返し、`get_source` やクライアントのファイル読み取りで直接開けるようにする (possdog の `file:line`、lockdocs の `pkg@ver path:line` の引用に倣う)。項目は `file` (package root からの相対パス。取得元とキャッシュの状態によらず同じ形)・`lines` (`434-466`、1 行なら `301`)・`url`。ローカルビルドした crate (workspace・path・git) では、開ける絶対パスを `path` に足す。docs.rs の crate の中身は `get_source` で読む (v0.17)
+  - docs.rs 由来の crate では、`file` は package root からの相対パス (docs.rs の JSON の span そのまま)、`url` は docs.rs のソースブラウザの URL に行のアンカーを付けたもの (`https://docs.rs/crate/<name>/<version>/source/<file>#434-466`。ソースブラウザも rustdoc のソースページも `#N` と `#N-M` で行を強調表示することを M0 で確かめた。ソースブラウザは span のパスがそのまま使え、src の外のファイルも指せる。v0.17)
+  - span が package root の外 (ビルドの生成物の `OUT_DIR` やビルドホストの絶対パス) なら `url` を付けず、warnings で知らせる
 
 ### 7.2 何を出し、何を出さないか
 
@@ -741,7 +759,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
     "format_version": 57,
     "features": ["full"]
   },
-  "warnings": ["no docs.rs build for host target x86_64-apple-darwin; used the docs.rs default target"],
+  "warnings": ["docs.rs built tokio with features [full]; items behind cfgs that were false in that build are missing"],
   "data": { "signature": "..." },
   "page": { "shown": 20, "total": 103, "has_more": true, "next_cursor": "..." },
   "hints": ["call list_methods on tokio::sync::Mutex to see all methods"]
@@ -751,7 +769,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 - `source` は `docs.rs` / `local` / `std` のいずれか。**実際にデータを返した取得元**を書く (ferritin は docs.rs のキャッシュを LocalDependency と誤表示している。テストで固定する)
 - `resolved_from` は `explicit` / `explicit_req` / `cargo_lock` / `cargo_lock_raw` (Cargo.lock を直接読んだもの。R-VR-2) / `external` (`build_external_docs` が記録した metadata。R-WS-10) / `git` (引数 `git` の crate) / `latest` のいずれか
 - `project_from` は `argument` / `CLAUDE_PROJECT_DIR` / `cwd` のいずれか (R-MCP-3)
-- `version`・`target`・`format_version` は**データ本体 (JSON の `crate_version`・`target.triple`・`format_version`) から読み**、要求値と食い違えば warnings に出す
+- `version`・`target`・`format_version` は**データ本体 (JSON の `crate_version`・`target.triple`・`format_version`) から読む**。`version` が解決した版と食い違えば、そのデータを使わない (R-VR-4)。`target`・`format_version` が要求値と食い違えば warnings に出す (v0.18)
 - ローカルビルドと std では `toolchain` (`rustc -vV` の要約)、`built_at`、`stale`、`features_requested` / `features_effective` を加える
 - ビルド中は応答の最上位に `status: "building"` と `retry_after_secs` を加える (エラーではない。付ける条件は R-OUT-9)
 - `warnings`・`page`・`hints` は該当するときだけ出す
@@ -759,7 +777,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 
 - R-OUT-9: **provenance はすべての成功応答に必須とする** (`status: building` の応答を含む)
   - 応答の骨格と下の状態を表す値 (`resolved_from` などの上の値の一覧を含む) は初期案で、M1 で outputSchema を作るときに確定する (ビルドの状態は M2。v0.16)
-  - 応答の骨格 (v0.15。outputSchema はこれに従う): 1 つの crate の応答の provenance で必須にするのは `source`・`crate`・`version` (データが無いときは要求した値か解決した値)・`target` だけで (crate を持たないツール (`search_crates`・`rust_release`) と、複数の crate の応答の共通部分の必須の項目は、M1 で outputSchema を作るときに決める。v0.17)、データ本体から読む項目 (`format_version` など) は任意にする。状態の項目 (`status`・`retry_after_secs`・`building_reason`・`partial`) は応答の最上位に置く。`stale`・`stale_reason` は provenance に置く。`sources` の各項目は、1 つの crate の provenance の項目に、`status`・`stale_reason`・`building_reason`・`retry_after_secs` と、失敗したものなら `code`・`reason`・`retryable` を足したものにする。1 つの crate の応答でも、ビルド中にデータがあれば最上位の `status` を付けず、`stale_reason: rebuilding` と `retry_after_secs` にする (複数の crate の応答の `partial` とそろえる)
+  - 応答の骨格 (v0.15。outputSchema はこれに従う): 1 つの crate の応答の provenance で必須にするのは `source`・`crate`・`version` (データが無いときは要求した値か解決した値。版を解決する前の `status: building` では `version`・`source` を省ける。v0.18)・`target` だけで (crate を持たないツール (`search_crates`・`rust_release`) と、複数の crate の応答の共通部分の必須の項目は、M1 で outputSchema を作るときに決める。v0.17)、データ本体から読む項目 (`format_version` など) は任意にする。状態の項目 (`status`・`retry_after_secs`・`building_reason`・`partial`) は応答の最上位に置く。`stale`・`stale_reason` は provenance に置く。`sources` の各項目は、1 つの crate の provenance の項目に、`status`・`stale_reason`・`building_reason`・`retry_after_secs` と、失敗したものなら `code`・`reason`・`retryable` を足したものにする。1 つの crate の応答でも、ビルド中にデータがあれば最上位の `status` を付けず、`stale_reason: rebuilding` と `retry_after_secs` にする (複数の crate の応答の `partial` とそろえる)
   - 複数の crate にまたがる応答 (`search_items`、`list_implementors` の `dependency_graph`、`list_crates`、`audit_dependencies` など) では、provenance を共通部分と、crate ごとの `sources` の配列に分ける (各項目の形は上の骨格のとおり)。範囲の一部がビルド中や取得中でも、結果が 1 件でもあれば `partial: true` (R-SR-5) で返し (ビルド中のものがあれば `retry_after_secs` も付ける)、`status: building` は結果が 0 件でビルド中のときだけにする。結果が 0 件でも、失敗や未取得の crate があれば `partial: true` にする。カーソルの束縛は R-OUT-3
   - 状態を表す値 (v0.15): `sources` の各項目の `status` は `ok`・`building`・`failed`・`unavailable` (応答の最上位の `status` は `building` だけ)。`building_reason` は `building` (ローカルビルドの実行中)・`waiting_for_lock` (cargo のロック。R-WS-2)・`waiting_for_slot` (ビルドの枠。R-SEC-7)・`fetching`・`indexing`。`stale` を付けたら `stale_reason` を `rebuilding` (再ビルド中。R-WS-4)・`inputs_changed` (外の記録の入力が変わった。R-MCP-3)・`ref_ttl_expired` (ブランチなどの解決が古い。§6.4)・`project_missing` (外のプロジェクトのディレクトリが消えた。扱いは M2。R-MCP-3) のいずれかで付ける
 
@@ -770,8 +788,8 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 - R-ERR-1: ツールの実行時エラーは、プロトコルエラーではなくツールの結果として返す (`isError: true`)。LLM が分岐して回復できるようにするため (先行実装の多くは JSON-RPC のエラーか、成功扱いの「見つかりません」テキストを返していて、LLM が判別できない)
   - ツールの処理中の panic も呼び出し単位で捕捉して `internal_error` の `isError: true` の結果として返し、サーバーや他の呼び出しを止めない (SDK が panic をプロトコルエラーに変えると、mmgeorge と同じ失敗になる)。仕様はサーバー内部のエラーをプロトコルエラーの例に挙げているが、同じ理由で意図的にツールの結果にする
   - panic の後も動き続けるので、共有状態のロックには poison の無いロック (parking_lot や `tokio::sync` のもの) を使い、std の `Mutex` / `RwLock` は使わない (1 回の panic で poison になり、以後そのロックを取る呼び出しがすべて失敗する。clippy.toml の `disallowed-types` で禁じている)。共有状態は差し替えで更新し、panic した呼び出しの書きかけの状態が他の呼び出しに見えないようにする
-  - `LazyLock` と `Once` も、初期化の関数が panic すると poison し、以後のアクセスがすべて panic する (回復できない)。初期化で panic しうる処理はせず、するなら poison しない `OnceLock` で行う (禁止はせず、レビューで守る)
-- R-ERR-2: **エラー結果では `content[0].text` が自己完結していること**。Claude Code はエラー時に `structuredContent` を無視する (Issue #86032)。Claude Code は、text のブロックが複数あれば改行でつないでモデルに渡す (2.1.301 で 2026-10-16 に確かめた。画面の表示は確かめていない。2.1.303 では、エラーの text がモデルの側で `<error>…</error>` に囲まれて見えた。M0 の A9)。text ブロックは 1 つにまとめ、`code`、`message`、`retryable`、`suggestions` (次の一手)、`request_id` を JSON で入れる (`request_id` は、突き合わせる相手の R-OBS-1 のログと一緒に M1 から。v0.17)。該当するときだけ、`reason`・`found`/`supported`・`did_you_mean`・候補 (キーは `candidates`。初期案。v0.17)・診断 (R-WS-7)・失敗の時刻・`retry_after_secs` (再試行できるエラー) を足す (v0.15)。`request_id` は呼び出しごとに払い出し、R-OBS-1 のログにも同じ値を記録する (複数のセッションが同時に動いても、報告されたエラーとログの行を 1 対 1 に対応付けるため。gnufood の `diagnostic_id` に倣う)。1 万文字以内に収める (長いエラー本文は先頭と末尾だけが残る)
+  - `LazyLock` と `Once` も、初期化の関数が panic すると poison する (`LazyLock` は以後のアクセスがすべて panic し、回復できない。`Once` は以後の `call_once` が panic する)。初期化で panic しうる処理はせず、するなら poison しない `OnceLock` で行う (禁止はせず、レビューで守る)
+- R-ERR-2: **エラー結果では `content[0].text` が自己完結していること**。Claude Code はエラー時に `structuredContent` を無視する (Issue #86032)。Claude Code は、text のブロックが複数あれば改行でつないでモデルに渡す (2.1.301 で 2026-10-16 に確かめた。画面の表示は確かめていない。2.1.303 では、エラーの text がモデルの側で `<error>…</error>` に囲まれて見えた。M0 の A9。v0.17)。text ブロックは 1 つにまとめ、`code`、`message`、`retryable`、`suggestions` (次の一手)、`request_id` を JSON で入れる。該当するときだけ、`reason`・`found`/`supported`・`did_you_mean`・候補 (キーは `candidates`。初期案。v0.17)・診断 (R-WS-7)・失敗の時刻・`retry_after_secs` (再試行できるエラー) を足す (v0.15)。`request_id` は呼び出しごとに払い出し、R-OBS-1 のログにも同じ値を記録する (複数のセッションが同時に動いても、報告されたエラーとログの行を 1 対 1 に対応付けるため。gnufood の `diagnostic_id` に倣う。ログと一緒に M1 から。v0.17)。1 万文字以内に収める (長いエラー本文は先頭と末尾だけが残る)
 
 | code | 状況 | suggestions の例 | `retryable` |
 | --- | --- | --- | --- |
@@ -780,7 +798,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 | `version_not_found` | 指定したバージョンが存在しない | 存在するバージョンの候補 | false |
 | `ambiguous_version` | Cargo.lock に同じ crate が複数バージョンある | 候補と、それぞれを使っている依存元 | false |
 | `ambiguous_path` | 同名の item が複数ある | 候補の正準パス | false |
-| `docs_unavailable` | docs.rs に JSON が無い (照会のツールに実際のビルド target と違う `target` を渡し、外のツールの記録も無い場合を含む。R-MCP-3)、既定のプロジェクトの外で `build_external_docs` の記録が無いか壊れている (R-MCP-3・R-WS-10)、取り直しても元データが壊れている (R-CA-4)、cargo が `-p` で失敗する依存 (R-WS-5)、展開の上限を超えた (R-NW-3)、展開できないか JSON として解析できない (R-DS-2・R-CA-4)、範囲を判定できずにローカルビルドしなかった (R-MCP-3) | JSON がある近くのバージョン、ローカルビルドの可否 (既定のプロジェクトの外のコードなら `build_external_docs`。R-MCP-3)、`readme` (API の代わりに導入手順だけでも得られる。mmgeorge は docs.rs にビルドが無いとき README に切り替える) | `reason` による (`corrupt` は true、それ以外は false) |
+| `docs_unavailable` | 文書を返せない。原因は `reason` (表の下) で示す | JSON がある近くのバージョン、ローカルビルドの可否 (既定のプロジェクトの外のコードなら `build_external_docs`。R-MCP-3)、`readme` (API の代わりに導入手順だけでも得られる。mmgeorge は docs.rs にビルドが無いとき README に切り替える) | `reason` による (`corrupt` は true、それ以外は false) |
 | `unsupported_format` | 形式に非対応 (`found` と `supported` を含む) | サーバーの更新、ローカルビルド | false |
 | `item_not_found` | パスが解決できない (探した経路を含む) | `did_you_mean` (類似度の下限あり) | false |
 | `build_failed` | ローカルビルドに失敗した。`cargo metadata`・`cargo fetch` の失敗 (既存の例外に当たらないもの) と、ビルドの最大時間の超過も含む (R-WS-7。v0.17) | 診断の要約 | 一時的な失敗は true、決定的な失敗は false。`cargo metadata`・`cargo fetch` の失敗は常に true (R-WS-7) |
@@ -794,9 +812,9 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 | `lockfile_outdated` | Cargo.lock が無いか、Cargo.toml と合っていない (R-VR-2) | Bash で `cargo fetch` を実行すると、ビルドせずに Cargo.lock が必要な分だけ更新される (`cargo check` はコンパイルまでするので、Cargo.lock を直すだけなら遅い。`cargo update` と、既存の lock への `cargo generate-lockfile` は全依存を新しい版に上げるので勧めない) | false |
 | `busy` | 同時に処理する呼び出しの数が上限 (R-SEC-7) を超えた | 少し待って再試行 | true |
 
-- `docs_unavailable` には原因 `reason` を付ける (v0.15。値の一覧は初期案で、M1・M2 で実装しながら確定する。v0.16): `no_json` (docs.rs にも外のツールの記録にも無い。docs.rs の 404 と 400 (版として解析できない値) はこれにする。ただし M1 からは、crates.io の sparse index で crate と版の存在を確かめて、無ければ `crate_not_found`・`version_not_found` を返す (docs.rs の 404 は両者を区別しないため。R-DS-6)。v0.17)・`no_record` (既定のプロジェクトの外で記録が無い)・`record_broken` (外の記録が壊れている)・`corrupt` (書き込んだ後に読み直すと内容ダイジェストが合わず、取り直しても合わなかった。ディスクの問題を疑う。30 秒後に再試行できる)・`build_unsupported` (`-p` で cargo が失敗する依存。R-WS-5)・`too_large` (展開の上限。R-NW-3)・`unparsable` (展開できないか、JSON として解析できない。先読みした形式が対応範囲内なのに逆直列化に失敗したもの (サーバーの不具合) を含む。範囲の外の形式は `unsupported_format`。R-DS-2・R-CA-4)・`scope_unknown` (範囲を判定できずにローカルビルドしなかった。R-MCP-3)・`target_unsupported` (独自の target で std を自分で作るプロジェクト。R-TG-1。v0.17)
+- `docs_unavailable` には原因 `reason` を付ける (v0.15。値の一覧は初期案で、M1・M2 で実装しながら確定する。v0.16): `no_json` (docs.rs にも外のツールの記録にも無い。照会のツールに実際のビルド target と違う `target` を渡した場合を含む (R-MCP-3)。docs.rs の 404 と 400 (版として解析できない値) はこれにする。ただし M1 からは、crates.io の sparse index で crate と版の存在を確かめて、無ければ `crate_not_found`・`version_not_found` を返す (docs.rs の 404 は両者を区別しないため。R-DS-6)。v0.17)・`no_record` (既定のプロジェクトの外で `build_external_docs` の記録が無い。R-MCP-3・R-WS-10)・`record_broken` (外の記録が壊れている。R-WS-10)・`corrupt` (書き込んだ後に読み直すと内容ダイジェストが合わず、取り直しても合わなかった。ディスクの問題を疑う。再試行でき、待つ時間は否定キャッシュの時間とあわせて M1 で決める。R-CA-4)・`build_unsupported` (`-p` で cargo が失敗する依存。R-WS-5)・`too_large` (展開の上限。R-NW-3)・`unparsable` (展開できないか、JSON として解析できない。先読みした形式が対応範囲内なのに逆直列化に失敗したもの (サーバーの不具合) を含む。範囲の外の形式は `unsupported_format`。R-DS-2・R-CA-4)・`scope_unknown` (範囲を判定できずにローカルビルドしなかった。R-MCP-3)・`target_unsupported` (独自の target で std を自分で作るプロジェクト。R-TG-1。v0.17)・`no_target_json` (docs.rs にその版の JSON はあるが、求める target の JSON が無い。R-TG-1。v0.18)
 
-- R-ERR-3: 否定的な結果のキャッシュは種類で分ける。「確定的に存在しない」(目安 1 時間)、「crate が見つからない」(公開直後の可能性があるので短め、目安 5 分)、「一時的な失敗」(目安 30 秒)。一時的な失敗を「存在しない」としてキャッシュしない。複数の取得元を順に試すとき、一時的な失敗は保留し、どの取得元も答えなかった場合だけ `network_error` として返す。docs.rs が想定外の HTTP ステータスを返したときも、一時的な失敗と同じく保留して次の取得元を試し、目安 30 秒だけキャッシュする (どこも答えなければ `network_error`、`retryable: false`、suggestions は報告のしかたとサーバーの更新。v0.17)
+- R-ERR-3: 否定的な結果のキャッシュは種類で分ける。「確定的に存在しない」(目安 1 時間。ただし存在しない版は sparse index の TTL (10 分。R-CA-3) に従う。v0.18)、「crate が見つからない」(公開直後の可能性があるので短め、目安 5 分)、「一時的な失敗」(目安 30 秒)。一時的な失敗を「存在しない」としてキャッシュしない。複数の取得元を順に試すとき、一時的な失敗は保留し、どの取得元も答えなかった場合だけ `network_error` として返す。docs.rs が想定外の HTTP ステータスを返したときも、一時的な失敗と同じく保留して次の取得元を試し、目安 30 秒だけキャッシュする (どこも答えなければ `network_error`。`retryable` と suggestions は上の表。v0.17)
 - R-ERR-4: JSON-RPC のエラーコードは、JSON-RPC 2.0 の標準コード (`-32700`、`-32600`〜`-32603`) と、仕様が定める `-32020`〜`-32022` だけを使う。独自のエラーはツール結果の `code` で返す。`-32020`〜`-32099` のうち仕様に無いコードと、廃止された `-32002`・`-32042` は出さない (MUST NOT)。`-32000`〜`-32019` も使わない (SHOULD NOT。`basic/index`)
 
 ---
@@ -837,19 +855,19 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - 環境変数 `CHATORA_RUSTDOC_MCP_CACHE__DIR` (設定の `cache.dir`。名前の規則は R-DIST-3) で場所を変えられるようにする
   - キャッシュ・state (R-DIST-3)・ログ (R-OBS-2) のディレクトリの権限と所有者は扱わない。umask のまま作り、所有者も確かめない (cargo の `target/` や `~/.cargo`、rust-analyzer と同じ。既定の場所はホームの下にあり、ホームの権限が他の利用者から守る。v0.15)。他の利用者が読み書きできる場所に置かないよう README で案内する (R-SEC-2)
   - state のディレクトリのもの (ビルドのプロセスの記録など。R-DIST-3) とログ (R-OBS-2) はキャッシュに置かない
-- R-CA-2 キー: `{source}/{crate}/{version}/{target}/{format_version}.json` を元データとし (std の `{version}` には rustc の commit-hash を使う。nightly は同じ版の文字列が約 6 週間続くため)、派生物 (アーカイブ・索引・展開したソース) を同じ場所に置く
+- R-CA-2 キー: `{source}/{crate}/{version}/{target}/{format_version}.json` を元データとし (`{crate}` は R-PR-1 で正規化した名前。v0.18) (std の `{version}` には rustc の commit-hash を使う。nightly は同じ版の文字列が約 6 週間続くため)、派生物 (アーカイブ・索引・展開したソース) を同じ場所に置く
   - 派生物のファイル名とヘッダには、マジックナンバー、スキーマの版、format_version、アーキテクチャ、**元データの内容ダイジェスト**を含め、合わなければ作り直す (mtime だけに頼らない)
   - スキーマの版には、アーカイブ形式を決めるライブラリ (rkyv) の互換な版の系列 (例: 0.8 系) も含め、Cargo.lock の rkyv の版と一致することをテストで強制する。依存の更新でアーカイブの配置が黙って変わるのを防ぐ (ferritin の `RKYV_SERIES` に倣う)
   - ローカルビルドの元データの鍵は R-WS-4 の内容ダイジェストとする
   - 派生物は rustup の toolchain ディレクトリ (読み取り専用でありうる) やユーザーの `target/` に書かず、すべてキャッシュの下に置く
 - R-CA-3 不変性:
   - docs.rs の完全一致バージョンの取得済み JSON は不変として扱う (JSON が無いという結果は R-ERR-3 の TTL に従う。再ビルドで現れることがある。R-DS-3)
-  - 「latest の解決結果」や crates.io の index には TTL を付ける (1h)
-  - ただし sparse index のファイルの TTL は 10 分とし (index の `cache-control: max-age=600` に合わせる)、TTL が切れたら、保存した ETag を `If-None-Match` に付けた条件付きのリクエストで確かめ直す (ETag が無ければ `Last-Modified` を `If-Modified-Since` に付ける)。`304` なら保存した中身をそのまま使って TTL を延ばし、`200` なら中身と ETag を置き換える。新しい版の公開に早く気付きつつ、変わっていない crate の取り直しを本文なしで済ませるため (serde の index は 164,874 バイトで、ETag を付けると `304` で 0 バイトだった。2026-10-19 に確認)。index から導く「latest の解決結果」も、index を確かめ直したときに導き直す。ミラー (R-CA-8) が条件付きのリクエストに応じなければ、毎回 `200` で取り直すだけで、結果は変わらない
+  - crates.io の sparse index のファイルの TTL は 10 分とし (index の `cache-control: max-age=600` に合わせる)、TTL が切れたら、保存した ETag を `If-None-Match` に付けた条件付きのリクエストで確かめ直す (ETag が無ければ `Last-Modified` を `If-Modified-Since` に付ける)。`304` なら保存した中身をそのまま使って TTL を延ばし、`200` なら中身と ETag を置き換える。新しい版の公開に早く気付きつつ、変わっていない crate の取り直しを本文なしで済ませるため (serde の index は 164,874 バイトで、ETag を付けると `304` で 0 バイトだった。2026-10-19 に確認)。index から導く「latest の解決結果」(semver 要件の解決も同じ) は独自の TTL を持たず、index を確かめ直したときに導き直す (v0.16 までの 1h の TTL は v0.17 で消した)。ミラー (R-CA-8) が条件付きのリクエストに応じなければ、毎回 `200` で取り直すだけで、結果は変わらない
   - ローカルビルドの結果は鮮度判定 (R-WS-4) で管理する
 - R-CA-4 整合性:
   - **すべての書き込み** (元データの JSON を含む) は一時ファイルに書き、fsync してからアトミックに rename する。一時ファイルの名前はプロセスごと・書き込みごとに一意にする (PID だけ、固定の `.tmp` だけでは衝突した先例がある)
-  - アーカイブの展開 (`.crate` など) は最後に完了印のファイルを書く。印が無ければ未完了として作り直す
+  - アーカイブの展開 (`.crate` など) は最後に完了印のファイルを書く。完了印の前に、展開した中身を fsync する (v0.18)。印が無ければ未完了として作り直す
+  - 取得した本体は、検証 (少なくとも format_version の先読み。R-FV-3) してからキャッシュに書く (v0.18)
   - 書きかけの一時ファイルと、中断したビルドの作業用ディレクトリは後始末する。他のプロセスが使っているものは消さない。判定の方式 (持ち主のプロセスの生死か、古さか) と時期は M1 で決める (v0.16)
   - 同じキーへの同時書き込みとビルドは、**プロセスをまたぐファイルロック**で排他する (M2 から。M1 のキャッシュは原子的な rename だけで、複数のプロセスが同じキーを重ねて取得するのは許す。結果は同じで壊れないため。v0.16)。取得とビルドは、ロックを取ってからキャッシュを確かめ直し、既にあればそれを使う (待っていた側が、相手の終えた取得やビルドを繰り返さないように。v0.15)
   - **版の違うサーバーの同居** (v0.15): プラグインの更新の後は、古いセッションのサーバーと新しいサーバーが同じキャッシュと state を同時に使う。サーバーが書く記録は形式の版を持ち、版の違う記録は壊れたとみなさず、無いものとして扱う (互いに取り直しを繰り返さないため)。ロックの名前には形式の版を入れない (版の違うサーバーどうしでも排他するため)。版をどこに入れるか、対象の記録の一覧、古い版の記録の片付けは Q-29 で決める (v0.16)
@@ -878,6 +896,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 - R-NW-2: docs.rs、crates.io の API と sparse index、static.crates.io、static.rust-lang.org、GitHub API、OSV へのリクエスト (User-Agent は R-NW-1 と同じ。crates.io の API の間隔は R-NW-1。crates.io を足したのは v0.16):
   - 接続と本体の受信を分けたタイムアウト。既定は接続 10 秒、本体の受信は無通信の時間で 120 秒 (全体の時間では数えないので、core の約 61MB や windows-rs の約 1GB も、遅い回線で途中で切らない)。設定で変えられる
   - 再試行は一時的エラー (429・5xx・通信エラー) だけ。R-DS-2・R-ERR-3 の一時的エラーもこの範囲を指す。`Retry-After` に従い、指数バックオフで行う
+  - GitHub API の rate limit は、403 と `x-ratelimit-remaining: 0` で分かる。そのときは `x-ratelimit-reset` まで待つ (v0.18)
   - 同じリクエストの重複抑止
 - R-NW-3: 本体は上限付きのストリームで読む (以下の数値は初期値で、M1 で測って決める。v0.16)。メモリ上で展開する場合の上限は 512MiB とし (core の約 61MB は収まる)、超えるもの (windows-rs は約 1GB) はディスクへ直接展開する。ディスクへの展開にも総サイズの上限 (`limits.extract_max_size`。既定 4GiB) を設け、超えたら打ち切って部分ファイルを消し、理由付きの `docs_unavailable` を返す。エラー時の本体は 16KiB まで
 - R-NW-4: GitHub token は任意とする。ログには出さない。設定 (`github.token`) でだけ受け、環境変数 `GITHUB_TOKEN` は読まない (他のツール向けに置かれた token を勝手に使わないため。v0.15)。token は GitHub API のベース URL (R-CA-8) へ送る。信頼したリポジトリの `.claude/settings.json` の `env` は、その URL (と設定ファイルの場所) も変えられるが、同じリポジトリは hook で token を読めるので、このサーバーでだけ止める守りは設けない (R-SEC-2 の考え方。v0.15)。このことを README に書く
@@ -890,7 +909,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - **外のコードを引き込む操作は、別のツールにする** (v0.14 のレビューで決定): 既定のプロジェクトの外のコードのビルド (R-WS-10 の対象) は、他の経路 (Cargo.toml を書き換えて rust-analyzer に拾わせる) と違って、Edit の許可も差分も要らず、「文書を見る」に見える 1 回の呼び出しで済む。攻撃者は、docs.rs のビルドだけをわざと失敗させて (環境変数 `DOCS_RS` で見分けられる)、ローカルビルドに落とせる。そこでこれらは `build_external_docs` だけが行い、利用者が Claude Code の許可ルールでこのツールにだけ確認を出せるようにする。Claude Code の許可ルールは、MCP のツールを引数では分けられない (括弧付きのルールは読み飛ばされる。文書で確認。2026-10-16)。`_meta["anthropic/requiresUserInteraction"]` は付けない (理由は付録 B)
   - **ツールの引数で指した場所のビルド**: git の場合、取り込んだリポジトリの cargo の設定と toolchain の指定は効かない (仮のプロジェクトの git 依存としてビルドするため。R-WS-2・R-WS-5)。`project` で指した外の workspace では、その workspace の設定が効く。clone は cargo が行うので、非公開のリポジトリは利用者の git の認証で取れる
   - **Claude Code の Bash のサンドボックスは MCP サーバーを覆わない** (Claude Code の文書: 「Claude's file tools, MCP servers, and hooks run outside it」。ローカルの MCP サーバーは利用者の全権限で動く)。サーバーが起動する cargo もサンドボックスの外で動く
-  - **子プロセス (cargo・rustdoc) には、サーバーの環境をそのまま渡す** (v0.14 で denylist をやめた。ただしビルドの制御のために外す・足す・上書きする変数は別: R-WS-2 の target dir、R-WS-6 の問い合わせの抑止、R-WS-7 の `LC_ALL`、R-WS-8 の `RUSTC_BOOTSTRAP`・`RUSTUP_AUTO_INSTALL`、R-WS-1 の `RUSTC`・`RUSTDOC`。秘密を除く目的の denylist は設けない。v0.17): 悪意のある build.rs は親プロセスの環境を読める (Linux の `/proc/<pid>/environ` など) うえ、同じ依存の build.rs を rust-analyzer や利用者の cargo がすべての環境変数付きで動かすので、このサーバーでだけ除いても守りにならない。`*_API_KEY` のような型で除くと、`env!` で鍵を埋め込むアプリの workspace の文書のビルドを壊す
+  - **子プロセス (cargo・rustdoc) には、サーバーの環境をそのまま渡す** (v0.14 で denylist をやめた。ただしビルドの制御のために外す・足す・上書きする変数は別: R-WS-2 の target dir、R-WS-6 の問い合わせの抑止、R-WS-7 の `LC_ALL`・`RUSTUP_AUTO_INSTALL`・`RUSTUP_DIST_SERVER`、R-WS-8 の `RUSTC_BOOTSTRAP`、R-WS-1 の `RUSTC`・`RUSTDOC` と、外す `RUSTUP_TOOLCHAIN` (v0.18)。秘密を除く目的の denylist は設けない。v0.17): 悪意のある build.rs は親プロセスの環境を読める (Linux の `/proc/<pid>/environ` など) うえ、同じ依存の build.rs を rust-analyzer や利用者の cargo がすべての環境変数付きで動かすので、このサーバーでだけ除いても守りにならない。`*_API_KEY` のような型で除くと、`env!` で鍵を埋め込むアプリの workspace の文書のビルドを壊す
   - 任意で、OS のサンドボックス (Linux の bubblewrap / Landlock、macOS の `sandbox-exec`) の中でビルドするモードを検討する (v1 では対象外。Windows には実用的な手段が無い)
   - 依存の crate のドキュメントは既定で docs.rs から取る (docs.rs はネットワーク無し・読み取り専用のサンドボックスでビルドしている)。ただし workspace を rustdoc にかけると、その**依存もすべて check され、依存の build.rs と proc-macro が実行される** (2026-10-14 に確認)。ローカルで実行されるコードは、workspace とその依存すべてに及ぶ (§5.1)
   - **MRTR を使う場合**: 今はどの要求にも `InputRequiredResult` を返さない (確認をすべてやめたため)。将来使う場合は、仕様の MUST と SHOULD (`requestState` の完全性など。`basic/patterns/mrtr`) に従う (v0.16)
@@ -916,12 +935,13 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 - R-SEC-6: サーバーが通信する先は、R-NW-1・R-NW-2 に列挙した取得元 (と R-CA-8 で設定したミラーとプロキシ) に限る。子プロセスの cargo の通信のうち、利用者のプロジェクトが設定したレジストリや git の依存は対象外で、cargo の設定に従う。rustup の自動導入の通信も子プロセスのもので、R-WS-7 のとおり扱う。引数 `git` の取得も子の cargo が行い、ホストは限らない (秘密を URL に入れて持ち出す経路になりうるが、同じことは Cargo.toml に git の依存を書けば rust-analyzer でもできる。R-SEC-2)。テレメトリや利用統計は機能として持たず、ツールの引数と応答の中身を第三者のサービス (LLM の API を含む) に送らない
 - R-SEC-7 (`server/tools` の Security の MUST):
   - **出力のサニタイズ**: 第三者の文字列 (README・doc・changelog・ソース・crates.io の説明・OSV の advisory・リリースノート・manifest の文字列) とビルドの診断から、制御文字 (改行とタブを除く)、ANSI エスケープ、Unicode の双方向の制御文字 (U+202A〜U+202E・U+2066〜U+2069) と双方向の印 (U+200E・U+200F・U+061C)、ゼロ幅の文字 (U+200B〜U+200D・U+2060)、異体字セレクタ (U+FE00〜U+FE0F・U+E0100〜U+E01EF)、タグ文字 (U+E0000〜U+E007F。人には見えずモデルにだけ読める指示に使われる) を除いて返す (仕様は「Sanitize tool outputs」とだけ定め、何を除くかは決めていないので、ここで決める)。サニタイズは出力の直前の 1 か所で、すべての文字列 (属性の文字列、const の値、`doc(alias)`、ファイル名、`did_you_mean`・hints・エラーの本文に埋め込む値を含む) に一律に適用する
+    - ソースの本文 (`get_source`・examples) では、双方向の制御文字やゼロ幅の文字などを除かずに `<U+202E>` のような見える印に置き換え、warnings で知らせる (Trojan Source を隠さないため)。文書 (doc コメントなど) では、これまでどおり除く (v0.18)
   - **呼び出しのレート制限** (`completion` の Security の MUST も兼ねる): 同時に処理するツール呼び出しの数、ローカルビルドの数、`completion/complete` の頻度に、設定できる上限を設ける (初期値は呼び出し 16、ローカルビルド 2、補完の頻度は R-MCP-19。どれもプロセスごとに数える。複数のセッションが同時にビルドすると CPU を奪い合って遅くなるが、結果は正しく、同じ target dir のビルドは cargo のロックで 1 つずつになるので受け入れる。v0.16)。ツール呼び出しが上限を超えたら、ビルドを待っている場合は `status: building`、それ以外は `busy` (`retryable: true`) を返す
 
 ### 9.6 可観測性
 
 - R-OBS-1: ツール呼び出しごとに、構造化ログ (JSON Lines) をファイルに出す。記録する項目は、`request_id` (R-ERR-2)、ツール名、引数 (パス以外は要約)、遅延、応答のバイト数と推定トークン数、エラーコード、キャッシュの当否、取得元。OTLP だけに頼らない (syphar は呼び出しごとのファイルログをやめて OTLP だけにした結果、手元で分析できなくなっている)
-  - 推定トークン数は文字数からの換算で出す。換算係数の校正の手順は M5 の eval (R-QA-6) で決める (v0.16)。**実行時には count_tokens などの外部の API を呼ばない** (応答の中身を外部に送ることになる)
+  - 推定トークン数は文字数からの換算で出す。換算係数の校正の手順は M5 の eval (R-QA-6) で決める (v0.16)。換算係数はモデルの世代で変わるので、eval のたびに校正し直す (v0.18)。**実行時には count_tokens などの外部の API を呼ばない** (応答の中身を外部に送ることになる)
 - R-OBS-2: ログの出力先とローテーション (ファイル名と数値は初期値で、実装時に決める。v0.16)
   - 既定の場所は state のディレクトリ (R-DIST-3) の `logs/`: Linux / macOS は `$XDG_STATE_HOME/chatora-rustdoc-mcp/logs/` (未設定なら `~/.local/state`)、Windows は `%LOCALAPPDATA%\chatora-rustdoc-mcp\state\logs\` (キャッシュの下に置くと `cache clear` で消える)。設定と環境変数で場所を変えられる
   - プロセスごとに 1 ファイル (`<日付>-<PID>.jsonl` など) に書く。複数のセッションのサーバーが同時に動いても、行が混ざらず、書き込みの排他も要らない。1 ファイルの上限を超えたら次のファイルに切り替える (初期値 20MB)
@@ -945,11 +965,11 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - `Attribute::Other` の中の cfg の表記の変化 (同じ形式の中でも変わる)
   - std のスナップショットの変化
   - beta (次の stable) の toolchain に crate 名を指定した `RUSTC_BOOTSTRAP` (ローカルビルドの既定。R-WS-8) を付けて、合成の workspace をローカルビルドし、形式と受け付けの変化を検知する (v0.17)
-  - あわせて **live の docs.rs に対する smoke test** を回し、docs.rs が新しい形式で配り始めたことや、URL の挙動 (R-DS-6) の変化を検知する
+  - あわせて **live の docs.rs に対する smoke test** を回し、docs.rs が新しい形式で配り始めたことや、URL の挙動 (R-DS-6) の変化、配られる target (R-TG-1) の変化を検知する (target は v0.18 で足した)
   - 失敗したら Issue を自動で開き、直ったら自動で閉じる (ferritin の nightly ジョブに倣う)。**失敗を放置しない** (46ki75 は live の CI が 5 週続けて失敗したまま放置され、その間に現行の形式が読めなくなっている)
 - R-QA-5 説明文とスキーマの検査 (CI):
   - 説明文と instructions の長さ (2,048 文字以内。§6.2)、戻り値の説明と代わりのツールを示す節の有無
-  - 説明文・instructions・prompt・同梱の skill に出てくるツール名が、すべて実在すること (§6.2。`tools.profile` の構成ごとに確かめる)
+  - 説明文・instructions・prompt・同梱の skill に出てくるツール名が、すべて実在すること (§6.2。R-MCP-12 を入れたら `tools.profile` の構成ごとに確かめる)
   - すべての JSON Schema が標準どおりであること (R-MCP-10)。ルートに combinator が無いこと、null 許容の型が無いこと
   - ツールのフル名 (プラグインの接頭辞込み) が 128 文字以内、プロパティ名が R-MCP-7 の文法に合うこと
   - **宣言した引数が実装で使われていること**。引数ごとに、値を変えると結果が変わるテストを持つ (rustdoc-mcp の `list_crates` は `workspace_member` を宣言しただけで使っていない)
@@ -962,16 +982,19 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - §8 のエラーコードごとに、MCP の応答で `isError: true` が付き、`content[0].text` が自己完結した JSON であることを結合テストで確かめる (ferritin は `isError` を計算して捨てている)
   - MCP の適合性テスト (公式のテストスイートか MCP Inspector の CLI) を、対応するすべての版 (v1 では 2026-07-28 だけ) で CI に載せる。`initialize` に対応する版を名指ししたエラーを返すことも確かめる
 - R-QA-6 **eval**: §3 の問いを元に問題集を作り、Claude Code (headless) で回す
+  - 進め方 (v0.18): M1 から小さく始める。§3 の問いのうち M1 のツールで答えるものを少数の問題集にして回し、ツールの分け方と応答の形を早めに確かめる。各マイルストーンで問題を足し、M5 で比較と校正を仕上げる
+  - Claude Code の挙動の検知 (v0.18): headless の `stream-json` で、モデルに渡った `tool_result` の形 (text か `structuredContent` か、エラーの text) を確かめるケースを M1 から置き (R-OUT-1・R-ERR-2)、Claude Code の版を上げたときに回す
   - 測るもの: 期待どおりのツールを選んだか、呼び出し回数、応答の総トークン数、答えが正しいか
   - トークンは 3 つに分けて測る: ① セッション開始時の固定費 (tool search が有効ならツール名と instructions、無効なら全ツールの定義)、② ツールの結果ごとの p50 / p95、③ タスク全体の総トークン数と呼び出し回数。換算には R-OBS-1 の校正値を使う
   - 必ず含めるケース: メソッドのパス (`Vec::iter`、`str::len`)、umbrella crate、feature で隠れた item、「X は Send か」、ビルド中の応答
-  - 比較する設定: `output.mode` (structured / text / toon)、`tools.profile` (full / core)、`detail` の既定値、`alwaysLoad` の有無、`max_chars` の有無
+  - 比較する設定: `output.mode` (structured / text / toon)、`detail` の既定値、`alwaysLoad` の有無、`max_chars` の有無 (`tools.profile` は R-MCP-12 を入れたとき。v0.18)
   - 基盤には Claude Code の `claude plugin eval` を使う。プラグインあり・なしの比較 (Δ) が取れ、`--json` で CI に載せられる
 
 ### 9.8 配布と設定
 
 - R-DIST-1: Linux / macOS / Windows を同等に扱う。配布の仕組みは ferritin に倣う
   - crates.io (`cargo install --locked chatora-rustdoc-mcp`) と、GitHub Releases のビルド済みバイナリで配る。README に正規の入手先を明記する (名前の似たプロジェクトや無断コピーが多い。survey §3)
+  - crates.io への最初の公開は M1 で、使える版ができたら公開して名前を取る (中身の無い版は出さない)。公開するまでは、README の Installation に、まだ公開していないので同じ名前の crate を入れないよう書く (v0.18)
   - 配る target (musl 版を含めるか。Q-27)、ビルド済みバイナリの作り方 (dist・`cargo binstall`・インストーラー)、リリースの流れ (release-plz など)、公式 MCP レジストリへの登録、依存の更新の bot、リリース前後の CI の検査、成果物の sha256 と attestation は M5 で決める (v0.16)
   - CI は 3 つの OS で、ビルド・テスト・clippy・rustdoc (`RUSTDOCFLAGS="-D warnings"`) を回す。OS 依存のコード (`std::os::unix` など) は lint では見つからない。toolchain は浮動の stable で、lint の多くを deny にしているので、6 週ごとの新しい stable で lint が増えるとコードを変えなくても CI が落ちうる。そのときはその都度直す (版を固定しない。v0.13 で決定)
   - crate は 1 つにし、MCP サーバーと CLI (`cache`) を同じバイナリに入れる (R-DIST-2)。パッケージ・lib の crate・バイナリ・MCP の serverInfo・設定とキャッシュと state のディレクトリ・環境変数の接頭辞 (`CHATORA_RUSTDOC_MCP_`)・README で勧める MCP サーバーの登録名は、すべて `chatora-rustdoc-mcp` にそろえる (v0.17)。ferritin が workspace で crate を分けているのは、CLI/TUI と MCP サーバーが別のバイナリだから。分けると、バイナリが依存する crate もすべて crates.io に公開する必要がある
@@ -992,7 +1015,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - 環境変数 `CHATORA_RUSTDOC_MCP_CONFIG` で利用者の設定ファイルの場所を変えられ、個々の設定値も環境変数で上書きできる。環境変数の名前は `CHATORA_RUSTDOC_MCP_` に、キーを大文字のスネークケースにしたものをつなぐ (表の入れ子は `__` でつなぐ。例: `network.offline` は `CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE`)。環境変数で受けられる値の制約は実装時に決める (v0.16)
   - **設定は、利用者の設定ファイルと環境変数だけ** (v0.14 で、プロジェクト単位の設定ファイル `.config/chatora-rustdoc.toml`・`.local.toml` をやめた。Q-24): 書く項目のほとんどはマシンや利用者の都合で決まるもので、プロジェクトに固有のもの (ローカルビルドの feature の組と rustdoc の `--cfg`) は Cargo.toml の `[package.metadata.docs.rs]` (R-FT-3・R-WS-1) に、nightly の指定は `rust-toolchain.toml` に、もともと書く場所がある。clone した第三者のリポジトリが、このサーバー独自の設定ファイルで取得元や上限を変える経路も無くなる (cargo の設定・`rust-toolchain.toml`・`[package.metadata.docs.rs]` と、Claude Code で信頼したリポジトリの `.claude/settings.json` の `env` は効く。R-SEC-2)。同じキーは環境変数が勝つ。設定ファイルは TOML。知らない `CHATORA_RUSTDOC_MCP_*` の環境変数 (`CHATORA_RUSTDOC_MCP_CONFIG` は数えない) と設定ファイルの知らないキーは、起動を止めず、応答には出さずにログで知らせる (綴りの誤りで設定が黙って効かないのを防ぐ。応答に出すと R-ARCH-5 の「同じ入力なら同じ出力」が崩れる。v0.15)。SessionStart の hook でも知らせるかは M5 で決める (R-DIST-5。v0.16)
     - **読む時期**: MCP サーバーは起動時に読み、動いている間の書き換えは再起動まで効かない。CLI は呼び出しごとに読む
-  - **設定項目の一覧** (暫定。最初の公開リリース (M5) で凍結し、以後は README で案内するので変えない。実装してみて要らないキーや名前の変更は、それまで自由に行う。v0.16)。容量は単位付きの文字列 (`"5GB"` など)、時間は単位をキー名に入れた整数 (`_secs` など) で書く (単位の一覧などは実装時に決める。v0.16)。1h の TTL (R-CA-3、R-STD-6) と sparse index の 10 分の TTL (R-CA-3) は固定値で、設定項目にしない
+  - **設定項目の一覧** (暫定。M5 のリリースで凍結し、以後は README で案内するので変えない。crates.io への最初の公開は M1 だが、凍結は M5 のまま。v0.18。実装してみて要らないキーや名前の変更は、それまで自由に行う。v0.16)。容量は単位付きの文字列 (`"5GB"` など)、時間は単位をキー名に入れた整数 (`_secs` など) で書く (単位の一覧などは実装時に決める。v0.16)。1h の TTL (R-STD-6)、sparse index の 10 分の TTL (R-CA-3)、OSV と `RELEASES.md` の 24 時間の TTL (R-AU-3、R-RR-1) は固定値で、設定項目にしない
 
     | 項目 | キー | 既定 | 要件 |
     | --- | --- | --- | --- |
@@ -1007,12 +1030,14 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
     | `--cfg docsrs` を渡すか | `build.cfg_docsrs` | `true` (壊れたら渡さずにやり直す。Q-11) | R-WS-1 |
     | nightly の日付の固定 | `build.nightly_date` | なし (固定しない) | R-WS-8 |
     | 1 回のビルドの最大時間 | `build.timeout_secs` | 1800 | R-WS-6 |
+    | ビルド (とロック待ち) を待つ上限 (`limits.request_timeout_secs` より短くする) | `build.wait_secs` | 10 (初期値。M2 で測って決める) | R-WS-6 (v0.18) |
+    | ローカルビルドの cargo の並列度 (`-j`) | `build.jobs` | コア数の半分 (初期値。M2 で測って決める) | R-WS-1 (v0.18) |
     | `build_failed` に付ける診断の件数 | `build.max_diagnostics` | 2 (1 件 3,500 文字、合計 8,000 文字以内) | R-WS-7 |
     | キャッシュの場所 | `cache.dir` | OS ごとの既定 (R-CA-1) | R-CA-1 |
     | GC の上限 (文書のキャッシュ / 専用 target dir / target dir の保持日数) | `cache.docs_max_size` / `cache.target_max_size` / `cache.target_max_age_days` | `"5GB"` / `"20GB"` / 30 | R-CA-5 |
     | 起動時の一括取得 / Cargo.lock の変化での裏の取得 | `prefetch.on_startup` / `prefetch.on_lockfile_change` | `false` / `false` | R-CA-6 (任意) |
     | dist から std の JSON を取るか / stable の分岐日に近い nightly を選ぶか | `std.fetch_from_dist` / `std.match_stable_branch_date` | `true` / `false` (後者は任意で M4 で検討。R-CA-8 を実装して `sources.static_rust_lang.enabled = false` にしたら、`std.fetch_from_dist` によらず取らない) | R-STD-6 |
-    | ツールの構成 (`full` / `core`) | `tools.profile` | `"full"` | R-MCP-12 (M5 で検討) |
+    | ツールの構成 (`full` / `core`) | `tools.profile` | `"full"` | R-MCP-12 (将来。v0.18) |
     | 出力の形式 (`structured` / `text` / `toon`) | `output.mode` | `"structured"` | R-OUT-1 (text・toon は M5) |
     | 応答の上限 | `output.max_chars` | 32000 (推定 8,000 トークン) | R-OUT-3 |
     | `detail` の既定 | `output.detail` | `"normal"` | R-OUT-7 |
@@ -1021,7 +1046,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
     | メモリの上限 | `limits.memory` | `"1GB"` | R-MEM-1 |
     | 同時に処理する呼び出し・ローカルビルドの数 / 補完の頻度の上限 (1 秒あたり) | `limits.concurrent_calls` / `limits.concurrent_builds` / `limits.completions_per_sec` | 16 / 2 / 20 (初期値) | R-SEC-7・R-MCP-19 |
     | ディスクへの展開の上限 | `limits.extract_max_size` | `"4GiB"` | R-NW-3・R-SC-2 |
-    | 1 リクエストあたりの時間の上限 | `limits.request_timeout_secs` | 30 | R-ARCH-6 |
+    | 1 リクエストあたりの時間の上限 (ビルドを待つ間は、より短い `build.wait_secs` が先に効く) | `limits.request_timeout_secs` | 30 | R-ARCH-6 |
     | ログの場所 / 1 ファイルの上限 / 保持期間 / 合計の上限 | `log.dir` / `log.file_max_size` / `log.retention_days` / `log.total_max_size` | `~/.local/state/chatora-rustdoc-mcp/logs/` など / `"20MB"` / 14 / `"50MB"` | R-OBS-2 |
     | stderr のログの絞り込み (tracing の `EnvFilter` の書き方。R-OBS-1 の呼び出しごとの記録は絞らない。誤った指定が 1 つでもあれば全体を既定に戻し、そのことをログに出す) | `log.filter` | `"info"` | R-SEC-1 (v0.17) |
 
@@ -1032,7 +1057,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - プラグインの名前とサーバーの名前は、どちらも `chatora-rustdoc-mcp` にする (v0.17。許可のルールの名前は R-SEC-2)
   - `plugin.json` の `mcpServers` でサーバーを起動する (`command: chatora-rustdoc-mcp serve`)
   - skill を 1 つ同梱する: いつ使うかの対応表 (MCP のツールを使う。CLI は案内しない)、LSP との境界、`rustc --explain` / `cargo clippy --explain` の案内。Rust の文脈 (`.rs` と `Cargo.toml`) に限定する (書き方は M5。v0.16)。バージョンの取得元を正確に書く (ferritin の skill は「プロジェクトで解決された版」と書きつつ既定は docs.rs の latest という食い違いがある)
-  - SessionStart hook では、前提が欠けていれば 1 行で知らせ、揃っていれば何も出さない。何を確かめるか (案: バイナリ、std の取得手段 (手元の `rust-docs-json` か R-STD-6 の dist)、プラグインと手動設定の重複登録、知らない設定、実行ファイルのパスの組み合わせ (R-WS-1)) と確かめ方 (バイナリに確かめるためのサブコマンドを足すかなど) は M5 で決める (v0.16)
+  - SessionStart hook では、前提が欠けていれば 1 行で知らせ、揃っていれば何も出さない。何を確かめるか (案: バイナリ、std の取得手段 (手元の `rust-docs-json` か R-STD-6 の dist)、プラグインと手動設定の重複登録、知らない設定、実行ファイルのパスの組み合わせ (R-WS-1。v0.17)) と確かめ方 (バイナリに確かめるためのサブコマンドを足すかなど) は M5 で決める (v0.16)
   - 任意で、依存の監査などのコマンドを同梱する
   - プラグインと手動設定の両方で登録するとツールが重複することを README に書く
   - 利用者ごとの設定はプラグインの `userConfig` で受け取る (項目は M5 で決める。v0.16)。token は `sensitive` を指定する
@@ -1075,7 +1100,7 @@ v1 では公開ホスティングをしない (§2 の非ゴール)。ただし�
   - これを守ると、ホスト版で ETag による HTTP キャッシュを導入できる。ferritin は、応答の本体を作る前に識別子から ETag を決める方式で、読み込みなしに約 1.5ms で 304 を返している
 - R-ARCH-6 資源の上限を、どの構成でも設定できるようにしておく
   - 対象: メモリ (R-MEM-1)、1 リクエストあたりの時間、応答サイズ (R-OUT-3)
-  - 1 リクエストあたりの時間の上限は既定 30 秒 (R-WS-6 のビルドもこの上限で待つのをやめる。HTTP の最初の応答バイトまでの時間制限にも収まる)。超える処理 (索引の作成、依存グラフ全体の取得など) は裏で続け、`status: building` (複数の crate にまたがる応答で結果が 1 件でもあれば `partial: true`。R-OUT-9) と `retry_after_secs` を返す (v0.15)
+  - 1 リクエストあたりの時間の上限は既定 30 秒 (HTTP の最初の応答バイトまでの時間制限にも収まる)。ローカルビルドとそのロック待ちは、これより短い R-WS-6 の上限 (`build.wait_secs`、既定 10 秒) で待つのをやめる (v0.18)。超える処理 (索引の作成、依存グラフ全体の取得など) は裏で続け、`retry_after_secs` を付けて返す (v0.15)。形は R-OUT-9 に従う: データが無ければ `status: building`、古いデータがあれば `stale_reason: rebuilding`、複数の crate にまたがる応答で結果が 1 件でもあれば `partial: true` (v0.17)
   - ホスト版では、これらが利用者をまたいだ資源の分配に使われる
 - R-ARCH-7 (先送り。v0.16) ディスクキャッシュの読み書きの trait 化は、共有キャッシュサーバーを作ると決めたときに行う。それまでは、キャッシュの読み書きを 1 か所 (データ層) にまとめておく。共有するのは正規化済みの元データとし、アーカイブは各自で作る (rkyv のアーカイブはアーキテクチャをまたいで使えないため)
 - R-ARCH-8 CI で `--no-default-features` の構成もビルドとテストを回し、リモート専用の経路がローカル機能に依存していないことを保証する
@@ -1095,7 +1120,7 @@ v1 では公開ホスティングをしない (§2 の非ゴール)。ただし�
 
 | 論点 | 候補 | 現時点の推し |
 | --- | --- | --- |
-| MCP SDK | [rmcp](https://crates.io/crates/rmcp) 3.5.1 / tower-mcp 0.24.0 (`protocol-2026-07-28` feature。v0.16 の時点は 0.23.2) / rust-mcp-sdk 2.0.0 / pmcp 2.22.7 / [mcplease](https://crates.io/crates/mcplease) 0.4.2 (版は M0 で比べたもの。v0.17) | **rmcp ≥ 3.5.1**。3.0.0 (2026-07-28 リリース) から 2026-07-28 版 (stateless、`server/discover`、SEP-2243 のヘッダ、緩和された `structuredContent`) に対応している。2026-07-28 の機能は v0.10 で確認した (discover・MRTR・`RequestStateCodec`・elicitation・キャッシュのヒント・tasks 拡張・subscriptions・prompts・completions・resource templates・`title`・icons はあり、Skills 拡張は無し)。v1 は MRTR も elicitation も使わないので、cargo feature の `request-state` と `elicitation` は要らない (将来 MRTR を使うなら `request-state`。R-SEC-2)。mcplease は stdio が同期的で 1 リクエストずつしか処理せず、進捗通知もキャンセルも無いので R-WS-6 と両立しない。rmcp の `CallToolResult::structured` は text にも同じ JSON を入れるので、R-OUT-1 と合う。引数の解析エラーが自動で -32602 になる点は R-ARG-1 のとおり自前の検証に替える。M0 で、同じ JSON-RPC を流して tower-mcp・rust-mcp-sdk・pmcp と比べ、rmcp を続けると決めた (tower-mcp は panic の扱いと引数の扱いが良いが、`server/discover` のキャッシュの指定と `initialize` の拒否の文言を変えられず (R-MCP-5・R-MCP-2)、7 か月で破壊的な minor が 16 回ある。rust-mcp-sdk はキャンセルした要求にも応答を送る (R-WS-6 の MUST NOT)。pmcp は stdio で 2026-07-28 を話さない。比較の表は m0-plan.md の §6.1。受け入れる rmcp の挙動は R-MCP-2。v0.17) |
+| MCP SDK | [rmcp](https://crates.io/crates/rmcp) 3.5.1 / tower-mcp 0.24.0 (`protocol-2026-07-28` feature。v0.16 の時点は 0.23.2) / rust-mcp-sdk 2.0.0 / pmcp 2.22.7 (この 4 つの版は M0 で比べたもの。v0.17) / [mcplease](https://crates.io/crates/mcplease) 0.4.2 | **rmcp ≥ 3.5.1**。3.0.0 (2026-07-28 リリース) から 2026-07-28 版 (stateless、`server/discover`、SEP-2243 のヘッダ、緩和された `structuredContent`) に対応している。2026-07-28 の機能は v0.10 で確認した (discover・MRTR・`RequestStateCodec`・elicitation・キャッシュのヒント・tasks 拡張・subscriptions・prompts・completions・resource templates・`title`・icons はあり、Skills 拡張は無し)。v1 は MRTR も elicitation も使わないので、cargo feature の `request-state` と `elicitation` は要らない (将来 MRTR を使うなら `request-state`。R-SEC-2)。mcplease は stdio が同期的で 1 リクエストずつしか処理せず、進捗通知もキャンセルも無いので R-WS-6 と両立しない。rmcp の `CallToolResult::structured` は text にも同じ JSON を入れるので、R-OUT-1 と合う。引数の解析エラーが自動で -32602 になる点は R-ARG-1 のとおり自前の検証に替える。M0 で、同じ JSON-RPC を流して tower-mcp・rust-mcp-sdk・pmcp と比べ、rmcp を続けると決めた (tower-mcp は panic の扱いと引数の扱いが良いが、`server/discover` のキャッシュの指定と `initialize` の拒否の文言を変えられず (R-MCP-5・R-MCP-2)、7 か月で破壊的な minor が 16 回ある。rust-mcp-sdk はキャンセルした要求にも応答を送る (R-WS-6 の MUST NOT)。pmcp は stdio で 2026-07-28 を話さない。比較の表は m0-plan.md の §6.1。受け入れる rmcp の挙動は R-MCP-2。v0.17) |
 | データ層 | 自作 / [ferritin-common](https://crates.io/crates/ferritin-common) 0.18.0 (MIT OR Apache-2.0) を依存として使う / [rustdoc_processor・rustdoc_resolver](https://github.com/LukeMathWalker/officina) 0.1.2 (Apache-2.0 のみなので、依存にはできるがコードは流用しない。R-DIST-4。Pavex から分離。cargo rustdoc → SQLite キャッシュ → 公開 import path と crate 外の re-export の索引) | **自作**。rustdoc_processor は R-PR-2 の公開パス索引と同じ問題を実運用で解いているので、索引の設計とテストケースの比較対象にする。M0 で評価し、依存にしないと決めた (rustdoc-types を 0.57 に固定していて形式 57 しか読めない、guppy・SQLite (bundled)・rayon・rkyv などで依存が重い、API が cargo rustdoc の起動を前提にしている)。同じ docs.rs の JSON で 11 crate の公開パスを突き合わせると、違いは rustdoc_processor の側 (マクロを索引に入れない、`use` で再エクスポートしたモジュール自身のパスを記録しない) と正準パスの規則の違い (改名) だけで、両方に共通する誤り (`pub use … as _`) が 1 つ見つかった (m0-plan.md の §6.1 の A10。突き合わせは poc/m0a-a10 でやり直せる。v0.17)。形式の正規化・rkyv の sidecar・逆引き索引・検索の調整値は ferritin の設計を踏襲するが、ferritin には要件と食い違う既知の欠陥が多い (付録 A の ferritin の行) |
 | JSON の形式 | `rustdoc-types` の最新 + 独自 shim | §5.2 のとおり。形式ごとの差分は [migrate_rustdoc_json](https://github.com/BD103/migrate_rustdoc_json) の移行コードと rustdoc-types の CHANGELOG で洗い出す |
 | JSON パーサー | serde_json (`unbounded_depth`、`preserve_order`) + serde_stacker | sonic-rs は 255 段の上限があり使えない。`preserve_order` は応答のキーの順のため (R-OUT-1・R-ARCH-5。v0.17) |
@@ -1125,14 +1150,14 @@ v1 では公開ホスティングをしない (§2 の非ゴール)。ただし�
 | Q-8 | `detail` の各段階 | 案が決まった (R-OUT-7)。数値は eval で調整 |
 | Q-9 | blanket impl の展開 | 案が決まった (R-SH-4)。eval で調整 |
 | Q-10 | 依存の `cargo rustdoc -p` に `--features` を渡せるか | 渡せない (workspace 外のパッケージへの指定は cargo が拒否する)。渡さなくても統合された feature が効く (R-FT-3)。v0.5 で解決 |
-| Q-11 | ローカルビルドで `--cfg docsrs` を渡すかの既定値 | 既定で渡し (docs.rs と同じ)、壊れたら渡さずにやり直す (R-WS-1)。v0.13 で決定。壊れた crate を記録して次から渡さないかは M2 で決める (v0.16)。M0 で測ったやり直しの頻度は、このリポジトリの依存 136 個中 1 個 (rustls-platform-verifier。`--cfg docsrs` を前提にした crate 自身の `docsrs` feature が、プロジェクトの組で有効でなかった)。stable と nightly で同じ (v0.17) |
-| Q-12 | stable + crate 名を指定した `RUSTC_BOOTSTRAP` を、ローカルビルドの既定にしてよいか | 既定にする。値は専用 target dir ごとに、依存の解決結果のすべての lib・proc-macro の crate 名に固定する (値を変えると proc-macro2 から 54〜65 unit が作り直される。固定すれば作り直しは文書化する crate だけ)。値を R-WS-4 の鍵に入れる。M0 で決定 (R-WS-8。v0.17) |
+| Q-11 | ローカルビルドで `--cfg docsrs` を渡すかの既定値 | 既定で渡し (docs.rs と同じ)、壊れたら渡さずにやり直す (R-WS-1)。v0.13 で決定。壊れた crate を記録して次から渡さないかは M2 で決める (v0.16)。M0 で測ったやり直しの頻度は、このリポジトリの依存のうち文書化できた 136 個中 1 個 (rustls-platform-verifier。`--cfg docsrs` を前提にした crate 自身の `docsrs` feature が、プロジェクトの組で有効でなかった)。stable と nightly で同じ (v0.17)。ただしこれは新しい版だけの標本で、削除された `doc_auto_cfg` を使う版 (`#![cfg_attr(docsrs, feature(doc_auto_cfg))]`) が手元の registry に 82/1,588 あり、`--cfg docsrs` を渡すと E0557 で壊れる (2026-10-19 に確認。v0.18) |
+| Q-12 | stable + crate 名を指定した `RUSTC_BOOTSTRAP` を、ローカルビルドの既定にしてよいか | 既定にする。値は専用 target dir ごとに、依存の解決結果のすべての lib (cdylib・staticlib・dylib だけの lib を含む。v0.18)・proc-macro の crate 名と member の bin の crate 名に固定する (値を変えると proc-macro2 から 54〜65 unit が作り直される。固定すれば作り直しは文書化する crate だけ)。値を R-WS-4 の鍵に入れる。M0 で決定 (R-WS-8。v0.17) |
 | Q-13 | crate ごとに `default-target` を上書きしている場合に、docs.rs が使った triple を JSON の `target.triple` だけで判別できるか | できる。`default-target` を上書きした windows-registry 0.100.0 と、`targets` を並べた winreg 0.56.0 で、`target.triple` が実際にビルドした triple だった。ビルドしていない target を名指しすると 404 で、別の target に差し替えられない (2026-10-16 に確認。R-TG-1・R-TG-2) |
 | Q-16 | OSV のミラーの容量と更新の手間 | 小さい。`crates.io/all.zip` は 3.6MB で毎日更新される (2026-10-15 に HEAD で確認)。1 日 1 回、条件付きのリクエストで取り直す (R-AU-3)。v0.13 で解決 |
 | Q-17 | `cargo doc --output-format json` と `cargo rustdoc` の違い | `cargo rustdoc` を使う。`cargo doc` は 2 回目が速く依存をまとめて作れるが、nightly の cargo かプロセス全体への `RUSTC_BOOTSTRAP=1` が要り、同名で版の違う依存は片方しか文書化されない。nightly で依存をまとめて文書化する用途の候補として M2 に残す。M0 で決定 (R-WS-1。v0.17) |
 | Q-18 | rustdoc JSON の型ごとの `impls` が、条件付きの blanket impl を絞り込んでいるか | 絞り込んでいる。Display の無い型には `ToString` が、Clone の無い型には `ToOwned` と `CloneToUninit` が載らない (2026-10-15 に stable 1.99、形式 61 で確認)。R-SH-4 は JSON の `impls` をそのまま使えばよい。ジェネリックな型での扱いは M1 のテストデータで確かめる。v0.13 で解決 |
 | Q-19 | モデル向けの文字列の言語 | 英語に統一する (説明文・instructions・warnings・hints・エラーのメッセージ・prompt。CLI の人向けの出力とログも英語)。v0.13 で決定 |
-| Q-20 | target ごとの依存・build-dependency・dev-dependency で feature が分かれる crate を、どの組でビルドするか (R-FT-3) | `cargo tree --workspace --target <t> -e normal` の組 (`cargo rustdoc --lib` が使う組と、resolver 1 でも 2 でも一致した)。M0 で決定 (R-FT-3。v0.17) |
+| Q-20 | target ごとの依存・build-dependency・dev-dependency で feature が分かれる crate を、どの組でビルドするか (R-FT-3) | v0.18 で改めた: 文書の組は、ビルドしたときの cargo の `compiler-artifact` の `features` を正として記録し、事前に予測しない。`enabled_in_project` は、全 member を統合した `cargo tree --workspace --target <t> -e normal` の組で判定する (R-FT-3)。M0 の決定 (`cargo tree --workspace` の組が `cargo rustdoc --lib` の組と、resolver 1 でも 2 でも一致する。v0.17) は、member が 1 つの workspace でしか成り立たなかった (2026-10-19 に確認。複数 member などでの確認は Q-31) |
 | Q-21 | 新しく足された依存の初回のローカルビルドに確認を求めるか | v0.8 で求めると決めたが、v0.14 で確認をすべてやめた (同じことを rust-analyzer やエージェントの Bash でもできるため。R-SEC-2) |
 | Q-24 | 設定ファイルのプロジェクト単位の上書きを許すか | v0.13 で許すと決めたが、v0.14 でやめた。プロジェクトに固有のものは Cargo.toml の `[package.metadata.docs.rs]` と `rust-toolchain.toml` で足りる (R-DIST-3) |
 | Q-26 | CLI のスクリプト向けの出力形式と出力の上限 | v0.14 で照会の CLI をやめたので、決める必要が無くなった (R-DIST-2) |
@@ -1149,8 +1174,9 @@ v1 では公開ホスティングをしない (§2 の非ゴール)。ただし�
 | Q-23 | mmap 前の検証 (R-CA-4 の bytecheck やチェックサム) を数百 MB のアーカイブにかけても、読み込みの目標 (§9.1 の < 50ms) に収まるか。ferritin の約 7ms は検証を省いた値 | ベンチマーク |
 | Q-25 | cargo#16720 (`cargo doc --output-format=markdown`) が実装されたら、取得元に加えるか、本サーバーの役割を見直すか | 上流の動きを見て判断する |
 | Q-27 | メモリアロケータ (mimalloc など) を替えるか。musl 版 (R-DIST-1) の性能が §9.1 の目標から大きく遅れる場合と、gnu 版でも parse と解放が速くなる場合 (M0 の A8 で、`get_item` の時間はほぼ parse と解放だった) | M1 で gnu 版を測り、musl 版は M5 で測って決める (v0.17) |
-| Q-31 | ローカルビルドの細部で、M0 で決めきれず M2 に回したもの (v0.17): `--target` を付けない形 (R-WS-1) での M0 の B1・B3・B5 の再確認と、同じ package が host 用と target 用の両方に現れるときの feature の組 (R-FT-3)。仮のプロジェクトの toolchain・`RUSTC_BOOTSTRAP` の値・target dir (R-WS-5)。鮮度の鍵を、要求した引数・feature の組と、やり直しで実際に使ったもののどちらで作るか (R-WS-4。`--cfg docsrs` と `[package.metadata.docs.rs]` の組のやり直し)。`RUSTC_BOOTSTRAP` の値の長さの上限 (Windows の環境変数は 32,767 文字。M0 では 238 名で 2,806 文字) と超えたときの扱い、nightly の経路で壊れたときに member の名前だけの値でやり直すか (R-WS-8)。`-Z fine-grain-locking` (R-WS-2) と `cargo doc --output-format json` (R-WS-1) を nightly の経路で使うか。`--cfg docsrs` で壊れた crate を記録するか (Q-11)。ほかに本文が M2 で決めるとしたもの (R-FT-3・R-WS-1・R-WS-7・R-MCP-3 など) も、M2 の計画で本文から拾う | M2 で実装しながら決める |
-| Q-29 | プロセスをまたぐ仕組みの細部 (R-CA-4・R-WS-6・R-WS-10)。原則は要件で決め、細部は動くものを作りながら決める (v0.15。v0.16 で本文の細部をここへ移した。「案」は移す前に本文で決めていたもの)。**ロック**: 置き場所 (案: state の `locks/`。キャッシュだけを共有する構成で排他が効くか、state の rename の規則との関係)、名前の作り方と増え方、複数のロックを取る順 (案: 鍵 → target dir → ビルドの枠)、target dir のロック (案: ビルドは共有ロック、GC と切り替えた古い target dir の削除は排他ロック)、NFS 上の `flock`。**版の違うサーバーの同居**: 版をファイル名かパスのどこに入れるか、対象の記録 (元データの内容ダイジェストの記録、否定キャッシュ、外のツールの記録、ビルドの失敗の記録、R-WS-6 のプロセスの記録など)、元データのダイジェストの記録と版の関係 (記録が無いときの扱い)、古い版の記録の片付け (案: キャッシュの下は GC、state の R-WS-6 の記録は書いた版のサーバーが消し、読めない記録には触らない)。**残った子孫** (R-WS-6): 記録するもの (案: サーバーの PID と起動時刻、子のプロセスグループの ID とその起動時刻を state に記録し、ビルドが終わったら消す)、照合の規則 (案: 記録したサーバーが死んでいて、残ったプロセスが記録したグループに属し、その起動時刻がグループの長の起動時刻以降のときだけ止める)、判定の上限、子を spawn するスレッド (`PR_SET_PDEATHSIG` は spawn した**スレッド**の終了で発火するので、長命の専用スレッドから spawn する案。PoC で確かめる)、切り替えた target dir の名前とほかのプロセスへの伝え方。**進行中の印** (R-WS-10): 試し取りの手順と記録の確かめ直しの順、ビルドの枠を待つ間も印を持つか (案: 持つ)、git で要求した rev・branch・tag の鍵と解決したコミットの鍵の両方を持つか (案: 両方)、呼び直しのとき進行中のビルドが要求より前にブランチを解決していた場合 (案: 終わるのを待ってから解決し直す)。**その他**: 置き換えられた古いビルドが枠を占め続けること、Windows で mmap 中の派生物を作り直すときの名前 (R-CA-2 の名前は元データのダイジェストで決まるので、同じ元データから作り直すと同じ名前になる。R-CA-4。v0.16)、結合テストの一覧 (2 プロセス、版の違うサーバー、キャンセル、罠の build.rs) | M2 の PoC |
+| Q-29 | プロセスをまたぐ仕組みの細部 (R-CA-4・R-WS-6・R-WS-10)。原則は要件で決め、細部は動くものを作りながら決める (v0.15。v0.16 で本文の細部をここへ移した。「案」は移す前に本文で決めていたもの)。**ロック**: 置き場所 (案: state の `locks/`。キャッシュだけを共有する構成で排他が効くか、state の rename の規則との関係)、名前の作り方と増え方、複数のロックを取る順 (案: 鍵 → target dir → ビルドの枠)、target dir のロック (案: ビルドは共有ロック、GC と切り替えた古い target dir の削除は排他ロック)、NFS 上の `flock`。**版の違うサーバーの同居**: 版をファイル名かパスのどこに入れるか、対象の記録 (元データの内容ダイジェストの記録、否定キャッシュ、外のツールの記録、ビルドの失敗の記録、R-WS-6 のプロセスの記録など)、元データのダイジェストの記録と版の関係 (記録が無いときの扱い)、古い版の記録の片付け (案: キャッシュの下は GC、state の R-WS-6 の記録は書いた版のサーバーが消し、読めない記録には触らない)。**残った子孫** (R-WS-6): 記録するもの (案: サーバーの PID と起動時刻、子のプロセスグループの ID とその起動時刻を state に記録し、ビルドが終わったら消す)、照合の規則 (案: 記録したサーバーが死んでいて、残ったプロセスが記録したグループに属し、その起動時刻がグループの長の起動時刻以降のときだけ止める)、判定の上限、子を spawn するスレッド (`PR_SET_PDEATHSIG` は spawn した**スレッド**の終了で発火するので、長命の専用スレッドから spawn する案。PoC で確かめる)、切り替えた target dir の名前とほかのプロセスへの伝え方。**進行中の印** (R-WS-10): 試し取りの手順と記録の確かめ直しの順、ビルドの枠を待つ間も印を持つか (案: 持つ)、git で要求した rev・branch・tag の鍵と解決したコミットの鍵の両方を持つか (案: 両方)、呼び直しのとき進行中のビルドが要求より前にブランチを解決していた場合 (案: 終わるのを待ってから解決し直す)。**その他**: 置き換えられた古いビルドが枠を占め続けること、Windows で mmap 中の派生物を作り直すときの名前 (R-CA-2 の名前は元データのダイジェストで決まるので、同じ元データから作り直すと同じ名前になる。R-CA-4。v0.16)、同名の crate を並行にビルドすると、同じ名前の JSON・`.d` (R-WS-1・R-WS-4) を上書きしうること (v0.18)、結合テストの一覧 (2 プロセス、版の違うサーバー、キャンセル、罠の build.rs) | M2 の PoC |
+| Q-31 | ローカルビルドの細部で、M0 で決めきれず M2 に回したもの (v0.17): `--target` を付けない形 (R-WS-1) での M0 の B1・B3・B5 の再確認と、同じ package が host 用と target 用の両方に現れるときの feature の組 (R-FT-3)。仮のプロジェクトの toolchain・`RUSTC_BOOTSTRAP` の値・target dir (R-WS-5)。鮮度の鍵を、要求した引数・feature の組と、やり直しで実際に使ったもののどちらで作るか (R-WS-4。`--cfg docsrs` と `[package.metadata.docs.rs]` の組のやり直し)。`RUSTC_BOOTSTRAP` の値の長さの上限 (Windows の環境変数は 32,767 文字。M0 では 238 名で 2,806 文字) と超えたときの扱い、nightly の経路で壊れたときに member の名前だけの値でやり直すか (R-WS-8)。`-Z fine-grain-locking` (R-WS-2) と `cargo doc --output-format json` (R-WS-1) を nightly の経路で使うか。`--cfg docsrs` で壊れた crate を記録するか (Q-11)。v0.18 で足したもの: 複数の member・workspace の中の path 依存・`default-members` での、文書の feature の組と `enabled_in_project` の組の確認 (R-FT-3)。cargo の設定の読み方 (合成の規則。R-WS-2)。実行ファイルを同じディレクトリから探す規則で、版の接尾辞が付く配布物 (`rustc-1.80` など) が別の toolchain を拾いうることと、symlink の解釈 (R-WS-1)。ほかに本文が M2 で決めるとしたもの (R-FT-3・R-WS-1・R-WS-7・R-MCP-3 など) も、M2 の計画で本文から拾う | M2 で実装しながら決める |
+| Q-32 | worktree (`claude -w`・subagent の worktree) と `--add-dir` で、サーバーが受け取る `CLAUDE_PROJECT_DIR` とカレントディレクトリ、worktree の置き場所 (R-MCP-3。v0.18) | M2 の前に実測してから決める |
 
 ---
 
@@ -1159,11 +1185,11 @@ v1 では公開ホスティングをしない (§2 の非ゴール)。ただし�
 | 段階 | 内容 | 完了条件 |
 | --- | --- | --- |
 | M0 PoC (完了。2026-10-19。結果は [m0-plan.md](m0-plan.md) の §6) | stdio サーバー (rmcp) と `get_item` (docs.rs の JSON、形式の正規化 (54〜61)、公開パス索引込み)。ローカルビルドの PoC (`RUSTC_BOOTSTRAP`、`cargo doc --output-format json`、feature の組、`--cfg docsrs`、dep-info) | Claude Code から呼べる。R-OUT-1 の挙動を再確認。Q-12・Q-17・Q-20 と、R-FV-3 の先読みの方法、R-WS-4 の dep-info の取り方が決まる。Q-11 の、渡さずにやり直す頻度を測る。R-MCP-16 のサーバーから閉じるときの扱い、R-OUT-2 の膨張率、R-MCP-3 の `cargo tree` の出力の形の安定性、Q-30 の cargo の挙動、rustdoc_processor を依存にするか (§10) を確かめる |
-| M1 MVP | 形式 46〜53 の shim (R-FV-2・R-FV-4)、バージョン解決 (§5.3)、`list_crates` / `resolve_version` / `crate_overview` / `get_item` / `search_items` / `list_module` / `list_methods` (固有と trait 由来。R-TI-1) / `list_impls` / `list_implementors` (crate 内のみ)、一覧の絞り込みと展開 (§6.5)、一覧への feature の注記 (R-FT-2)、定義位置 (R-OUT-8)、std (dist からの直接取得 R-STD-6 を含む)、正準パス、impl の構造的な分類、描画規則 (§7)、ディスクキャッシュ (原子的な書き込みだけ。プロセスをまたぐロックは M2。R-CA-4)、エラー設計。`search_items` の既定の範囲 (R-SR-2) のうち workspace の分は M2、`list_crates` の advisory の件数は M4 から | 依存 crate と std について、ferritin のホスト版より正確で小さい答えが返る (R-QA-1 の代表的な item のスナップショットで比較する。eval での比較は M5)。§3 の Q20 (umbrella crate) に答えられる。`--no-default-features` の構成でもビルドとテストが通る (R-ARCH-8) |
-| M2 workspace | Q-29・Q-31 の細部を決める。ローカルビルド (R-WS-8 の toolchain の選び方、内容ダイジェストの鮮度判定、永続 target dir、プロセス間ロック、ビルド中の応答、ビルド失敗のキャッシュ)、private items、docs.rs に JSON が無い場合のローカルビルド、`build_external_docs` (R-WS-10)、CLI の `cache` と GC の最小限 (容量の上限。R-CA-5。v0.16) | 自分の workspace を引ける。編集後に正しく再ビルドされる。外のプロジェクトと git の crate を引ける |
+| M1 MVP | 形式 46〜53 の shim (R-FV-2・R-FV-4)、バージョン解決 (§5.3)、`list_crates` / `resolve_version` / `crate_overview` / `get_item` / `search_items` / `list_module` / `list_methods` (固有と trait 由来。R-TI-1) / `list_impls` / `list_implementors` (crate 内のみ)、一覧の絞り込みと展開 (§6.5)、一覧への feature の注記 (R-FT-2)、定義位置 (R-OUT-8)、std (dist からの直接取得 R-STD-6 を含む)、正準パス、impl の構造的な分類、描画規則 (§7)、ディスクキャッシュ (原子的な書き込みだけ。プロセスをまたぐロックは M2。R-CA-4)、エラー設計、構造化ログ (R-OBS-1。`request_id` と合わせて。R-ERR-2)、小さな eval (M1 のツールで答える §3 の問いと、Claude Code の挙動の検知のケース。R-QA-6。v0.18)、使える版ができたら crates.io への最初の公開 (R-DIST-1。v0.18)。本文が M1 で決めるとした細部 (R-OUT-9 の応答の骨格、R-OUT-3 のカーソル、R-CA-4 の否定キャッシュと後始末、R-TI-4 の索引の構成など) も、M1 の計画で本文から拾う。`search_items` の既定の範囲 (R-SR-2) のうち workspace の分は M2、`list_crates` の advisory の件数は M4 から | 依存 crate と std について、ferritin のホスト版より正確で小さい答えが返る (R-QA-1 の代表的な item のスナップショットで比較する。eval での比較は M5)。§3 の Q20 (umbrella crate) に答えられる。`--no-default-features` の構成でもビルドとテストが通る (R-ARCH-8) |
+| M2 workspace | 着手の前に Q-32 を確かめる (v0.18)。Q-29・Q-31 の細部を決める。ローカルビルド (R-WS-8 の toolchain の選び方、内容ダイジェストの鮮度判定、永続 target dir、プロセス間ロック、ビルド中の応答、ビルド失敗のキャッシュ)、private items (公開パスの無い item のパスと検索での扱い。R-PR-2・R-SR-4。v0.18)、docs.rs に JSON が無い場合のローカルビルド (求める target の JSON が無い場合を含む。R-TG-1。v0.18)、`build_external_docs` (R-WS-10)、CLI の `cache` と GC の最小限 (容量の上限。R-CA-5。v0.16) | 自分の workspace を引ける。編集後に正しく再ビルドされる。外のプロジェクトと git の crate を引ける |
 | M3 crate 情報 | features (`inspect_features`。cfg の計算自体は M1 の R-FT-2) / README / changelog / examples / metadata / `search_crates` / `get_source` | §3 の Q10〜Q13・Q15・Q16 と、Q14 のうち changelog で答えられる部分に答えられる |
-| M4 差別化 | 依存グラフ全体の implementors、Deref とプリミティブを含むメソッド解決、MSRV を踏まえた std 表示、`api_diff`、`audit_dependencies`、`rust_release`。任意: `search_source` (R-SC-6)、シグネチャ検索と同梱の散文の検索 (R-SR-1)、docs.rs のビルド時の依存の版との差の警告 (R-PR-5)、stable の版に近い nightly の `rust-docs-json` の選択 (R-STD-6) | 既存実装では答えられないか不正確な問い (§3 の Q7、Q9、Q14 の破壊的変更、Q17〜Q19) に答えられる。任意の `search_source` を入れた場合は Q21 も |
-| M5 仕上げ | eval の問題集、性能目標、GC の既定値の見直し、Claude Code プラグインとしての配布、配布の方式 (配る target (Q-27)・リリースの流れ・公式 MCP レジストリに登録するかなど) を決める (R-DIST-1)。任意: resources (R-MCP-13)、prompts (R-MCP-18)、completions (R-MCP-19)、icons (R-MCP-7)、skill の単独インストール (R-DIST-6)、隔離環境 (R-CA-8)。eval で採否や既定を決めるもの: `output.mode` (R-OUT-1)、`detail` の既定 (R-OUT-7)、`alwaysLoad` (R-MCP-8・Q-15)、`max_chars` (R-OUT-3)、`tools.profile` (R-MCP-12) | eval の問題集で §3 の問いに答えられる。M1・M4 で測って決めた §9.1 の目標を満たす。GC が容量の上限を守る。Claude Code のプラグインとして 3 OS で導入できる (任意の機能と M6 は含めない。v0.16) |
+| M4 差別化 | 依存グラフ全体の implementors、Deref とプリミティブを含むメソッド解決、`#![no_std]` の member での core・alloc のパス (R-PR-2。v0.18)、MSRV を踏まえた std 表示、`api_diff`、`audit_dependencies`、`rust_release`。任意: `search_source` (R-SC-6)、シグネチャ検索と同梱の散文の検索 (R-SR-1)、docs.rs のビルド時の依存の版との差の警告 (R-PR-5)、stable の版に近い nightly の `rust-docs-json` の選択 (R-STD-6) | 既存実装では答えられないか不正確な問い (§3 の Q7、Q9、Q14 の破壊的変更、Q17〜Q19) に答えられる。任意の `search_source` を入れた場合は Q21 も |
+| M5 仕上げ | eval の比較と校正の仕上げ (問題集は M1 から各段階で足す。R-QA-6。v0.18)、性能目標、GC の既定値の見直し、Claude Code プラグインとしての配布、配布の方式 (配る target (Q-27)・リリースの流れ・公式 MCP レジストリに登録するかなど) を決める (R-DIST-1)。任意: resources (R-MCP-13)、prompts (R-MCP-18)、completions (R-MCP-19)、icons (R-MCP-7)、skill の単独インストール (R-DIST-6)、隔離環境 (R-CA-8)。eval で採否や既定を決めるもの: `output.mode` (R-OUT-1)、`detail` の既定 (R-OUT-7)、`alwaysLoad` (R-MCP-8・Q-15)、`max_chars` (R-OUT-3) (`tools.profile` (R-MCP-12) は v0.18 で将来に回した) | eval の問題集で §3 の問いに答えられる。M1・M4 で測って決めた §9.1 の目標を満たす。GC が容量の上限を守る。Claude Code のプラグインとして 3 OS で導入できる (任意の機能と M6 は含めない。v0.16) |
 | M6 共有 (任意) | Streamable HTTP (R-MCP-1、R-SEC-5、R-MCP-17)。任意: tasks 拡張 (R-WS-6)、認証 (静的なトークンか OAuth。R-SEC-5)。ホスト版か共有キャッシュサーバー (§9.10) を作ると決めた場合だけ着手する | 複数のセッションから 1 プロセスを共有でき、`Origin` と `Host` の検査 (R-SEC-5) が効く |
 
 ---
@@ -1192,22 +1218,60 @@ v1 では公開ホスティングをしない (§2 の非ゴール)。ただし�
 
 ## 14. 改訂履歴
 
+### v0.18 (2026-10-19)
+
+M0 の後のレビューで利用者が決めた 27 件を反映した版 (M1・M2 への申し送りは [m0-plan.md](m0-plan.md) の §7.2)。
+
+1. docs.rs の target: 2026-05-01 から docs.rs は `targets` の無い crate を既定の target だけでビルドする。求める target の JSON が無ければ、既定のプロジェクトの依存は M2 からローカルビルドし、M1 の間は `docs_unavailable` (`no_target_json`) を返す。別の target の文書で代用しない。live の smoke test で配られる target も見る (R-TG-1・R-TG-2・§5.1・§7.3・§8・R-QA-4・R-WS-10)
+2. crate の名前: パッケージ名とコードに書く名前の両方を受け、文脈で解く。path の先頭は lib 名、キャッシュの鍵は正規化した名前 (R-PR-1・§6.4・R-CA-2)
+3. build metadata の版: docs.rs には build metadata 込みの版で頼み、返った `crate_version` が違えば使わない (R-VR-1・R-VR-4・R-DS-6・§7.3)
+4. feature の組: 文書の組は `compiler-artifact` の `features` を記録し、`enabled_in_project` は全 member を統合した `cargo tree --workspace` の組で判定する (R-FT-3・Q-20・Q-31)
+5. M0 のコードの不具合: M1 の計画の最初の段で直す。impl の `for` の確認と決定的な探索 (R-PR-7)、公開パス索引の経路の数の上限 (R-PR-3)、検証してからキャッシュに書く (R-CA-4)
+6. crates.io の名前: M1 で使える版ができたら最初の公開をする。それまでは README に、同じ名前の crate を入れないよう書く (R-DIST-1・§12)
+7. ローカルビルドの失敗の振り分け: SIGKILL・オフラインの 3 つの文言 (`net.offline` でも)・`revspec`・CLI の `Authentication failed for` を足し、`timeout` は決定的な失敗、キャンセルは記録しない。文言は M2 でテストに固定する (R-WS-7・R-WS-6)
+8. `enabled_in_project`: 関連 item の親の cfg を足し、true / false / unknown の 3 値にする (R-FT-2)
+9. cargo の設定の合成: 実測を注記し、読み方を M2 で決める (R-WS-2・R-TG-1・R-WS-4・R-VR-2・Q-31)
+10. 事実に合わせる直し: `RUSTC_BOOTSTRAP` に cdylib などだけの lib (R-WS-8・Q-12)、`-p` に package id (R-WS-1)、std の私的な依存 (R-PR-4)、版の解決前の provenance (R-OUT-9)、展開の fsync (R-CA-4)、存在しない版の TTL (R-ERR-3)、GitHub の rate limit (R-NW-2・R-RR-1)、host の `rust-std` の判定 (R-TG-1)、正準パスの「最短」(§4)、`doc_auto_cfg` (Q-11・R-WS-1)、同名の crate の並行ビルド (Q-29)、7 日間の従来の方式 (R-MCP-2)
+11. eval: M1 から小さく始め、各マイルストーンで足し、M5 で仕上げる (R-QA-6・§12)
+12. 対象のクライアント: MCP 2026-07-28 を話すクライアント (主に Claude Code) に狭めた。R-MCP-12 は将来に回した (§1・R-MCP-10・R-MCP-12・§12)
+13. worktree: Q-32 を足し、M2 の前に確かめる (R-MCP-3)
+14. Claude Code の挙動の検知: eval に `tool_result` の形を確かめるケースを置く (R-OUT-1・R-QA-6)
+15. no_std: `#![no_std]` の member では core・alloc のパスで示す。M4 (R-PR-2・R-TI-1・§12)
+16. private item のパス: 公開パスが無ければ crate 内でのパスと可視性。自分の workspace の検索は private も含める。M2 (§4・R-PR-2・R-SR-4・§12)
+17. vendoring: ソースは `manifest_path` から読み、docs.rs は checksum が一致したときだけ使う (R-SC-2・R-SC-4・R-VR-2・R-DS-1・§5.1)
+18. 明示した版と取得元: 解決された版と一致すればプロジェクトの取得元のもの (R-VR-1)
+19. std のソース: 合う `rust-src` が無ければ dist から取るのを既定にした (R-SC-2・R-STD-6)
+20. `api_diff`: 片側の feature の組でだけ有効な item は Major に使わない。hidden 付きのビルドは両側とも外のツールが作る (R-AD-3・R-AD-4・R-WS-10)
+21. 古い手元の nightly: プロジェクトの toolchain の版より古ければ dist の新しいものを使う (R-STD-1・R-STD-6)
+22. 制御文字: ソースの本文では見える印に置き換えて warnings で知らせる (R-SEC-7)
+23. CPU: cargo に `-j` (初期値はコア数の半分) と設定 `build.jobs`。ロックの取り合いと対処を README に (R-WS-1・R-WS-2・R-DIST-3)
+24. 待つ上限: ビルドとロック待ちは `build.wait_secs` (初期値 10 秒) で、1 リクエストの上限 (30 秒) より先に効く (R-WS-6・R-ARCH-6・R-MCP-4・R-MCP-1・R-WS-10・R-SR-2・R-DIST-3)
+25. `RUSTUP_TOOLCHAIN`: 子の cargo に渡さず、ログに出す (R-WS-1・R-SEC-2)
+26. 注記と申し送り: agent や helper の問い合わせは止まらない (R-WS-6)、版の接尾辞の付く実行ファイル (R-WS-1・Q-31)、全 crate 名の値で item が違いうる (R-WS-8)、全版が pre-release・yanked のときの latest (R-VR-3)、docs.rs の span の絶対パス (R-SC-2)、継承した readme と `README` (R-SC-4)、members の glob (R-VR-2)、換算係数の校正 (R-OBS-1)、コードの申し送り (m0-plan.md の §7.2)
+27. 独自の target のプロジェクト (`target_unsupported`) の docs.rs の照会は、1 の例外として docs.rs の既定の target で代用し、実際の triple を provenance と warnings に示す (R-TG-1・R-TG-2)
+
 ### v0.17 (2026-10-19)
 
-M0 の結果を反映した版 ([m0-plan.md](m0-plan.md) の §6 と、反映の一覧の §7.1)。
+M0 の結果を反映した版 (結果と根拠は [m0-plan.md](m0-plan.md) の §6、反映の一覧は §7.1、反映した後の見直しと申し送りは §7.2)。
 
-- 名前をすべて `chatora-rustdoc-mcp` にそろえた: パッケージ、lib の crate、バイナリ、MCP の serverInfo、設定・キャッシュ・state のディレクトリ、環境変数の接頭辞 (`CHATORA_RUSTDOC_MCP_`)、README で勧める MCP サーバーの登録名 (R-DIST-1・R-DIST-3・R-DIST-5・R-CA-1・R-OBS-2・R-SEC-2)。v0.3 で `chatora-rustdoc-mcp` から `chatora-rustdoc` に変えた理由 (CLI としても使う) は、v0.14 で照会の CLI をやめて人向けの `cache` だけになり、弱まった。§14 の過去の版の記述は当時の名前のまま残す
-- **M0 で決めたことを反映した** (根拠と測った値は m0-plan.md の §6):
-  - 未決事項: Q-12・Q-17・Q-20・Q-30 を §11.1 に移した。Q-11 にやり直しの頻度 (136 個中 1 個) を足した
-  - ローカルビルド: 既定は stable + `RUSTC_BOOTSTRAP` で、値は解決結果の全 crate 名に固定する (R-WS-8)。`cargo doc` は使わない (R-WS-1)。host で `build.target` も無ければ `--target` を付けない (R-WS-1)。dep-info は rustdoc の `--emit=dep-info` で取り、`RUSTC_BOOTSTRAP` の値を鮮度の鍵に入れる (R-WS-4)。feature の組は `cargo tree -e normal --target <t>` (R-FT-3)。resolver 2 以上で `-p` が panic する依存は起動前に判定する (R-WS-5・R-MCP-3)。依存の種類は stable の `cargo tree` で判定する (R-MCP-3)。`rust-std` の有無は sysroot で先に判定し、target の JSON 仕様は v1 で対応しない (R-TG-1)。実行ファイルの一部だけの指定と rustup の無い環境の既定 (R-WS-1)。`cargo metadata` の失敗のまとめ方と、git の失敗の文言・`LC_ALL=C` (R-WS-7)。子プロセスでは GUI の askpass も止める (R-WS-6。M0 で git の CLI が利用者のデスクトップにダイアログを出した)
-  - 形式と索引: 先読みの方法 (R-FV-3)、形式 54〜61 の shim (R-FV-2)、`pub use … as _` はパスを作らない (R-PR-2)
-  - MCP と出力: rmcp で受け入れる挙動 (R-MCP-2・R-ARG-1)、stdio ではサーバーから listen を閉じる場面が無い (R-MCP-16)、`preserve_order` (R-OUT-1)、膨張率の実測とほかの crate の型の正準パスは M1 から (R-OUT-2)、where 句を `normal` に (R-OUT-7)、`source_location` の形と行のアンカー (R-OUT-8)、trait は impl の見出しで (R-SH-2)、`request_id` は M1 から (R-ERR-2)、docs.rs の 400 と想定外のステータス (§8)、`log.filter` (R-DIST-3)
+- 名前をすべて `chatora-rustdoc-mcp` にそろえた: パッケージ、lib の crate、バイナリ、MCP の serverInfo、設定・キャッシュ・state のディレクトリ、環境変数の接頭辞 (`CHATORA_RUSTDOC_MCP_`)、README で勧める MCP サーバーの登録名 (R-DIST-1・R-DIST-3・R-DIST-5・R-CA-1・R-OBS-2・R-SEC-2)。v0.4 で `chatora-rustdoc-mcp` から `chatora-rustdoc` に変えた理由 (CLI としても使う) は、v0.14 で照会の CLI をやめて人向けの `cache` と `install-skill` だけになり、弱まった。§14 の過去の版の記述は当時の名前のまま残す
+- **M0 で決めたことを反映した**:
+  - 未決事項: Q-12・Q-17・Q-20・Q-30 を §11.1 に移した。Q-11 にやり直しの頻度 (136 個中 1 個) と原因を足した
+  - ローカルビルド: 既定は stable + `RUSTC_BOOTSTRAP` で、値は解決結果の全 crate 名に固定する (R-WS-8)。`cargo doc` は使わない (R-WS-1)。target が host で `build.target` も無ければ `--target` を付けない (仮のプロジェクトも同じ規則。R-WS-1・R-WS-5)。`+<toolchain>` はサーバーが選んだ toolchain のときだけ付ける (R-WS-1)。dep-info は rustdoc の `--emit=dep-info` で取り、`RUSTC_BOOTSTRAP` の値を鮮度の鍵に入れる (R-WS-4)。feature の組は `cargo tree -e normal --target <t>` (R-FT-3)。resolver 2 以上で `-p` が panic する依存は起動前に判定する (R-WS-5・R-MCP-3)。依存の種類は stable の `cargo tree` で判定する (R-MCP-3)。`rust-std` の有無は sysroot で先に判定し、target の JSON 仕様は v1 で対応しない (R-TG-1)。実行ファイルの一部だけの指定と rustup の無い環境の既定 (R-WS-1)。rustup の無い環境では rustup のコマンドを案内しない (R-TG-1・R-WS-7・R-STD-4)。`cargo metadata` の失敗のまとめ方と、git の失敗の文言・`LC_ALL=C` (R-WS-7)。子プロセスでは GUI の askpass も止める (R-WS-6。M0 で git の CLI が利用者のデスクトップにダイアログを出した)
+  - 形式・索引・パス: 先読みの方法 (R-FV-3)、形式 54〜61 の shim (R-FV-2)、docs.rs で確かめた形式に 48・55 を足した (R-FV-4・R-QA-2)、形式 61 でも stable と nightly で属性の表記が違うものがある (R-FT-2)、`pub use … as _` はパスを作らない (R-PR-2)、解決の手順で親も公開パス索引から引く (R-PR-1)、型のメンバーを探す段の順 (R-PR-7)、`html_root_url` の形と、crate をまたぐ re-export には行き先と次の呼び出しの hint を返すこと (R-PR-4)、docs.rs の span は package root からの相対パス (R-PR-5・R-SC-2)
+  - MCP と出力: rmcp で受け入れる挙動 (R-MCP-2・R-ARG-1)、stdio ではサーバーから listen を閉じる場面が無い (R-MCP-16)、Claude Code 2.1.303 で確かめたこと (R-OUT-1・R-ERR-2)、`preserve_order` (R-OUT-1)、膨張率の実測値と `macro_rules!` の示し方 (R-OUT-2)、ほかの crate の型の正準パスは M1 から (R-OUT-2)、where 句を `normal` に (R-OUT-7)、`source_location` の形と行のアンカー (R-OUT-8)、trait は impl の見出しで (R-SH-2)、`request_id` は M1 から・候補のキーは `candidates` (R-ERR-2)、docs.rs の 400 と想定外のステータス (§8・R-ERR-3)、404 から `crate_not_found`・`version_not_found` を分けるのは M1 から (R-DS-6・§8)、`log.filter` (R-DIST-3)
   - 技術選定: SDK の比較 (rmcp を続ける)、rustdoc_processor は依存にしない (§10)
   - M0 を完了とした (§12)。`-Z fine-grain-locking` の評価を M2 に回した (R-WS-2)
 - **反映した後の見直し** (前提を持たないレビュアー 4 人で並列に読み、食い違いと抜けを直した):
-  - 判断したこと: `build_unsupported` の依存は仮のプロジェクトを作って外部ツールとしてビルドする (R-WS-5)。host は利用するビルドの toolchain の host とする (R-TG-1)。依存の鮮度の鍵は鍵の一部だけで作る (R-WS-4)。target の JSON 仕様と build-std は `target_unsupported` とする (R-TG-1・§8)。`full` では未加工の部分木を落とす (R-OUT-9)。plugin の名前は `chatora-rustdoc-mcp` で、両方の規則名を許し、CI で確かめる (R-DIST-5・R-SEC-2)。`log.filter` は stderr のログだけを絞り、誤った指定が 1 つでもあれば全体を既定に戻す (設定の表・R-SEC-1)
-  - そのまま直したこと: dev だけの依存 (R-MCP-3)、`RUSTC_BOOTSTRAP` の値にメンバーの bin の名前を入れる (R-WS-8)、子プロセスの環境の例外 (R-SEC-2)、`cargo metadata` の失敗を返すのはローカルビルドの照会だけ (R-VR-2)、`build.*_path` の既定、`kind` の語彙 (R-SH-2)、map を整列する (R-ARCH-5)、beta と `RUSTC_BOOTSTRAP` の先行テスト (R-QA-4)、§9.1 の指標、§10 の JSON の parser・HTTP・SDK の版、M0 の形式の範囲 (§12)、Q-27 を広げた
+  - 判断したこと: 照会のツールが `build_unsupported` を返す依存は、外のツールが仮のプロジェクトで文書化する (R-WS-5・R-WS-10・§6.3)。`--target` を省くかの判定に使う host は、ビルドに使う toolchain の `rustc -vV` の host とする (R-WS-1・R-TG-1)。`RUSTC_BOOTSTRAP` の値を鮮度の鍵に入れるとき、member 以外のパッケージには部分木に現れる crate 名だけを入れる (R-WS-4)。target の JSON 仕様と build-std は `target_unsupported` とする (R-TG-1・§8)。`full` でも生の rustdoc の部分木を返さない (R-OUT-7)。プラグインの名前は `chatora-rustdoc-mcp` とし、README には手動とプラグインの両方の登録の許可ルールを書き、実在のツール名に当たるかを CI で確かめる (R-DIST-5・R-SEC-2・R-QA-5)。`log.filter` は stderr のログだけを絞り、誤った指定が 1 つでもあれば全体を既定に戻す (設定の表・R-SEC-1)
+  - そのまま直したこと: `-p` で名指しできない依存の列挙に dev だけの依存を足した (R-MCP-3)、`RUSTC_BOOTSTRAP` の値にメンバーの bin の名前を入れる (R-WS-8)、子プロセスの環境の例外 (R-SEC-2)、`cargo metadata` の失敗を返すのはローカルビルドの照会だけ (R-VR-2)、`cargo fetch` の失敗は `cargo metadata` の失敗と同じく返し、ビルドの最大時間の超過も `build_failed` にする (R-WS-7・§8)、`build.*_path` の既定 (R-DIST-3)、`enabled_in_dev_only` の求め方 (R-FT-2)、`api_diff` で両側の feature の組が違えば warnings (R-AD-4)、`rust_release` はリリース日が今日以前の版だけを返す (R-RR-1)、provenance の必須の項目は 1 つの crate の応答のもので、ほかは M1 で決める (R-OUT-9)、`kind` の語彙 (R-SH-2)、map を整列する (R-ARCH-5)、beta と `RUSTC_BOOTSTRAP` の先行テスト (R-QA-4)、§9.1 の指標、§10 の JSON の parser・HTTP・SDK の版、M0 の形式の範囲 (§12)、Q-27 を広げた
   - 回したこと: 形式 46〜53 の shim を M1 に (§12)、`name` の無い要求の確認を M1 に (R-ARG-1)、ローカルビルドの細部を M2 に (Q-31 を足した)
+- **文書の見直し** (担当を分けた 7 人で、要件・計画・調査文書・README・コメント・一覧ページを読み、誤り・食い違い・重複を直した。参照の誤り (R-DS-6 の R-VR-6、R-SEC-2 の `RUSTUP_AUTO_INSTALL` の置き場所など)、`docs_unavailable` の表を `reason` の一覧に寄せた、§12 の M1 に構造化ログと本文の「M1 で決める」細部の拾い上げを足した、など)。判断したこと:
+  - ビルド中の応答の形を R-OUT-9 にそろえた: 古いデータがあれば `stale_reason: rebuilding` と `retry_after_secs`、無ければ `status: building`。キャンセルで止めないビルドの条件にも入れた (R-WS-2・R-WS-6・R-ARCH-6)
+  - Cargo.lock が古いときも、docs.rs の照会は直読みで続けて warnings で知らせ、`lockfile_outdated` はローカルビルドの照会と Cargo.lock が無いときに返す (R-VR-2)
+  - 複数の crate の応答で欠けた crate の状態と理由は `sources` に載せ、warnings は要約の 1 行にする (R-SR-5)
+  - `source_location.file` は package root からの相対パスに固定し、ローカルビルドした crate だけ開ける絶対パスを `path` に足す (R-OUT-8)
+  - 「latest の解決結果」の 1h の TTL を消し、sparse index の TTL (10 分) に従わせる (R-CA-3・R-DIST-3)
 
 ### v0.16 (2026-10-19)
 

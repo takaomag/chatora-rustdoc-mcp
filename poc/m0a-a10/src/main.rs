@@ -69,7 +69,8 @@ fn compare(cache: &Cache, release: &str) {
     );
 
     // The public paths of each item in rustdoc_processor's index (modules and items), and its
-    // canonical path, which is the first of them (shortest, then in order).
+    // canonical path: the one rustdoc_processor picks for an item, and for a module the shortest,
+    // then the first in lexicographic order.
     let mut their_paths: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
     let mut their_canonical: BTreeMap<u32, String> = BTreeMap::new();
     for (id, entry) in theirs

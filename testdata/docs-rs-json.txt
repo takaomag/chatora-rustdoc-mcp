@@ -5,7 +5,7 @@
 # Tests that use it look it up in the cache and check the sha256 of the decompressed JSON.
 #
 # docs.rs serves the latest build of a release, so a rebuild there changes the JSON (and maybe the
-# format). Then fetch it again, check the format, and update this list.
+# format). Then delete the cached file, fetch it again, check the format, and update this list.
 #
 # Collected on 2026-10-19. Columns: crate, version, format_version, size in bytes, sha256, note.
 

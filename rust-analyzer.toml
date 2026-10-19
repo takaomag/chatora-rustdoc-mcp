@@ -1,8 +1,8 @@
 # NOTE: `files.exclude` はここに書けない (global 節の設定で、workspace の rust-analyzer.toml は受け付けない)。
 # NOTE: `check.command` もここでは効かない (flycheck はこのファイルを読まない。rust-analyzer 1.99.0 で確認)。
+# この 2 つは .vscode/settings.json に書く。
 # NOTE: 下の `[rustfmt] overrideCommand` も、VS Code の保存時の整形には効かなかった (rust-analyzer 1.99.1)。
 # ほかのエディタのために残し、VS Code 向けには .vscode/settings.json にも書いている。
-# いずれも .vscode/settings.json に書く。
 
 [imports.granularity]
 enforce = true

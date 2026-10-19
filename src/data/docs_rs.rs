@@ -52,7 +52,7 @@ pub struct DocsRs {
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     /// docs.rs has no rustdoc JSON for this version: the crate or the version does not exist, it
-    /// was built before docs.rs made JSON, or its build failed (requirements R-DS-3 and R-DS-5).
+    /// was built before docs.rs made JSON, or its build failed (requirements R-DS-3 and R-DS-6).
     #[error("docs.rs has no rustdoc JSON for this crate version")]
     NotFound,
     /// docs.rs rejected the request as malformed.

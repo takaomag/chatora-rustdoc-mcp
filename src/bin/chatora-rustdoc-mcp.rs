@@ -1,4 +1,5 @@
-//! The `chatora-rustdoc-mcp` binary: an MCP server that looks up Rust documentation, plus a small CLI to manage its cache.
+//! The `chatora-rustdoc-mcp` binary. `serve` runs the MCP server that looks up Rust
+//! documentation; the CLI to manage the cache (requirement R-DIST-2) comes later.
 
 use std::{error::Error as _, ffi::OsString};
 
