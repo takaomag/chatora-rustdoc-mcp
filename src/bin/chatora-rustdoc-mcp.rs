@@ -19,7 +19,6 @@ use semver as _;
 use serde as _;
 use serde_json as _;
 use serde_stacker as _;
-#[cfg(test)]
 use sha2 as _;
 #[cfg(test)]
 use tempfile as _;

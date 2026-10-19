@@ -155,8 +155,13 @@ fn test_cache() -> TempDir {
     let dir = TempDir::new().expect("a temporary directory");
     let json = serde_json::to_vec(&demo_crate()).expect("serializes");
     let name: CrateName = "demo".parse().expect("a crate name");
-    Cache::at(dir.path())
-        .write_docs_rs_json(&name, &Version::new(0, 1, 0), &json)
+    let cache = Cache::at(dir.path());
+    cache
+        .write_docs_rs_json(
+            &cache.docs_rs_dir(&name, &Version::new(0, 1, 0), None),
+            rustdoc_types::FORMAT_VERSION,
+            &json,
+        )
         .expect("the cache is writable");
     dir
 }

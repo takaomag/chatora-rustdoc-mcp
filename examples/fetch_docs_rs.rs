@@ -24,7 +24,7 @@ use std::{
 
 use chatora_rustdoc_mcp::data::{
     self,
-    cache::Cache,
+    cache::{Cache, CachedJson},
     crate_name::CrateName,
     docs_rs::DocsRs,
     format_version,
@@ -72,12 +72,14 @@ async fn fetch(cache: &Cache, docs_rs: &DocsRs, arg: &str) -> Result<String, Box
     let (name, version) = arg.split_once('@').ok_or("expected crate@version")?;
     let name: CrateName = name.parse()?;
     let version = Version::parse(version)?;
-    let path = cache.docs_rs_json_path(&name, &version);
-    // A symlink counts as not cached, as for the cache itself.
-    let cached = std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file());
+    let dir = cache.docs_rs_dir(&name, &version, None);
+    let cached = matches!(cache.read_docs_rs_json(&dir)?, CachedJson::Found(_));
     let source = if cached { "cache" } else { "docs.rs" };
-    let json = data::docs_rs_json(cache, docs_rs, &name, &version, None).await?;
+    let json = data::docs_rs_json(cache, docs_rs, &name, &version, None)
+        .await?
+        .json;
     let format_version = format_version::read(&json)?;
+    let path = dir.join(format!("{format_version}.json"));
     let mut sha256 = String::new();
     for byte in Sha256::digest(&json) {
         write!(sha256, "{byte:02x}")?;

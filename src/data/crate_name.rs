@@ -61,11 +61,26 @@ impl CrateName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The name as the cache keys it: lowercase, with `_` written as `-`. crates.io counts names
+    /// that differ only in these as the same crate, so they share one entry (requirements R-PR-1
+    /// and R-CA-2).
+    #[must_use]
+    pub fn cache_key(&self) -> String {
+        self.0.to_ascii_lowercase().replace('_', "-")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_crates_io_counts_as_one_share_a_cache_key() {
+        let key = |name: &str| name.parse::<CrateName>().expect("valid").cache_key();
+        assert_eq!(key("Tokio_Util"), "tokio-util");
+        assert_eq!(key("tokio-util"), "tokio-util");
+    }
 
     #[test]
     fn accepts_crates_io_names() {

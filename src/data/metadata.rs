@@ -17,7 +17,9 @@ use super::{
     blocking,
     cargo::{self, Failure, RunError},
     cargo_lock::CargoLock,
+    features::{self, FeatureSets},
     project::{self, Workspace},
+    target::TargetTriple,
 };
 
 /// The parts of the output of `cargo metadata --format-version 1` that are used.
@@ -123,26 +125,28 @@ pub enum Resolution {
         /// Cargo.lock.
         lock: CargoLock,
         /// Why `cargo metadata` failed, for the warnings.
-        because: MetadataError,
+        because: CargoError,
     },
 }
 
-/// Why `cargo metadata` gave no result.
+/// Why a cargo command gave no result.
 #[derive(Debug, thiserror::Error)]
-pub enum MetadataError {
+pub enum CargoError {
     /// cargo did not finish.
     #[error(transparent)]
     Run(#[from] RunError),
     /// cargo failed.
-    #[error("cargo metadata failed")]
+    #[error("cargo {command} failed")]
     Failed {
+        /// The subcommand.
+        command: &'static str,
         /// What kind of failure its messages tell.
         failure: Failure,
         /// The end of its stderr.
         stderr: Box<str>,
     },
-    /// The output is not what `--format-version 1` prints.
-    #[error("the output of cargo metadata could not be read")]
+    /// The output is not in the form asked for.
+    #[error("the output of cargo could not be read")]
     Unreadable(#[source] io::Error),
 }
 
@@ -161,6 +165,21 @@ pub enum ResolveError {
     Malformed(#[source] toml::de::Error),
 }
 
+/// Why the feature sets of a workspace are not known.
+#[derive(Debug, thiserror::Error)]
+pub enum FeaturesError {
+    /// The packages cannot be resolved.
+    #[error(transparent)]
+    Resolve(#[from] ResolveError),
+    /// `cargo metadata` failed, so `cargo tree`, which resolves the same way, would fail, too.
+    /// Only Cargo.lock is known.
+    #[error("cargo metadata failed, so the features are not known")]
+    NoMetadata,
+    /// `cargo tree` failed.
+    #[error(transparent)]
+    Cargo(#[from] CargoError),
+}
+
 /// Resolves the packages of workspaces, and keeps each result while its inputs stay the same.
 #[derive(Debug)]
 pub struct Resolver {
@@ -177,6 +196,8 @@ pub struct Resolver {
 struct Kept {
     inputs: Inputs,
     resolution: Arc<Resolution>,
+    /// The feature sets from `cargo tree`, by target. The same inputs decide them.
+    features: Mutex<HashMap<TargetTriple, Arc<FeatureSets>>>,
 }
 
 /// The inputs that decide the output of `cargo metadata`, by content (requirement R-VR-2).
@@ -255,6 +276,7 @@ impl Resolver {
                     Arc::new(Kept {
                         inputs,
                         resolution: Arc::clone(&resolution),
+                        features: Mutex::new(HashMap::new()),
                     }),
                 );
             },
@@ -263,13 +285,53 @@ impl Resolver {
         Ok(resolution)
     }
 
+    /// The features that the normal build of `workspace` for `target`, the actual build target,
+    /// enables on each package (requirements R-FT-2 and R-FT-3). They are kept with the result of
+    /// `cargo metadata`, while the same inputs decide both.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the packages cannot be resolved by `cargo metadata`, or `cargo tree`
+    /// fails.
+    pub async fn features(
+        &self,
+        workspace: &Workspace,
+        target: &TargetTriple,
+    ) -> Result<Arc<FeatureSets>, FeaturesError> {
+        let resolution = self.resolve(workspace).await?;
+        if let Resolution::CargoLockRaw { .. } = &*resolution {
+            return Err(FeaturesError::NoMetadata);
+        }
+        let kept = self
+            .kept
+            .lock()
+            .await
+            .get(&workspace.root)
+            .filter(|kept| Arc::ptr_eq(&kept.resolution, &resolution))
+            .cloned();
+        if let Some(kept) = &kept
+            && let Some(sets) = kept.features.lock().await.get(target)
+        {
+            return Ok(Arc::clone(sets));
+        }
+        let sets = Arc::new(features::read(&workspace.root, self.offline, target).await?);
+        if let Some(kept) = kept {
+            kept.features
+                .lock()
+                .await
+                .insert(target.clone(), Arc::clone(&sets));
+        }
+        Ok(sets)
+    }
+
     /// Runs `cargo metadata` in `root` and reads its output.
-    async fn run_metadata(&self, root: &Path) -> Result<Metadata, MetadataError> {
+    async fn run_metadata(&self, root: &Path) -> Result<Metadata, CargoError> {
         let mut command = cargo::project_command(root, self.offline);
         command.args(["metadata", "--format-version", "1"]);
         let output = cargo::run(command).await?;
         if !output.status.success() {
-            return Err(MetadataError::Failed {
+            return Err(CargoError::Failed {
+                command: "metadata",
                 failure: cargo::classify(&output, self.offline),
                 stderr: cargo::stderr_tail(&output),
             });
@@ -278,11 +340,11 @@ impl Resolver {
         let metadata: Metadata =
             blocking(move || serde_json::from_slice(&output.stdout).map_err(io::Error::other))
                 .await
-                .map_err(MetadataError::Unreadable)?;
+                .map_err(CargoError::Unreadable)?;
         if metadata.version == 1 {
             Ok(metadata)
         } else {
-            Err(MetadataError::Unreadable(io::Error::other(format!(
+            Err(CargoError::Unreadable(io::Error::other(format!(
                 "format version {} instead of 1",
                 metadata.version
             ))))
@@ -425,11 +487,73 @@ mod tests {
         let Resolution::CargoLockRaw { lock, because } = &*resolution else {
             panic!("--locked refuses to add b: {resolution:?}");
         };
-        assert!(matches!(because, MetadataError::Failed {
+        assert!(matches!(because, CargoError::Failed {
             failure: Failure::LockfileOutdated,
             ..
         }));
         assert_eq!(lock.packages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn features_are_those_of_the_normal_build_for_the_target() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        let package = |name: &str, rest: &str| {
+            fs::create_dir_all(root.join(name).join("src")).expect("made");
+            fs::write(root.join(name).join("src/lib.rs"), "").expect("written");
+            fs::write(
+                root.join(name).join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{rest}"
+                ),
+            )
+            .expect("written");
+        };
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver = \"3\"\nmembers = [\"a\"]\n",
+        )
+        .expect("written");
+        package("dep", "[features]\nx = []\ny = []\nz = []\n");
+        package(
+            "pm",
+            "[lib]\nproc-macro = true\n[dependencies]\ndep = { path = \"../dep\", features = [\"x\"] }\n",
+        );
+        package(
+            "a",
+            "[dependencies]\npm = { path = \"../pm\" }\ndep = { path = \"../dep\", features = [\"y\"] }\n\
+             [dev-dependencies]\ndep = { path = \"../dep\", features = [\"z\"] }\n",
+        );
+        let status = Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(root)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("cargo runs")
+            .status;
+        assert!(status.success(), "cargo generate-lockfile");
+        let workspace = project::workspace_of(root).expect("a workspace");
+        let target = crate::data::target::build_target();
+        let resolver = Resolver::new(true);
+        let sets = resolver
+            .features(&workspace, &target)
+            .await
+            .expect("cargo tree works offline here");
+        let version = Version::new(0, 1, 0);
+        let names = |set: Option<&std::collections::BTreeSet<Box<str>>>| {
+            set.expect("built")
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        // `pm` is a member as a path dependency, so building the whole workspace enables its
+        // `x` on `dep` for the target, too, as `cargo check --workspace` does (cargo 1.99.1).
+        // `z` is only for the tests.
+        assert_eq!(names(sets.normal("dep", &version)), ["x", "y"]);
+        assert_eq!(names(sets.with_dev("dep", &version)), ["x", "y", "z"]);
+        let again = resolver.features(&workspace, &target).await.expect("kept");
+        assert!(Arc::ptr_eq(&sets, &again), "kept");
     }
 
     #[tokio::test]

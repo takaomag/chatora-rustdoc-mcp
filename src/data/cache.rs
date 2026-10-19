@@ -1,11 +1,11 @@
-//! The disk cache of rustdoc JSON (requirements R-CA-1 and R-CA-4).
+//! The disk cache (requirements R-CA-1, R-CA-2 and R-CA-4).
 //!
-//! M0a keeps only the JSON fetched from docs.rs, at a provisional path. The final keys (R-CA-2),
-//! content digests and the cleanup of leftover temporary files (R-CA-4), locks across processes
-//! (M2), and the GC (R-CA-5) come later.
+//! The rustdoc JSON fetched from docs.rs is kept as it came, with a digest of its contents, and the
+//! crates.io sparse index next to it. Locks across processes (M2) and the GC (R-CA-5) come later.
 
 use std::{
-    ffi::OsString,
+    cmp::Reverse,
+    ffi::{OsStr, OsString},
     fs::{self, File, Metadata},
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
@@ -13,18 +13,33 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, SystemTime},
 };
 
 use etcetera::BaseStrategy as _;
 use semver::Version;
+use sha2::{Digest as _, Sha256};
 
-use super::{crate_name::CrateName, docs_rs::MAX_BYTES, target::TargetTriple};
+use super::{
+    crate_name::CrateName,
+    docs_rs::MAX_BYTES,
+    rustdoc_json::SUPPORTED,
+    target::TargetTriple,
+};
 
 /// Environment variable that sets where the cache is (setting `cache.dir`, requirement R-CA-1).
 pub const DIR_ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_CACHE__DIR";
 
 /// Directory of this server under the OS cache directory.
 const APP_DIR: &str = "chatora-rustdoc-mcp";
+
+/// The directory of the JSON for the crate's default target on docs.rs, which no target triple can
+/// be, as a triple starts with a letter or a digit.
+const DEFAULT_TARGET_DIR: &str = "_default";
+
+/// How old a temporary file must be to count as left behind by a write that did not finish. A
+/// write takes seconds, so one that is still going on is never removed (decided in M1).
+const STALE_TEMPORARY_AGE: Duration = Duration::from_hours(1);
 
 /// Counts the writes of this process, so that no two temporary files share a name (requirement
 /// R-CA-4).
@@ -34,6 +49,21 @@ static WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 pub struct Cache {
     root: Arc<Path>,
+}
+
+/// A rustdoc JSON read from the cache.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CachedJson {
+    /// The JSON, whose contents match its digest.
+    Found(Box<[u8]>),
+    /// The JSON in `format` does not match its digest: it was damaged on the disk (requirement
+    /// R-CA-4).
+    Corrupt {
+        /// Its format version, from its file name.
+        format: u32,
+    },
+    /// No JSON is cached.
+    None,
 }
 
 /// Why the cache directory could not be decided.
@@ -70,31 +100,23 @@ impl Cache {
         Self { root: root.into() }
     }
 
-    /// Where the rustdoc JSON fetched from docs.rs for `name` at `version` is kept.
+    /// The directory of the rustdoc JSON fetched from docs.rs for `name` at `version`, built for
+    /// `target`, or for the crate's default target on docs.rs: `docs.rs/<name>/<version>/<target>`
+    /// (requirement R-CA-2). The name is the cache key of [`CrateName`], and the default target is
+    /// `_default`, which no target triple can be. Each JSON there is `<format_version>.json`,
+    /// with its digest in `<format_version>.json.sha256`.
     #[must_use]
-    pub fn docs_rs_json_path(&self, name: &CrateName, version: &Version) -> PathBuf {
-        self.root
-            .join("docs.rs")
-            .join(name.as_str())
-            .join(version.to_string())
-            .join("rustdoc.json")
-    }
-
-    /// Where the rustdoc JSON fetched from docs.rs for `name` at `version`, built for `target`, is
-    /// kept. The JSON for the crate's default target is at [`Self::docs_rs_json_path`].
-    #[must_use]
-    pub fn docs_rs_target_json_path(
+    pub fn docs_rs_dir(
         &self,
         name: &CrateName,
         version: &Version,
-        target: &TargetTriple,
+        target: Option<&TargetTriple>,
     ) -> PathBuf {
         self.root
             .join("docs.rs")
-            .join(name.as_str())
+            .join(name.cache_key())
             .join(version.to_string())
-            .join(target.as_str())
-            .join("rustdoc.json")
+            .join(target.map_or(DEFAULT_TARGET_DIR, TargetTriple::as_str))
     }
 
     /// The cache directory, where nothing configures cargo or rustup: rustc runs there to tell the
@@ -111,20 +133,55 @@ impl Cache {
         self.root.join("index.crates.io").join(index_path)
     }
 
-    /// Reads the rustdoc JSON fetched from docs.rs for `name` at `version`, or returns `None` if
-    /// it is not cached. A symlink in or on the way to its place, and anything but a regular file,
-    /// count as not cached (requirement R-CA-4).
+    /// Reads the rustdoc JSON fetched from docs.rs in `dir` ([`Self::docs_rs_dir`]) whose
+    /// contents match its digest. Of several formats, the newest that this server reads is taken,
+    /// or else the newest (requirement R-FV-6). A JSON without a digest, as one written by an
+    /// older server or cut off before its digest, counts as not cached. A symlink and anything
+    /// but a regular file count as not cached, too (requirement R-CA-4).
     ///
     /// # Errors
     ///
-    /// Returns an error when the file exists but cannot be read, or is larger than the JSON that
-    /// is held in memory.
-    pub fn read_docs_rs_json(
-        &self,
-        name: &CrateName,
-        version: &Version,
-    ) -> io::Result<Option<Box<[u8]>>> {
-        self.read_file(&self.docs_rs_json_path(name, version))
+    /// Returns an error when a file exists but cannot be read, or is larger than the JSON that is
+    /// held in memory.
+    pub fn read_docs_rs_json(&self, dir: &Path) -> io::Result<CachedJson> {
+        let mut formats = match fs::read_dir(dir) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| json_format(&entry.file_name()))
+                .collect::<Vec<u32>>(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(CachedJson::None),
+            Err(error) => return Err(error),
+        };
+        // Supported formats first, newest first in each group.
+        formats.sort_by_key(|&format| (Reverse(SUPPORTED.contains(&format)), Reverse(format)));
+        for format in formats {
+            let path = dir.join(format!("{format}.json"));
+            let (Some(json), Some(digest)) = (
+                self.read_file(&path)?,
+                self.read_file(&with_suffix(&path, ".sha256"))?,
+            ) else {
+                continue;
+            };
+            return Ok(if digest.trim_ascii() == sha256_hex(&json).as_bytes() {
+                CachedJson::Found(json)
+            } else {
+                CachedJson::Corrupt { format }
+            });
+        }
+        Ok(CachedJson::None)
+    }
+
+    /// Fails unless `dir` is under the cache directory, so that nothing outside is written or
+    /// removed.
+    fn check_inside(&self, dir: &Path) -> io::Result<()> {
+        if dir.starts_with(&self.root) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not in the cache", dir.display()),
+            ))
+        }
     }
 
     /// Reads the cached file at `path`, which is under the cache directory, or returns `None` if
@@ -143,19 +200,37 @@ impl Cache {
         read_regular_file(&self.root, path, MAX_BYTES)
     }
 
-    /// Writes the rustdoc JSON fetched from docs.rs for `name` at `version`, replacing what was
-    /// there. A reader sees either the old file or the whole new one, never a part.
+    /// Writes a rustdoc JSON fetched from docs.rs in `format` to `dir`, replacing the one in the
+    /// same format, and then its digest (requirement R-CA-4). A reader sees either the old file or
+    /// the whole new one; between the two writes, the new JSON does not match the old digest and
+    /// is fetched again.
     ///
     /// # Errors
     ///
-    /// Returns an error when the directory or the file cannot be written.
-    pub fn write_docs_rs_json(
-        &self,
-        name: &CrateName,
-        version: &Version,
-        json: &[u8],
-    ) -> io::Result<()> {
-        write_atomically(&self.docs_rs_json_path(name, version), json)
+    /// Returns an error when the directory or a file cannot be written.
+    pub fn write_docs_rs_json(&self, dir: &Path, format: u32, json: &[u8]) -> io::Result<()> {
+        self.check_inside(dir)?;
+        let path = dir.join(format!("{format}.json"));
+        write_atomically(&path, json)?;
+        write_atomically(&with_suffix(&path, ".sha256"), sha256_hex(json).as_bytes())
+    }
+
+    /// Removes the rustdoc JSON in `format` from `dir`, with its digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a file is there but cannot be removed.
+    pub fn remove_docs_rs_json(&self, dir: &Path, format: u32) -> io::Result<()> {
+        self.check_inside(dir)?;
+        let path = dir.join(format!("{format}.json"));
+        for path in [with_suffix(&path, ".sha256"), path] {
+            match fs::remove_file(&path) {
+                Ok(()) => {},
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -313,7 +388,67 @@ pub(super) fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     {
         tracing::warn!(path = %temp.display(), %error, "failed to remove a temporary file");
     }
+    if result.is_ok() {
+        remove_stale_temporaries(dir);
+    }
     result
+}
+
+/// Removes the temporary files in `dir` that writes which did not finish left behind: those older
+/// than [`STALE_TEMPORARY_AGE`] (requirement R-CA-4, decided in M1). The places that are never
+/// written again are left to the GC (requirement R-CA-5).
+fn remove_stale_temporaries(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with('.') && name.ends_with(".tmp")) {
+            continue;
+        }
+        // Not followed if it is a symlink.
+        let stale = entry.metadata().is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_some_and(|age| age > STALE_TEMPORARY_AGE)
+        });
+        if stale && let Err(error) = fs::remove_file(entry.path()) {
+            tracing::warn!(path = %entry.path().display(), %error, "failed to remove a stale temporary file");
+        }
+    }
+}
+
+/// The format version in the name of a JSON file of the cache, `<format_version>.json`.
+fn json_format(file_name: &OsStr) -> Option<u32> {
+    let digits = file_name.to_str()?.strip_suffix(".json")?;
+    if digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        digits.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// The SHA-256 of `contents`, in lowercase hex.
+pub(super) fn sha256_hex(contents: &[u8]) -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(contents) {
+        for nibble in [byte >> 4, byte & 0xf] {
+            hex.extend(char::from_digit(u32::from(nibble), 16));
+        }
+    }
+    hex
+}
+
+/// `path` with `suffix` added to its file name.
+pub(super) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().map(OsString::from).unwrap_or_default();
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
 fn write_and_rename(temp: &Path, path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -344,33 +479,105 @@ mod tests {
         names
     }
 
+    /// The place of serde's JSON for the default target.
+    fn serde_dir(cache: &Cache) -> PathBuf {
+        let (name, version) = serde();
+        cache.docs_rs_dir(&name, &version, None)
+    }
+
     #[test]
-    fn written_json_is_read_back() {
+    fn written_json_is_read_back_by_its_digest() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let cache = Cache::at(dir.path());
-        let (name, version) = serde();
+        let place = serde_dir(&cache);
+        assert!(place.ends_with("docs.rs/serde/1.0.228/_default"));
         assert_eq!(
-            cache.read_docs_rs_json(&name, &version).expect("reads"),
-            None
+            cache.read_docs_rs_json(&place).expect("reads"),
+            CachedJson::None
         );
         cache
-            .write_docs_rs_json(&name, &version, b"first")
+            .write_docs_rs_json(&place, 61, b"first")
             .expect("writes");
         cache
-            .write_docs_rs_json(&name, &version, b"second")
+            .write_docs_rs_json(&place, 61, b"second")
             .expect("overwrites");
         assert_eq!(
-            cache
-                .read_docs_rs_json(&name, &version)
-                .expect("reads")
-                .as_deref(),
-            Some(&b"second"[..])
+            cache.read_docs_rs_json(&place).expect("reads"),
+            CachedJson::Found(Box::from(&b"second"[..]))
         );
-        let path = cache.docs_rs_json_path(&name, &version);
-        assert!(path.ends_with("docs.rs/serde/1.0.228/rustdoc.json"));
         // No temporary file is left behind.
-        let parent = path.parent().expect("the file has a directory");
-        assert_eq!(file_names(parent), ["rustdoc.json"]);
+        assert_eq!(file_names(&place), ["61.json", "61.json.sha256"]);
+    }
+
+    #[test]
+    fn a_supported_format_is_read_before_others() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let place = serde_dir(&cache);
+        let newest = SUPPORTED.end().saturating_add(1);
+        cache
+            .write_docs_rs_json(&place, newest, b"too new")
+            .expect("writes");
+        cache
+            .write_docs_rs_json(&place, 40, b"too old")
+            .expect("writes");
+        assert_eq!(
+            cache.read_docs_rs_json(&place).expect("reads"),
+            CachedJson::Found(Box::from(&b"too new"[..])),
+            "the newest when none is supported"
+        );
+        cache
+            .write_docs_rs_json(&place, *SUPPORTED.start(), b"read")
+            .expect("writes");
+        assert_eq!(
+            cache.read_docs_rs_json(&place).expect("reads"),
+            CachedJson::Found(Box::from(&b"read"[..]))
+        );
+    }
+
+    #[test]
+    fn json_that_does_not_match_its_digest_is_corrupt() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let place = serde_dir(&cache);
+        cache
+            .write_docs_rs_json(&place, 61, b"json")
+            .expect("writes");
+        fs::write(place.join("61.json"), b"jsoN").expect("damaged");
+        assert_eq!(
+            cache.read_docs_rs_json(&place).expect("reads"),
+            CachedJson::Corrupt { format: 61 }
+        );
+        cache.remove_docs_rs_json(&place, 61).expect("removes");
+        assert_eq!(file_names(&place), Vec::<OsString>::new());
+        // Without its digest, as from an older server, it is not cached.
+        fs::write(place.join("61.json"), b"json").expect("written");
+        assert_eq!(
+            cache.read_docs_rs_json(&place).expect("reads"),
+            CachedJson::None
+        );
+    }
+
+    #[test]
+    fn stale_temporary_files_are_removed_when_writing_next_to_them() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let place = dir.path().join("place");
+        fs::create_dir_all(&place).expect("made");
+        let stale = place.join(".61.json.1.0.tmp");
+        let fresh = place.join(".61.json.2.0.tmp");
+        for path in [&stale, &fresh] {
+            fs::write(path, b"part").expect("written");
+        }
+        let two_hours_ago = SystemTime::now()
+            .checked_sub(Duration::from_hours(2))
+            .expect("a time");
+        File::options()
+            .write(true)
+            .open(&stale)
+            .and_then(|file| file.set_modified(two_hours_ago))
+            .expect("made old");
+        write_atomically(&place.join("61.json"), b"json").expect("writes");
+        assert_eq!(file_names(&place), [".61.json.2.0.tmp", "61.json"]);
     }
 
     #[cfg(unix)]
@@ -378,16 +585,16 @@ mod tests {
     fn a_symlink_in_the_cache_is_not_followed() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let cache = Cache::at(dir.path());
-        let (name, version) = serde();
-        let path = cache.docs_rs_json_path(&name, &version);
-        let parent = path.parent().expect("the file has a directory");
-        fs::create_dir_all(parent).expect("the directory is made");
+        let place = serde_dir(&cache);
+        cache
+            .write_docs_rs_json(&place, 61, b"secret")
+            .expect("writes");
         let secret = dir.path().join("secret");
-        fs::write(&secret, b"secret").expect("the file is written");
-        std::os::unix::fs::symlink(&secret, &path).expect("the symlink is made");
+        fs::rename(place.join("61.json"), &secret).expect("moved");
+        std::os::unix::fs::symlink(&secret, place.join("61.json")).expect("the symlink is made");
         assert_eq!(
-            cache.read_docs_rs_json(&name, &version).expect("reads"),
-            None
+            cache.read_docs_rs_json(&place).expect("reads"),
+            CachedJson::None
         );
     }
 
@@ -398,16 +605,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let root = dir.path().join("cache");
         let cache = Cache::at(&root);
-        let (name, version) = serde();
         let elsewhere = dir.path().join("elsewhere");
-        fs::create_dir_all(elsewhere.join("1.0.228")).expect("the directory is made");
-        fs::write(elsewhere.join("1.0.228/rustdoc.json"), b"secret").expect("the file is written");
+        let outside = Cache::at(&elsewhere);
+        let outside_place = elsewhere.join("1.0.228/_default");
+        outside
+            .write_docs_rs_json(&outside_place, 61, b"secret")
+            .expect("writes");
         fs::create_dir_all(root.join("docs.rs")).expect("the directory is made");
         std::os::unix::fs::symlink(&elsewhere, root.join("docs.rs/serde"))
             .expect("the symlink is made");
         assert_eq!(
-            cache.read_docs_rs_json(&name, &version).expect("reads"),
-            None
+            cache.read_docs_rs_json(&serde_dir(&cache)).expect("reads"),
+            CachedJson::None
         );
     }
 
@@ -415,8 +624,7 @@ mod tests {
     fn what_is_not_a_regular_file_is_not_read() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let cache = Cache::at(dir.path());
-        let (name, version) = serde();
-        let path = cache.docs_rs_json_path(&name, &version);
+        let path = serde_dir(&cache).join("61.json");
         fs::create_dir_all(&path).expect("a directory is made in place of the file");
         assert_eq!(cache.read_file(&path).expect("reads"), None);
     }
@@ -426,10 +634,9 @@ mod tests {
     fn a_fifo_in_the_cache_is_not_read_and_does_not_block() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let cache = Cache::at(dir.path());
-        let (name, version) = serde();
-        let path = cache.docs_rs_json_path(&name, &version);
-        fs::create_dir_all(path.parent().expect("the file has a directory"))
-            .expect("the directory is made");
+        let place = serde_dir(&cache);
+        let path = place.join("61.json");
+        fs::create_dir_all(&place).expect("the directory is made");
         let status = std::process::Command::new("mkfifo")
             .arg(&path)
             .status()

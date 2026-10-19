@@ -15,7 +15,7 @@ use std::{fmt::Write as _, time::Instant};
 
 use chatora_rustdoc_mcp::{
     data::{
-        cache::Cache,
+        cache::{Cache, CachedJson},
         crate_name::CrateName,
         format_version,
         rustdoc_json::{self, ParseError},
@@ -63,12 +63,15 @@ fn entry(crate_name: &str, version: &str) -> Entry {
 /// Reads the JSON of `entry` from the cache and checks that it is the one in the list.
 fn cached_json(cache: &Cache, entry: &Entry) -> Box<[u8]> {
     let (name, version) = (&entry.name, &entry.version);
-    let json = cache
-        .read_docs_rs_json(name, version)
+    let json = match cache
+        .read_docs_rs_json(&cache.docs_rs_dir(name, version, None))
         .expect("the cache is readable")
-        .unwrap_or_else(|| {
-            panic!("{name}@{version} is not in the cache: run `cargo run --example fetch_docs_rs -- {name}@{version}`")
-        });
+    {
+        CachedJson::Found(json) => json,
+        CachedJson::Corrupt { .. } | CachedJson::None => panic!(
+            "{name}@{version} is not in the cache: run `cargo run --example fetch_docs_rs -- {name}@{version}`"
+        ),
+    };
     let mut sha256 = String::new();
     for byte in Sha256::digest(&json) {
         write!(sha256, "{byte:02x}").expect("writing to a String does not fail");

@@ -306,6 +306,61 @@ B5 は大きいので 4 つに分けた: B5a (既定のプロジェクトと wor
   - 実際の cargo (`--offline`) で、結果を再利用すること、member の Cargo.toml を変えると取り直すこと、glob に合う member が増えると `lockfile_outdated` になり Cargo.lock だけの結果に落ちること、Cargo.lock が無いときのエラー
   - `members` の glob の展開
 
+#### B5c (2026-10-19)
+
+- `data::packages` (`local` の中): `cargo metadata` の結果 (失敗したときは Cargo.lock だけ) から、プロジェクトのパッケージと依存の辺を持つ `PackageGraph` を作る
+  - package id で索引し、同名の複数版を共存させる (R-VR-2)
+  - checksum は Cargo.lock の、名前・版・source が一致するものから取る
+- 名前の引き方 (`look_up`。R-PR-1)
+  - member の依存の extern の名前 (改名の後の名前)、パッケージ名、lib 名のどれでも当たる。`-` と `_`、大文字と小文字は区別しない
+  - extern の名前とパッケージ名が別のパッケージに当たったら、`AmbiguousPackage` として候補を返す。どのエラーコードで返すかは C1 で決める (§8 の `ambiguous_version` は「同じ crate の複数版」の意味なので、そのままでは合わない)
+  - 同じパッケージの複数版なら、member から直接依存している版が 1 つだけのときにそれを使い、ほかの版を `other_versions` として返す (warnings に書く想定)。0 個か 2 個以上なら `AmbiguousVersion` として、全部の版を古い順に、それぞれの依存元と一緒に返す (`ambiguous_version`)。直接の依存は、dev・build を含むすべての種類と、改名した依存を数える。member 自身も直接とみなす
+- docs.rs を使ってよいか (`docs_rs_check`。R-VR-2): 取得元が crates.io で、Cargo.lock の checksum が sparse index の同じ版の `cksum` と一致するときだけ許す。それ以外を `NotCratesIo`・`NoChecksum`・`NotInIndex`・`ChecksumMismatch` に分ける。crates.io の source は `registry+https://github.com/rust-lang/crates.io-index` と `sparse+https://index.crates.io/` の 2 つの書き方を認める
+- Cargo.lock だけのとき
+  - 改名と lib 名は分からないので、パッケージ名から作った名前で引く
+  - member と path 依存を区別できないので、source の無いものをすべて member とみなす
+  - `dependencies` の `name`・`name version`・`name version (source)` の 3 つの書き方を読む
+- このリポジトリの実際の `cargo metadata` の出力 (248 パッケージ) で確かめた
+  - 直接の依存は 1 つに決まった (build metadata 付きの `toml@1.1.8+spec-1.1.0` も)
+  - 間接にしか使われない 2 版 (windows-sys・getrandom) は、依存元付きの曖昧さになった
+  - checksum は Cargo.lock から引けた
+- テスト: 直接の版を選ぶこと、直接でない複数版の曖昧さと依存元、extern の名前とパッケージ名の衝突、Cargo.lock だけのときの引き方、docs.rs の判定と source の読み方
+
+#### B5d (2026-10-19)
+
+- `data::features` (`local` の中): `cargo tree --workspace --target <target> -e normal --prefix depth --format '{p}\t{f}'` で、通常のビルドの各パッケージの feature の組を取る (`enabled_in_project` の判定用。R-FT-2・R-FT-3)。`-e normal,dev` も取り、`enabled_in_dev_only` はその差で求められるようにした。resolver 1 では dev の feature が通常の組にも入るので、差は自然に空になる (合成の workspace で確かめた)
+- host 用と target 用の組
+  - resolver 2 以上では、同じパッケージが target 用と host 用 (proc-macro の下) で別の組で出る。workspace の中の path 依存は暗黙の member としてルートにも出て、行だけではどちらか分からない
+  - そこで `--prefix depth` で木の形を読み、proc-macro とその下を host 用とした。パッケージの組は、ルート以外で target 用の位置に出た組、無ければルートの組、それも無ければ host 用の組 (proc-macro だけが使うパッケージ) にする
+  - `-e no-proc-macro` では host 用のルートの行が消えなかったので使わない
+  - 合成の workspace で、`cargo check --workspace --target <t>` の `compiler-artifact` の `features` と突き合わせた。workspace 全体のビルドでは、暗黙の member の proc-macro が依存に付けた feature が target 用にも統合され、cargo tree の組と一致した (target 用は `w,x,y`、host 用は `x`)。`-p a` だけのビルドでは target 用は `y` になる。要件どおり全 member を統合した組で判定する
+- キャッシュ: target ごとに、`cargo metadata` の結果と同じ入力の鍵で持つ (`Resolver::features`)。入力が変われば一緒に捨てる。`cargo metadata` が失敗したとき (Cargo.lock だけのとき) は、同じく失敗するので実行せずエラーにする (`enabled_in_project: unknown` になる想定)
+- `metadata::MetadataError` を、`cargo tree` の失敗にも使えるよう `CargoError` に改名し、subcommand を持たせた
+- 扱っていないこと: 実際のビルド target の決め方 (`.cargo/config.toml` の `build.target` を読むか。読み方は Q-31 で M2)。今は呼び出し側が target を渡す。`--target` を付けない形での再確認 (Q-31)。B5 はこれで終わり
+- テスト: 木の読み取り (host 用・target 用・ルートの組、proc-macro だけが使うパッケージ、読めない行)、実際の cargo で通常の組と dev を含む組、結果を再利用すること
+
+#### B6 (2026-10-19)
+
+利用者が決めた 4 件 (どれも推奨案): キャッシュの配置を要件の鍵に今合わせる、解析できない JSON は 1 回取り直して 1 時間覚える、書きかけの一時ファイルは古さで判定して書くついでに消す、読める形式が無いことは 1 時間覚えてサーバーの更新で捨てる。
+
+- 配置 (R-CA-2): `docs.rs/<名前>/<版>/<target か _default>/<format_version>.json` と、その SHA-256 の `<format_version>.json.sha256`
+  - 名前は `CrateName::cache_key` (小文字にし、`_` を `-` にする。crates.io が同じ crate とみなす名前は同じ場所になる)
+  - `_default` は docs.rs の既定の target。target triple は英数字で始まるので、衝突しない
+  - 形式ごとに別のファイルになったので、別の形式を探した結果は既定のものを上書きしない。読むときは、このサーバーが読める形式の新しいものを先に、無ければ一番新しいものを取る (R-FV-6。サーバーの更新で読める範囲が広がれば、手元のものをそのまま読む)
+  - 既存のキャッシュは読まれない (取り直しになる)。CI の actions cache の鍵を `docs-rs-json-v2-…` に上げた。testdata の全件を新しい配置に取り直し、sha256 が一覧と一致し、testdata のテストが通ることを確かめた
+- 内容ダイジェスト (R-CA-4): JSON を書いた後に digest を書く。読むときに合わなければ壊れたとみなし、消して 1 回だけ取り直し、warnings とログに出す。digest の無い JSON (古いサーバーが書いたもの、digest を書く前に止まったもの) は、無いものとして取り直す。sha2 を dev-dependency から通常の依存に移した (Cargo.lock は変わらない。B8 の std の検証でも使う)
+- 失敗の記録は `miss.json` に種類・時刻・サーバーの版を書く
+  - JSON が無い・target の JSON だけが無い (1 時間)、一時的な失敗 (30 秒) は今までどおり
+  - 解析できない (`unparsable`)、読める形式が無い: 1 時間。記録したサーバーと版が違えば無視する (別の版なら読めるかもしれないため)
+  - `corrupt`: 取り直して書いた JSON を読み直すと digest が合わない (ディスクの問題を疑う)。§8 の定義どおり再試行できるものとして、30 秒にした
+- 解析できない JSON (`unparsable`): 取得時に先頭の検証を通ったのに解析に失敗したら (`Json`・`FormatMismatch`・`TooDeep`)、キャッシュから消して 1 回だけ取り直す。docs.rs が同じ中身を返したら、そこで 1 時間覚える。違う中身でも解析できなければ、ツールが `remember_unparsable` で覚える。先頭の検証を通らない本文 (プロキシのエラーページなど) は、今までどおりキャッシュせず、取り直しもしない
+  - 質問のときに「corrupt を 1 時間覚える」と書いたが、§8 の定義では、解析できないものは `unparsable`、ディスクで壊れるものが `corrupt` だった。そこで 1 時間は `unparsable` に当てた
+- 一時ファイルの後始末: 書き込みが成功したら、同じディレクトリの `.…tmp` のうち更新が 1 時間より古いものを消す。二度と書かない場所に残ったものは GC (R-CA-5) に任せる
+- キャッシュの書き込みと削除は、キャッシュのディレクトリの下でなければ拒む
+- ツール (`get_item`): 読み込みの警告を応答の `warnings` の先頭に入れる (`provenance` の直後という順は保つ)。`docs_unavailable` に `unparsable`・`corrupt` (どちらも `retry_after_secs` 付き) を足した
+- 扱っていないこと: 同じ鍵への同時の書き込みの排他 (M2。今は原子的な rename だけ)。古い配置のファイルの片付け (GC の R-CA-5)。手元の `~/.cache/chatora-rustdoc-mcp` の古い配置のファイルは読まれないまま残る
+- テスト: 配置と digest、読める形式を先に読むこと、digest の不一致と digest の無いファイル、古い一時ファイルだけを消すこと、壊れたキャッシュを 1 回だけ取り直すこと (終わりの印)、解析できない JSON の取り直しと記録、新しいビルドへの置き換え、別のサーバーの版の記録を無視すること、読める形式が無いことを覚えること、symlink・FIFO・ディレクトリを読まないこと
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

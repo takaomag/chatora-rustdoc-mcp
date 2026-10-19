@@ -69,7 +69,9 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.CHATORA_RUSTDOC_MCP_CACHE__DIR }}
-          key: docs-rs-json-${{ hashFiles('testdata/docs-rs-json.txt') }}
+          # v2: キャッシュの配置 (docs.rs/<名前>/<版>/<target>/<形式>.json と digest。M1 の B6)。
+          # 配置を変えたら上げる。
+          key: docs-rs-json-v2-${{ hashFiles('testdata/docs-rs-json.txt') }}
       - name: Fetch the test data
         run: >-
           awk -F'\t' '!/^#/ && NF >= 2 { print $1 "@" $2 }' testdata/docs-rs-json.txt

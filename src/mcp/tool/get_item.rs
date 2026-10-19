@@ -2,7 +2,7 @@
 //!
 //! M0a takes only an exact version, reads only docs.rs, and parses the JSON on every call.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use rmcp::model::{CallToolResult, JsonObject, Tool, ToolAnnotations};
 use semver::Version;
@@ -244,7 +244,7 @@ fn same_crate_name(a: &str, b: &str) -> bool {
 /// crate takes a large part of a second.
 pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
     // The target is chosen in M1 C1; until then, the crate's default target on docs.rs.
-    let json = match data::docs_rs_json(
+    let loaded = match data::docs_rs_json(
         &state.cache,
         &state.docs_rs,
         &arguments.name,
@@ -253,48 +253,93 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
     )
     .await
     {
-        Ok(json) => json,
+        Ok(loaded) => loaded,
         Err(error) => return load_error(&arguments, &error),
     };
-    let Some((looked_up, arguments)) = look_up_on_blocking(json, arguments).await else {
+    let mut warnings = loaded.warnings;
+    let Some((looked_up, arguments, json)) = look_up_on_blocking(loaded.json, arguments).await
+    else {
         return shutting_down();
     };
-    // A format this server does not read: docs.rs may have the release in another one
-    // (requirement R-DS-2).
-    if let Err(Failure::Parse(ParseError::UnsupportedFormat { found, .. })) = &looked_up {
-        match data::docs_rs_json_in_another_format(
+    let (looked_up, arguments) = match &looked_up {
+        // A format this server does not read: docs.rs may have the release in another one
+        // (requirement R-DS-2).
+        Err(Failure::Parse(ParseError::UnsupportedFormat { found, .. })) => {
+            match data::docs_rs_json_in_another_format(
+                &state.cache,
+                &state.docs_rs,
+                &arguments.name,
+                &arguments.version,
+                None,
+                *found,
+            )
+            .await
+            {
+                Ok(Some(json)) => {
+                    let Some((again, returned, _)) = look_up_on_blocking(json, arguments).await
+                    else {
+                        return shutting_down();
+                    };
+                    (again, returned)
+                },
+                Ok(None) => (looked_up, arguments),
+                Err(error) => return load_error(&arguments, &error),
+            }
+        },
+        // Its header was read when it was fetched, yet it does not parse: docs.rs may have served
+        // it broken, so it is fetched again, once (requirement R-CA-4).
+        Err(Failure::Parse(
+            ParseError::Json { .. } | ParseError::FormatMismatch { .. } | ParseError::TooDeep,
+        )) => match data::refetch_unparsable(
             &state.cache,
             &state.docs_rs,
             &arguments.name,
             &arguments.version,
             None,
-            *found,
+            &json,
         )
         .await
         {
-            Ok(Some(json)) => {
-                let Some((again, returned)) = look_up_on_blocking(json, arguments).await else {
+            Ok(again) => {
+                warnings.extend(again.warnings);
+                let Some((again, returned, json)) =
+                    look_up_on_blocking(again.json, arguments).await
+                else {
                     return shutting_down();
                 };
-                return finish(again, &returned);
+                if let Err(Failure::Parse(_)) = &again
+                    && let Err(error) = data::remember_unparsable(
+                        &state.cache,
+                        &returned.name,
+                        &returned.version,
+                        None,
+                        &json,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %ErrorChain(&error), "failed to remember a JSON that cannot be parsed");
+                }
+                (again, returned)
             },
-            Ok(None) => {},
             Err(error) => return load_error(&arguments, &error),
-        }
-    }
-    finish(looked_up, &arguments)
+        },
+        Ok(_) | Err(Failure::Parse(_) | Failure::Item(_) | Failure::Serialize(_)) => {
+            (looked_up, arguments)
+        },
+    };
+    finish(looked_up, &arguments, &warnings)
 }
 
 /// Looks the item up in `json` on a blocking thread, since parsing a large crate takes a large
-/// part of a second. The arguments come back with the result. `None` if the runtime is shutting
-/// down; a panic goes on to `run_tool`.
+/// part of a second. The arguments and the JSON come back with the result. `None` if the runtime
+/// is shutting down; a panic goes on to `run_tool`.
 async fn look_up_on_blocking(
     json: Box<[u8]>,
     arguments: Arguments,
-) -> Option<(Result<Value, Failure>, Arguments)> {
+) -> Option<(Result<Value, Failure>, Arguments, Box<[u8]>)> {
     match tokio::task::spawn_blocking(move || {
         let looked_up = look_up(&json, &arguments);
-        (looked_up, arguments)
+        (looked_up, arguments, json)
     })
     .await
     {
@@ -317,10 +362,17 @@ fn shutting_down() -> CallToolResult {
     )
 }
 
-/// The tool result of a lookup.
-fn finish(looked_up: Result<Value, Failure>, arguments: &Arguments) -> CallToolResult {
+/// The tool result of a lookup, with the `warnings` about how the JSON was loaded first.
+fn finish(
+    looked_up: Result<Value, Failure>,
+    arguments: &Arguments,
+    warnings: &[Box<str>],
+) -> CallToolResult {
     match looked_up {
-        Ok(response) => CallToolResult::structured(response),
+        Ok(mut response) => {
+            add_warnings(&mut response, warnings);
+            CallToolResult::structured(response)
+        },
         Err(Failure::Parse(error)) => parse_error(arguments, &error),
         Err(Failure::Item(error)) => item_error(arguments, &error),
         Err(Failure::Serialize(error)) => {
@@ -332,6 +384,36 @@ fn finish(looked_up: Result<Value, Failure>, arguments: &Arguments) -> CallToolR
                 &["report the bug to the server's maintainers, with the server's stderr log"],
             )
         },
+    }
+}
+
+/// Puts `warnings` first among the `warnings` of `response`, which come right after `provenance`
+/// (§7.3).
+fn add_warnings(response: &mut Value, warnings: &[Box<str>]) {
+    if warnings.is_empty() {
+        return;
+    }
+    let Some(fields) = response.as_object_mut() else {
+        return;
+    };
+    let mut all: Vec<Value> = warnings.iter().map(|warning| json!(warning)).collect();
+    if let Some(Value::Array(more)) = fields.get_mut("warnings") {
+        all.append(more);
+        fields.insert("warnings".to_owned(), Value::Array(all));
+        return;
+    }
+    // The fields are in order: rebuild them with `warnings` after `provenance`.
+    let old = std::mem::take(fields);
+    let mut all = Some(Value::Array(all));
+    for (key, value) in old {
+        let after = key == "provenance";
+        fields.insert(key, value);
+        if after && let Some(all) = all.take() {
+            fields.insert("warnings".to_owned(), all);
+        }
+    }
+    if let Some(all) = all {
+        fields.insert("warnings".to_owned(), all);
     }
 }
 
@@ -413,6 +495,17 @@ fn load_error(arguments: &Arguments, error: &LoadError) -> CallToolResult {
                 "retry_after_secs": retry_after.as_secs().max(1),
             }));
         },
+        LoadError::Unparsable { retry_after } => {
+            return remembered_error(&release, error, "unparsable", false, *retry_after, &[
+                "docs.rs served JSON that this server cannot parse; it is fetched again after \
+                 retry_after_secs, or read by a newer version of the server",
+            ]);
+        },
+        LoadError::Corrupt { retry_after } => {
+            return remembered_error(&release, error, "corrupt", true, *retry_after, &[
+                "check the disk that holds the cache, then try again after retry_after_secs",
+            ]);
+        },
         LoadError::Cache(_) => {
             return super::tool_error(
                 "internal_error",
@@ -454,6 +547,25 @@ fn load_error(arguments: &Arguments, error: &LoadError) -> CallToolResult {
         body.insert("reason".to_owned(), json!(reason));
     }
     error_result(&body)
+}
+
+/// The `docs_unavailable` error for a failure that is remembered for `retry_after` (§8).
+fn remembered_error(
+    release: &str,
+    error: &LoadError,
+    reason: &str,
+    retryable: bool,
+    retry_after: Duration,
+    suggestions: &[&str],
+) -> CallToolResult {
+    error_result(&json!({
+        "code": "docs_unavailable",
+        "message": format!("rustdoc JSON of {release} could not be loaded: {}", ErrorChain(error)),
+        "retryable": retryable,
+        "suggestions": suggestions,
+        "reason": reason,
+        "retry_after_secs": retry_after.as_secs().max(1),
+    }))
 }
 
 /// The tool error for JSON that could not be parsed (§8).

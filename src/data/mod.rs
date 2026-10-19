@@ -7,10 +7,14 @@ pub mod cargo;
 pub mod cargo_lock;
 pub mod crate_name;
 pub mod docs_rs;
+#[cfg(feature = "local")]
+pub mod features;
 pub mod format_version;
 mod http;
 #[cfg(feature = "local")]
 pub mod metadata;
+#[cfg(feature = "local")]
+pub mod packages;
 #[cfg(feature = "local")]
 pub mod project;
 pub mod rustdoc_json;
@@ -21,9 +25,8 @@ mod test_http;
 pub mod version;
 
 use std::{
-    ffi::OsString,
     io,
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -31,7 +34,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use self::{
-    cache::Cache,
+    cache::{Cache, CachedJson, with_suffix},
     crate_name::CrateName,
     docs_rs::{DocsRs, FetchError},
     format_version::Header,
@@ -40,12 +43,28 @@ use self::{
 };
 
 /// How long it is remembered that docs.rs has no JSON for a release (requirement R-ERR-3, about
-/// an hour). docs.rs may build it later (requirement R-DS-3).
+/// an hour). docs.rs may build it later (requirement R-DS-3). A JSON that cannot be parsed and
+/// one with no format this server reads are remembered as long (decided in M1): docs.rs changes
+/// them only when it builds the release again.
 const MISSING_TTL: Duration = Duration::from_hours(1);
 
 /// How long a transient failure to fetch a JSON is remembered (requirement R-ERR-3, about
-/// 30 seconds), so that every lookup does not wait for the same failure again.
+/// 30 seconds), so that every lookup does not wait for the same failure again. A JSON that the
+/// cache keeps damaging is remembered as long (decided in M1).
 const TRANSIENT_TTL: Duration = Duration::from_secs(30);
+
+/// The name of the file that remembers a failure, in the directory of the JSON.
+const MISS_FILE: &str = "miss.json";
+
+/// A rustdoc JSON, and the warnings about how it was loaded.
+#[derive(Debug)]
+pub struct Loaded {
+    /// The JSON.
+    pub json: Box<[u8]>,
+    /// What the response warns about, such as a cached JSON that was damaged and fetched again
+    /// (requirement R-CA-4).
+    pub warnings: Vec<Box<str>>,
+}
 
 /// Why rustdoc JSON could not be loaded.
 #[derive(Debug, thiserror::Error)]
@@ -75,22 +94,87 @@ pub enum LoadError {
         /// How long until it is tried again.
         retry_after: Duration,
     },
+    /// The JSON could not be parsed, even after it was fetched again, a while ago (requirement
+    /// R-CA-4).
+    #[error("this rustdoc JSON could not be parsed even when fetched again; it is tried again in {} seconds", retry_after.as_secs())]
+    Unparsable {
+        /// How long until it is fetched again.
+        retry_after: Duration,
+    },
+    /// The cached JSON did not match its digest when it was read back after being written again:
+    /// the disk may be failing (`corrupt`, requirement R-CA-4).
+    #[error(
+        "the cached rustdoc JSON was damaged again after it was fetched again; check the disk of the cache"
+    )]
+    Corrupt {
+        /// How long until it is fetched again.
+        retry_after: Duration,
+    },
     /// The cached file exists but could not be read, or the blocking task that uses the cache was
     /// cancelled (when the runtime shuts down).
     #[error("the cache of rustdoc JSON could not be used")]
     Cache(#[source] io::Error),
 }
 
-/// A remembered failure to fetch a JSON, kept next to where the JSON would be.
+/// A remembered failure, in [`MISS_FILE`] next to where the JSON would be.
 #[derive(Debug, Serialize, Deserialize)]
 struct Miss {
-    /// docs.rs has no JSON for the release, rather than a transient failure.
-    missing: bool,
-    /// docs.rs has JSON for the release, but not for the target asked for.
-    #[serde(default)]
-    no_target: bool,
+    /// What failed.
+    kind: MissKind,
     /// When it failed, in seconds since the Unix epoch.
     at: u64,
+    /// The version of the server that remembered it.
+    server: Box<str>,
+}
+
+/// What failed to be fetched or read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MissKind {
+    /// docs.rs has no JSON for the release.
+    Missing,
+    /// docs.rs has JSON for the release, but not for the target asked for.
+    NoTarget,
+    /// Fetching failed transiently.
+    Transient,
+    /// The JSON could not be parsed, even after it was fetched again.
+    Unparsable,
+    /// docs.rs has the release in no format that this server reads.
+    NoSupportedFormat,
+    /// The JSON was damaged on the disk again after it was fetched again.
+    Corrupt,
+}
+
+impl MissKind {
+    /// How long it is remembered.
+    const fn ttl(self) -> Duration {
+        match self {
+            Self::Missing | Self::NoTarget | Self::Unparsable | Self::NoSupportedFormat => {
+                MISSING_TTL
+            },
+            Self::Transient | Self::Corrupt => TRANSIENT_TTL,
+        }
+    }
+
+    /// Whether only the server that remembered it trusts it: another version may parse the JSON
+    /// or read its format.
+    const fn is_about_this_server(self) -> bool {
+        matches!(self, Self::Unparsable | Self::NoSupportedFormat)
+    }
+}
+
+impl Miss {
+    /// How long it is still remembered, or `None` if it no longer is.
+    fn remaining(&self) -> Option<Duration> {
+        if self.kind.is_about_this_server() && *self.server != *env!("CARGO_PKG_VERSION") {
+            return None;
+        }
+        let ttl = self.kind.ttl();
+        let age = SystemTime::now()
+            .duration_since(system_time(self.at))
+            .unwrap_or(ttl);
+        Some(ttl.saturating_sub(age)).filter(|remaining| !remaining.is_zero())
+    }
 }
 
 /// Returns the rustdoc JSON of `name` at exactly `version`, from the cache or else from docs.rs.
@@ -104,72 +188,85 @@ struct Miss {
 /// unparsable. A missing JSON is remembered for an hour and a transient failure for 30 seconds
 /// (requirement R-ERR-3). A failure to write the cache is logged and does not fail the load.
 ///
+/// A cached JSON that does not match its digest is removed and fetched again, once, with a
+/// warning; if the new one does not match when read back, the cache is reported corrupt
+/// (requirement R-CA-4).
+///
 /// # Errors
 ///
 /// Returns an error when the cached file cannot be read, the fetch fails or failed a moment ago,
-/// or docs.rs returns another version.
+/// docs.rs returns another version, or the cache damages the JSON again.
 pub async fn docs_rs_json(
     cache: &Cache,
     docs_rs: &DocsRs,
     name: &CrateName,
     version: &Version,
     target: Option<&TargetTriple>,
-) -> Result<Box<[u8]>, LoadError> {
+) -> Result<Loaded, LoadError> {
     // The cache is read and written on a blocking thread, so that tens of megabytes of disk I/O do
     // not hold up the async workers.
-    let path = json_path(cache, name, version, target);
-    let miss_path = with_suffix(&path, ".miss.json");
+    let dir = cache.docs_rs_dir(name, version, target);
     let (cached, miss) = {
-        let (cache, path, miss_path) = (cache.clone(), path.clone(), miss_path.clone());
+        let (cache, dir) = (cache.clone(), dir.clone());
         blocking(move || {
-            let Some(json) = cache.read_file(&path)? else {
-                let miss = cache
-                    .read_file(&miss_path)?
-                    .and_then(|miss| serde_json::from_slice::<Miss>(&miss).ok());
-                return Ok((None, miss));
+            let cached = cache.read_docs_rs_json(&dir)?;
+            if let CachedJson::Corrupt { format } = cached {
+                tracing::warn!(dir = %dir.display(), format, "a cached rustdoc JSON does not match its digest; fetching it again");
+                cache.remove_docs_rs_json(&dir, format)?;
+            }
+            let miss = match cached {
+                CachedJson::None => read_miss(&cache, &dir)?,
+                CachedJson::Found(_) | CachedJson::Corrupt { .. } => None,
             };
-            Ok((Some(json), None))
+            Ok((cached, miss))
         })
         .await
         .map_err(LoadError::Cache)?
     };
-    if let Some(json) = cached {
-        return Ok(json);
-    }
-    if let Some(miss) = miss {
-        let ttl = if miss.missing {
-            MISSING_TTL
-        } else {
-            TRANSIENT_TTL
-        };
-        let age = SystemTime::now()
-            .duration_since(system_time(miss.at))
-            .unwrap_or(ttl);
-        if age < ttl {
-            return Err(
-                if let (true, true, Some(target)) = (miss.missing, miss.no_target, target) {
-                    LoadError::NoTargetJson {
-                        target: target.clone(),
-                    }
-                } else if miss.missing {
-                    LoadError::Fetch(FetchError::NotFound)
-                } else {
-                    LoadError::RecentFailure {
-                        retry_after: ttl.saturating_sub(age),
-                    }
-                },
-            );
-        }
+    let recovering = match cached {
+        CachedJson::Found(json) => {
+            return Ok(Loaded {
+                json,
+                warnings: Vec::new(),
+            });
+        },
+        CachedJson::Corrupt { .. } => true,
+        CachedJson::None => false,
+    };
+    if let Some((kind, retry_after)) = miss {
+        return Err(match kind {
+            MissKind::NoTarget => target.map_or(LoadError::Fetch(FetchError::NotFound), |target| {
+                LoadError::NoTargetJson {
+                    target: target.clone(),
+                }
+            }),
+            MissKind::Missing | MissKind::NoSupportedFormat => {
+                LoadError::Fetch(FetchError::NotFound)
+            },
+            MissKind::Transient => LoadError::RecentFailure { retry_after },
+            MissKind::Unparsable => LoadError::Unparsable { retry_after },
+            MissKind::Corrupt => LoadError::Corrupt { retry_after },
+        });
     }
     match docs_rs
         .fetch_rustdoc_json(name, version, target, None)
         .await
     {
-        Ok(json) => store(json, version, path, Some(miss_path)).await,
+        Ok(json) => {
+            let json = store(cache, &dir, version, json, recovering).await?;
+            let warnings = if recovering {
+                vec![Box::from(
+                    "the cached rustdoc JSON was damaged on the disk, so it was fetched again",
+                )]
+            } else {
+                Vec::new()
+            };
+            Ok(Loaded { json, warnings })
+        },
         Err(FetchError::NotFound) if target.is_some() => {
             let error = match docs_rs.has_rustdoc_json(name, version).await {
                 Ok(true) => {
-                    remember_miss(miss_path, true, true).await;
+                    remember_miss(&dir, MissKind::NoTarget).await;
                     target.map_or(LoadError::Fetch(FetchError::NotFound), |target| {
                         LoadError::NoTargetJson {
                             target: target.clone(),
@@ -177,7 +274,7 @@ pub async fn docs_rs_json(
                     })
                 },
                 Ok(false) => {
-                    remember_miss(miss_path, true, false).await;
+                    remember_miss(&dir, MissKind::Missing).await;
                     LoadError::Fetch(FetchError::NotFound)
                 },
                 // Whether the release has JSON at all is not known: nothing is remembered.
@@ -186,19 +283,19 @@ pub async fn docs_rs_json(
             Err(error)
         },
         Err(error) => {
-            let missing = match &error {
-                FetchError::NotFound | FetchError::BadRequest => Some(true),
+            let kind = match &error {
+                FetchError::NotFound | FetchError::BadRequest => Some(MissKind::Missing),
                 FetchError::Transient { .. }
                 | FetchError::UnexpectedStatus { .. }
                 | FetchError::Network(_)
-                | FetchError::Certificate(_) => Some(false),
+                | FetchError::Certificate(_) => Some(MissKind::Transient),
                 // A broken body may be fetched whole next time.
                 FetchError::TooLarge { .. }
                 | FetchError::TooManyLayers
                 | FetchError::Corrupt(_) => None,
             };
-            if let Some(missing) = missing {
-                remember_miss(miss_path, missing, false).await;
+            if let Some(kind) = kind {
+                remember_miss(&dir, kind).await;
             }
             Err(LoadError::Fetch(error))
         },
@@ -212,8 +309,10 @@ pub async fn docs_rs_json(
 /// it built the release in it, so a 404 is expected.
 ///
 /// Every format is tried, whatever fails on the way (decided in M1): a JSON that is found is
-/// cached in place of the default one and returned. If none is found, `None` is returned, unless
-/// a transient failure may have hidden one, which is then returned as the error.
+/// cached next to the default one, under its own format, and returned. If none is found, `None`
+/// is returned, unless a transient failure may have hidden one, which is then returned as the
+/// error. That none is found is remembered for an hour by this version of the server (R-FV-6,
+/// decided in M1).
 ///
 /// # Errors
 ///
@@ -226,21 +325,28 @@ pub async fn docs_rs_json_in_another_format(
     target: Option<&TargetTriple>,
     found: u32,
 ) -> Result<Option<Box<[u8]>>, LoadError> {
+    let dir = cache.docs_rs_dir(name, version, target);
+    let miss = {
+        let (cache, dir) = (cache.clone(), dir.clone());
+        blocking(move || read_miss(&cache, &dir))
+            .await
+            .map_err(LoadError::Cache)?
+    };
+    if let Some((MissKind::NoSupportedFormat, _)) = miss {
+        return Ok(None);
+    }
     let mut transient = None;
     for format in SUPPORTED.rev().filter(|&format| format != found) {
         let error = match docs_rs
             .fetch_rustdoc_json(name, version, target, Some(format))
             .await
         {
-            Ok(json) => {
-                let path = json_path(cache, name, version, target);
-                match store(json, version, path, None).await {
-                    Ok(json) if format_version::peek(&json) == Some(format) => {
-                        return Ok(Some(json));
-                    },
-                    Ok(_) | Err(LoadError::WrongVersion { .. }) => continue,
-                    Err(error) => return Err(error),
-                }
+            Ok(json) => match store(cache, &dir, version, json, false).await {
+                Ok(json) if format_version::peek(&json) == Some(format) => {
+                    return Ok(Some(json));
+                },
+                Ok(_) | Err(LoadError::WrongVersion { .. }) => continue,
+                Err(error) => return Err(error),
             },
             Err(error) => error,
         };
@@ -256,19 +362,95 @@ pub async fn docs_rs_json_in_another_format(
             | FetchError::Certificate(_) => transient = Some(error),
         }
     }
-    transient.map_or(Ok(None), |error| Err(LoadError::Fetch(error)))
+    if let Some(error) = transient {
+        return Err(LoadError::Fetch(error));
+    }
+    remember_miss(&dir, MissKind::NoSupportedFormat).await;
+    Ok(None)
 }
 
-/// Checks a fetched `json` and caches it at `path` when it is rustdoc JSON of `version`, and
-/// forgets a remembered failure at `miss_path`. A JSON of another version is an error; one whose
-/// header cannot be read is returned without being cached.
-async fn store(
-    json: Box<[u8]>,
+/// Fetches the rustdoc JSON of `name` at `version` again, when `json` could not be parsed.
+///
+/// Its digest matched, so docs.rs may have served it broken (requirement R-CA-4). The cached one
+/// is removed first. If docs.rs returns the same contents, that is remembered for
+/// an hour by this version of the server (decided in M1); if the new one cannot be parsed
+/// either, the caller calls [`remember_unparsable`].
+///
+/// # Errors
+///
+/// Returns an error when the fetch fails, docs.rs returns the same JSON or another version, or
+/// the cache cannot be used.
+pub async fn refetch_unparsable(
+    cache: &Cache,
+    docs_rs: &DocsRs,
+    name: &CrateName,
     version: &Version,
-    path: PathBuf,
-    miss_path: Option<PathBuf>,
+    target: Option<&TargetTriple>,
+    json: &[u8],
+) -> Result<Loaded, LoadError> {
+    let dir = cache.docs_rs_dir(name, version, target);
+    forget(cache, &dir, json).await?;
+    let fresh = docs_rs
+        .fetch_rustdoc_json(name, version, target, None)
+        .await?;
+    if *fresh == *json {
+        remember_miss(&dir, MissKind::Unparsable).await;
+        return Err(LoadError::Unparsable {
+            retry_after: MISSING_TTL,
+        });
+    }
+    let json = store(cache, &dir, version, fresh, false).await?;
+    Ok(Loaded {
+        json,
+        warnings: vec![Box::from(
+            "the cached rustdoc JSON could not be parsed, so it was fetched again",
+        )],
+    })
+}
+
+/// Removes the cached `json` of `name` at `version`, which could not be parsed even after it was
+/// fetched again, and remembers that for an hour by this version of the server (decided in M1).
+///
+/// # Errors
+///
+/// Returns an error when the cache cannot be used.
+pub async fn remember_unparsable(
+    cache: &Cache,
+    name: &CrateName,
+    version: &Version,
+    target: Option<&TargetTriple>,
+    json: &[u8],
+) -> Result<(), LoadError> {
+    let dir = cache.docs_rs_dir(name, version, target);
+    forget(cache, &dir, json).await?;
+    remember_miss(&dir, MissKind::Unparsable).await;
+    Ok(())
+}
+
+/// Removes `json` from the cache directory `dir`, by the format it declares.
+async fn forget(cache: &Cache, dir: &Path, json: &[u8]) -> Result<(), LoadError> {
+    let Some(format) = format_version::peek(json) else {
+        return Ok(());
+    };
+    let (cache, dir) = (cache.clone(), dir.to_path_buf());
+    blocking(move || cache.remove_docs_rs_json(&dir, format))
+        .await
+        .map_err(LoadError::Cache)
+}
+
+/// Checks a fetched `json` and caches it in `dir` when it is rustdoc JSON of `version`, and
+/// forgets a remembered failure. A JSON of another version is an error; one whose header cannot
+/// be read is returned without being cached. With `read_back`, the cached file is read back: if
+/// it does not match, the cache is damaging what it is given, which is remembered for 30 seconds
+/// and returned as an error (requirement R-CA-4).
+async fn store(
+    cache: &Cache,
+    dir: &Path,
+    version: &Version,
+    json: Box<[u8]>,
+    read_back: bool,
 ) -> Result<Box<[u8]>, LoadError> {
-    let version = version.clone();
+    let (cache, dir_path, version) = (cache.clone(), dir.to_path_buf(), version.clone());
     // The JSON moves to the blocking thread and comes back, so that tens of megabytes are not
     // copied. Reading the header goes through the whole JSON.
     let (json, outcome) = blocking(move || {
@@ -279,11 +461,17 @@ async fn store(
             }) if Version::parse(&found).ok().as_ref() != Some(&version) => {
                 Stored::WrongVersion(found)
             },
-            Ok(_) => {
-                if let Some(miss_path) = miss_path {
-                    remove_if_there(&miss_path);
+            Ok(Header { format_version, .. }) => {
+                remove_if_there(&dir_path.join(MISS_FILE));
+                match cache.write_docs_rs_json(&dir_path, format_version, &json) {
+                    Ok(()) if read_back => match cache.read_docs_rs_json(&dir_path)? {
+                        CachedJson::Found(again) if *again == *json => Stored::Written(Ok(())),
+                        CachedJson::Found(_) | CachedJson::Corrupt { .. } | CachedJson::None => {
+                            Stored::Damaged
+                        },
+                    },
+                    written => Stored::Written(written),
                 }
-                Stored::Written(cache::write_atomically(&path, &json))
             },
             Err(_) => Stored::NotRustdocJson,
         };
@@ -300,6 +488,13 @@ async fn store(
             tracing::warn!("not caching a body from docs.rs that is not rustdoc JSON");
         },
         Stored::WrongVersion(found) => return Err(LoadError::WrongVersion { found }),
+        Stored::Damaged => {
+            tracing::error!(dir = %dir.display(), "the cache damaged a rustdoc JSON again after it was fetched again");
+            remember_miss(dir, MissKind::Corrupt).await;
+            return Err(LoadError::Corrupt {
+                retry_after: TRANSIENT_TTL,
+            });
+        },
     }
     Ok(json)
 }
@@ -309,23 +504,33 @@ enum Stored {
     Written(io::Result<()>),
     NotRustdocJson,
     WrongVersion(Box<str>),
+    /// Read back, it did not match what was written.
+    Damaged,
 }
 
-/// Remembers at `miss_path` that fetching failed: missing (for the target only, with `no_target`)
-/// or transiently. A failure to write it is logged.
-async fn remember_miss(miss_path: PathBuf, missing: bool, no_target: bool) {
+/// The failure remembered in `dir` that still holds, and how long it does.
+fn read_miss(cache: &Cache, dir: &Path) -> io::Result<Option<(MissKind, Duration)>> {
+    Ok(cache
+        .read_file(&dir.join(MISS_FILE))?
+        .and_then(|miss| serde_json::from_slice::<Miss>(&miss).ok())
+        .and_then(|miss| Some((miss.kind, miss.remaining()?))))
+}
+
+/// Remembers in `dir` that fetching or reading failed. A failure to write it is logged.
+async fn remember_miss(dir: &Path, kind: MissKind) {
     let miss = Miss {
-        missing,
-        no_target,
+        kind,
         at: unix_seconds(SystemTime::now()),
+        server: env!("CARGO_PKG_VERSION").into(),
     };
+    let path = dir.join(MISS_FILE);
     let written = blocking(move || {
         let json = serde_json::to_vec(&miss).map_err(io::Error::other)?;
-        cache::write_atomically(&miss_path, &json)
+        cache::write_atomically(&path, &json)
     })
     .await;
     if let Err(error) = written {
-        tracing::warn!(%error, "failed to remember a failed fetch in the cache");
+        tracing::warn!(%error, "failed to remember a failure in the cache");
     }
 }
 
@@ -336,26 +541,6 @@ fn remove_if_there(path: &Path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {},
         Err(error) => tracing::warn!(path = %path.display(), %error, "failed to remove a file"),
     }
-}
-
-/// Where the JSON of `name` at `version` for `target`, or the default target, is cached.
-fn json_path(
-    cache: &Cache,
-    name: &CrateName,
-    version: &Version,
-    target: Option<&TargetTriple>,
-) -> PathBuf {
-    target.map_or_else(
-        || cache.docs_rs_json_path(name, version),
-        |target| cache.docs_rs_target_json_path(name, version, target),
-    )
-}
-
-/// `path` with `suffix` added to its file name.
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().map(OsString::from).unwrap_or_default();
-    name.push(suffix);
-    path.with_file_name(name)
 }
 
 /// Reads a semantic version from a string, for `#[serde(deserialize_with)]`.
@@ -438,22 +623,144 @@ mod tests {
         )
     }
 
+    /// The JSON of serde cached for the default target, if any.
+    fn cached(cache: &Cache) -> Option<Box<[u8]>> {
+        let (name, version) = serde();
+        match cache
+            .read_docs_rs_json(&cache.docs_rs_dir(&name, &version, None))
+            .expect("reads")
+        {
+            CachedJson::Found(json) => Some(json),
+            CachedJson::Corrupt { .. } | CachedJson::None => None,
+        }
+    }
+
     /// Loads the JSON of serde from a server that answers `body`, with an empty cache, and reads
     /// back what was cached.
     async fn load(body: &[u8]) -> (Result<Box<[u8]>, LoadError>, Option<Box<[u8]>>) {
         let (cache, docs_rs, _requests, _dir) = setup(vec![ok(body)]);
         let (name, version) = serde();
-        let json = docs_rs_json(&cache, &docs_rs, &name, &version, None).await;
-        let cached = cache.read_docs_rs_json(&name, &version).expect("reads");
-        (json, cached)
+        let json = docs_rs_json(&cache, &docs_rs, &name, &version, None)
+            .await
+            .map(|loaded| loaded.json);
+        (json, cached(&cache))
     }
+
+    const SERDE_61: &[u8] = br#"{"root":0,"crate_version":"1.0.228","format_version":61}"#;
 
     #[tokio::test]
     async fn rustdoc_json_of_the_version_is_cached() {
-        let json = br#"{"root":0,"crate_version":"1.0.228","format_version":61}"#;
-        let (loaded, cached) = load(json).await;
-        assert_eq!(loaded.expect("loads").as_ref(), json);
-        assert_eq!(cached.as_deref(), Some(&json[..]));
+        let (loaded, cached) = load(SERDE_61).await;
+        assert_eq!(loaded.expect("loads").as_ref(), SERDE_61);
+        assert_eq!(cached.as_deref(), Some(SERDE_61));
+    }
+
+    #[tokio::test]
+    async fn the_json_is_kept_by_its_format_with_a_digest() {
+        let (cache, docs_rs, _requests, dir) = setup(vec![ok(SERDE_61)]);
+        // Names that crates.io counts as the same share the place.
+        let name: CrateName = "Serde".parse().expect("valid");
+        let version = Version::new(1, 0, 228);
+        docs_rs_json(&cache, &docs_rs, &name, &version, None)
+            .await
+            .expect("loads");
+        let place = dir.path().join("docs.rs/serde/1.0.228/_default");
+        let mut names: Vec<String> = std::fs::read_dir(&place)
+            .expect("the directory is there")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, ["61.json", "61.json.sha256"]);
+        assert_eq!(
+            std::fs::read_to_string(place.join("61.json.sha256")).expect("the digest"),
+            cache::sha256_hex(SERDE_61)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_damaged_cache_is_fetched_again_once() {
+        let (cache, docs_rs, requests, _dir) = setup(vec![ok(SERDE_61), ok(SERDE_61)]);
+        let (name, version) = serde();
+        docs_rs_json(&cache, &docs_rs, &name, &version, None)
+            .await
+            .expect("loads");
+        // A byte changes on the disk; the digest stays.
+        let file = cache.docs_rs_dir(&name, &version, None).join("61.json");
+        std::fs::write(&file, SERDE_61.to_ascii_uppercase()).expect("damaged");
+        let loaded = docs_rs_json(&cache, &docs_rs, &name, &version, None)
+            .await
+            .expect("fetched again");
+        assert_eq!(&*loaded.json, SERDE_61);
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        let again = docs_rs_json(&cache, &docs_rs, &name, &version, None)
+            .await
+            .expect("cached");
+        assert_eq!(again.warnings, Vec::<Box<str>>::new());
+        assert_eq!(requests.iter().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn json_that_cannot_be_parsed_is_fetched_again_once_and_remembered() {
+        let (cache, docs_rs, requests, _dir) = setup(vec![ok(SERDE_61), ok(SERDE_61)]);
+        let (name, version) = serde();
+        let loaded = docs_rs_json(&cache, &docs_rs, &name, &version, None)
+            .await
+            .expect("loads");
+        // Say the parser fails on it: docs.rs returns the same.
+        let refetched =
+            refetch_unparsable(&cache, &docs_rs, &name, &version, None, &loaded.json).await;
+        assert!(
+            matches!(refetched, Err(LoadError::Unparsable { .. })),
+            "{refetched:?}"
+        );
+        let remembered = docs_rs_json(&cache, &docs_rs, &name, &version, None).await;
+        assert!(
+            matches!(remembered, Err(LoadError::Unparsable { .. })),
+            "{remembered:?}"
+        );
+        assert_eq!(requests.iter().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn json_that_cannot_be_parsed_is_replaced_by_a_new_build() {
+        let rebuilt = br#"{"root":1,"crate_version":"1.0.228","format_version":61}"#;
+        let (cache, docs_rs, _requests, _dir) = setup(vec![ok(SERDE_61), ok(rebuilt)]);
+        let (name, version) = serde();
+        let loaded = docs_rs_json(&cache, &docs_rs, &name, &version, None)
+            .await
+            .expect("loads");
+        let refetched = refetch_unparsable(&cache, &docs_rs, &name, &version, None, &loaded.json)
+            .await
+            .expect("a new build");
+        assert_eq!(&*refetched.json, rebuilt);
+        assert_eq!(refetched.warnings.len(), 1);
+        assert_eq!(cached(&cache).as_deref(), Some(&rebuilt[..]));
+    }
+
+    #[tokio::test]
+    async fn what_another_server_version_remembered_about_parsing_is_not_trusted() {
+        let (cache, docs_rs, _requests, _dir) = setup(vec![ok(SERDE_61)]);
+        let (name, version) = serde();
+        let dir = cache.docs_rs_dir(&name, &version, None);
+        let miss = Miss {
+            kind: MissKind::Unparsable,
+            at: unix_seconds(SystemTime::now()),
+            server: "0.0.0".into(),
+        };
+        cache::write_atomically(
+            &dir.join(MISS_FILE),
+            &serde_json::to_vec(&miss).expect("serializes"),
+        )
+        .expect("written");
+        docs_rs_json(&cache, &docs_rs, &name, &version, None)
+            .await
+            .expect("fetched, as this version may parse it");
     }
 
     #[tokio::test]
@@ -552,13 +859,7 @@ mod tests {
             "GET /crate/serde/1.0.228/json/61 HTTP/1.1",
             "GET /crate/serde/1.0.228/json/60 HTTP/1.1",
         ]);
-        assert_eq!(
-            cache
-                .read_docs_rs_json(&name, &version)
-                .expect("reads")
-                .as_deref(),
-            Some(&json[..])
-        );
+        assert_eq!(cached(&cache).as_deref(), Some(&json[..]));
     }
 
     #[tokio::test]
@@ -575,14 +876,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_format_is_none_without_transient_failures() {
-        let (cache, docs_rs, _requests, _dir) = setup(vec![status("404 Not Found"); 8]);
+    async fn no_format_is_none_without_transient_failures_and_remembered() {
+        let (cache, docs_rs, requests, _dir) = setup(vec![status("404 Not Found"); 8]);
         let (name, version) = serde();
-        assert_eq!(
-            docs_rs_json_in_another_format(&cache, &docs_rs, &name, &version, None, 40)
-                .await
-                .expect("no error"),
-            None
-        );
+        for _ in 0..2 {
+            assert_eq!(
+                docs_rs_json_in_another_format(&cache, &docs_rs, &name, &version, None, 40)
+                    .await
+                    .expect("no error"),
+                None
+            );
+        }
+        // The second search did not ask docs.rs again.
+        assert_eq!(requests.iter().count(), 8);
     }
 }
