@@ -87,6 +87,7 @@
     "rustdoc",
     "RUSTDOCFLAGS",
     "rustup",
+    "serde",
     "shellcheck",
     "shfmt",
     "supertrait",

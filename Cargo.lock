@@ -59,6 +59,7 @@ name = "chatora-rustdoc"
 version = "0.1.0"
 dependencies = [
  "rmcp",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

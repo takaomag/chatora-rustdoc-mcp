@@ -1,5 +1,7 @@
 //! Frontend layer: the MCP server. MCP types appear only in this module.
 
+mod echo;
+
 use std::borrow::Cow;
 
 use rmcp::{
@@ -7,9 +9,15 @@ use rmcp::{
     ServiceExt as _,
     model::{
         CacheScope,
+        CallToolRequestParams,
+        CallToolResponse,
+        CallToolResult,
+        ContentBlock,
         DiscoverResult,
         ErrorData,
         Implementation,
+        ListToolsResult,
+        PaginatedRequestParams,
         ProtocolVersion,
         ServerCapabilities,
         ServerConfig,
@@ -25,8 +33,8 @@ const SUPPORTED_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
 /// `CARGO_BIN_NAME` is not set when compiling the library.
 const SERVER_NAME: &str = "chatora-rustdoc-mcp";
 
-/// How long clients may cache `server/discover` (requirement R-MCP-5).
-const DISCOVER_TTL_MS: u64 = 60 * 60 * 1000;
+/// How long clients may cache `server/discover` and `tools/list` (requirement R-MCP-5).
+const LIST_TTL_MS: u64 = 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy)]
 struct Server;
@@ -50,9 +58,62 @@ impl ServerHandler for Server {
             SUPPORTED_VERSIONS.to_vec(),
             self.get_info(),
         )
-        .with_ttl_ms(DISCOVER_TTL_MS)
+        .with_ttl_ms(LIST_TTL_MS)
         .with_cache_scope(CacheScope::Public)))
     }
+
+    fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
+        // The list is not paginated, so any cursor is invalid (requirement R-MCP-5).
+        let result = if request.is_some_and(|request| request.cursor.is_some()) {
+            Err(ErrorData::invalid_params(
+                "tools/list is not paginated; omit the cursor",
+                None,
+            ))
+        } else {
+            Ok(ListToolsResult::with_all_items(vec![echo::tool()])
+                .with_ttl_ms(LIST_TTL_MS)
+                .with_cache_scope(CacheScope::Public))
+        };
+        std::future::ready(result)
+    }
+
+    fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> + Send + '_ {
+        // Only an unknown tool is a JSON-RPC error; bad arguments are tool errors (requirement R-ARG-1).
+        let result = match request.name.as_ref() {
+            echo::NAME => Ok(echo::call(request.arguments.as_ref()).into()),
+            name => Err(ErrorData::invalid_params(
+                format!("unknown tool: {name}"),
+                None,
+            )),
+        };
+        std::future::ready(result)
+    }
+}
+
+/// Builds the `invalid_argument` tool error (requirement R-ARG-1).
+fn invalid_argument(message: &str, suggestions: &[&str]) -> CallToolResult {
+    tool_error("invalid_argument", message, false, suggestions)
+}
+
+/// Builds a tool error whose `content[0].text` is self-contained JSON (requirement R-ERR-2).
+///
+/// It has no `structuredContent`: Claude Code ignores it on errors (requirement R-OUT-1).
+fn tool_error(code: &str, message: &str, retryable: bool, suggestions: &[&str]) -> CallToolResult {
+    let body = serde_json::json!({
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+        "suggestions": suggestions,
+    });
+    CallToolResult::error(vec![ContentBlock::text(body.to_string())])
 }
 
 /// Errors that stop the MCP server.

@@ -3,6 +3,7 @@
 use std::{error::Error as _, ffi::OsString};
 
 use rmcp as _;
+use serde_json as _;
 use thiserror as _;
 use tracing as _;
 use tracing_subscriber as _;
