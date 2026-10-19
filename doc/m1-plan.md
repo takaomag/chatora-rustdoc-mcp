@@ -361,6 +361,19 @@ B5 は大きいので 4 つに分けた: B5a (既定のプロジェクトと wor
 - 扱っていないこと: 同じ鍵への同時の書き込みの排他 (M2。今は原子的な rename だけ)。古い配置のファイルの片付け (GC の R-CA-5)。手元の `~/.cache/chatora-rustdoc-mcp` の古い配置のファイルは読まれないまま残る
 - テスト: 配置と digest、読める形式を先に読むこと、digest の不一致と digest の無いファイル、古い一時ファイルだけを消すこと、壊れたキャッシュを 1 回だけ取り直すこと (終わりの印)、解析できない JSON の取り直しと記録、新しいビルドへの置き換え、別のサーバーの版の記録を無視すること、読める形式が無いことを覚えること、symlink・FIFO・ディレクトリを読まないこと
 
+#### B7 (2026-10-19)
+
+- `rustdoc_json::v46_to_53`: 形式 46・48〜53 の shim。対応範囲を 46 からにした (`SUPPORTED = 46..=61`)。47 は欠番なので、`supported_formats()` で除き、別の形式を探すときも docs.rs に問い合わせない
+- 形式 54 とのスキーマの違いは、rustdoc-types の変更履歴で確かめた
+  - `Item::attrs` が文字列の配列であること (54 で `Attribute` になった)。この shim の中心
+  - 54〜56 と同じく `ExternalCrate::path` が無い (`v54_to_56` の型を使い回した)
+  - 51 で `AssocItemConstraint::args` などが `Option<Box<GenericArgs>>` になったが、serde の `Option` は値そのものを受けるので、shim は要らない
+  - 58 で足された `stability`・`const_stability` は `None` にする
+- 属性の写す範囲 (R-FV-2 の「M1 で決める」): 形式 54 以降に variant があるものは、すべて写す (`non_exhaustive`・`must_use` (理由付き、52〜53 の `#[attr = MustUse {reason: "…"}]` も)・`macro_export`・`export_name`・`link_section`・`automatically_derived`・`repr` (`C`・`transparent`・`simd`・`Rust`・整数型・`align(n)`・`packed`・`packed(n)`)・`no_mangle` (`unsafe(…)` で包んだものも)・`target_feature`)。variant の無いものと解析できないものは、文字列のまま `Other` に残す
+  - `#[inline]` (46) と `#[attr = Inline(Hint)]` (48 以降) は、形式 61 でも `Other` なので、書き換えずに残した。形式をまたいだ比較では表記が違って見えるが、`Other` の文字列は形式の版を上げずに変わりうると上流が明言しているので、揃えない
+  - testdata (tokio 1.45.1・clap 4.5.39 の 46、syn 2.0.104 の 48、clap 4.5.41 の 53) で、実際に出る属性の文字列を数えて範囲を確かめた。どれも shim で読め、variant のある属性が文字列のまま残らないことを testdata のテストで確かめるようにした
+- テスト: 属性の文字列の解析 (各 variant、文字列リテラルのエスケープ、`repr` の組み合わせ、解析できないものは `Other`)、形式 46・48・51・53 の手作りの JSON、45 と 47 は非対応、testdata の 4 件
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

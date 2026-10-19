@@ -3,9 +3,10 @@
 //!
 //! The format, read ahead from the end of the JSON ([`format_version::read`]), chooses the types to
 //! deserialize into: the latest types for format 57 and from 61, and shims that differ from them
-//! only where a change broke reading, for 54 to 56 and for 58 to 60. The JSON is parsed once, as a
-//! stream, without going through `serde_json::Value`. Formats before 54 come in M1.
+//! only where a change broke reading, for 46 to 53, 54 to 56 and 58 to 60. The JSON is parsed
+//! once, as a stream, without going through `serde_json::Value`.
 
+mod v46_to_53;
 mod v54_to_56;
 mod v58_to_60;
 
@@ -16,8 +17,16 @@ use serde::de::DeserializeOwned;
 
 use super::format_version::{self, FormatVersionError};
 
-/// The formats this server reads (requirement R-FV-4). Formats 46 to 53 come in M1.
-pub const SUPPORTED: RangeInclusive<u32> = 54..=FORMAT_VERSION;
+/// The formats this server reads (requirement R-FV-4). Format 47 was skipped and never exists.
+pub const SUPPORTED: RangeInclusive<u32> = 46..=FORMAT_VERSION;
+
+/// The format that rustdoc skipped: no JSON has it (requirement R-FV-4).
+const SKIPPED: u32 = 47;
+
+/// The formats of [`SUPPORTED`] that exist, oldest first.
+pub fn supported_formats() -> impl DoubleEndedIterator<Item = u32> {
+    SUPPORTED.filter(|&format| format != SKIPPED)
+}
 
 /// The deepest nesting of arrays and objects that is parsed (requirement R-FV-8).
 ///
@@ -95,6 +104,9 @@ pub fn parse(json: &[u8]) -> Result<ParsedCrate, ParseError> {
         source,
     };
     let krate = match read_ahead {
+        46 | 48..=53 => deserialize::<v46_to_53::Crate>(json)
+            .map_err(json_error)?
+            .into_latest(),
         54..=56 => deserialize::<v54_to_56::Crate>(json)
             .map_err(json_error)?
             .into_latest(),
@@ -345,12 +357,57 @@ mod tests {
     }
 
     #[test]
-    fn older_formats_are_unsupported() {
-        let json = serde_json::to_vec(&krate(53, vec![module(0)])).expect("serializes");
-        assert!(matches!(
-            parse(&json),
-            Err(ParseError::UnsupportedFormat { found: 53, .. })
-        ));
+    fn formats_46_to_53_get_their_attributes_parsed() {
+        for format_version in [46, 48, 51, 53] {
+            let mut expected = krate(format_version, vec![module(0)]);
+            let json = json_of(&expected, |value| {
+                if let Some(external_crate) = value["external_crates"]["1"].as_object_mut() {
+                    external_crate.remove("path");
+                }
+                let item = &mut value["index"]["0"];
+                item["attrs"] = json!(["#[non_exhaustive]", "#[repr(C)]", "#[inline]"]);
+                if let Some(item) = item.as_object_mut() {
+                    item.remove("stability");
+                    item.remove("const_stability");
+                }
+            });
+            let std = expected
+                .external_crates
+                .get_mut(&1)
+                .expect("the crate has std");
+            std.path = PathBuf::new();
+            expected.index.get_mut(&Id(0)).expect("the root").attrs = vec![
+                Attribute::NonExhaustive,
+                Attribute::Repr(rustdoc_types::AttributeRepr {
+                    kind: rustdoc_types::ReprKind::C,
+                    align: None,
+                    packed: None,
+                    int: None,
+                }),
+                Attribute::Other("#[inline]".to_owned()),
+            ];
+            assert_eq!(
+                parse(&json).expect("parses").krate,
+                expected,
+                "{format_version}"
+            );
+        }
+    }
+
+    #[test]
+    fn older_formats_and_the_skipped_one_are_unsupported() {
+        for format_version in [45, 47] {
+            let json =
+                serde_json::to_vec(&krate(format_version, vec![module(0)])).expect("serializes");
+            assert!(
+                matches!(
+                    parse(&json),
+                    Err(ParseError::UnsupportedFormat { found, .. }) if found == format_version
+                ),
+                "{format_version}"
+            );
+        }
+        assert!(!supported_formats().any(|format| format == 47));
     }
 
     #[test]

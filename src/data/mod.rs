@@ -38,7 +38,6 @@ use self::{
     crate_name::CrateName,
     docs_rs::{DocsRs, FetchError},
     format_version::Header,
-    rustdoc_json::SUPPORTED,
     target::TargetTriple,
 };
 
@@ -336,7 +335,10 @@ pub async fn docs_rs_json_in_another_format(
         return Ok(None);
     }
     let mut transient = None;
-    for format in SUPPORTED.rev().filter(|&format| format != found) {
+    for format in rustdoc_json::supported_formats()
+        .rev()
+        .filter(|&format| format != found)
+    {
         let error = match docs_rs
             .fetch_rustdoc_json(name, version, target, Some(format))
             .await
@@ -864,9 +866,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_transient_failure_on_the_way_is_reported_when_no_format_is_found() {
-        // Format 61 fails transiently three times; 54 to 60 are not there.
+        // Format 61 fails transiently three times; the older ones are not there.
+        let older = rustdoc_json::supported_formats().count().saturating_sub(1);
         let mut responses = vec![status("503 Service Unavailable"); 3];
-        responses.extend(vec![status("404 Not Found"); 7]);
+        responses.extend(vec![status("404 Not Found"); older]);
         let (cache, docs_rs, _requests, _dir) = setup(responses);
         let (name, version) = serde();
         assert!(matches!(
@@ -877,7 +880,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_format_is_none_without_transient_failures_and_remembered() {
-        let (cache, docs_rs, requests, _dir) = setup(vec![status("404 Not Found"); 8]);
+        let formats = rustdoc_json::supported_formats().count();
+        let (cache, docs_rs, requests, _dir) = setup(vec![status("404 Not Found"); formats]);
         let (name, version) = serde();
         for _ in 0..2 {
             assert_eq!(
@@ -887,7 +891,7 @@ mod tests {
                 None
             );
         }
-        // The second search did not ask docs.rs again.
-        assert_eq!(requests.iter().count(), 8);
+        // Format 47 was not asked for, and the second search did not ask docs.rs again.
+        assert_eq!(requests.iter().count(), formats);
     }
 }

@@ -28,9 +28,9 @@ pub(super) struct Crate {
     format_version: u32,
 }
 
-/// `rustdoc_types::ExternalCrate` without `path`.
+/// `rustdoc_types::ExternalCrate` without `path`, as in formats 46 to 56.
 #[derive(Deserialize)]
-struct ExternalCrate {
+pub(super) struct ExternalCrate {
     name: String,
     html_root_url: Option<String>,
 }
@@ -69,7 +69,7 @@ impl Crate {
 }
 
 impl ExternalCrate {
-    fn into_latest(self) -> rustdoc_types::ExternalCrate {
+    pub(super) fn into_latest(self) -> rustdoc_types::ExternalCrate {
         let Self {
             name,
             html_root_url,

@@ -148,6 +148,25 @@ fn every_supported_format_is_parsed_into_the_latest_types() {
             krate.index.contains_key(&krate.root),
             "{what}: the root is not in the index"
         );
+        // Formats before 54 write attributes as strings; those with a variant become it
+        // (requirement R-FV-2).
+        if entry.format_version < 54 {
+            let unparsed = krate
+                .index
+                .values()
+                .flat_map(|item| &item.attrs)
+                .filter(|attr| {
+                    matches!(attr, rustdoc_types::Attribute::Other(text)
+                        if ["#[non_exhaustive", "#[automatically_derived", "#[macro_export", "#[must_use", "#[repr"]
+                            .iter()
+                            .any(|prefix| text.starts_with(prefix)))
+                })
+                .count();
+            assert_eq!(
+                unparsed, 0,
+                "{what}: attributes with a variant left as strings"
+            );
+        }
         // Formats before 57 have no path for external crates; it reads as an empty path.
         let empty_paths = krate
             .external_crates
