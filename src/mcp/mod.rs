@@ -157,10 +157,8 @@ pub async fn serve() -> Result<(), ServeError> {
     );
     match Server.serve(stdio()).await {
         Ok(running) => match running.waiting().await {
-            Ok(QuitReason::JoinError(error)) | Err(error) => match error.try_into_panic() {
-                Ok(payload) => std::panic::resume_unwind(payload),
-
-                Err(error) => Err(ServeError::Cancelled(error)),
+            Ok(QuitReason::JoinError(error)) | Err(error) => {
+                Err(ServeError::Cancelled(crate::task::resume_if_panic(error)))
             },
 
             Ok(_) => Ok(()),

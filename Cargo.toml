@@ -19,6 +19,7 @@ include = ["/src", "/README.md", "/LICENSE-*"]
 [dependencies]
 const_format = "0.2.36"
 derive_more = { version = "2.1.1", default-features = false, features = ["display", "as_ref"] }
+etcetera = "0.11.0"
 reqwest = "0.13.5"
 # マクロ (`#[tool_router]` など) は使わず、`ServerHandler` を手で実装する (doc/m0-plan.md の D1)。
 rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
@@ -164,3 +165,6 @@ wildcard_enum_match_arm = "warn"
 # rustc の missing_docs が crate doc の欠落も拾うので不要。
 [lints.rustdoc]
 unescaped_backticks = "warn"
+
+[dev-dependencies]
+tempfile = "3.27.0"
