@@ -31,6 +31,8 @@ use rmcp::{
 use crate::data::{
     cache::{Cache, CacheError},
     docs_rs::DocsRs,
+    sparse_index::SparseIndex,
+    target,
 };
 
 /// Protocol versions this server implements (requirement R-MCP-2).
@@ -141,8 +143,8 @@ pub enum ServeError {
     /// The cache directory is not usable as configured.
     #[error("the cache directory cannot be used")]
     Cache(#[from] CacheError),
-    /// The HTTP client for docs.rs could not be set up.
-    #[error("the HTTP client for docs.rs could not be set up")]
+    /// The HTTP client for docs.rs or the crates.io index could not be set up.
+    #[error("the HTTP client for docs.rs or the crates.io index could not be set up")]
     Http(#[from] reqwest::Error),
     /// The MCP session could not start, for example because the client asked for an
     /// unsupported protocol version.
@@ -171,10 +173,15 @@ pub async fn serve() -> Result<(), ServeError> {
         version = env!("CARGO_PKG_VERSION"),
         "starting the MCP server over stdio"
     );
+    let cache = Cache::open_default()?;
+    // The cache is where nothing configures rustc (requirement R-TG-1).
+    let host = target::host_target(cache.dir()).await;
     let server = Server {
         tools: Arc::new(tool::ToolState {
-            cache: Cache::open_default()?,
             docs_rs: DocsRs::new()?,
+            index: SparseIndex::new(cache.clone())?,
+            host,
+            cache,
         }),
     };
     match server.serve(stdio()).await {

@@ -438,6 +438,20 @@ C1 は大きいので 5 つに分けた: C1a (照会の層をアーカイブの�
 - 扱っていないこと: プロセスの中でアーカイブを使い回すこと (今は呼び出しのたびに開いて検証する。core で 42 ms)。std と docs.rs の他の crate への組み込みは C1b・C1e
 - CI の修正: 286f3f4 の push で、Windows の clippy が `src/data/cargo.rs` のテストの `use super::*` を未使用として落ちていた (テストはすべて Unix 専用だった)。テストのモジュールごと Unix 専用にした
 
+#### C1b-1 (2026-10-19)
+
+C1b も 3 つに分けた: C1b-1 (版・target・provenance)、C1b-2 (プロジェクトの文脈)、C1b-3 (std)。
+
+- 引数 (§6.4): `crate` は `name` か `name@版`。`version` でも渡せる。両方あって食い違えば `invalid_argument`。版は完全一致・semver 要件・`latest` (B2 の `VersionSpec`)。省けば latest (Cargo.lock を読むのは C1b-2)。`target` は任意の target triple
+- 版の解決: crates.io の sparse index (B1) で引き、`VersionSpec::resolve` (B2) で決める。index に無ければ `crate_not_found`、合う版が無ければ `version_not_found` に近い版を `candidates` で添える (§8)。index の失敗は `network_error` (一時的なものは再試行できる)。解決の警告 (pre-release・yanked だけのとき) は warnings に出す
+  - 完全一致の版で、その target の JSON が既にキャッシュにあれば index を引かない (オフラインでも、テストでも引けるように)
+  - crates.io の綴り (`Serde_Json` → `serde_json`) を docs.rs とキャッシュに使い、パスの先頭も code の書き方 (`-` を `_`) に直す。index を引かなかったときは、provenance の `crate` が頼まれた綴りのままになる (C1e で JSON から lib 名を取るときに直す)
+- target: 引数が無ければ、起動時に `rustc -vV` で決めたホストの target (B4)。代わりの値を使ったときは warnings に理由を出す。JSON の target が求めたものと違えば warnings に出す (§7.3)。docs.rs にその target の JSON が無ければ `no_target_json` (B4。R-TG-1 のとおり M1 では代用しない)
+- provenance: `resolved_from` は `explicit`・`explicit_req`・`latest` (§7.3)。outputSchema もこの 3 つにした
+- 解析に失敗したときの立て直し (別の形式・取り直し) を `recover` に分けた
+- 実際の crates.io と docs.rs で確かめた: latest (`serde` → 1.0.229)、semver 要件 (`serde@^1.0.200`)、完全一致 (`1.0.228`、形式 57)、無い版 (候補 5 つ)、無い crate、綴りの違い、`aarch64-apple-darwin` (`no_target_json`)。2 回目からはアーカイブから引き、ほぼ 0 秒
+- テスト: 引数の解析 (版の 3 つの渡し方、食い違い、target、誤り)、パスの先頭の書き方。stdio の結合テストは `target` を明示し、キャッシュもその target の場所に置く (ホストによらないように)
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

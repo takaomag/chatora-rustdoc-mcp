@@ -150,6 +150,10 @@ fn demo_crate() -> Crate {
     }
 }
 
+/// The target of the JSON of [`demo_crate`], which the tests ask for, so that they do not depend on
+/// the host.
+const TARGET: &str = "x86_64-unknown-linux-gnu";
+
 /// A cache directory that holds the JSON of [`demo_crate`], so that `get_item` needs no network.
 fn test_cache() -> TempDir {
     let dir = TempDir::new().expect("a temporary directory");
@@ -158,7 +162,11 @@ fn test_cache() -> TempDir {
     let cache = Cache::at(dir.path());
     cache
         .write_docs_rs_json(
-            &cache.docs_rs_dir(&name, &Version::new(0, 1, 0), None),
+            &cache.docs_rs_dir(
+                &name,
+                &Version::new(0, 1, 0),
+                Some(&TARGET.parse().expect("a target")),
+            ),
             rustdoc_types::FORMAT_VERSION,
             &json,
         )
@@ -392,17 +400,17 @@ fn get_item_returns_structured_content_and_tool_errors() {
     server.send(&call_tool(
         1,
         "get_item",
-        json!({ "crate": "demo@0.1.0", "path": "hello" }),
+        json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET }),
     ));
     server.send(&call_tool(
         2,
         "get_item",
-        json!({ "crate": "demo@0.1.0", "path": "demo::nothing" }),
+        json!({ "crate": "demo@0.1.0", "path": "demo::nothing", "target": TARGET }),
     ));
     server.send(&call_tool(
         3,
         "get_item",
-        json!({ "crate": "demo", "path": "hello" }),
+        json!({ "crate": "demo@not a version", "path": "hello" }),
     ));
     server.send(&call_tool(4, "nope", json!({})));
 

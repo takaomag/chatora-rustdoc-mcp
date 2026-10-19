@@ -32,6 +32,10 @@ pub struct ItemRequest<'a> {
     pub version: &'a Version,
     /// The path of the item, starting with the crate name (`tokio::sync::Mutex::lock`).
     pub path: &'a str,
+    /// How the version was chosen.
+    pub resolved_from: ResolvedFrom,
+    /// The target asked for, to warn when the data is for another.
+    pub target: Option<&'a str>,
 }
 
 /// The result of `get_item` (the common shape of §7.3).
@@ -81,6 +85,10 @@ pub enum Source {
 pub enum ResolvedFrom {
     /// Given exactly by the caller.
     Explicit,
+    /// The largest version that the caller's semver requirement matches.
+    ExplicitReq,
+    /// The latest version on crates.io, as no version was given (requirement R-VR-3).
+    Latest,
 }
 
 /// One item, as of `detail=normal` (requirement R-OUT-7), with the signature before the prose
@@ -285,6 +293,14 @@ impl<'a> Query<'a> {
                 rustdoc_types::FORMAT_VERSION
             )));
         }
+        let target = view.target_triple();
+        if let Some(requested) = self.request.target
+            && requested != target
+        {
+            self.warnings.push(Cow::Owned(format!(
+                "the target {requested} was asked for, but the data is for {target}"
+            )));
+        }
         if self.index.is_incomplete() {
             self.warnings.push(Cow::Borrowed(
                 "this crate re-exports its modules through too many paths; some public paths \
@@ -295,8 +311,8 @@ impl<'a> Query<'a> {
             source: Source::DocsRs,
             name: self.request.name.as_str(),
             version,
-            resolved_from: ResolvedFrom::Explicit,
-            target: view.target_triple(),
+            resolved_from: self.request.resolved_from,
+            target,
             format_version: view.format_version(),
         }
     }
@@ -950,6 +966,8 @@ mod tests {
             name: &name,
             version: &version,
             path,
+            resolved_from: ResolvedFrom::Explicit,
+            target: None,
         }))
     }
 
@@ -1049,6 +1067,8 @@ mod tests {
             name: &name,
             version: &version,
             path: "my_crate::sync::Mutex",
+            resolved_from: ResolvedFrom::Explicit,
+            target: None,
         })
         .expect("found");
         let response = serde_json::to_value(response).expect("serializes");

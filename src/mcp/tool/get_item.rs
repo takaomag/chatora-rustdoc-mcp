@@ -18,10 +18,13 @@ use crate::{
         crate_name::CrateName,
         docs_rs::FetchError,
         rustdoc_json::ParseError,
+        sparse_index::IndexError,
+        target::TargetTriple,
+        version::VersionSpec,
     },
     query::{
         across::Indexed,
-        get_item::{GetItemError, ItemRequest, get_item},
+        get_item::{GetItemError, ItemRequest, ResolvedFrom, get_item},
         load,
         view::CrateView,
     },
@@ -34,8 +37,18 @@ pub(super) const NAME: &str = "get_item";
 const DESCRIPTION: &str = include_str!("get_item.md");
 
 /// How to pass `crate`, for `invalid_argument`.
-const CRATE_EXAMPLE: &[&str] =
-    &[r#"pass the crate with an exact version, for example {"crate": "tokio@1.47.1"}"#];
+const CRATE_EXAMPLE: &[&str] = &[
+    r#"pass the crate, with a version if it matters, for example {"crate": "tokio"} or {"crate": "tokio@1.47.1"}"#,
+];
+
+/// How to pass `version`, for `invalid_argument`.
+const VERSION_EXAMPLE: &[&str] = &[
+    r#"pass an exact version (1.47.1), a semver requirement (^1.47) or latest, for example {"version": "1.47.1"}"#,
+];
+
+/// How to pass `target`, for `invalid_argument`.
+const TARGET_EXAMPLE: &[&str] =
+    &[r#"pass a target triple, for example {"target": "x86_64-unknown-linux-gnu"}"#];
 
 /// How to pass `path`, for `invalid_argument`.
 const PATH_EXAMPLE: &[&str] =
@@ -45,9 +58,24 @@ const PATH_EXAMPLE: &[&str] =
 #[derive(Debug)]
 pub(super) struct Arguments {
     name: CrateName,
+    /// The version asked for, in `crate` or `version`; `latest` when neither has one.
+    version: VersionSpec,
+    /// The path, starting with the crate name.
+    path: Box<str>,
+    /// The target asked for.
+    target: Option<TargetTriple>,
+}
+
+/// What is looked up, once the version and the target are decided.
+#[derive(Debug)]
+struct Request {
+    /// The crate, as crates.io spells it when the index was read.
+    name: CrateName,
     version: Version,
     /// The path, starting with the crate name.
     path: Box<str>,
+    resolved_from: ResolvedFrom,
+    target: TargetTriple,
 }
 
 /// Definition of the tool for `tools/list`.
@@ -57,7 +85,17 @@ pub(super) fn definition() -> Tool {
         "properties": {
             "crate": {
                 "type": "string",
-                "description": "The crate and its exact version, as name@version (tokio@1.47.1).",
+                "description": "The crate (tokio), or the crate and its version as name@version \
+                                (tokio@1.47.1).",
+            },
+            "version": {
+                "type": "string",
+                "description": "The version: exact (1.47.1, not ^1.47.1), a semver requirement \
+                                (^1.47, ~1.47) or latest. Defaults to the latest.",
+            },
+            "target": {
+                "type": "string",
+                "description": "The target triple to document for. Defaults to the host's.",
             },
             "path": {
                 "type": "string",
@@ -94,7 +132,10 @@ fn output_schema() -> JsonObject {
                     "source": { "type": "string", "enum": ["docs.rs"] },
                     "crate": { "type": "string" },
                     "version": { "type": "string" },
-                    "resolved_from": { "type": "string", "enum": ["explicit"] },
+                    "resolved_from": {
+                        "type": "string",
+                        "enum": ["explicit", "explicit_req", "latest"],
+                    },
                     "target": { "type": "string" },
                     "format_version": { "type": "integer" },
                 },
@@ -168,22 +209,20 @@ pub(super) fn parse_arguments(
     arguments: Option<&JsonObject>,
 ) -> Result<Arguments, InvalidArgument> {
     let argument = |name| arguments.and_then(|arguments| arguments.get(name));
-    let crate_argument = match argument("crate") {
-        Some(Value::String(value)) => value,
-        Some(_) => {
-            return Err(InvalidArgument::new(
-                "`crate` must be a string",
-                CRATE_EXAMPLE,
-            ));
-        },
-        None => return Err(InvalidArgument::new("`crate` is required", CRATE_EXAMPLE)),
+    let string = |name: &'static str, example| match argument(name) {
+        Some(Value::String(value)) => Ok(Some(value.trim())),
+        Some(_) => Err(InvalidArgument::new(
+            format!("`{name}` must be a string"),
+            example,
+        )),
+        None => Ok(None),
     };
-    let Some((name, version)) = crate_argument.trim().split_once('@') else {
-        return Err(InvalidArgument::new(
-            "`crate` must have an exact version, as name@version; finding the version from \
-             Cargo.lock is not supported yet",
-            CRATE_EXAMPLE,
-        ));
+    let Some(crate_argument) = string("crate", CRATE_EXAMPLE)? else {
+        return Err(InvalidArgument::new("`crate` is required", CRATE_EXAMPLE));
+    };
+    let (name, in_crate) = match crate_argument.split_once('@') {
+        Some((name, version)) => (name, Some(version)),
+        None => (crate_argument, None),
     };
     let name: CrateName = name.parse().map_err(|error| {
         InvalidArgument::new(
@@ -191,25 +230,43 @@ pub(super) fn parse_arguments(
             CRATE_EXAMPLE,
         )
     })?;
-    let version = Version::parse(version).map_err(|error| {
-        InvalidArgument::new(
-            format!(
-                "`crate` must have an exact version such as 1.47.1; version requirements are not \
-                 supported yet ({error})"
-            ),
-            CRATE_EXAMPLE,
-        )
-    })?;
-    let path = match argument("path") {
-        Some(Value::String(path)) => path.trim().trim_start_matches("::"),
-        Some(_) => {
-            return Err(InvalidArgument::new(
-                "`path` must be a string",
-                PATH_EXAMPLE,
-            ));
-        },
-        None => return Err(InvalidArgument::new("`path` is required", PATH_EXAMPLE)),
+    let parse_version = |version: &str, example| {
+        version.parse::<VersionSpec>().map_err(|error| {
+            InvalidArgument::new(format!("the version is not valid: {error}"), example)
+        })
     };
+    let version = match (in_crate, string("version", VERSION_EXAMPLE)?) {
+        (Some(in_crate), Some(argument)) => {
+            let (in_crate, argument) = (
+                parse_version(in_crate, CRATE_EXAMPLE)?,
+                parse_version(argument, VERSION_EXAMPLE)?,
+            );
+            if in_crate != argument {
+                return Err(InvalidArgument::new(
+                    format!(
+                        "`crate` has the version {in_crate} but `version` is {argument}; give it \
+                         once"
+                    ),
+                    VERSION_EXAMPLE,
+                ));
+            }
+            in_crate
+        },
+        (Some(version), None) => parse_version(version, CRATE_EXAMPLE)?,
+        (None, Some(version)) => parse_version(version, VERSION_EXAMPLE)?,
+        (None, None) => VersionSpec::Latest,
+    };
+    let target = string("target", TARGET_EXAMPLE)?
+        .map(|target| {
+            target.parse::<TargetTriple>().map_err(|error| {
+                InvalidArgument::new(format!("`target` is not valid: {error}"), TARGET_EXAMPLE)
+            })
+        })
+        .transpose()?;
+    let Some(path) = string("path", PATH_EXAMPLE)? else {
+        return Err(InvalidArgument::new("`path` is required", PATH_EXAMPLE));
+    };
+    let path = path.trim_start_matches("::");
     if path.is_empty() {
         return Err(InvalidArgument::new(
             "`path` must not be empty",
@@ -221,7 +278,118 @@ pub(super) fn parse_arguments(
         name,
         version,
         path,
+        target,
     })
+}
+
+/// Decides the version (requirements R-VR-1 and R-VR-3) for `target`. An exact version whose JSON
+/// for `target` is cached is taken as it is; otherwise the crates.io index is read, which also
+/// gives the crate's published spelling. Returns the request with the warnings about how it was
+/// decided, or the tool error (boxed, as a result is large).
+async fn resolve(
+    state: &ToolState,
+    arguments: Arguments,
+    target: TargetTriple,
+) -> Result<(Request, Vec<Box<str>>), Box<CallToolResult>> {
+    let mut warnings: Vec<Box<str>> = Vec::new();
+    if arguments.target.is_none()
+        && let Some(why) = &state.host.stand_in_because
+    {
+        warnings.push(
+            format!("the target {target} is used, as the host target is not known: {why}").into(),
+        );
+    }
+    let Arguments {
+        name,
+        version: spec,
+        path,
+        ..
+    } = arguments;
+    if let VersionSpec::Exact(version) = &spec {
+        let dir = state.cache.docs_rs_dir(&name, version, Some(&target));
+        if let Ok(Some(_)) = state.cache.docs_rs_source(&dir) {
+            let request = Request {
+                version: version.clone(),
+                path: with_lib_name(&name.cache_key(), &path),
+                name,
+                resolved_from: ResolvedFrom::Explicit,
+                target,
+            };
+            return Ok((request, warnings));
+        }
+    }
+    let entry = state
+        .index
+        .entry(&name)
+        .await
+        .map_err(|error| Box::new(index_error(&name, &error)))?;
+    let resolved = spec.resolve(&entry.versions).map_err(|no_version| {
+        Box::new(error_result(&json!({
+            "code": "version_not_found",
+            "message": format!("{} has no version {spec} on crates.io", entry.name),
+            "retryable": false,
+            "suggestions": ["ask for one of the candidates"],
+            "candidates": no_version
+                .suggestions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        })))
+    })?;
+    warnings.extend(resolved.warnings.into_iter().map(Into::into));
+    let resolved_from = match spec {
+        VersionSpec::Exact(_) => ResolvedFrom::Explicit,
+        VersionSpec::Requirement(_) => ResolvedFrom::ExplicitReq,
+        VersionSpec::Latest => ResolvedFrom::Latest,
+    };
+    // The name as published, for docs.rs and the cache, and at the head of the path as code writes
+    // it (`Serde_Json::Value` is `serde_json::Value`).
+    let published: CrateName = entry.name.parse().unwrap_or(name);
+    let path = with_lib_name(published.as_str(), &path);
+    let request = Request {
+        name: published,
+        version: resolved.version.version.clone(),
+        path,
+        resolved_from,
+        target,
+    };
+    Ok((request, warnings))
+}
+
+/// The tool error for an index that could not be read (§8).
+fn index_error(name: &CrateName, error: &IndexError) -> CallToolResult {
+    let message = format!(
+        "the versions of {name} could not be read: {}",
+        ErrorChain(error)
+    );
+    match error {
+        IndexError::NotFound => error_result(&json!({
+            "code": "crate_not_found",
+            "message": format!("crates.io has no crate {name}"),
+            "retryable": false,
+            "suggestions": ["check the spelling of the crate name"],
+        })),
+        IndexError::Transient { .. } | IndexError::Network(_) => error_result(&json!({
+            "code": "network_error",
+            "message": message,
+            "retryable": true,
+            "suggestions": ["try again in a while"],
+        })),
+        IndexError::UnexpectedStatus { .. }
+        | IndexError::TooLarge { .. }
+        | IndexError::Malformed(_) => error_result(&json!({
+            "code": "network_error",
+            "message": message,
+            "retryable": false,
+            "suggestions": [],
+        })),
+        IndexError::Cache(_) => super::tool_error(
+            "internal_error",
+            "the cache of the crates.io index could not be used",
+            false,
+            &["check the server's stderr log for the cache directory and the error"],
+        ),
+    }
 }
 
 /// `path`, starting with the crate name: it is added when the first segment is something else.
@@ -235,9 +403,33 @@ fn with_crate_name(name: &CrateName, path: &str) -> Box<str> {
     }
 }
 
-/// Whether `a` and `b` name the same crate, with `-` and `_` the same.
+/// `path` with the crate name at its head written as code writes it: `name` with `_` for `-`
+/// (`Serde-JSON::Value` asked of `serde_json` is `serde_json::Value`). The lib name can differ from
+/// that; C1e reads it from the JSON.
+fn with_lib_name(name: &str, path: &str) -> Box<str> {
+    let lib = name.replace('-', "_");
+    let rest = match path.split_once("::") {
+        Some((first, rest)) if same_crate_name(first, name) => rest,
+        None if same_crate_name(path, name) => "",
+        Some(_) | None => path,
+    };
+    if rest.is_empty() {
+        lib.into()
+    } else {
+        format!("{lib}::{rest}").into()
+    }
+}
+
+/// Whether `a` and `b` name the same crate, with `-` and `_` the same and the case ignored, as
+/// crates.io does (requirement R-PR-1).
 fn same_crate_name(a: &str, b: &str) -> bool {
-    let normalized = |byte: &u8| if *byte == b'-' { b'_' } else { *byte };
+    let normalized = |byte: &u8| {
+        if *byte == b'-' {
+            b'_'
+        } else {
+            byte.to_ascii_lowercase()
+        }
+    };
     a.len() == b.len()
         && a.bytes()
             .zip(b.bytes())
@@ -247,12 +439,20 @@ fn same_crate_name(a: &str, b: &str) -> bool {
 /// Looks the item up in the archive of the crate, or else loads the JSON of the crate and archives
 /// it first, on a blocking thread, since parsing a large crate takes a large part of a second.
 pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
-    // The target is chosen in M1 C1; until then, the crate's default target on docs.rs.
+    let target = arguments
+        .target
+        .clone()
+        .unwrap_or_else(|| state.host.triple.clone());
+    let (arguments, mut warnings) = match resolve(&state, arguments, target).await {
+        Ok(resolved) => resolved,
+        Err(error) => return *error,
+    };
+    let target = Some(&arguments.target);
     let dir = state
         .cache
-        .docs_rs_dir(&arguments.name, &arguments.version, None);
+        .docs_rs_dir(&arguments.name, &arguments.version, target);
     let arguments = match look_up_archived(state.cache.clone(), dir.clone(), arguments).await {
-        Some(Ok((looked_up, arguments))) => return finish(looked_up, &arguments, &[]),
+        Some(Ok((looked_up, arguments))) => return finish(looked_up, &arguments, &warnings),
         Some(Err(arguments)) => arguments,
         None => return shutting_down(),
     };
@@ -261,14 +461,14 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
         &state.docs_rs,
         &arguments.name,
         &arguments.version,
-        None,
+        Some(&arguments.target),
     )
     .await
     {
         Ok(loaded) => loaded,
         Err(error) => return load_error(&arguments, &error),
     };
-    let mut warnings = loaded.warnings;
+    warnings.extend(loaded.warnings);
     let lookup = Lookup {
         cache: state.cache.clone(),
         dir,
@@ -277,7 +477,25 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
     else {
         return shutting_down();
     };
-    let (looked_up, arguments) = match &looked_up {
+    match recover(&state, &lookup, looked_up, arguments, &json, &mut warnings).await {
+        Ok((looked_up, arguments)) => finish(looked_up, &arguments, &warnings),
+        Err(result) => *result,
+    }
+}
+
+/// When `looked_up` failed because the JSON did not parse, tries again as far as that can help:
+/// another format (requirement R-DS-2), or the JSON fetched once more (requirement R-CA-4).
+/// Returns the result to finish with, or the tool error to return as it is (boxed, as a result is
+/// large).
+async fn recover(
+    state: &ToolState,
+    lookup: &Lookup,
+    looked_up: Result<Value, Failure>,
+    arguments: Request,
+    json: &[u8],
+    warnings: &mut Vec<Box<str>>,
+) -> Result<(Result<Value, Failure>, Request), Box<CallToolResult>> {
+    Ok(match &looked_up {
         // A format this server does not read: docs.rs may have the release in another one
         // (requirement R-DS-2).
         Err(Failure::Parse(ParseError::UnsupportedFormat { found, .. })) => {
@@ -286,7 +504,7 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
                 &state.docs_rs,
                 &arguments.name,
                 &arguments.version,
-                None,
+                Some(&arguments.target),
                 *found,
             )
             .await
@@ -294,12 +512,12 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
                 Ok(Some(json)) => {
                     let Some((again, returned, _)) = lookup.on_blocking(json, arguments).await
                     else {
-                        return shutting_down();
+                        return Err(Box::new(shutting_down()));
                     };
                     (again, returned)
                 },
                 Ok(None) => (looked_up, arguments),
-                Err(error) => return load_error(&arguments, &error),
+                Err(error) => return Err(Box::new(load_error(&arguments, &error))),
             }
         },
         // Its header was read when it was fetched, yet it does not parse: docs.rs may have served
@@ -311,24 +529,25 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
             &state.docs_rs,
             &arguments.name,
             &arguments.version,
-            None,
-            &json,
+            Some(&arguments.target),
+            json,
         )
         .await
         {
             Ok(again) => {
                 warnings.extend(again.warnings);
-                let Some((again, returned, json)) = lookup.on_blocking(again.json, arguments).await
+                let Some((again, returned, fetched)) =
+                    lookup.on_blocking(again.json, arguments).await
                 else {
-                    return shutting_down();
+                    return Err(Box::new(shutting_down()));
                 };
                 if let Err(Failure::Parse(_)) = &again
                     && let Err(error) = data::remember_unparsable(
                         &state.cache,
                         &returned.name,
                         &returned.version,
-                        None,
-                        &json,
+                        Some(&returned.target),
+                        &fetched,
                     )
                     .await
                 {
@@ -336,14 +555,13 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
                 }
                 (again, returned)
             },
-            Err(error) => return load_error(&arguments, &error),
+            Err(error) => return Err(Box::new(load_error(&arguments, &error))),
         },
         Ok(_)
         | Err(Failure::Parse(_) | Failure::Archive(_) | Failure::Item(_) | Failure::Serialize(_)) => {
             (looked_up, arguments)
         },
-    };
-    finish(looked_up, &arguments, &warnings)
+    })
 }
 
 /// Looks the item up in the archive of the crate in `dir`, on a blocking thread. `Some(Ok(_))`
@@ -352,8 +570,8 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
 async fn look_up_archived(
     cache: Cache,
     dir: PathBuf,
-    arguments: Arguments,
-) -> Option<Result<(Result<Value, Failure>, Arguments), Arguments>> {
+    arguments: Request,
+) -> Option<Result<(Result<Value, Failure>, Request), Request>> {
     let task = tokio::task::spawn_blocking(move || match load::open_archived(&cache, &dir) {
         Ok(Some(mapped)) => Ok((look_up_in(&mapped, &arguments), arguments)),
         Ok(None) => Err(arguments),
@@ -385,8 +603,8 @@ impl Lookup {
     async fn on_blocking(
         &self,
         json: Box<[u8]>,
-        arguments: Arguments,
-    ) -> Option<(Result<Value, Failure>, Arguments, Box<[u8]>)> {
+        arguments: Request,
+    ) -> Option<(Result<Value, Failure>, Request, Box<[u8]>)> {
         let (cache, dir) = (self.cache.clone(), self.dir.clone());
         match tokio::task::spawn_blocking(move || {
             let looked_up = load::archive_json(&cache, &dir, &json)
@@ -422,7 +640,7 @@ fn shutting_down() -> CallToolResult {
 /// The tool result of a lookup, with the `warnings` about how the JSON was loaded first.
 fn finish(
     looked_up: Result<Value, Failure>,
-    arguments: &Arguments,
+    arguments: &Request,
     warnings: &[Box<str>],
 ) -> CallToolResult {
     match looked_up {
@@ -494,24 +712,26 @@ enum Failure {
 
 /// Looks the item up in the archive `mapped`, and serializes the response while the items it
 /// borrows from are still there.
-fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Arguments) -> Result<Value, Failure> {
+fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Request) -> Result<Value, Failure> {
     let view = CrateView::new(mapped.get());
     get_item(&view, ItemRequest {
         name: &arguments.name,
         version: &arguments.version,
         path: &arguments.path,
+        resolved_from: arguments.resolved_from,
+        target: Some(arguments.target.as_str()),
     })
     .map_err(Failure::Item)
     .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize))
 }
 
 /// `name@version` of the request.
-fn release(arguments: &Arguments) -> String {
+fn release(arguments: &Request) -> String {
     format!("{}@{}", arguments.name, arguments.version)
 }
 
 /// The tool error for JSON that could not be loaded (§8).
-fn load_error(arguments: &Arguments, error: &LoadError) -> CallToolResult {
+fn load_error(arguments: &Request, error: &LoadError) -> CallToolResult {
     let release = release(arguments);
     tracing::warn!(%release, error = %ErrorChain(error), "rustdoc JSON could not be loaded");
     let fetch = match error {
@@ -626,7 +846,7 @@ fn remembered_error(
 }
 
 /// The tool error for JSON that could not be parsed (§8).
-fn parse_error(arguments: &Arguments, error: &ParseError) -> CallToolResult {
+fn parse_error(arguments: &Request, error: &ParseError) -> CallToolResult {
     let release = release(arguments);
     tracing::warn!(%release, error = %ErrorChain(error), "rustdoc JSON could not be parsed");
     let message = format!(
@@ -661,7 +881,7 @@ fn parse_error(arguments: &Arguments, error: &ParseError) -> CallToolResult {
 }
 
 /// The tool error for a path that does not name one item (§8).
-fn item_error(arguments: &Arguments, error: &GetItemError) -> CallToolResult {
+fn item_error(arguments: &Request, error: &GetItemError) -> CallToolResult {
     let release = release(arguments);
     match error {
         GetItemError::NotFound => error_result(&json!({
@@ -721,21 +941,76 @@ mod tests {
         let parsed = arguments(json!({ "crate": "axum-core@0.5.6", "path": "::axum-core::body" }))
             .expect("valid");
         assert_eq!(&*parsed.path, "axum-core::body");
-        assert_eq!(parsed.version, Version::new(0, 5, 6));
+        assert_eq!(parsed.version, VersionSpec::Exact(Version::new(0, 5, 6)));
     }
 
     #[test]
-    fn a_crate_without_an_exact_version_is_an_invalid_argument() {
-        for crate_argument in ["tokio", "tokio@1", "tokio@^1.47", "1tokio@1.47.1"] {
-            let error = arguments(json!({ "crate": crate_argument, "path": "tokio::spawn" }))
-                .expect_err(crate_argument);
-            assert!(
-                error.message.contains("`crate`"),
-                "{crate_argument}: {error:?}"
-            );
+    fn the_head_of_a_path_is_written_as_code_writes_it() {
+        assert_eq!(
+            &*with_lib_name("serde_json", "Serde-Json::Value"),
+            "serde_json::Value"
+        );
+        assert_eq!(&*with_lib_name("serde_json", "Value"), "serde_json::Value");
+        assert_eq!(&*with_lib_name("serde-json", "serde_json"), "serde_json");
+        assert_eq!(
+            &*with_lib_name("tokio", "sync::Mutex"),
+            "tokio::sync::Mutex"
+        );
+    }
+
+    #[test]
+    fn the_version_is_in_crate_or_version_or_left_out() {
+        let version = |value: Value| arguments(value).expect("valid").version;
+        assert_eq!(
+            version(json!({ "crate": "tokio", "path": "spawn" })),
+            VersionSpec::Latest
+        );
+        assert_eq!(
+            version(json!({ "crate": "tokio@^1.47", "path": "spawn" })),
+            "^1.47".parse().expect("a requirement")
+        );
+        assert_eq!(
+            version(json!({ "crate": "tokio", "version": "1.47.1", "path": "spawn" })),
+            VersionSpec::Exact(Version::new(1, 47, 1))
+        );
+        assert_eq!(
+            version(json!({ "crate": "tokio@1.47.1", "version": "1.47.1", "path": "spawn" })),
+            VersionSpec::Exact(Version::new(1, 47, 1))
+        );
+        let target = arguments(json!({
+            "crate": "tokio", "path": "spawn", "target": "aarch64-apple-darwin",
+        }))
+        .expect("valid")
+        .target;
+        assert_eq!(
+            target.as_ref().map(TargetTriple::as_str),
+            Some("aarch64-apple-darwin")
+        );
+    }
+
+    #[test]
+    fn bad_arguments_are_invalid_arguments() {
+        for (value, about) in [
+            (json!({ "crate": "1tokio", "path": "spawn" }), "`crate`"),
+            (
+                json!({ "crate": "tokio@not a version", "path": "spawn" }),
+                "version",
+            ),
+            (
+                json!({ "crate": "tokio@1.47.1", "version": "1.47.0", "path": "spawn" }),
+                "`version`",
+            ),
+            (
+                json!({ "crate": "tokio", "path": "spawn", "target": "../x" }),
+                "`target`",
+            ),
+            (json!({ "crate": "tokio", "path": " " }), "`path`"),
+            (json!({ "crate": "tokio" }), "`path`"),
+            (json!({ "path": "spawn" }), "`crate`"),
+        ] {
+            let error = arguments(value.clone()).expect_err("invalid");
+            assert!(error.message.contains(about), "{value}: {error:?}");
         }
-        arguments(json!({ "crate": "tokio@1.47.1", "path": " " })).expect_err("an empty path");
-        arguments(json!({ "crate": "tokio@1.47.1" })).expect_err("no path");
     }
 
     /// Every property of a full response is declared in the output schema.

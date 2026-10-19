@@ -22,7 +22,7 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 
-use crate::data::{cache::Cache, docs_rs::DocsRs};
+use crate::data::{cache::Cache, docs_rs::DocsRs, sparse_index::SparseIndex, target::HostTarget};
 
 /// What the tools share for the life of the server.
 #[derive(Debug)]
@@ -31,6 +31,10 @@ pub(super) struct ToolState {
     pub(super) cache: Cache,
     /// The docs.rs client.
     pub(super) docs_rs: DocsRs,
+    /// The crates.io sparse index, for the versions of crates.
+    pub(super) index: SparseIndex,
+    /// The host target, the default target of the documentation (requirement R-TG-1).
+    pub(super) host: HostTarget,
 }
 
 /// Definitions of every tool, in the order `tools/list` returns them.

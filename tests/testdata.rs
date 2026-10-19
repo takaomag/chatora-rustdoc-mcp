@@ -23,7 +23,7 @@ use chatora_rustdoc_mcp::{
     },
     query::{
         across::Indexed,
-        get_item::{ItemRequest, get_item},
+        get_item::{ItemRequest, ResolvedFrom, get_item},
         path_index::Resolution,
         view::CrateView,
     },
@@ -387,6 +387,8 @@ fn representative_items_are_returned_by_get_item() {
             name: &entry.name,
             version: &entry.version,
             path,
+            resolved_from: ResolvedFrom::Explicit,
+            target: None,
         })
         .unwrap_or_else(|error| panic!("{path}: {error}"));
         let response = serde_json::to_value(&response).expect("serializes");
