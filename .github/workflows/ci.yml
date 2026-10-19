@@ -1,0 +1,102 @@
+# 要件 R-QA-4・R-ARCH-8・R-DIST-4 と doc/m1-plan.md の A1 の CI。
+# action はコミットの SHA で固定し、コメントに版を書く (タグは付け替えられるため)。版は出てから 2 週間以上たったものを選ぶ。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # unstable のオプションを使うので nightly の rustfmt で整形を確かめる (rustfmt.toml の冒頭)。
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install nightly --profile minimal --component rustfmt
+      - run: cargo +nightly fmt --check
+
+  # 配る 3 つの OS で、既定の構成とローカル機能の無い構成 (要件 R-ARCH-8) の両方を検査する。
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # rust-toolchain.toml の toolchain を入れる。
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - run: cargo test --locked --no-default-features
+
+  # rustdoc の警告は Cargo.toml の [lints.rustdoc] では deny にせず、ここで止める。
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo doc --locked --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # testdata/docs-rs-json.txt の docs.rs の JSON を取ってキャッシュし、実データのテスト (#[ignore]) を回す
+  # (doc/m1-plan.md の P3)。一覧が変わらない限り、docs.rs から取り直さない。
+  testdata:
+    runs-on: ubuntu-latest
+    env:
+      CHATORA_RUSTDOC_MCP_CACHE__DIR: ${{ github.workspace }}/../rustdoc-json-cache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CHATORA_RUSTDOC_MCP_CACHE__DIR }}
+          key: docs-rs-json-${{ hashFiles('testdata/docs-rs-json.txt') }}
+      - name: Fetch the test data
+        run: >-
+          awk -F'\t' '!/^#/ && NF >= 2 { print $1 "@" $2 }' testdata/docs-rs-json.txt
+          | xargs cargo run --locked --release --example fetch_docs_rs --
+      - run: cargo test --locked --release --test testdata -- --ignored
+
+  # toml の整形 (.taplo.toml) と Markdown の lint (.markdownlint.jsonc)。
+  config-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: taplo
+      - run: taplo fmt --check
+      - uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
+        with:
+          globs: |
+            **/*.md
+            !target/**
+
+  # 依存のライセンス・既知の脆弱性・取得元・禁じる crate (deny.toml。要件 R-DIST-4)。
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-deny
+      - run: cargo deny --locked check

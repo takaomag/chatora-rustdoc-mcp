@@ -16,6 +16,13 @@ publish = true
 # THIRD-PARTY-NOTICES (要件 R-DIST-4) を作ったら足す。`include_str!` で埋め込むファイル (説明文・skill など) も、`/src` の外に置いたら足す。
 include = ["/src", "/README.md", "/LICENSE-*"]
 
+[features]
+default = ["local"]
+# プロジェクトの文脈を要する機能 (cargo・rustc の起動、ローカルビルド) をまとめる (要件 R-ARCH-2)。
+# `--no-default-features` では、cargo を起動するコードも build.rs を実行するコードもバイナリに入らない。
+# 中身は doc/m1-plan.md の B5 から入る。
+local = []
+
 [dependencies]
 const_format = "0.2.36"
 derive_more = { version = "2.1.1", default-features = false, features = ["display", "as_ref"] }

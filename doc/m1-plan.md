@@ -143,7 +143,21 @@ m0-plan.md の §7.2 の申し送り。
 
 ## 6. 結果
 
-(進めながら書く)
+### 6.1 M1a
+
+#### A1 (2026-10-19)
+
+- cargo feature `local` を既定で有効にして作った (Cargo.toml。中身は B5 から)
+- deny.toml: ライセンスの許可の一覧は、2026-10-19 の Cargo.lock の依存が使うもの (MIT・Apache-2.0・Apache-2.0 WITH LLVM-exception・BSD-3-Clause・CDLA-Permissive-2.0・ISC・Unicode-3.0・Zlib)。取得元は crates.io だけ、同じ crate の複数の版は警告
+- .github/workflows/ci.yml の job:
+  - `fmt`: nightly の rustfmt
+  - `check`: Linux・macOS・Windows で、既定と `--no-default-features` の clippy (`-D warnings`) と test
+  - `doc`: `RUSTDOCFLAGS=-D warnings` の rustdoc
+  - `testdata`: testdata の一覧の JSON を docs.rs から取って actions/cache に置き、`#[ignore]` の実データのテストを回す
+  - `config-lint`: taplo と markdownlint-cli2
+  - `deny`: cargo-deny
+- action は、出てから 2 週間以上たった版のコミットの SHA で固定した
+- 手元で確かめたこと: fmt・clippy (既定と `--no-default-features`)・test・doc・taplo、testdata の job と同じコマンド (取得はキャッシュから、4 件が成功)。cargo-deny と markdownlint-cli2 はホストに無いので、CI の初回で確かめる
 
 ## 7. M1 の終わり方
 
