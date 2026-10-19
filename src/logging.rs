@@ -6,7 +6,7 @@ use tracing_subscriber::{
 };
 
 /// Environment variable that filters the log, in the `EnvFilter` syntax (setting `log.filter`).
-const FILTER_ENV_VAR: &str = "CHATORA_RUSTDOC_LOG__FILTER";
+const FILTER_ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_LOG__FILTER";
 
 /// Installs the global subscriber that writes the log to stderr.
 ///

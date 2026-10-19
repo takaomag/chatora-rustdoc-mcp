@@ -1,4 +1,4 @@
-//! Internal library of the `chatora-rustdoc` binary.
+//! Internal library of the `chatora-rustdoc-mcp` binary.
 //!
 //! It is published only because it is part of the same package.
 //! Its API is not stable and may change in any release, including patch releases.

@@ -77,7 +77,7 @@ impl Server {
     fn start() -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"))
             .arg("serve")
-            .env("CHATORA_RUSTDOC_LOG__FILTER", "off")
+            .env("CHATORA_RUSTDOC_MCP_LOG__FILTER", "off")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

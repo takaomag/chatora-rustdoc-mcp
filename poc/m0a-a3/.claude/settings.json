@@ -2,7 +2,7 @@
   "enableAllProjectMcpServers": true,
   "permissions": {
     "allow": [
-      "mcp__chatora-rustdoc__*"
+      "mcp__chatora-rustdoc-mcp__*"
     ]
   }
 }

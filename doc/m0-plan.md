@@ -139,10 +139,10 @@ Q-30 の内訳:
 **決めたこと** (§3.3 の D1・D3 を含む)
 
 - D1: ツールは rmcp のマクロを使わず、`ServerHandler` の `list_tools`・`call_tool` を手で実装した。D3: `serve` の引数は手で解析した。D2 (仮のキャッシュと `outputSchema`) は A4 以降
-- バイナリ名を `chatora-rustdoc-mcp` (`src/bin/chatora-rustdoc-mcp.rs`) にした。パッケージ名と lib の crate 名は `chatora-rustdoc` のまま。serverInfo の `name` もバイナリ名にそろえた (要件の §14 の v0.17 (作成中) に記録済み)
+- バイナリ名を `chatora-rustdoc-mcp` (`src/bin/chatora-rustdoc-mcp.rs`) にし、serverInfo の `name` もそろえた。その後、A4 の前に、パッケージ・lib の crate・環境変数の接頭辞・ディレクトリ名なども含めて、名前をすべて `chatora-rustdoc-mcp` にそろえた (要件の §14 の v0.17 (作成中) に記録済み)
 - lib は層 (`data`・`query`・`mcp`) と、層をまたぐ `logging` に分けた。tokio の runtime はバイナリで作り、lib の `mcp::serve` は async にした
 - `mcp::serve` のエラーは thiserror の `ServeError` で返す。セッションのタスクの panic はエラーにせず、`resume_unwind` で投げ直す (不具合を終了コード 101 で伝えるため)。ツール 1 回分の panic は、逆に `internal_error` の結果に変える (R-ERR-1)
-- ログは tracing で stderr に出す。絞り込みは環境変数 `CHATORA_RUSTDOC_LOG__FILTER` (設定キー `log.filter` に当たる。既定 `info`、誤った指定は無視する)
+- ログは tracing で stderr に出す。絞り込みは環境変数 `CHATORA_RUSTDOC_MCP_LOG__FILTER` (設定キー `log.filter` に当たる。既定 `info`、誤った指定は無視する)
 - `initialize` の拒否の `message` は const_format で組み立てる。const_format とその依存 3 つのライセンスは Zlib で、M5 の cargo-deny (R-DIST-4) で許可の一覧に入れる必要がある
 - 仮のツールは `echo` (配線の確認) と `sleep` (進捗通知とキャンセルの確認。A3 でも使う) の 2 つ。どちらも A8 で消す
 - エラー本文の `request_id` (R-ERR-2) は、ログと対応付ける R-OBS-1 と一緒に M1 で入れる

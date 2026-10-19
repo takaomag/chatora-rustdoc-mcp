@@ -20,7 +20,7 @@ SCHEMAS = [
 ]
 
 OUT_DIR = pathlib.Path(__file__).resolve().parent / "schemas"
-USER_AGENT = "chatora-rustdoc/update-schemas (https://github.com/takaomag/chatora-rustdoc)"
+USER_AGENT = "chatora-rustdoc-mcp/update-schemas (https://github.com/takaomag/chatora-rustdoc-mcp)"
 
 
 def fetch(url):

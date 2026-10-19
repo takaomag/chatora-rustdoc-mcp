@@ -1,11 +1,11 @@
 [package]
-name = "chatora-rustdoc"
+name = "chatora-rustdoc-mcp"
 version = "0.1.0"
 authors = ["Takao Magoori <takaomag@users.noreply.github.com>"]
 description = "MCP server that looks up version-accurate Rust API documentation from rustdoc JSON"
 keywords = ["rustdoc", "mcp", "documentation", "llm", "agent"]
 categories = ["development-tools"]
-repository = "https://github.com/takaomag/chatora-rustdoc"
+repository = "https://github.com/takaomag/chatora-rustdoc-mcp"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 edition = "2024"

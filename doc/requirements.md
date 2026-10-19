@@ -1,4 +1,4 @@
-# chatora-rustdoc 要件定義 (ドラフト v0.16)
+# chatora-rustdoc-mcp 要件定義 (ドラフト v0.16)
 
 - 作成日: 2026-10-13 (v0.1) / 最終改訂: 2026-10-19 (v0.16)
 - 状態: たたき台。既存実装の精読と 2026-10-14 の再検証 (調査文書の三次調査) を反映済み。採らなかった候補の良い点は付録 B、根拠は付録 A、経緯は §14。残る未決事項 (§11.2) を PoC・eval・実測で詰めてから v1.0 にする
@@ -822,10 +822,10 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 
   | OS | 既定の場所 |
   | --- | --- |
-  | Linux / macOS | `$XDG_CACHE_HOME/chatora-rustdoc/` (`XDG_CACHE_HOME` が未設定なら `~/.cache`) |
-  | Windows | `%LOCALAPPDATA%\chatora-rustdoc\cache\` |
+  | Linux / macOS | `$XDG_CACHE_HOME/chatora-rustdoc-mcp/` (`XDG_CACHE_HOME` が未設定なら `~/.cache`) |
+  | Windows | `%LOCALAPPDATA%\chatora-rustdoc-mcp\cache\` |
 
-  - 環境変数 `CHATORA_RUSTDOC_CACHE__DIR` (設定の `cache.dir`。名前の規則は R-DIST-3) で場所を変えられるようにする
+  - 環境変数 `CHATORA_RUSTDOC_MCP_CACHE__DIR` (設定の `cache.dir`。名前の規則は R-DIST-3) で場所を変えられるようにする
   - キャッシュ・state (R-DIST-3)・ログ (R-OBS-2) のディレクトリの権限と所有者は扱わない。umask のまま作り、所有者も確かめない (cargo の `target/` や `~/.cargo`、rust-analyzer と同じ。既定の場所はホームの下にあり、ホームの権限が他の利用者から守る。v0.15)。他の利用者が読み書きできる場所に置かないよう README で案内する (R-SEC-2)
   - state のディレクトリのもの (ビルドのプロセスの記録など。R-DIST-3) とログ (R-OBS-2) はキャッシュに置かない
 - R-CA-2 キー: `{source}/{crate}/{version}/{target}/{format_version}.json` を元データとし (std の `{version}` には rustc の commit-hash を使う。nightly は同じ版の文字列が約 6 週間続くため)、派生物 (アーカイブ・索引・展開したソース) を同じ場所に置く
@@ -888,7 +888,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - **README に書くこと** (要点。文面は M5 で README を書くときに決める。v0.16)
     - 照会のツールは、既定のプロジェクト (R-MCP-3) のコードを、確認なしに、Claude Code のサンドボックスの外でビルドする (build.rs と proc-macro を実行する)。外のツール `build_external_docs` は、エージェントが指したそれ以外のコード (R-WS-10) をビルドする
     - ビルドしなくても `cargo metadata`・`cargo tree`・`rustc -vV` を起動し、プロジェクトの設定が任意の実行ファイルを動かしうる (`cargo tree` も `build.rustc`・`rustc-wrapper` を動かすことを 2026-10-16 に確かめた)。信頼できないリポジトリで Claude Code を開いて使わず、`build_external_docs` でも指させない
-    - 許可ルールの書き方: `allow` に `mcp__chatora-rustdoc__*` を、`ask` に `mcp__chatora-rustdoc__build_external_docs` を書く (`ask` を書かずに `*` だけを許可すると、外のコードも確認なしにビルドされる)。ask のルールが効かない権限モードがある (端末の `bypassPermissions` と VS Code の auto。実測と追っている Issue は [claude-code-issues.md](claude-code-issues.md))
+    - 許可ルールの書き方: `allow` に `mcp__chatora-rustdoc-mcp__*` を、`ask` に `mcp__chatora-rustdoc-mcp__build_external_docs` を書く (`ask` を書かずに `*` だけを許可すると、外のコードも確認なしにビルドされる)。ask のルールが効かない権限モードがある (端末の `bypassPermissions` と VS Code の auto。実測と追っている Issue は [claude-code-issues.md](claude-code-issues.md))
     - 同じことはこのサーバーが無くてもできる (Cargo.toml に依存を書けば rust-analyzer が build.rs を動かし、エージェントは Bash で cargo を実行できる)
     - キャッシュを他の利用者も書ける場所 (`/tmp` など) に置かない。キャッシュ・state・ログは umask のまま作る
     - 信頼したリポジトリの `.claude/settings.json` の `env` で、このサーバーの設定も変えられる (2026-10-16 に確かめた)
@@ -914,7 +914,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 - R-OBS-1: ツール呼び出しごとに、構造化ログ (JSON Lines) をファイルに出す。記録する項目は、`request_id` (R-ERR-2)、ツール名、引数 (パス以外は要約)、遅延、応答のバイト数と推定トークン数、エラーコード、キャッシュの当否、取得元。OTLP だけに頼らない (syphar は呼び出しごとのファイルログをやめて OTLP だけにした結果、手元で分析できなくなっている)
   - 推定トークン数は文字数からの換算で出す。換算係数の校正の手順は M5 の eval (R-QA-6) で決める (v0.16)。**実行時には count_tokens などの外部の API を呼ばない** (応答の中身を外部に送ることになる)
 - R-OBS-2: ログの出力先とローテーション (ファイル名と数値は初期値で、実装時に決める。v0.16)
-  - 既定の場所は state のディレクトリ (R-DIST-3) の `logs/`: Linux / macOS は `$XDG_STATE_HOME/chatora-rustdoc/logs/` (未設定なら `~/.local/state`)、Windows は `%LOCALAPPDATA%\chatora-rustdoc\state\logs\` (キャッシュの下に置くと `cache clear` で消える)。設定と環境変数で場所を変えられる
+  - 既定の場所は state のディレクトリ (R-DIST-3) の `logs/`: Linux / macOS は `$XDG_STATE_HOME/chatora-rustdoc-mcp/logs/` (未設定なら `~/.local/state`)、Windows は `%LOCALAPPDATA%\chatora-rustdoc-mcp\state\logs\` (キャッシュの下に置くと `cache clear` で消える)。設定と環境変数で場所を変えられる
   - プロセスごとに 1 ファイル (`<日付>-<PID>.jsonl` など) に書く。複数のセッションのサーバーが同時に動いても、行が混ざらず、書き込みの排他も要らない。1 ファイルの上限を超えたら次のファイルに切り替える (初期値 20MB)
   - 保持期間と合計の上限 (初期値 14 日・50MB) を超えた古いログを消す。他のプロセスが書いているファイルと、所有マーカー (R-CA-5) の無いディレクトリのファイルは消さない。どれも設定で変えられる。判定の方式と GC の時期は実装時に決める (v0.16)
   - ログにはツールの引数 (パスはそのまま、それ以外は要約) が残り、プロジェクトのパスには利用者名が入りうるので、ログの場所と記録する項目を README に書く (トークンは出さない。R-NW-4)
@@ -961,10 +961,10 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 ### 9.8 配布と設定
 
 - R-DIST-1: Linux / macOS / Windows を同等に扱う。配布の仕組みは ferritin に倣う
-  - crates.io (`cargo install --locked chatora-rustdoc`) と、GitHub Releases のビルド済みバイナリで配る。README に正規の入手先を明記する (名前の似たプロジェクトや無断コピーが多い。survey §3)
+  - crates.io (`cargo install --locked chatora-rustdoc-mcp`) と、GitHub Releases のビルド済みバイナリで配る。README に正規の入手先を明記する (名前の似たプロジェクトや無断コピーが多い。survey §3)
   - 配る target (musl 版を含めるか。Q-27)、ビルド済みバイナリの作り方 (dist・`cargo binstall`・インストーラー)、リリースの流れ (release-plz など)、公式 MCP レジストリへの登録、依存の更新の bot、リリース前後の CI の検査、成果物の sha256 と attestation は M5 で決める (v0.16)
   - CI は 3 つの OS で、ビルド・テスト・clippy・rustdoc (`RUSTDOCFLAGS="-D warnings"`) を回す。OS 依存のコード (`std::os::unix` など) は lint では見つからない。toolchain は浮動の stable で、lint の多くを deny にしているので、6 週ごとの新しい stable で lint が増えるとコードを変えなくても CI が落ちうる。そのときはその都度直す (版を固定しない。v0.13 で決定)
-  - crate は 1 つにし、MCP サーバーと CLI (`cache`) を同じバイナリ `chatora-rustdoc-mcp` に入れる (R-DIST-2。パッケージ名は `chatora-rustdoc` のまま。バイナリ名は 2026-10-19 に M0 で決めた)。ferritin が workspace で crate を分けているのは、CLI/TUI と MCP サーバーが別のバイナリだから。分けると、バイナリが依存する crate もすべて crates.io に公開する必要がある
+  - crate は 1 つにし、MCP サーバーと CLI (`cache`) を同じバイナリに入れる (R-DIST-2)。パッケージ・lib の crate・バイナリ・MCP の serverInfo・設定とキャッシュと state のディレクトリ・環境変数の接頭辞 (`CHATORA_RUSTDOC_MCP_`)・README で勧める MCP サーバーの登録名は、すべて `chatora-rustdoc-mcp` にそろえる (v0.17)。ferritin が workspace で crate を分けているのは、CLI/TUI と MCP サーバーが別のバイナリだから。分けると、バイナリが依存する crate もすべて crates.io に公開する必要がある
 - R-DIST-2: サブコマンドは `serve` (stdio)、`serve --http` (M6 以降。R-MCP-1)、そして人が使う CLI。CLI で照会はしない (エージェントは MCP を使い、人は docs.rs で足りる。CI で公開 API を検査するなら cargo-public-api がある。v0.14 でやめた)
   - `cache ls` / `cache gc` / `cache clear [<crate@版>]` (R-CA-5)
   - `install-skill` (任意。R-DIST-6)
@@ -973,14 +973,14 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
 
   | OS | 既定の場所 |
   | --- | --- |
-  | Linux / macOS | `$XDG_CONFIG_HOME/chatora-rustdoc/config.toml` (`XDG_CONFIG_HOME` が未設定なら `~/.config`) |
-  | Windows | `%APPDATA%\chatora-rustdoc\config.toml` |
+  | Linux / macOS | `$XDG_CONFIG_HOME/chatora-rustdoc-mcp/config.toml` (`XDG_CONFIG_HOME` が未設定なら `~/.config`) |
+  | Windows | `%APPDATA%\chatora-rustdoc-mcp\config.toml` |
 
   - macOS も `~/Library/Application Support` ではなく XDG の規則に従う。開発者向け CLI の多くがそうしており、Linux と案内を揃えられる。[etcetera](https://crates.io/crates/etcetera) の `choose_base_strategy` (Windows では Windows の規則、それ以外では XDG) がこの規則と一致する
   - パスを `HOME` から自前で組み立てない (Windows には `HOME` が無い)
-  - ビルドのプロセスの記録 (R-WS-6) は、state のディレクトリに置く (ロックファイルの置き場所は Q-29): Linux / macOS は `$XDG_STATE_HOME/chatora-rustdoc/` (未設定なら `~/.local/state`)、Windows は `%LOCALAPPDATA%\chatora-rustdoc\state\`。書き込みは R-CA-4 と同じく、一時ファイルからの原子的な置き換えとロックで行う。キャッシュ (R-CA-1) と分け、GC と `cache clear` の対象にしない (動いているビルドの記録を消さないため)
-  - 環境変数 `CHATORA_RUSTDOC_CONFIG` で利用者の設定ファイルの場所を変えられ、個々の設定値も環境変数で上書きできる。環境変数の名前は `CHATORA_RUSTDOC_` に、キーを大文字のスネークケースにしたものをつなぐ (表の入れ子は `__` でつなぐ。例: `network.offline` は `CHATORA_RUSTDOC_NETWORK__OFFLINE`)。環境変数で受けられる値の制約は実装時に決める (v0.16)
-  - **設定は、利用者の設定ファイルと環境変数だけ** (v0.14 で、プロジェクト単位の設定ファイル `.config/chatora-rustdoc.toml`・`.local.toml` をやめた。Q-24): 書く項目のほとんどはマシンや利用者の都合で決まるもので、プロジェクトに固有のもの (ローカルビルドの feature の組と rustdoc の `--cfg`) は Cargo.toml の `[package.metadata.docs.rs]` (R-FT-3・R-WS-1) に、nightly の指定は `rust-toolchain.toml` に、もともと書く場所がある。clone した第三者のリポジトリが、このサーバー独自の設定ファイルで取得元や上限を変える経路も無くなる (cargo の設定・`rust-toolchain.toml`・`[package.metadata.docs.rs]` と、Claude Code で信頼したリポジトリの `.claude/settings.json` の `env` は効く。R-SEC-2)。同じキーは環境変数が勝つ。設定ファイルは TOML。知らない `CHATORA_RUSTDOC_*` の環境変数 (`CHATORA_RUSTDOC_CONFIG` は数えない) と設定ファイルの知らないキーは、起動を止めず、応答には出さずにログで知らせる (綴りの誤りで設定が黙って効かないのを防ぐ。応答に出すと R-ARCH-5 の「同じ入力なら同じ出力」が崩れる。v0.15)。SessionStart の hook でも知らせるかは M5 で決める (R-DIST-5。v0.16)
+  - ビルドのプロセスの記録 (R-WS-6) は、state のディレクトリに置く (ロックファイルの置き場所は Q-29): Linux / macOS は `$XDG_STATE_HOME/chatora-rustdoc-mcp/` (未設定なら `~/.local/state`)、Windows は `%LOCALAPPDATA%\chatora-rustdoc-mcp\state\`。書き込みは R-CA-4 と同じく、一時ファイルからの原子的な置き換えとロックで行う。キャッシュ (R-CA-1) と分け、GC と `cache clear` の対象にしない (動いているビルドの記録を消さないため)
+  - 環境変数 `CHATORA_RUSTDOC_MCP_CONFIG` で利用者の設定ファイルの場所を変えられ、個々の設定値も環境変数で上書きできる。環境変数の名前は `CHATORA_RUSTDOC_MCP_` に、キーを大文字のスネークケースにしたものをつなぐ (表の入れ子は `__` でつなぐ。例: `network.offline` は `CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE`)。環境変数で受けられる値の制約は実装時に決める (v0.16)
+  - **設定は、利用者の設定ファイルと環境変数だけ** (v0.14 で、プロジェクト単位の設定ファイル `.config/chatora-rustdoc.toml`・`.local.toml` をやめた。Q-24): 書く項目のほとんどはマシンや利用者の都合で決まるもので、プロジェクトに固有のもの (ローカルビルドの feature の組と rustdoc の `--cfg`) は Cargo.toml の `[package.metadata.docs.rs]` (R-FT-3・R-WS-1) に、nightly の指定は `rust-toolchain.toml` に、もともと書く場所がある。clone した第三者のリポジトリが、このサーバー独自の設定ファイルで取得元や上限を変える経路も無くなる (cargo の設定・`rust-toolchain.toml`・`[package.metadata.docs.rs]` と、Claude Code で信頼したリポジトリの `.claude/settings.json` の `env` は効く。R-SEC-2)。同じキーは環境変数が勝つ。設定ファイルは TOML。知らない `CHATORA_RUSTDOC_MCP_*` の環境変数 (`CHATORA_RUSTDOC_MCP_CONFIG` は数えない) と設定ファイルの知らないキーは、起動を止めず、応答には出さずにログで知らせる (綴りの誤りで設定が黙って効かないのを防ぐ。応答に出すと R-ARCH-5 の「同じ入力なら同じ出力」が崩れる。v0.15)。SessionStart の hook でも知らせるかは M5 で決める (R-DIST-5。v0.16)
     - **読む時期**: MCP サーバーは起動時に読み、動いている間の書き換えは再起動まで効かない。CLI は呼び出しごとに読む
   - **設定項目の一覧** (暫定。最初の公開リリース (M5) で凍結し、以後は README で案内するので変えない。実装してみて要らないキーや名前の変更は、それまで自由に行う。v0.16)。容量は単位付きの文字列 (`"5GB"` など)、時間は単位をキー名に入れた整数 (`_secs` など) で書く (単位の一覧などは実装時に決める。v0.16)。1h の TTL (R-CA-3、R-STD-6) と sparse index の 10 分の TTL (R-CA-3) は固定値で、設定項目にしない
 
@@ -1012,7 +1012,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
     | 同時に処理する呼び出し・ローカルビルドの数 / 補完の頻度の上限 (1 秒あたり) | `limits.concurrent_calls` / `limits.concurrent_builds` / `limits.completions_per_sec` | 16 / 2 / 20 (初期値) | R-SEC-7・R-MCP-19 |
     | ディスクへの展開の上限 | `limits.extract_max_size` | `"4GiB"` | R-NW-3・R-SC-2 |
     | 1 リクエストあたりの時間の上限 | `limits.request_timeout_secs` | 30 | R-ARCH-6 |
-    | ログの場所 / 1 ファイルの上限 / 保持期間 / 合計の上限 | `log.dir` / `log.file_max_size` / `log.retention_days` / `log.total_max_size` | `~/.local/state/chatora-rustdoc/logs/` など / `"20MB"` / 14 / `"50MB"` | R-OBS-2 |
+    | ログの場所 / 1 ファイルの上限 / 保持期間 / 合計の上限 | `log.dir` / `log.file_max_size` / `log.retention_days` / `log.total_max_size` | `~/.local/state/chatora-rustdoc-mcp/logs/` など / `"20MB"` / 14 / `"50MB"` | R-OBS-2 |
 
 - R-DIST-4: ライセンスは MIT OR Apache-2.0 とする (`LICENSE-MIT` / `LICENSE-APACHE`)
   - 他の実装のコードを流用するのは、MIT か MIT OR Apache-2.0 のものに限り、出典と著作権表示を `THIRD-PARTY-NOTICES` に残す。AGPL (possdog)・LGPL (KevinT3Hu)・Apache-2.0 のみ (dmvk、46ki75)・ライセンス本文の無いもの (syphar、Xevion) は、設計の参考にとどめてコードを写さない
@@ -1182,7 +1182,7 @@ v1 では公開ホスティングをしない (§2 の非ゴール)。ただし�
 
 M0 の結果を反映する版 ([m0-plan.md](m0-plan.md) の §7)。反映を終えたら冒頭の版と日付を改める。
 
-- バイナリ名を `chatora-rustdoc-mcp` にした (パッケージ名と lib の crate 名は `chatora-rustdoc` のまま。MCP の serverInfo の `name` もバイナリ名にそろえる。R-DIST-1・R-DIST-5)
+- 名前をすべて `chatora-rustdoc-mcp` にそろえた: パッケージ、lib の crate、バイナリ、MCP の serverInfo、設定・キャッシュ・state のディレクトリ、環境変数の接頭辞 (`CHATORA_RUSTDOC_MCP_`)、README で勧める MCP サーバーの登録名 (R-DIST-1・R-DIST-3・R-DIST-5・R-CA-1・R-OBS-2・R-SEC-2)。v0.3 で `chatora-rustdoc-mcp` から `chatora-rustdoc` に変えた理由 (CLI としても使う) は、v0.14 で照会の CLI をやめて人向けの `cache` だけになり、弱まった。§14 の過去の版の記述は当時の名前のまま残す
 
 ### v0.16 (2026-10-19)
 

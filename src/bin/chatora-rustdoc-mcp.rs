@@ -33,7 +33,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn serve() -> std::process::ExitCode {
-    if let Err(error) = chatora_rustdoc::logging::init() {
+    if let Err(error) = chatora_rustdoc_mcp::logging::init() {
         eprintln!("{BIN_NAME}: failed to set up logging: {error}");
         return std::process::ExitCode::FAILURE;
     }
@@ -47,7 +47,7 @@ fn serve() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         },
     };
-    match runtime.block_on(chatora_rustdoc::mcp::serve()) {
+    match runtime.block_on(chatora_rustdoc_mcp::mcp::serve()) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             // Print the whole chain of causes on one line.

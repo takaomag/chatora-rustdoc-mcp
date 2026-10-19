@@ -1,4 +1,4 @@
-# chatora-rustdoc
+# chatora-rustdoc-mcp
 
 > **Status: early development.** Nothing works yet. Everything below describes what is planned, and it will change.
 
@@ -17,12 +17,12 @@ An MCP server that looks up Rust API documentation from rustdoc JSON, so that co
 ## Installation (planned)
 
 ```sh
-cargo install --locked chatora-rustdoc
+cargo install --locked chatora-rustdoc-mcp
 # or, for a prebuilt binary
-cargo binstall chatora-rustdoc
+cargo binstall chatora-rustdoc-mcp
 ```
 
-The package `chatora-rustdoc` installs the `chatora-rustdoc-mcp` binary. Prebuilt binaries and installer scripts will be published on GitHub Releases. Claude Code v2.1.292 or later is required.
+Prebuilt binaries and installer scripts will be published on GitHub Releases. Claude Code v2.1.292 or later is required.
 
 ## Usage (planned)
 
@@ -37,7 +37,7 @@ chatora-rustdoc-mcp cache clear serde@1.0.228
 chatora-rustdoc-mcp install-skill   # optional, may come later
 ```
 
-Subagents that list their `tools` get no MCP tools unless you add `mcp__chatora-rustdoc` (or, for a plugin install, the `mcp__plugin_<plugin>_<server>` name) to the list.
+Subagents that list their `tools` get no MCP tools unless you add `mcp__chatora-rustdoc-mcp` (or, for a plugin install, the `mcp__plugin_<plugin>_<server>` name) to the list.
 
 ## Security
 
@@ -53,8 +53,8 @@ To allow the lookup tools but still be asked before code from elsewhere is built
 ```json
 {
   "permissions": {
-    "allow": ["mcp__chatora-rustdoc__*"],
-    "ask": ["mcp__chatora-rustdoc__build_external_docs"]
+    "allow": ["mcp__chatora-rustdoc-mcp__*"],
+    "ask": ["mcp__chatora-rustdoc-mcp__build_external_docs"]
   }
 }
 ```

@@ -4,7 +4,7 @@
 
 ## 仕組み
 
-- `.mcp.json` で、このディレクトリのサーバーを `chatora-rustdoc` という名前で登録する (利用者の設定には登録しない)
+- `.mcp.json` で、このディレクトリのサーバーを `chatora-rustdoc-mcp` という名前で登録する (利用者の設定には登録しない)
 - `.claude/settings.json` で、そのサーバーを有効にし、ツールの呼び出しを許可する
 - `run-server.sh` は `../../target/debug/chatora-rustdoc-mcp serve` を起動し、やりとりを `logs/` に写す
   - `<時刻>-<PID>.in.jsonl`: Claude Code から受けた行
@@ -18,7 +18,7 @@
 このディレクトリで実行し、出力の `tool_result` を見る。
 
 ```sh
-claude -p 'Call the mcp__chatora-rustdoc__probe_result tool once with {"is_error": false}. Then reply with exactly the tool result you received, verbatim, and nothing else.' --output-format stream-json --verbose
+claude -p 'Call the mcp__chatora-rustdoc-mcp__probe_result tool once with {"is_error": false}. Then reply with exactly the tool result you received, verbatim, and nothing else.' --output-format stream-json --verbose
 ```
 
 `{"is_error": true}` でも同じように実行する。
@@ -26,7 +26,7 @@ claude -p 'Call the mcp__chatora-rustdoc__probe_result tool once with {"is_error
 ## 対話モードで確かめる (R-WS-6)
 
 1. このディレクトリで `claude` を起動する
-2. 次のように頼む: `Call mcp__chatora-rustdoc__sleep with {"seconds": 20}.`
+2. 次のように頼む: `Call mcp__chatora-rustdoc-mcp__sleep with {"seconds": 20}.`
 3. 実行中の表示に進捗 (`slept 3 of 20 seconds` など) が出るかを見る
 4. 10 秒ほどで Esc を押して止める
 5. `/exit` で終える

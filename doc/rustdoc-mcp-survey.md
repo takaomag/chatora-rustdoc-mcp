@@ -3,7 +3,7 @@
 - 調査日: 2026-10-13 (同日、主要な実装のソースを精読した二次調査で訂正)。2026-10-14 に三次調査 (全記載の再検証と追記。§9) で改訂し、2026-10-15 に整理した (§11)
 - 目的: Claude Code で Rust 開発をするとき、現在使っている ferritin より優れた rustdoc 系 MCP があるかを判断する
 - 調査時点の環境: ferritin のホスト版 (`https://ferritin.rs/mcp`, HTTP transport) を使っていた
-- その後: この調査を受けて自作 (chatora-rustdoc) を決めた。要件は [requirements.md](requirements.md)。§1 の推奨は調査時点の判断
+- その後: この調査を受けて自作 (chatora-rustdoc-mcp) を決めた。要件は [requirements.md](requirements.md)。§1 の推奨は調査時点の判断
 
 ---
 

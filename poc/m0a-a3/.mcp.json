@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "chatora-rustdoc": {
+    "chatora-rustdoc-mcp": {
       "command": "./run-server.sh",
       "args": []
     }

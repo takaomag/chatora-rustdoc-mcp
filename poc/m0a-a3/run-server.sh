@@ -9,5 +9,5 @@ mkdir -p "${log_dir}"
 prefix="${log_dir}/$(date +%Y%m%dT%H%M%S)-$$"
 
 tee "${prefix}.in.jsonl" \
-  | CHATORA_RUSTDOC_LOG__FILTER=debug "${dir}/../../target/debug/chatora-rustdoc-mcp" serve 2>"${prefix}.stderr.log" \
+  | CHATORA_RUSTDOC_MCP_LOG__FILTER=debug "${dir}/../../target/debug/chatora-rustdoc-mcp" serve 2>"${prefix}.stderr.log" \
   | tee "${prefix}.out.jsonl"
