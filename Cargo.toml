@@ -17,6 +17,7 @@ publish = true
 include = ["/src", "/README.md", "/LICENSE-*"]
 
 [dependencies]
+const_format = "0.2.36"
 # マクロ (`#[tool_router]` など) は使わず、`ServerHandler` を手で実装する (doc/m0-plan.md の D1)。
 rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
 serde_json = "1.0.154"

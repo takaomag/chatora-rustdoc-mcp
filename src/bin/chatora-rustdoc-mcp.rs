@@ -2,6 +2,7 @@
 
 use std::{error::Error as _, ffi::OsString};
 
+use const_format as _;
 use rmcp as _;
 use serde_json as _;
 use thiserror as _;

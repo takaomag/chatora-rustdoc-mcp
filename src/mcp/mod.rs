@@ -14,8 +14,11 @@ use rmcp::{
         CallToolResult,
         ContentBlock,
         DiscoverResult,
+        ErrorCode,
         ErrorData,
         Implementation,
+        InitializeRequestParams,
+        InitializeResult,
         ListToolsResult,
         PaginatedRequestParams,
         ProtocolVersion,
@@ -33,6 +36,14 @@ const SUPPORTED_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
 /// `CARGO_BIN_NAME` is not set when compiling the library.
 const SERVER_NAME: &str = "chatora-rustdoc-mcp";
 
+/// Message of the error for `initialize`, the only hint an old client can show (requirement R-MCP-2).
+const INITIALIZE_REJECTED_MESSAGE: &str = const_format::concatcp!(
+    SERVER_NAME,
+    " supports only MCP 2026-07-28, which has no initialize handshake. Use a client that speaks \
+     it: Claude Code v2.1.292 or later, without MCP_PROTOCOL_NEGOTIATION=legacy or \
+     MCP_SDK_GENERATION=v1.",
+);
+
 /// How long clients may cache `server/discover` and `tools/list` (requirement R-MCP-5).
 const LIST_TTL_MS: u64 = 60 * 60 * 1000;
 
@@ -44,6 +55,22 @@ impl ServerHandler for Server {
         let mut config = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
         config.server_info = Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION"));
         config
+    }
+
+    fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<InitializeResult, ErrorData>> + Send + '_ {
+        // No supported version has `initialize`, so every request is rejected.
+        std::future::ready(Err(ErrorData::new(
+            ErrorCode::UNSUPPORTED_PROTOCOL_VERSION,
+            INITIALIZE_REJECTED_MESSAGE,
+            Some(serde_json::json!({
+                "requested": request.protocol_version,
+                "supported": SUPPORTED_VERSIONS,
+            })),
+        )))
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
