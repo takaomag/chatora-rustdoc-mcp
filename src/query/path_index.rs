@@ -303,6 +303,10 @@ impl<'a> Walker<'a> {
         let Some(target) = reexport.id else {
             return;
         };
+        // `pub use Trait as _;` brings a trait into scope without a name, so it adds no path.
+        if !reexport.is_glob && reexport.name == "_" {
+            return;
+        }
         let Some(item) = self.krate.index.get(&target) else {
             // The item is in another crate.
             if reexport.is_glob {
@@ -800,6 +804,25 @@ mod tests {
             index.resolve(&krate, "my_crate::S::unlock"),
             Resolution::NotFound
         );
+    }
+
+    #[test]
+    fn a_reexport_as_underscore_adds_no_path() {
+        // `pub mod x { pub struct T; } pub mod prelude { pub use crate::x::T as _; }`, as with
+        // `tracing_subscriber::prelude`.
+        let krate = krate(
+            vec![
+                module(0, "c", &[1, 3]),
+                module(1, "x", &[2]),
+                structure(2, "T", &[]),
+                module(3, "prelude", &[4]),
+                reexport(4, "crate::x::T", "_", Some(2), false),
+            ],
+            &[],
+        );
+        let index = PathIndex::build(&krate);
+        assert_eq!(paths(&index, 2), ["c::x::T"]);
+        assert_eq!(index.resolve(&krate, "c::prelude::_"), Resolution::NotFound);
     }
 
     #[test]
