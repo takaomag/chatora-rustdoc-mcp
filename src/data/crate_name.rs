@@ -78,8 +78,8 @@ mod tests {
             &"a".repeat(64),
         ] {
             assert_eq!(
-                name.parse::<CrateName>().map(|n| n.to_string()),
-                Ok(name.to_owned())
+                name.parse::<CrateName>().as_ref().map(CrateName::as_str),
+                Ok(name)
             );
         }
     }

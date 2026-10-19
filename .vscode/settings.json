@@ -76,6 +76,7 @@
     "doctest",
     "fallibles",
     "idents",
+    "krate",
     "Magoori",
     "mkhl",
     "MSRV",

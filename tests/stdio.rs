@@ -28,31 +28,31 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const PROTOCOL_VERSION: &str = "2026-07-28";
 
 /// The `_meta` that every 2026-07-28 request carries, plus `extra` fields.
-fn meta(extra: &Value) -> Value {
+fn meta(extra: Value) -> Value {
     let mut meta = json!({
         "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
         "io.modelcontextprotocol/clientCapabilities": {},
     });
-    if let (Some(meta), Some(extra)) = (meta.as_object_mut(), extra.as_object()) {
-        meta.extend(extra.clone());
+    if let (Some(meta), Value::Object(extra)) = (meta.as_object_mut(), extra) {
+        meta.extend(extra);
     }
     meta
 }
 
 /// A 2026-07-28 request: `params` plus the required `_meta`.
-fn request(id: u64, method: &str, params: &Value) -> Value {
-    let mut params = params.clone();
-    params["_meta"] = meta(&json!({}));
-    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+fn request(id: u64, method: &str, mut params: Value) -> Value {
+    params["_meta"] = meta(json!({}));
+    // Moved in rather than written inside `json!`, which would serialize a copy of it.
+    let mut request = json!({ "jsonrpc": "2.0", "id": id, "method": method });
+    request["params"] = params;
+    request
 }
 
 /// A `tools/call` request.
-fn call_tool(id: u64, name: &str, arguments: &Value) -> Value {
-    request(
-        id,
-        "tools/call",
-        &json!({ "name": name, "arguments": arguments }),
-    )
+fn call_tool(id: u64, name: &str, arguments: Value) -> Value {
+    let mut params = json!({ "name": name });
+    params["arguments"] = arguments;
+    request(id, "tools/call", params)
 }
 
 /// Parses the JSON in `content[0].text` of a tool result.
@@ -202,7 +202,7 @@ impl Drop for Server {
 #[test]
 fn discover_describes_the_server() {
     let mut server = Server::start();
-    server.send(&request(1, "server/discover", &json!({})));
+    server.send(&request(1, "server/discover", json!({})));
     let response = server.response(1);
     let result = &response["result"];
     assert_eq!(result["supportedVersions"], json!([PROTOCOL_VERSION]));
@@ -244,8 +244,8 @@ fn initialize_is_rejected_with_a_message_for_old_clients() {
 #[test]
 fn tools_list_is_cacheable_and_not_paginated() {
     let mut server = Server::start();
-    server.send(&request(1, "tools/list", &json!({})));
-    server.send(&request(2, "tools/list", &json!({ "cursor": "x" })));
+    server.send(&request(1, "tools/list", json!({})));
+    server.send(&request(2, "tools/list", json!({ "cursor": "x" })));
     let response = server.response(1);
     let result = &response["result"];
     let names: Vec<&Value> = result["tools"]
@@ -268,9 +268,9 @@ fn tools_list_is_cacheable_and_not_paginated() {
 #[test]
 fn echo_returns_structured_content_and_tool_errors() {
     let mut server = Server::start();
-    server.send(&call_tool(1, "echo", &json!({ "text": "hi" })));
-    server.send(&call_tool(2, "echo", &json!({})));
-    server.send(&call_tool(3, "nope", &json!({})));
+    server.send(&call_tool(1, "echo", json!({ "text": "hi" })));
+    server.send(&call_tool(2, "echo", json!({})));
+    server.send(&call_tool(3, "nope", json!({})));
 
     let response = server.response(1);
     let result = &response["result"];
@@ -297,11 +297,11 @@ fn echo_returns_structured_content_and_tool_errors() {
 fn protocol_errors_follow_the_2026_07_28_rules() {
     let mut server = Server::start();
     // The first request with `_meta` starts the session.
-    server.send(&request(1, "tools/list", &json!({})));
+    server.send(&request(1, "tools/list", json!({})));
     server.response(1);
     server.send(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
-    server.send(&request(3, "ping", &json!({})));
-    server.send(&request(4, "logging/setLevel", &json!({ "level": "info" })));
+    server.send(&request(3, "ping", json!({})));
+    server.send(&request(4, "logging/setLevel", json!({ "level": "info" })));
     assert_eq!(server.response(2)["error"]["code"], -32602);
     assert_eq!(server.response(3)["error"]["code"], -32601);
     assert_eq!(server.response(4)["error"]["code"], -32601);
@@ -320,7 +320,7 @@ fn rmcp_deviations_from_the_requirements() {
     server.send(&request(
         2,
         "tools/call",
-        &json!({ "name": "echo", "arguments": "hi" }),
+        json!({ "name": "echo", "arguments": "hi" }),
     ));
     assert_eq!(server.response(2)["error"]["code"], -32601);
     assert!(server.finish().success());
@@ -329,8 +329,8 @@ fn rmcp_deviations_from_the_requirements() {
 #[test]
 fn progress_is_reported_and_a_cancelled_request_gets_no_response() {
     let mut server = Server::start();
-    let mut sleep = call_tool(1, "sleep", &json!({ "seconds": 5 }));
-    sleep["params"]["_meta"] = meta(&json!({ "progressToken": "p1" }));
+    let mut sleep = call_tool(1, "sleep", json!({ "seconds": 5 }));
+    sleep["params"]["_meta"] = meta(json!({ "progressToken": "p1" }));
     server.send(&sleep);
 
     let progress = server.notification("notifications/progress");
@@ -344,7 +344,7 @@ fn progress_is_reported_and_a_cancelled_request_gets_no_response() {
         "params": { "requestId": 1, "reason": "test" },
     }));
     // The server keeps working for other requests.
-    server.send(&call_tool(2, "echo", &json!({ "text": "after" })));
+    server.send(&call_tool(2, "echo", json!({ "text": "after" })));
     assert_eq!(
         server.response(2)["result"]["structuredContent"]["text"],
         "after"
@@ -369,7 +369,7 @@ fn subscriptions_listen_is_acknowledged_with_no_notifications() {
     server.send(&request(
         5,
         "subscriptions/listen",
-        &json!({ "notifications": { "toolsListChanged": true } }),
+        json!({ "notifications": { "toolsListChanged": true } }),
     ));
     let acknowledged = server.notification("notifications/subscriptions/acknowledged");
     assert_eq!(
@@ -378,7 +378,7 @@ fn subscriptions_listen_is_acknowledged_with_no_notifications() {
     );
     assert_eq!(acknowledged["params"]["notifications"], json!({}));
     // The subscription does not block other requests.
-    server.send(&call_tool(6, "echo", &json!({ "text": "during listen" })));
+    server.send(&call_tool(6, "echo", json!({ "text": "during listen" })));
     assert_eq!(server.response(6)["result"]["isError"], false);
     // A client cancels the subscription before it leaves. Otherwise rmcp waits 5 seconds for it
     // to end after stdin closes, as it does for every request still in progress.

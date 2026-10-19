@@ -63,7 +63,7 @@ pub(super) fn parse_arguments(arguments: Option<&JsonObject>) -> Result<bool, Ca
 /// Returns `{"from":"structuredContent"}` as structured content and `{"from":"text"}` as text.
 pub(super) fn execute(is_error: bool) -> CallToolResult {
     let mut result = CallToolResult::structured(json!({ "from": "structuredContent" }));
-    result.content = vec![ContentBlock::text(json!({ "from": "text" }).to_string())];
+    result.content = vec![ContentBlock::text(r#"{"from":"text"}"#)];
     result.is_error = Some(is_error);
     result
 }
