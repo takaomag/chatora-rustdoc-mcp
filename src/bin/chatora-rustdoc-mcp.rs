@@ -10,7 +10,6 @@ use etcetera as _;
 use reqwest as _;
 use rmcp as _;
 use semver as _;
-#[cfg(test)]
 use serde as _;
 use serde_json as _;
 #[cfg(test)]

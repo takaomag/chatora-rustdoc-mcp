@@ -22,18 +22,15 @@ use std::{
     process::ExitCode,
 };
 
-use chatora_rustdoc_mcp::data::{self, cache::Cache, crate_name::CrateName, docs_rs::DocsRs};
+use chatora_rustdoc_mcp::data::{
+    self,
+    cache::Cache,
+    crate_name::CrateName,
+    docs_rs::DocsRs,
+    format_version,
+};
 use semver::Version;
 use sha2::{Digest as _, Sha256};
-
-/// Only the field this example needs.
-///
-/// A stand-in until A5 reads `format_version` ahead: `serde_json` scans the whole JSON for it, and
-/// fails on nesting deeper than its recursion limit.
-#[derive(serde::Deserialize)]
-struct Header {
-    format_version: u32,
-}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -78,14 +75,14 @@ async fn fetch(cache: &Cache, docs_rs: &DocsRs, arg: &str) -> Result<String, Box
     let path = cache.docs_rs_json_path(&name, &version);
     let source = if path.is_file() { "cache" } else { "docs.rs" };
     let json = data::docs_rs_json(cache, docs_rs, &name, &version).await?;
-    let header: Header = serde_json::from_slice(&json)?;
+    let format_version = format_version::read(&json)?;
     let mut sha256 = String::new();
     for byte in Sha256::digest(&json) {
         write!(sha256, "{byte:02x}")?;
     }
     Ok(format!(
         "{name}@{version}\tformat={}\tsize={}\tsha256={sha256}\tsource={source}\t{}",
-        header.format_version,
+        format_version,
         json.len(),
         path.display()
     ))

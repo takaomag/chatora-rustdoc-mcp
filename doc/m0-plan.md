@@ -256,6 +256,30 @@ R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52�
 - データ層の同期のディスク I/O は `spawn_blocking` で回す。タスクの panic は `src/task.rs` の `resume_if_panic` で投げ直す (`mcp::serve` と共通。ツールの中なら `run_tool` が `internal_error` にする)
 - 例とテストが使う dev-dependency (`serde`・`sha2`・`tempfile`) は、lib と bin のテストのビルドにも見えるので、`#[cfg(test)] use … as _;` で並べる
 
+#### A5 (2026-10-19)
+
+**R-FV-3 の先読みの方法を決めた**: 末尾からの走査を主にし、読めなければ全体の走査に落とす。全体を解析する A6 で、本文の値と照合する。
+
+- テストデータ 11 件 (形式 46〜61) は、どれも 1 行の compact な JSON で末尾に改行が無く、トップレベルのキーは `root, crate_version, includes_private, index, paths, external_crates, target, format_version` の順だった。`format_version` は常に最後のメンバー
+- `src/data/format_version.rs`
+  - `peek`: 末尾から `}`・数字・`:`・`"format_version"` を読み、その手前がトップレベルの区切り (`,` か `{`) であることを確かめる。空白と改行を許す。入れ子のオブジェクトや文字列の中の `format_version` は読まない (最後の `}` の手前が数字にならない)
+  - `scan`: serde で `format_version` だけを持つ構造体に逆直列化する。serde_json の既定の再帰の上限のまま (深い入れ子への備え (R-FV-8) は A6)
+  - `read`: `peek` で読めなければ warn を出して `scan` に落とす
+- テストデータを使うテスト `tests/testdata.rs` (`#[ignore]`。`cargo test --release --test testdata -- --ignored --nocapture` で回す) で、11 件すべてについて、sha256 の照合と、`peek` と `scan` が一覧と同じ形式を返すことを確かめた
+
+時間 (release ビルド。`peek` は大きさによらない):
+
+| JSON | 大きさ | `peek` | `scan` |
+| --- | --- | --- | --- |
+| syn@2.0.104 (形式 48) | 9.6 MB | 0.3 µs | 8.7 ms |
+| tokio@1.45.1 (形式 46) | 6.1 MB | 0.6 µs | 5.9 ms |
+| serde@1.0.228 (形式 57) | 3.2 MB | 0.2 µs | 3.1 ms |
+| clap@4.6.7 (形式 61) | 0.3 MB | 0.1 µs | 0.24 ms |
+
+`scan` は約 1 GB/s で、core (約 61 MB) なら約 60 ms、windows-rs (約 1 GB) なら約 1 秒かかる見込み。`peek` なら、ファイルから読むときも末尾の数十バイトを seek して読めば足りる (R-PF-1 の mmap とも相性がよい)。
+
+**v0.17 で要件に反映すること**: R-FV-3 の案を「決定」にし、上の方式 (末尾からの走査 → 全体の走査 → 全体の解析での照合) を書く。
+
 ### 6.2 M0b
 
 (未着手)
