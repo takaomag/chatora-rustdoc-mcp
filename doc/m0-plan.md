@@ -466,6 +466,25 @@ R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52�
 - R-ERR-2: `request_id` は M1 から
 - §8: docs.rs の 400 も `no_json` にすること。想定外の HTTP ステータスの扱い (`network_error`、retryable false)
 
+#### A9 (2026-10-19)
+
+環境: Claude Code 2.1.303 (Linux)、モデルは Opus 5.5、サーバーは debug ビルド。A3 と同じ [poc/m0a-a3/](../poc/m0a-a3/) で、README の A9 の節の問いを headless (`claude -p … --output-format stream-json --verbose`) で 5 回実行した。合計で約 1.08 ドル。
+
+| 回 | 確かめたこと | 結果 |
+| --- | --- | --- |
+| 1 | R-OUT-1 (成功、引数を指定) | モデルに渡った tool_result は `structuredContent` の JSON で、キーの順 (provenance → data、signature → docs) も保たれていた |
+| 2 | R-ERR-2 (エラー、`tokio@1.0.0`) | `is_error: true` で、text の JSON (`docs_unavailable`、`reason: no_json`、suggestions) がそのまま渡った |
+| 3 | 版を指定した問い (axum 0.8.9 の `Router::route`) | 説明文だけで、1 回目に `{"crate": "axum@0.8.9", "path": "axum::Router::route"}` を作れた。答えには impl の where 句を使い、`docs_truncated` を見て「本文は確かめていない」と断っていた |
+| 4 | ほかの crate の re-export (axum 0.8.9 の `debug_handler`) | `reexport_of` と hint を受けて、`axum-macros@0.5.1` の `axum_macros::debug_handler` を引き直した (docs.rs からその場で取得)。ツールの呼び出しは 2 回で、回り道は無かった |
+| 5 | 版の無い問い (tokio の `spawn`) | `invalid_argument` にはならなかった。説明文の「Cargo.lock is not read yet」を読み、モデルが自分で Bash で Cargo.lock を探して、版を決めてから 1 回で呼んだ |
+
+- 接続の順は A3 と同じ (`server/discover` → `tools/list` → `tools/call`、どれも `_meta` で 2026-07-28)。ツールは遅延読み込みで、毎回 ToolSearch で `select:` してから呼んだ
+- 回 2 で、モデルの返答は `<error>…</error>` で囲まれていた。stream-json の tool_result の中身にはこの囲みが無いので、Claude Code が `is_error` の結果をモデルに渡すときに囲んでいると考えられる (確かめてはいない)
+- 回 5 は、作業ディレクトリ `poc/m0a-a3` に Cargo.lock が無かったので、モデルはリポジトリ直下の Cargo.lock (tokio 1.53.3) を使った。これは実験の置き方によるもので、実際の利用では作業ディレクトリのプロジェクトの Cargo.lock になる。ただ、モデルに任せると別のプロジェクトの Cargo.lock を拾いうるので、M1 でサーバーがプロジェクトを決めて (R-MCP-3) Cargo.lock から版を決める (R-VR-2) 意味がある
+- モデルが答えの中で「出力に無い」と書いたものは、ドキュメントの本文 (回 3) と必要な feature (回 4、axum の `macros`)。どちらも M1 以降の範囲 (R-OUT-7 の `full`、R-FT)
+
+前提が崩れた項目は無いので、§7 の出力設計は今のままで A10 に進む。
+
 ### 6.2 M0b
 
 (未着手)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts chatora-rustdoc-mcp for the A3 experiment (doc/m0-plan.md) and records what it exchanges
+# Starts chatora-rustdoc-mcp for the A3 and A9 experiments (doc/m0-plan.md) and records what it exchanges
 # with Claude Code: the lines it reads (stdin), the lines it writes (stdout) and its log (stderr).
 set -euo pipefail
 
