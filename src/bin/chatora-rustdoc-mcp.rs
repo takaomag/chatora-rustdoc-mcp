@@ -9,9 +9,11 @@ use derive_more as _;
 use etcetera as _;
 use reqwest as _;
 use rmcp as _;
+use rustdoc_types as _;
 use semver as _;
 use serde as _;
 use serde_json as _;
+use serde_stacker as _;
 #[cfg(test)]
 use sha2 as _;
 #[cfg(test)]

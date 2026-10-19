@@ -13,7 +13,12 @@
 
 use std::{fmt::Write as _, time::Instant};
 
-use chatora_rustdoc_mcp::data::{cache::Cache, crate_name::CrateName, format_version};
+use chatora_rustdoc_mcp::data::{
+    cache::Cache,
+    crate_name::CrateName,
+    format_version,
+    rustdoc_json::{self, ParseError},
+};
 use semver::Version;
 use sha2::{Digest as _, Sha256};
 
@@ -91,6 +96,59 @@ fn format_version_is_read_from_the_end_of_every_format() {
             entry.version,
             entry.format_version,
             json.len()
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the JSON of testdata/docs-rs-json.txt in the cache"]
+fn every_supported_format_is_parsed_into_the_latest_types() {
+    let cache = Cache::open_default().expect("the cache directory is known");
+    for entry in entries() {
+        let json = cached_json(&cache, &entry);
+        let what = format!("{}@{}", entry.name, entry.version);
+        let started = Instant::now();
+        let parsed = rustdoc_json::parse(&json);
+        let parse_time = started.elapsed();
+        if !rustdoc_json::SUPPORTED.contains(&entry.format_version) {
+            assert!(
+                matches!(parsed, Err(ParseError::UnsupportedFormat { found, .. }) if found == entry.format_version),
+                "{what}: {parsed:?}"
+            );
+            eprintln!("{what}: format {} is unsupported", entry.format_version);
+            continue;
+        }
+        let krate = parsed
+            .unwrap_or_else(|error| panic!("{what}: {error}"))
+            .krate;
+        assert_eq!(krate.format_version, entry.format_version, "{what}");
+        assert_eq!(
+            krate.crate_version.as_deref(),
+            Some(entry.version.to_string().as_str()),
+            "{what}"
+        );
+        assert!(
+            krate.index.contains_key(&krate.root),
+            "{what}: the root is not in the index"
+        );
+        // Formats before 57 have no path for external crates; it reads as an empty path.
+        let empty_paths = krate
+            .external_crates
+            .values()
+            .filter(|external_crate| external_crate.path.as_os_str().is_empty())
+            .count();
+        if entry.format_version < 57 {
+            assert_eq!(empty_paths, krate.external_crates.len(), "{what}");
+        } else {
+            assert_eq!(empty_paths, 0, "{what}");
+        }
+        eprintln!(
+            "{what}: format {}, {} bytes, {} items, {} paths, {} external crates, parse {parse_time:?}",
+            entry.format_version,
+            json.len(),
+            krate.index.len(),
+            krate.paths.len(),
+            krate.external_crates.len()
         );
     }
 }

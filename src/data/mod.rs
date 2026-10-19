@@ -4,6 +4,7 @@ pub mod cache;
 pub mod crate_name;
 pub mod docs_rs;
 pub mod format_version;
+pub mod rustdoc_json;
 
 use semver::Version;
 

@@ -280,6 +280,48 @@ R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52�
 
 **v0.17 で要件に反映すること**: R-FV-3 の案を「決定」にし、上の方式 (末尾からの走査 → 全体の走査 → 全体の解析での照合) を書く。
 
+#### A6 (2026-10-19)
+
+環境: rustdoc-types 0.61.0 (形式 61)、serde_json 1.0.154 (`unbounded_depth`)、serde_stacker 0.1.14。
+
+**形式 54〜61 の違い** (rustdoc-types 0.54・0.56・0.57.4・0.60・0.61 の定義を見比べた。0.61 の更新履歴は「TODO」のまま):
+
+| 形式 | 変更 | 0.61 の型で古い形式を読むと |
+| --- | --- | --- |
+| 55 | `Attribute::MacroExport` を追加 (それまでは `Other("#[macro_export]")`)。**更新履歴は `MacroUse` と書いているが、型は `MacroExport`** | 読めるが、54 では意味が変わる |
+| 56 | `ItemKind::Attribute` を追加 | 影響なし |
+| 57 | `ExternalCrate::path: PathBuf` を追加 (必須) | 54〜56 は読めない |
+| 58・59 | `Item::stability`・`const_stability` (`Option`) を追加 | 影響なし |
+| 60 | `default_unstable` (`Option`) を追加 | 影響なし |
+| 61 | `Stability::level` を、`level` の値で区別して平らに並べる形から、入れ子の形に変更 | 58〜60 で `stability` に値があると読めない |
+
+**作ったもの** (`src/data/rustdoc_json/`)
+
+- `parse`: 先読みした形式で型を選び、serde_json で 1 回のストリーミングの解析をする (`Value` を経由しない)。57 と 61 以降は 0.61 の型で直接、54〜56 と 58〜60 は shim。53 以下は `UnsupportedFormat` (M1)。62 以上は 0.61 の型で読んでみて、読めれば `newer_than_supported` を立てて warn を出し、読めなければ `UnsupportedFormat` (R-FV-5)。解析した `format_version` が先読みと違えば `FormatMismatch`
+- `v54_to_56.rs`: `ExternalCrate` を `path` なしで受け、空の `PathBuf` (「不明」) を入れる。54 だけ `Other("#[macro_export]")` を `MacroExport` に写す
+- `v58_to_60.rs`: `Item` の `stability`・`const_stability` を古い形の `Stability` で受けて写す
+- shim から 0.61 の型への変換は、`..` を使わずにフィールドを全部分解する (R-FV-9)
+- 再帰の上限を外し、serde_stacker でスタックを伸ばす (R-FV-8)。300 段の入れ子の型を、単体テストで読めることを確かめた
+
+**テストデータでの結果** (release ビルド。`tests/testdata.rs` の `#[ignore]` のテスト):
+
+| JSON | 形式 | 大きさ | item | paths | 解析 |
+| --- | --- | --- | --- | --- | --- |
+| clap@4.5.42 | 54 | 0.43 MB | 22 | 2,768 | 4.7 ms |
+| clap@4.5.46 | 55 | 0.43 MB | 22 | 2,772 | 3.2 ms |
+| clap@4.5.48 | 56 | 0.44 MB | 23 | 2,780 | 2.8 ms |
+| clap@4.5.56 | 57 | 0.44 MB | 23 | 2,693 | 3.1 ms |
+| serde@1.0.228 | 57 | 3.2 MB | 2,916 | 2,644 | 23.3 ms |
+| clap@4.6.1 | 60 | 0.44 MB | 23 | 2,727 | 2.7 ms |
+| clap@4.6.7 | 61 | 0.30 MB | 23 | 1,065 | 1.4 ms |
+
+- 形式 54〜61 はすべて読め、`crate_version` が一覧の版と一致し、`root` が `index` にあった。外部 crate の `path` は、56 以前ではすべて空、57 以降ではすべて空でなかった。46・48・53 は `UnsupportedFormat` になった
+- 全体の解析は約 140 MB/s で、A5 の `scan` (約 1 GB/s) の約 7 倍遅い。core (約 61 MB) なら約 0.45 秒かかる見込みで、R-PF-1 の rkyv のアーカイブ (M1) で読み込みを速くする根拠になる
+- 58〜60 の shim は、`stability` を持つ JSON (std など) がテストデータに無いので、単体テストの手作りの JSON でだけ確かめた。M1 で std の JSON を扱うときに実物で確かめる
+- clap の item は 22〜23 個しか無い (中身は clap_builder の re-export)。crate をまたぐ re-export (R-PR-3 の手順 3・R-PR-4) の題材になる。M0a の公開パス索引は crate の中だけなので、A7 の代表の item は tokio・serde などから選ぶ
+
+**v0.17 で要件に反映すること**: R-FV-2 の「形式 54: `Item::attrs` の型変更、57: `ExternalCrate::path`、61: `Stability::level`」に、55 の `MacroExport` (54 の `Other("#[macro_export]")` を写す) を足す。`ExternalCrate::path` が無い形式では空のパスを「不明」として扱うことを書く。
+
 ### 6.2 M0b
 
 (未着手)
