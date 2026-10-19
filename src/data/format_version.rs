@@ -50,6 +50,37 @@ pub fn peek(json: &[u8]) -> Option<u32> {
     matches!(rest.last(), Some(b',' | b'{')).then_some(format_version)
 }
 
+/// The top-level members of rustdoc JSON that are checked before it is cached: its format, and the
+/// version of the crate it documents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Header {
+    /// `format_version`.
+    pub format_version: u32,
+    /// `crate_version`, which rustdoc leaves out when the crate has none.
+    pub crate_version: Option<Box<str>>,
+}
+
+/// Reads [`Header`] by parsing the whole of `json` once and skipping everything else, without
+/// limit on nesting.
+///
+/// # Errors
+///
+/// Returns an error when `json` is not a JSON object with a `format_version` that fits in a `u32`.
+pub fn read_header(json: &[u8]) -> Result<Header, FormatVersionError> {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        format_version: u32,
+        #[serde(default)]
+        crate_version: Option<String>,
+    }
+    serde_json::from_slice::<Raw>(json)
+        .map(|raw| Header {
+            format_version: raw.format_version,
+            crate_version: raw.crate_version.map(String::into_boxed_str),
+        })
+        .map_err(FormatVersionError)
+}
+
 /// Reads `format_version` by parsing the whole of `json` and skipping everything else.
 ///
 /// # Errors

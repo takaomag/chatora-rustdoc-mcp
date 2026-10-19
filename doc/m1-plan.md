@@ -238,6 +238,17 @@ m0-plan.md の §7.2 の小さなものを片付けた。
   - 比較は semver の順 (`0.10.0` > `0.9.0`)
 - まだ無いもの: `crate_not_found`・`version_not_found` のエラーへの写し (C1・C2)、プロジェクトの Cargo.lock からの解決 (B5)、`resolved_from` (C1)
 
+#### B3 (2026-10-19)
+
+- 返った JSON の照合 (R-VR-4): キャッシュに書く前に、`format_version` と `crate_version` を 1 回の走査で読み (`format_version::read_header`)、`crate_version` が頼んだ版と違えば使わずキャッシュもしない (`LoadError::WrongVersion`。MCP では `docs_unavailable` の `version_mismatch`)。本物の docs.rs で、zstd-sys の `2.1.0` に `2.1.2+zstd.1.5.7` が返り、断られることを確かめた
+- 否定キャッシュ (R-ERR-3): docs.rs に JSON が無い (404・400) ことは 1 時間、一時的な失敗 (429・5xx・想定外のステータス・通信・証明書) は 30 秒、JSON の場所の隣の `.miss.json` に覚える。覚えている間は問い合わせず、JSON が無いなら `no_json`、一時的な失敗なら `network_error` に `retry_after_secs` を付けて返す。壊れた本体 (上限超え・展開の失敗) は覚えない。取れたら記録を消す
+- 再試行 (R-NW-2): 429・5xx・接続の失敗・タイムアウトを、最大 3 回まで送り直す (`data::http::send`。docs.rs と sparse index で共有)。待ち時間は `Retry-After` (秒の形だけ) か、0.5 秒から倍にしていく。`Retry-After` が 5 秒を超えたら待たずに返す (1 回の照会の時間の上限を食いつぶさないため)
+- 形式番号付きの URL (R-DS-2 の手順 3): 解析で対応外の形式になったら、対応する形式を新しい順に `/json/{n}` で試す。利用者が決めたとおり、一時的な失敗や壊れた本体があっても最後まで試し、読める形式が見つかればそれをキャッシュして引き直す。見つからなければ、途中に一時的な失敗があればそれを、無ければもとの `unsupported_format` を返す
+- 証明書の検証の失敗 (A6 から回したもの): 原因のどこかに `certificate` を含むエラーを `FetchError::Certificate` に分け、再試行せず、`network_error` (retryable false) と、プロキシの CA 証明書を足すよう案内する。rustls のエラーの型は reqwest の外に出てこないので、文言で判定している (できる範囲で)
+- target を指定した取得は、target の検証の型とあわせて B4 で入れる
+- 要件に足すこと (M1 の終わり): §8 の `docs_unavailable` の `reason` に `version_mismatch`、一時的な失敗を覚えている間の `network_error` の `retry_after_secs`、再試行の回数と待ち時間の初期値
+- テスト: 再試行 (503 の後に 200)、形式番号の URL、状態の分類 (503 は 3 回送る)、別の版を使わない、JSON が無いことと一時的な失敗を覚える、別の形式を見つけてキャッシュする、途中の一時的な失敗を返す、どの形式も無ければ `None`、証明書の失敗の判定
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

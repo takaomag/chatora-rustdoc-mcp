@@ -254,29 +254,72 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
         Ok(json) => json,
         Err(error) => return load_error(&arguments, &error),
     };
-    let looked_up = tokio::task::spawn_blocking(move || {
+    let Some((looked_up, arguments)) = look_up_on_blocking(json, arguments).await else {
+        return shutting_down();
+    };
+    // A format this server does not read: docs.rs may have the release in another one
+    // (requirement R-DS-2).
+    if let Err(Failure::Parse(ParseError::UnsupportedFormat { found, .. })) = &looked_up {
+        match data::docs_rs_json_in_another_format(
+            &state.cache,
+            &state.docs_rs,
+            &arguments.name,
+            &arguments.version,
+            *found,
+        )
+        .await
+        {
+            Ok(Some(json)) => {
+                let Some((again, returned)) = look_up_on_blocking(json, arguments).await else {
+                    return shutting_down();
+                };
+                return finish(again, &returned);
+            },
+            Ok(None) => {},
+            Err(error) => return load_error(&arguments, &error),
+        }
+    }
+    finish(looked_up, &arguments)
+}
+
+/// Looks the item up in `json` on a blocking thread, since parsing a large crate takes a large
+/// part of a second. The arguments come back with the result. `None` if the runtime is shutting
+/// down; a panic goes on to `run_tool`.
+async fn look_up_on_blocking(
+    json: Box<[u8]>,
+    arguments: Arguments,
+) -> Option<(Result<Value, Failure>, Arguments)> {
+    match tokio::task::spawn_blocking(move || {
         let looked_up = look_up(&json, &arguments);
         (looked_up, arguments)
     })
-    .await;
-    let (looked_up, arguments) = match looked_up {
-        Ok(done) => done,
-        // The runtime is shutting down. A panic goes on to `run_tool`.
+    .await
+    {
+        Ok(done) => Some(done),
         Err(error) => {
             let error = crate::task::resume_if_panic(error);
             tracing::error!(%error, "the get_item lookup did not finish");
-            return super::tool_error(
-                "internal_error",
-                "the server stopped the lookup because it is shutting down",
-                false,
-                &[],
-            );
+            None
         },
-    };
+    }
+}
+
+/// The tool error when the lookup was stopped because the server is shutting down.
+fn shutting_down() -> CallToolResult {
+    super::tool_error(
+        "internal_error",
+        "the server stopped the lookup because it is shutting down",
+        false,
+        &[],
+    )
+}
+
+/// The tool result of a lookup.
+fn finish(looked_up: Result<Value, Failure>, arguments: &Arguments) -> CallToolResult {
     match looked_up {
         Ok(response) => CallToolResult::structured(response),
-        Err(Failure::Parse(error)) => parse_error(&arguments, &error),
-        Err(Failure::Item(error)) => item_error(&arguments, &error),
+        Err(Failure::Parse(error)) => parse_error(arguments, &error),
+        Err(Failure::Item(error)) => item_error(arguments, &error),
         Err(Failure::Serialize(error)) => {
             tracing::error!(%error, "the get_item response could not be serialized");
             super::tool_error(
@@ -331,6 +374,27 @@ fn load_error(arguments: &Arguments, error: &LoadError) -> CallToolResult {
     tracing::warn!(%release, error = %ErrorChain(error), "rustdoc JSON could not be loaded");
     let fetch = match error {
         LoadError::Fetch(fetch) => fetch,
+        LoadError::WrongVersion { found } => {
+            return error_result(&json!({
+                "code": "docs_unavailable",
+                "message": format!(
+                    "docs.rs returned the rustdoc JSON of version {found} for {release}, so it is not \
+                     used (no other version is shown in place of the one asked for)"
+                ),
+                "retryable": false,
+                "suggestions": ["ask for the version with its build metadata, such as 2.1.0+zstd.1.5.6"],
+                "reason": "version_mismatch",
+            }));
+        },
+        LoadError::RecentFailure { retry_after } => {
+            return error_result(&json!({
+                "code": "network_error",
+                "message": format!("rustdoc JSON of {release} could not be loaded: {}", ErrorChain(error)),
+                "retryable": true,
+                "suggestions": ["try again after retry_after_secs"],
+                "retry_after_secs": retry_after.as_secs().max(1),
+            }));
+        },
         LoadError::Cache(_) => {
             return super::tool_error(
                 "internal_error",
@@ -357,6 +421,10 @@ fn load_error(arguments: &Arguments, error: &LoadError) -> CallToolResult {
             ("network_error", None, true, &["try again in a while"])
         },
         FetchError::UnexpectedStatus { .. } => ("network_error", None, false, &[]),
+        FetchError::Certificate(_) => ("network_error", None, false, &[
+            "the TLS certificate of docs.rs was rejected: if a proxy inspects TLS, add its CA \
+             certificate to the system's trusted certificates",
+        ]),
     };
     let mut body = json!({
         "code": code,

@@ -9,11 +9,10 @@
 //! (R-ERR-3), come later in M1.
 
 use std::{
-    ffi::OsString,
     io,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime},
 };
 
 use reqwest::{StatusCode, header};
@@ -25,6 +24,9 @@ use super::{
     cache::{self, Cache},
     crate_name::CrateName,
     http::{self, BodyError},
+    system_time,
+    unix_seconds,
+    with_suffix,
 };
 
 /// Where the sparse index is. Kept in one place so that a mirror can replace it later
@@ -246,7 +248,7 @@ impl SparseIndex {
                 request = request.header(header::IF_MODIFIED_SINCE, last_modified);
             }
         }
-        let mut response = request.send().await.map_err(IndexError::Network)?;
+        let mut response = http::send(request).await.map_err(IndexError::Network)?;
         match (response.status(), cached) {
             (StatusCode::NOT_MODIFIED, Some(cached)) => {
                 let entry = parse(&cached.body, now).map_err(IndexError::Malformed)?;
@@ -275,9 +277,7 @@ impl SparseIndex {
                 Ok(entry)
             },
             (StatusCode::NOT_FOUND, _) => Err(IndexError::NotFound),
-            (status, _) if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() => {
-                Err(IndexError::Transient { status })
-            },
+            (status, _) if http::is_transient(status) => Err(IndexError::Transient { status }),
             (status, _) => Err(IndexError::UnexpectedStatus { status }),
         }
     }
@@ -395,13 +395,6 @@ fn write_record(path: &std::path::Path, record: &Record) -> io::Result<()> {
     cache::write_atomically(path, &json)
 }
 
-/// `path` with `suffix` added to its file name.
-fn with_suffix(path: &std::path::Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().map(OsString::from).unwrap_or_default();
-    name.push(suffix);
-    path.with_file_name(name)
-}
-
 /// The value of the header `name`, if it is text.
 fn header_value(response: &reqwest::Response, name: header::HeaderName) -> Option<String> {
     response
@@ -409,17 +402,6 @@ fn header_value(response: &reqwest::Response, name: header::HeaderName) -> Optio
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
-}
-
-fn unix_seconds(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
-}
-
-fn system_time(seconds: u64) -> SystemTime {
-    UNIX_EPOCH
-        .checked_add(Duration::from_secs(seconds))
-        .unwrap_or(UNIX_EPOCH)
 }
 
 #[cfg(test)]

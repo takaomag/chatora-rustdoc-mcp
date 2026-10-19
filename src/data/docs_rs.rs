@@ -60,6 +60,10 @@ pub enum FetchError {
     /// early.
     #[error("the request to docs.rs failed")]
     Network(#[source] reqwest::Error),
+    /// The TLS certificate of the server was rejected, as when a proxy intercepts TLS or there are
+    /// no CA certificates. Trying again does not help.
+    #[error("the TLS certificate of docs.rs could not be verified")]
+    Certificate(#[source] reqwest::Error),
     /// The body, or one of its decompressed layers, is larger than the limit.
     #[error("the rustdoc JSON is larger than {limit} bytes")]
     TooLarge {
@@ -111,7 +115,9 @@ impl DocsRs {
     }
 
     /// Fetches the rustdoc JSON of `name` at exactly `version`, built for the docs.rs default
-    /// target, and returns it decompressed. It holds no spare capacity.
+    /// target, and returns it decompressed. It holds no spare capacity. With `format`, it asks for
+    /// the JSON in that format, which docs.rs has only if it built the release in that format
+    /// (requirement R-DS-2).
     ///
     /// # Errors
     ///
@@ -121,22 +127,26 @@ impl DocsRs {
         &self,
         name: &CrateName,
         version: &Version,
+        format: Option<u32>,
     ) -> Result<Box<[u8]>, FetchError> {
-        // Both parts are validated, so they cannot change the shape of the URL.
-        let url = format!("{}/crate/{name}/{version}/json", self.base_url);
-        let mut response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(FetchError::Network)?;
+        // Both parts are validated, so they cannot change the shape of the URL. The `+` of build
+        // metadata is taken as itself in a path.
+        let mut url = format!("{}/crate/{name}/{version}/json", self.base_url);
+        if let Some(format) = format {
+            url = format!("{url}/{format}");
+        }
+        let mut response = http::send(self.client.get(&url)).await.map_err(|error| {
+            if http::is_certificate_error(&error) {
+                FetchError::Certificate(error)
+            } else {
+                FetchError::Network(error)
+            }
+        })?;
         match response.status() {
             StatusCode::OK => {},
             StatusCode::NOT_FOUND => return Err(FetchError::NotFound),
             StatusCode::BAD_REQUEST => return Err(FetchError::BadRequest),
-            status if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() => {
-                return Err(FetchError::Transient { status });
-            },
+            status if http::is_transient(status) => return Err(FetchError::Transient { status }),
             status => return Err(FetchError::UnexpectedStatus { status }),
         }
         let body =
@@ -183,7 +193,10 @@ fn decompress(mut data: Vec<u8>, limit: u64) -> Result<Vec<u8>, FetchError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{super::test_http::serve_once, *};
+    use super::{
+        super::test_http::{serve_once, serve_sequence},
+        *,
+    };
 
     const JSON: &[u8] = br#"{"format_version":61}"#;
 
@@ -258,7 +271,7 @@ mod tests {
         let (name, version) = serde();
         let docs_rs = DocsRs::for_local_test(&base_url);
         let json = docs_rs
-            .fetch_rustdoc_json(&name, &version)
+            .fetch_rustdoc_json(&name, &version, None)
             .await
             .expect("fetches");
         assert_eq!(&*json, JSON);
@@ -295,15 +308,60 @@ mod tests {
         ];
         let (name, version) = serde();
         for (status, expected) in cases {
-            let head = format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n");
-            let (base_url, _request) = serve_once(&head, &[]);
+            let head =
+                format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            // A transient status is sent again, up to three times in all.
+            let (base_url, _requests) = serve_sequence(vec![(head, Vec::new()); 3]);
             let docs_rs = DocsRs::for_local_test(&base_url);
             let error = docs_rs
-                .fetch_rustdoc_json(&name, &version)
+                .fetch_rustdoc_json(&name, &version, None)
                 .await
                 .expect_err("fails");
             assert!(expected(&error), "{status}: {error:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_is_tried_again() {
+        let unavailable = (
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n"
+                .to_owned(),
+            Vec::new(),
+        );
+        let ok = (
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                JSON.len()
+            ),
+            JSON.to_vec(),
+        );
+        let (base_url, requests) = serve_sequence(vec![unavailable, ok]);
+        let (name, version) = serde();
+        let json = DocsRs::for_local_test(&base_url)
+            .fetch_rustdoc_json(&name, &version, None)
+            .await
+            .expect("fetched on the second attempt");
+        assert_eq!(&*json, JSON);
+        assert_eq!(requests.iter().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_format_number_asks_for_that_format() {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            JSON.len()
+        );
+        let (base_url, request) = serve_once(&head, JSON);
+        let (name, version) = serde();
+        DocsRs::for_local_test(&base_url)
+            .fetch_rustdoc_json(&name, &version, Some(60))
+            .await
+            .expect("fetched");
+        let request = request.recv().expect("the server saw the request");
+        assert!(
+            request.starts_with("GET /crate/serde/1.0.228/json/60 HTTP/1.1\r\n"),
+            "{request}"
+        );
     }
 
     /// A body that ends before its `content-length` is a network error, not a broken zstd body
@@ -320,7 +378,7 @@ mod tests {
         let (name, version) = serde();
         let docs_rs = DocsRs::for_local_test(&base_url);
         let error = docs_rs
-            .fetch_rustdoc_json(&name, &version)
+            .fetch_rustdoc_json(&name, &version, None)
             .await
             .expect_err("fails");
         assert!(matches!(error, FetchError::Network(_)), "{error:?}");
