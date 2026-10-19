@@ -32,7 +32,12 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Largest body, before and after each zstd layer is decompressed, held in memory (requirement
 /// R-NW-3, initial value).
-const MAX_BYTES: u64 = 512 * 1024 * 1024;
+pub(super) const MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Most memory reserved for a body before it arrives, whatever its `content-length` says. A
+/// larger body grows the buffer as it comes, so a server cannot make the client reserve
+/// [`MAX_BYTES`] for each of many requests up front.
+const MAX_INITIAL_CAPACITY: u64 = 64 * 1024 * 1024;
 
 /// The magic number at the start of a zstd frame.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
@@ -148,7 +153,10 @@ impl DocsRs {
         // The body is read in chunks so that it never grows past the limit (requirement R-NW-3).
         // docs.rs sends `content-length`, so the buffer is sized once instead of growing; the
         // limit caps the size taken from the header.
-        let mut body = Vec::with_capacity(capacity_for(response.content_length(), MAX_BYTES));
+        let mut body = Vec::with_capacity(capacity_for(
+            response.content_length(),
+            MAX_INITIAL_CAPACITY,
+        ));
         while let Some(chunk) = response.chunk().await.map_err(FetchError::Network)? {
             if exceeds(body.len().saturating_add(chunk.len()), MAX_BYTES) {
                 return Err(FetchError::TooLarge { limit: MAX_BYTES });
@@ -159,11 +167,11 @@ impl DocsRs {
     }
 }
 
-/// A buffer size for a body of `expected` bytes, at most `limit` bytes (plus one, to tell "at the
-/// limit" from "over it"). An unknown size gives no up-front capacity.
+/// A buffer size for a body of `expected` bytes, at most `limit` bytes. An unknown size gives no
+/// up-front capacity.
 fn capacity_for(expected: Option<u64>, limit: u64) -> usize {
     expected
-        .map(|expected| expected.min(limit.saturating_add(1)))
+        .map(|expected| expected.min(limit))
         .and_then(|capacity| usize::try_from(capacity).ok())
         .unwrap_or(0)
 }
@@ -206,14 +214,7 @@ fn decompress(mut data: Vec<u8>, limit: u64) -> Result<Vec<u8>, FetchError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{BufRead as _, BufReader, Write as _},
-        net::TcpListener,
-        sync::mpsc,
-        thread,
-    };
-
-    use super::*;
+    use super::{super::test_http::serve_once, *};
 
     const JSON: &[u8] = br#"{"format_version":61}"#;
 
@@ -227,7 +228,7 @@ mod tests {
     #[test]
     fn the_body_capacity_trusts_content_length_only_up_to_the_limit() {
         assert_eq!(capacity_for(Some(100), 1000), 100);
-        assert_eq!(capacity_for(Some(u64::MAX), 1000), 1001);
+        assert_eq!(capacity_for(Some(u64::MAX), 1000), 1000);
         assert_eq!(capacity_for(None, 1000), 0);
     }
 
@@ -275,36 +276,6 @@ mod tests {
             decompress(truncated, MAX_BYTES),
             Err(FetchError::Corrupt(_))
         ));
-    }
-
-    /// Serves one HTTP response on a local port, and sends back the request head it received.
-    fn serve_once(head: &str, body: &[u8]) -> (String, mpsc::Receiver<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a local port is free");
-        let base_url = format!("http://{}", listener.local_addr().expect("bound"));
-        let (sender, request) = mpsc::channel();
-        let (head, body) = (head.to_owned(), body.to_vec());
-        thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("the client connects");
-            let mut reader = BufReader::new(stream);
-            let mut request_head = String::new();
-            loop {
-                let mut line = String::new();
-                reader
-                    .read_line(&mut line)
-                    .expect("the request is readable");
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-                request_head.push_str(&line);
-            }
-            let mut stream = reader.into_inner();
-            stream
-                .write_all(head.as_bytes())
-                .expect("the response is writable");
-            stream.write_all(&body).expect("the response is writable");
-            sender.send(request_head).expect("the test waits");
-        });
-        (base_url, request)
     }
 
     fn serde() -> (CrateName, Version) {

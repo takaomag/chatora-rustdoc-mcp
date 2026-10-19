@@ -10,6 +10,8 @@ use derive_more as _;
 use etcetera as _;
 #[cfg(test)]
 use insta as _;
+#[cfg(unix)]
+use libc as _;
 use reqwest as _;
 use rmcp as _;
 use rustdoc_types as _;

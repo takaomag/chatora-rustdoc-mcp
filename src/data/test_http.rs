@@ -1,0 +1,38 @@
+//! A local HTTP server for the tests of the data layer.
+
+use std::{
+    io::{BufRead as _, BufReader, Write as _},
+    net::TcpListener,
+    sync::mpsc,
+    thread,
+};
+
+/// Serves one HTTP response on a local port, and sends back the request head it received.
+pub(super) fn serve_once(head: &str, body: &[u8]) -> (String, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a local port is free");
+    let base_url = format!("http://{}", listener.local_addr().expect("bound"));
+    let (sender, request) = mpsc::channel();
+    let (head, body) = (head.to_owned(), body.to_vec());
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("the client connects");
+        let mut reader = BufReader::new(stream);
+        let mut request_head = String::new();
+        loop {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .expect("the request is readable");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            request_head.push_str(&line);
+        }
+        let mut stream = reader.into_inner();
+        stream
+            .write_all(head.as_bytes())
+            .expect("the response is writable");
+        stream.write_all(&body).expect("the response is writable");
+        sender.send(request_head).expect("the test waits");
+    });
+    (base_url, request)
+}

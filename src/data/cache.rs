@@ -6,8 +6,8 @@
 
 use std::{
     ffi::OsString,
-    fs,
-    io::{self, Write as _},
+    fs::{self, File, Metadata},
+    io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -18,7 +18,7 @@ use std::{
 use etcetera::BaseStrategy as _;
 use semver::Version;
 
-use super::crate_name::CrateName;
+use super::{crate_name::CrateName, docs_rs::MAX_BYTES};
 
 /// Environment variable that sets where the cache is (setting `cache.dir`, requirement R-CA-1).
 pub const DIR_ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_CACHE__DIR";
@@ -81,19 +81,35 @@ impl Cache {
     }
 
     /// Reads the rustdoc JSON fetched from docs.rs for `name` at `version`, or returns `None` if
-    /// it is not cached.
-    ///
-    /// A symlink in its place is not followed and counts as not cached (requirement R-CA-4).
+    /// it is not cached. A symlink in or on the way to its place, and anything but a regular file,
+    /// count as not cached (requirement R-CA-4).
     ///
     /// # Errors
     ///
-    /// Returns an error when the file exists but cannot be read.
+    /// Returns an error when the file exists but cannot be read, or is larger than the JSON that
+    /// is held in memory.
     pub fn read_docs_rs_json(
         &self,
         name: &CrateName,
         version: &Version,
     ) -> io::Result<Option<Box<[u8]>>> {
-        read_file(&self.docs_rs_json_path(name, version))
+        self.read_file(&self.docs_rs_json_path(name, version))
+    }
+
+    /// Reads the cached file at `path`, which is under the cache directory, or returns `None` if
+    /// there is none (requirement R-CA-4).
+    ///
+    /// A symlink at `path` or between the cache directory and it is not followed, and anything but
+    /// a regular file is not read; both count as not cached. The cache directory itself may be a
+    /// symlink. On Unix, the file is opened without following a symlink and without waiting on a
+    /// FIFO, and must be the file that was checked, so that it cannot be swapped in between.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file exists but cannot be read, or is larger than the JSON that
+    /// is held in memory ([`MAX_BYTES`]).
+    pub(super) fn read_file(&self, path: &Path) -> io::Result<Option<Box<[u8]>>> {
+        read_regular_file(&self.root, path, MAX_BYTES)
     }
 
     /// Writes the rustdoc JSON fetched from docs.rs for `name` at `version`, replacing what was
@@ -112,23 +128,109 @@ impl Cache {
     }
 }
 
-/// Reads a cached file at `path`, or `None` if there is none. A symlink in its place is not
-/// followed and counts as not cached (requirement R-CA-4).
-///
-/// # Errors
-///
-/// Returns an error when the file exists but cannot be read.
-pub(super) fn read_file(path: &Path) -> io::Result<Option<Box<[u8]>>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            tracing::warn!(path = %path.display(), "ignoring a symlink in the cache");
-            Ok(None)
-        },
-        // `fs::read` sizes the buffer to the file, so boxing it does not copy.
-        Ok(_) => fs::read(path).map(|json| Some(json.into_boxed_slice())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+/// [`Cache::read_file`] with the cache directory `root` and a size limit of `max_len` bytes.
+fn read_regular_file(root: &Path, path: &Path, max_len: u64) -> io::Result<Option<Box<[u8]>>> {
+    if let Some(dirs) = path.strip_prefix(root).ok().and_then(Path::parent) {
+        let mut dir = root.to_path_buf();
+        for component in dirs.components() {
+            dir.push(component);
+            match fs::symlink_metadata(&dir) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    tracing::warn!(path = %dir.display(), "ignoring a symlink in the cache");
+                    return Ok(None);
+                },
+                Ok(_) => {},
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
     }
+    let checked = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !checked.is_file() {
+        tracing::warn!(path = %path.display(), "ignoring what is not a regular file in the cache");
+        return Ok(None);
+    }
+    if checked.len() > max_len {
+        return Err(too_large(path, max_len));
+    }
+    let file = match open_without_following(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound || is_symlink_loop(&error) => {
+            tracing::warn!(path = %path.display(), "the cached file changed while it was opened");
+            return Ok(None);
+        },
+        Err(error) => return Err(error),
+    };
+    let opened = file.metadata()?;
+    if !opened.is_file() || !is_same_file(&checked, &opened) {
+        tracing::warn!(path = %path.display(), "the cached file changed while it was opened");
+        return Ok(None);
+    }
+    let mut contents = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
+    file.take(max_len.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if u64::try_from(contents.len()).map_or(true, |len| len > max_len) {
+        return Err(too_large(path, max_len));
+    }
+    Ok(Some(contents.into_boxed_slice()))
+}
+
+fn too_large(path: &Path, max_len: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "the cached file {} is larger than {max_len} bytes",
+            path.display()
+        ),
+    )
+}
+
+/// Opens `path` for reading, failing if it is a symlink, and without waiting for a writer if it
+/// is a FIFO.
+#[cfg(unix)]
+fn open_without_following(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Opens `path` for reading. Windows has no flag that refuses a symlink, so a symlink that
+/// replaces the file after it was checked is followed.
+#[cfg(not(unix))]
+fn open_without_following(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+/// Whether opening failed because the file is a symlink (`O_NOFOLLOW` gives `ELOOP`).
+#[cfg(unix)]
+fn is_symlink_loop(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+const fn is_symlink_loop(_: &io::Error) -> bool {
+    false
+}
+
+/// Whether `checked` and `opened` are the same file. On Windows, telling files apart needs an API
+/// that is not stable yet, so it is not checked there.
+#[cfg(unix)]
+fn is_same_file(checked: &Metadata, opened: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    checked.dev() == opened.dev() && checked.ino() == opened.ino()
+}
+
+#[cfg(not(unix))]
+const fn is_same_file(_: &Metadata, _: &Metadata) -> bool {
+    true
 }
 
 /// Decides the cache directory from the value of [`DIR_ENV_VAR`] and, when it is unset or empty,
@@ -184,7 +286,7 @@ pub(super) fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 fn write_and_rename(temp: &Path, path: &Path, contents: &[u8]) -> io::Result<()> {
-    let mut file = fs::File::create_new(temp)?;
+    let mut file = File::create_new(temp)?;
     file.write_all(contents)?;
     file.sync_all()?;
     fs::rename(temp, path)
@@ -255,6 +357,72 @@ mod tests {
         assert_eq!(
             cache.read_docs_rs_json(&name, &version).expect("reads"),
             None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_in_the_cache_is_not_followed() {
+        // `docs.rs/serde` points to a directory outside the cache that has the file.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path().join("cache");
+        let cache = Cache::at(&root);
+        let (name, version) = serde();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(elsewhere.join("1.0.228")).expect("the directory is made");
+        fs::write(elsewhere.join("1.0.228/rustdoc.json"), b"secret").expect("the file is written");
+        fs::create_dir_all(root.join("docs.rs")).expect("the directory is made");
+        std::os::unix::fs::symlink(&elsewhere, root.join("docs.rs/serde"))
+            .expect("the symlink is made");
+        assert_eq!(
+            cache.read_docs_rs_json(&name, &version).expect("reads"),
+            None
+        );
+    }
+
+    #[test]
+    fn what_is_not_a_regular_file_is_not_read() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let (name, version) = serde();
+        let path = cache.docs_rs_json_path(&name, &version);
+        fs::create_dir_all(&path).expect("a directory is made in place of the file");
+        assert_eq!(cache.read_file(&path).expect("reads"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_in_the_cache_is_not_read_and_does_not_block() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let (name, version) = serde();
+        let path = cache.docs_rs_json_path(&name, &version);
+        fs::create_dir_all(path.parent().expect("the file has a directory"))
+            .expect("the directory is made");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "mkfifo makes the FIFO");
+        assert_eq!(cache.read_file(&path).expect("reads"), None);
+    }
+
+    #[test]
+    fn a_file_over_the_limit_is_an_error() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("rustdoc.json");
+        fs::write(&path, b"12345").expect("the file is written");
+        assert_eq!(
+            read_regular_file(dir.path(), &path, 5)
+                .expect("reads")
+                .as_deref(),
+            Some(&b"12345"[..])
+        );
+        assert_eq!(
+            read_regular_file(dir.path(), &path, 4)
+                .expect_err("too large")
+                .kind(),
+            io::ErrorKind::InvalidData
         );
     }
 

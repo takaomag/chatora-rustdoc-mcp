@@ -44,6 +44,10 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 ] }
 zstd = { version = "0.14.3", default-features = false }
 
+[target."cfg(unix)".dependencies]
+# キャッシュのファイルを symlink をたどらずに開く `O_NOFOLLOW` と、FIFO で止まらない `O_NONBLOCK` (要件 R-CA-4)。
+libc = "0.2.191"
+
 [profile.release]
 opt-level = 3
 debug = false

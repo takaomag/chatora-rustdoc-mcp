@@ -140,6 +140,7 @@ dependencies = [
  "derive_more",
  "etcetera",
  "insta",
+ "libc",
  "reqwest",
  "rmcp",
  "rustdoc-types",
