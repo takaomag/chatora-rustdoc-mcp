@@ -1,0 +1,12 @@
+# Two versions of one crate as normal dependencies, for B2 (doc/m0-plan.md §4.2).
+[package]
+name = "dup-ws"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+itoa_old = { package = "itoa", version = "0.4" }
+itoa_new = { package = "itoa", version = "1" }
+
+[workspace]

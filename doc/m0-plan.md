@@ -455,6 +455,7 @@ R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52�
 - `request_id` と R-OBS-1 のログ
 - 壊れたキャッシュの取り直し (R-CA-4)。今はキャッシュの読み出しの失敗を `internal_error` にしている
 - docs.rs の 404 は「crate や版が無い」と「JSON が無い」を区別できない。`crate_not_found`・`version_not_found` に分けるには crates.io の index を見る (R-VR-4)
+- 性能 (A10 の後に測った。release ビルド、キャッシュ済み): 1 回の `get_item` の時間はほぼ parse で、rmcp (14 MB) では読み出し 6 ms・parse 62 ms・索引 0.6 ms・照会と直列化 0.02 ms・解放 9 ms。解放は応答の後に別のスレッドへ回した (33a4341)。parse した crate と索引をメモリに残す案 (2 回目以降が 1 ms 未満になる。R-MEM-1 の上限と R-PF-1 の rkyv と合わせて設計する) と、メモリの確保器 (mimalloc など) を替える案は、M1 で測ってから決める。公開パス索引のパスを crate から借りる (`&str`) と索引を作るときの確保が減るが、crate と索引を一緒にメモリに残すときに自己参照になるので、メモリに残す案と一緒に決める
 
 **v0.17 で要件に反映すること**
 
@@ -530,7 +531,31 @@ R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52�
 
 ### 6.2 M0b
 
-(未着手)
+実験のスクリプトと合成の workspace は [poc/m0b/](../poc/m0b/) にある (共通の設定は `env.sh`、手順は README)。「実際の workspace」はこのリポジトリ (Cargo.lock に 242 パッケージ、member のビルドで 186 unit)。
+
+#### B2 (2026-10-19)
+
+環境: stable 1.99.1 (2026-10-13)・cargo 1.99.1、nightly 1.101.0-nightly (2026-10-17)・cargo 1.101.0-nightly (2026-10-12)、host x86_64-unknown-linux-gnu、12 コア。スクリプトは [poc/m0b/b2-doc-vs-rustdoc/](../poc/m0b/b2-doc-vs-rustdoc/) の `run.sh` (このリポジトリ) と `dup.sh` (同名で版の違う依存。`dup-ws/` は itoa 0.4.8 と 1.0.18 に通常の依存として依存する)。どのケースも専用の target dir で、コールドとウォームを測った。
+
+| 比べたこと | `cargo rustdoc … -- -Z unstable-options --output-format json` | `cargo doc -Z unstable-options --output-format json` |
+| --- | --- | --- |
+| member (`--lib`) をコールドで | 25.2 s | 26.3 s |
+| 依存 (serde 1.0.229) をコールドで | 6.5 s | 6.1 s |
+| 何も変えずに 2 回目 | member 0.51 s・serde 0.25 s。文書化する crate の rustdoc は毎回やり直す (186 unit のうち 185 が fresh) | member 0.23 s・serde 0.09 s。全部 fresh |
+| JSON の出る場所 | `target/<triple>/doc/<name>.json` だけ | 同じ場所に加えて、unit ごとの `<build dir>/…/build/<pkg>/<hash>/out/<name>.json` |
+| artifact のメッセージ | 文書化した unit の `filenames` が空 | uplift した JSON のパスを指す |
+| 依存をまとめて文書化 | できない (1 crate ずつ) | `-p` なしで 146 crate の JSON を 38.4 s (member だけより 13 s 多いだけ。ウォームは 0.18 s) |
+| stable の cargo + `RUSTC_BOOTSTRAP=chatora_rustdoc_mcp` | 動く (24.7 s) | `the -Z flag is only accepted on the nightly channel of Cargo` で拒否。`RUSTC_BOOTSTRAP=1` (プロセス全体) なら動く (26.5 s) |
+| 同名で版の違う依存 (itoa 0.4.8 と 1.0.18) | 1 版ずつ作れるが、どちらも `target/<triple>/doc/itoa.json` に出て、後のビルドが上書きする | 両方を `-p` で指すと `document output filename collision` で失敗する。`-p` なしだと 0.4.8 は check だけで文書化されず、警告も無い (1.0.18 だけ) |
+
+- 同じ target dir で `cargo rustdoc` → `cargo doc` → `cargo rustdoc` → `cargo check` と続けても、依存の unit は使い回され、やり直すのは member の 1 unit だけだった (`--output-format json` は文書化する crate の最後の rustdoc にだけ効き、依存の check の fingerprint を変えない)
+- **要件との食い違い**: R-WS-1 の「同名で版の違う依存は別々のファイルに出るが、メッセージの `filenames` は両方とも同じ `target/doc/dep.json` を指す (2026-10-14 に確認)」は、今回の cargo では再現しなかった。`cargo doc` は片方しか文書化しない (`-p` で両方を指すとエラー)
+- proc-macro からしか使われない依存 (このリポジトリの syn 2.0.119 と 3.0.9) を `-p` で名指しすると、`cargo rustdoc` も `cargo doc` も、cargo の feature resolver の panic (`did not find features for (… syn …, NormalOrDev) within activated_features`、`resolver/features.rs:326`) で止まった。R-WS-5 の「`-p` で cargo が失敗する依存」が resolver 2 で実際に起きる (B7-9 で種類ごとに確かめる)
+- target dir 1 つの大きさは 0.6〜0.75 GB (member の文書化で 627 MB、依存をまとめた `cargo doc` で 757 MB)
+
+**決めたこと (Q-17)**: ローカルビルドは R-WS-1 のとおり `cargo rustdoc` で行う。stable + crate を絞った `RUSTC_BOOTSTRAP` (R-WS-8) と両立し、同名の複数版も 1 版ずつ作れる。毎回やり直すのは文書化する crate の rustdoc だけで、鮮度は R-WS-4 でサーバーが判定するので問題にならない。JSON の場所はメッセージに頼らず、ターゲット名から求める (R-WS-1 のとおり)。同名の複数版は、ビルドごとに JSON を移す (R-WS-1 のとおり)。`cargo doc --output-format json` は、nightly を使うときに依存をまとめて文書化する用途の候補として M2 に残す (同名の複数版の古い方が黙って落ちることに注意)。
+
+**v0.17 で要件に反映すること**: Q-17 を決定にする。R-WS-1 の `cargo doc` の節の「同名で版の違う依存は別々のファイルに出る」を、今回の結果 (`-p` で両方を指すとエラー、`-p` なしだと古い方が落ちる) に直す。
 
 ---
 
