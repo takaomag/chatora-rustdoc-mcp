@@ -13,11 +13,14 @@
 
 use std::{fmt::Write as _, time::Instant};
 
-use chatora_rustdoc_mcp::data::{
-    cache::Cache,
-    crate_name::CrateName,
-    format_version,
-    rustdoc_json::{self, ParseError},
+use chatora_rustdoc_mcp::{
+    data::{
+        cache::Cache,
+        crate_name::CrateName,
+        format_version,
+        rustdoc_json::{self, ParseError},
+    },
+    query::path_index::{PathIndex, Resolution},
 };
 use semver::Version;
 use sha2::{Digest as _, Sha256};
@@ -44,6 +47,14 @@ fn entries() -> Vec<Entry> {
             }
         })
         .collect()
+}
+
+/// The entry of `crate_name` at `version` in the list.
+fn entry(crate_name: &str, version: &str) -> Entry {
+    entries()
+        .into_iter()
+        .find(|entry| entry.name.as_str() == crate_name && entry.version.to_string() == version)
+        .unwrap_or_else(|| panic!("{crate_name}@{version} is not in the list"))
 }
 
 /// Reads the JSON of `entry` from the cache and checks that it is the one in the list.
@@ -150,5 +161,95 @@ fn every_supported_format_is_parsed_into_the_latest_types() {
             krate.paths.len(),
             krate.external_crates.len()
         );
+    }
+}
+
+/// The canonical path and the definition path of what `path` resolves to in `index`.
+fn describe(krate: &rustdoc_types::Crate, index: &PathIndex, path: &str) -> String {
+    let describe_id = |id: rustdoc_types::Id| {
+        let canonical = index
+            .canonical_path(id)
+            .map_or_else(|| "-".to_owned(), ToString::to_string);
+        let definition = krate
+            .paths
+            .get(&id)
+            .map_or_else(|| "-".to_owned(), |summary| summary.path.join("::"));
+        format!("canonical {canonical}, definition {definition}")
+    };
+    match index.resolve(krate, path) {
+        Resolution::Item(id) => format!("item: {}", describe_id(id)),
+        Resolution::Member { parent, member } => {
+            let name = krate.index[&member].name.clone().unwrap_or_default();
+            format!("member {name} of {}", describe_id(parent))
+        },
+        Resolution::ExternalReexport(reexport) => format!(
+            "re-export of {}",
+            reexport
+                .definition
+                .as_ref()
+                .map_or_else(|| "?".to_owned(), ToString::to_string)
+        ),
+        Resolution::Ambiguous(ids) => format!("ambiguous among {} items", ids.len()),
+        Resolution::NotFound => "not found".to_owned(),
+    }
+}
+
+#[test]
+#[ignore = "needs the JSON of testdata/docs-rs-json.txt in the cache"]
+fn representative_items_are_found_by_their_public_paths() {
+    let cache = Cache::open_default().expect("the cache directory is known");
+    let cases = [
+        (
+            "tokio",
+            "1.53.3",
+            "tokio::sync::Mutex",
+            "item: canonical tokio::sync::Mutex, definition tokio::sync::mutex::Mutex",
+        ),
+        (
+            "tokio",
+            "1.53.3",
+            "tokio::sync::mutex::Mutex",
+            "item: canonical tokio::sync::Mutex, definition tokio::sync::mutex::Mutex",
+        ),
+        (
+            "tokio",
+            "1.53.3",
+            "tokio::sync::Mutex::lock",
+            "member lock of canonical tokio::sync::Mutex, definition tokio::sync::mutex::Mutex",
+        ),
+        (
+            "axum",
+            "0.8.9",
+            "axum::Json",
+            "item: canonical axum::Json, definition axum::json::Json",
+        ),
+        (
+            "axum",
+            "0.8.9",
+            "axum::Router",
+            "item: canonical axum::Router, definition axum::routing::Router",
+        ),
+        (
+            "axum",
+            "0.8.9",
+            "axum::body::Body",
+            "re-export of axum_core::body::Body",
+        ),
+        (
+            "serde",
+            "1.0.228",
+            "serde::Deserialize",
+            "item: canonical serde::Deserialize, definition serde::de::Deserialize",
+        ),
+    ];
+    for (crate_name, version, path, expected) in cases {
+        let json = cached_json(&cache, &entry(crate_name, version));
+        let krate = rustdoc_json::parse(&json).expect("parses").krate;
+        let started = Instant::now();
+        let index = PathIndex::build(&krate);
+        let build_time = started.elapsed();
+        let found = describe(&krate, &index, path);
+        eprintln!("{path}: {found} (index built in {build_time:?})");
+        assert_eq!(found, expected, "{path}");
     }
 }

@@ -322,6 +322,38 @@ R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52�
 
 **v0.17 で要件に反映すること**: R-FV-2 の「形式 54: `Item::attrs` の型変更、57: `ExternalCrate::path`、61: `Stability::level`」に、55 の `MacroExport` (54 の `Other("#[macro_export]")` を写す) を足す。`ExternalCrate::path` が無い形式では空のパスを「不明」として扱うことを書く。
 
+#### A7 (2026-10-19)
+
+**JSON で確かめたこと** (tokio 1.53.3・axum 0.8.9。どちらも形式 61):
+
+- docs.rs の JSON の `index` に private module は無い。tokio の `sync::mutex` は無く、中の `Mutex` は `index` にあって、`tokio::sync` の `Use` (`source: "mutex::Mutex"`) からだけたどれる
+- `#[doc(hidden)]` の item は、rustdoc が既定で JSON から除くので、どの crate にも無かった (気にするのは `--document-hidden-items` で作る M4 の `api_diff` のとき)
+- glob の `Use` は少なく (tokio 0、axum 2、serde 1、clap 1)、crate の外を指すものが多い (clap の中身は `pub use clap_builder::*` の 1 つ)
+- crate をまたぐ re-export の定義パスも private module を含みうる (`axum::body::Bytes` の行き先は `bytes::bytes::Bytes`)。M1 で行き先の crate の公開パス索引で引き直す必要がある
+- serde 1.0.228 の `Deserialize` は、crate をまたぐ re-export ではなく serde 自身の item (定義パス `serde::de::Deserialize`) として `index` にあった (予想と違ったので、テストの期待値を直した)
+
+**作ったもの** (`src/query/path_index.rs`)
+
+- `PathIndex::build`: ルートから `Module.items` と `Use` を深さ優先にたどり、item ごとの公開パスを集める (R-PR-2)。非 glob の `Use` は改名を反映し、glob は crate の中のモジュールの item と enum の variant を展開する。公開でない item と `is_stripped` のモジュールは公開パスに入れない。crate をまたぐ re-export と glob は記録だけして、中身は引かない (M1)。プリミティブ型の re-export (`id` が無い `Use`) も M1。たどっている途中のモジュールに戻ったら止め、深さは 256 まで (R-PR-3)
+- 正準パス: 改名の無いパス → 短いパス → 辞書順 (§4。hidden・unstable のモジュールの除外は、データのある M1・M4)
+- `PathIndex::resolve`: 公開パス → crate をまたぐ re-export → 定義パスの順に引き、無ければ親を引いてからメンバー (固有の impl → trait の impl → blanket impl の item、trait の item、enum の variant) を名前で探す (R-PR-1)。同じパスに複数の item があれば `Ambiguous` (R-PR-7)。crate 名の `-` と `_` は同一視する
+- `ItemEnum` の変種は `_` でまとめずに書き出した (`wildcard_enum_match_arm`)。rustdoc-types に変種が増えたら、ここで見直すことになる
+- 長く保持する文字列は `Box<str>`、パスは `Box<[Box<str>]>`
+
+**代表の item** (release ビルド。`tests/testdata.rs` の `#[ignore]` のテスト):
+
+| 引いたパス | 結果 |
+| --- | --- |
+| `tokio::sync::Mutex` | item。正準パス `tokio::sync::Mutex`、定義パス `tokio::sync::mutex::Mutex` |
+| `tokio::sync::mutex::Mutex` (定義パス) | 同じ item |
+| `tokio::sync::Mutex::lock` | `Mutex` の固有の impl の `lock` |
+| `axum::Json` | item。正準パス `axum::Json`、定義パス `axum::json::Json` |
+| `axum::Router` | item。正準パス `axum::Router`、定義パス `axum::routing::Router` |
+| `axum::body::Body` | crate をまたぐ re-export (`axum_core::body::Body`) |
+| `serde::Deserialize` | item。正準パス `serde::Deserialize`、定義パス `serde::de::Deserialize` |
+
+索引を作る時間は、tokio で約 0.5 ms、axum で約 0.3 ms、serde で約 0.1 ms。
+
 ### 6.2 M0b
 
 (未着手)
