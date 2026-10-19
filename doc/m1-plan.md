@@ -158,6 +158,7 @@ m0-plan.md の §7.2 の申し送り。
   - `deny`: cargo-deny
 - action は、出てから 2 週間以上たった版のコミットの SHA で固定した
 - 手元で確かめたこと: fmt・clippy (既定と `--no-default-features`)・test・doc・taplo、testdata の job と同じコマンド (取得はキャッシュから、4 件が成功)。cargo-deny と markdownlint-cli2 はホストに無いので、CI の初回で確かめる
+- CI の初回 (2026-10-19): config-lint 以外はすべて通った (Windows の aws-lc-rs のビルド、cargo-deny、docs.rs から取り直した testdata の sha256 を含む)。markdownlint-cli2 が、見出しで始まらない 2 つの Markdown (ツールの説明文 `src/mcp/tool/get_item.md` と、実験の crate の doc に取り込む `poc/m0b/b5-dep-info/probe/README.md`) を MD041 で落としたので、どちらも文書ではないとして対象から外した
 
 ## 7. M1 の終わり方
 

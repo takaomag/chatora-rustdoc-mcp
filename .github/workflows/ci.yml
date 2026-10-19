@@ -85,11 +85,15 @@ jobs:
         with:
           tool: taplo
       - run: taplo fmt --check
+      # src/ の Markdown はツールの説明文 (`include_str!` でモデルに渡す文字列) で、文書ではない。
+      # probe の README.md も実験の crate の doc に取り込む断片。どちらも見出しで始めない。
       - uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
         with:
           globs: |
             **/*.md
             !target/**
+            !src/**
+            !poc/m0b/b5-dep-info/probe/README.md
 
   # 依存のライセンス・既知の脆弱性・取得元・禁じる crate (deny.toml。要件 R-DIST-4)。
   deny:
