@@ -17,7 +17,7 @@ pub(super) const NAME: &str = "sleep";
 const MAX_SECONDS: u32 = 60;
 
 /// Definition of the tool for `tools/list`.
-pub(super) fn tool() -> Tool {
+pub(super) fn definition() -> Tool {
     let input_schema: JsonObject = [
         ("type".to_owned(), json!("object")),
         (
@@ -56,7 +56,7 @@ pub(super) fn tool() -> Tool {
 }
 
 /// Checks the arguments and returns the number of seconds to sleep (requirement R-ARG-1).
-pub(super) fn parse(arguments: Option<&JsonObject>) -> Result<u32, CallToolResult> {
+pub(super) fn parse_arguments(arguments: Option<&JsonObject>) -> Result<u32, CallToolResult> {
     let seconds = match arguments.and_then(|arguments| arguments.get("seconds")) {
         Some(Value::Number(number)) => number
             .as_u64()
@@ -78,7 +78,7 @@ pub(super) fn parse(arguments: Option<&JsonObject>) -> Result<u32, CallToolResul
 
 /// Sleeps one second at a time, sending a progress notification after each second when the
 /// request has a progress token, and stops as soon as the request is cancelled (requirement R-WS-6).
-pub(super) async fn call(seconds: u32, context: RequestContext<RoleServer>) -> CallToolResult {
+pub(super) async fn execute(seconds: u32, context: RequestContext<RoleServer>) -> CallToolResult {
     let progress_token = context.meta.get_progress_token();
     for elapsed in 1..=seconds {
         tokio::select! {

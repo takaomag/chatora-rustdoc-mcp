@@ -114,7 +114,7 @@ impl ServerHandler for Server {
             ))
         } else {
             Ok(
-                ListToolsResult::with_all_items(vec![echo::tool(), sleep::tool()])
+                ListToolsResult::with_all_items(vec![echo::definition(), sleep::definition()])
                     .with_ttl_ms(LIST_TTL_MS)
                     .with_cache_scope(CacheScope::Public),
             )
@@ -131,12 +131,12 @@ impl ServerHandler for Server {
         match request.name.as_ref() {
             echo::NAME => {
                 let arguments = request.arguments;
-                Ok(run_tool(async move { echo::call(arguments.as_ref()) })
+                Ok(run_tool(async move { echo::execute(arguments.as_ref()) })
                     .await
                     .into())
             },
-            sleep::NAME => match sleep::parse(request.arguments.as_ref()) {
-                Ok(seconds) => Ok(run_tool(sleep::call(seconds, context)).await.into()),
+            sleep::NAME => match sleep::parse_arguments(request.arguments.as_ref()) {
+                Ok(seconds) => Ok(run_tool(sleep::execute(seconds, context)).await.into()),
                 Err(error) => Ok(error.into()),
             },
             name => Err(ErrorData::invalid_params(

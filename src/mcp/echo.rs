@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 pub(super) const NAME: &str = "echo";
 
 /// Definition of the tool for `tools/list`.
-pub(super) fn tool() -> Tool {
+pub(super) fn definition() -> Tool {
     let input_schema: JsonObject = [
         ("type".to_owned(), json!("object")),
         (
@@ -41,7 +41,7 @@ pub(super) fn tool() -> Tool {
 }
 
 /// Runs the tool. The arguments are checked here, not by the SDK (requirement R-ARG-1).
-pub(super) fn call(arguments: Option<&JsonObject>) -> CallToolResult {
+pub(super) fn execute(arguments: Option<&JsonObject>) -> CallToolResult {
     match arguments.and_then(|arguments| arguments.get("text")) {
         Some(Value::String(text)) => CallToolResult::structured(json!({ "text": text })),
         Some(_) => super::invalid_argument("`text` must be a string", &[
