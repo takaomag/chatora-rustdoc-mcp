@@ -207,3 +207,18 @@ m0-plan.md の §7.2 の申し送り。
 - 本体の受け取りで先に確保する容量は、`content-length` によらず 64 MiB まで (`MAX_INITIAL_CAPACITY`)。それより大きい本体は届くにつれて伸ばす
 - `libc` を Unix の依存に足した (`O_NOFOLLOW`・`O_NONBLOCK`・`ELOOP`)。もとから間接の依存で、Cargo.lock の版は変わらない
 - テスト: JSON でない 200 の本体がキャッシュに残らない、JSON は残る (ローカルの HTTP サーバー。docs.rs のテストの道具を src/data/test_http.rs に移して共有した)。間のディレクトリの symlink、ディレクトリ、FIFO (止まらずに読まない)、上限を超える大きさ
+
+#### A6 (2026-10-19)
+
+m0-plan.md の §7.2 の小さなものを片付けた。
+
+- `source_location` の span が package の外 (生成物の `OUT_DIR`、ビルドホストの絶対パス) なら、URL を付けずに warnings で知らせる (R-OUT-8)
+- 展開の段数の上限を超えた本体 (`TooManyLayers`) を `too_large` から `unparsable` に改めた (R-DS-4 は「壊れている」とする)
+- `SERVER_NAME` を `env!("CARGO_PKG_NAME")` にした (パッケージ名とバイナリ名が同じになったため)
+- 新しすぎる形式の warnings を、R-FV-5 の例に寄せて「対応する形式・追加的な変更として読んだ・results unverified」の文言にした
+- stdio の結合テストでログを `debug` で有効にした。stdout に JSON-RPC でない行が出ればテストが落ちるので、ログの経路も R-SEC-1 の検査を通る
+- テストの HTTP クライアントはプロキシを使わない (`DocsRs::for_local_test`)。設定は本番と同じ `client_builder` から作る
+- `name` の無い `tools/call` への rmcp の応答を確かめた: `-32601` (R-ARG-1 は `-32602`)。`arguments` がオブジェクトでない場合と同じく、ハンドラの外で起きるので受け入れる違いとしてテストで固定した。M1 の終わりに要件の R-MCP-2 の一覧に足す
+- 応答のキーの順を確かめるテストを足した (`Value` の比較は順を見ないため。R-OUT-1・R-SH-1)。`Map::remove` は今もテストでしか使っていない
+- そのほか: sleep のエラーの文言は上限の定数から作る、説明文の長さのテストは失敗時に文字数を出す、examples/fetch_docs_rs.rs はキャッシュの symlink をキャッシュとみなさない、tests/stdio.rs のコメントの参照先
+- §7.2 の残りは、それを扱う段で直す: TLS の検証の失敗の分類 (B3)、`log.filter` (D1)、`ambiguous_path` の候補数・応答の大きさ・親が曖昧なときのメンバー・`tokio::select!` の書き方 (C1)、キャンセルと同時実行の上限 (D2)

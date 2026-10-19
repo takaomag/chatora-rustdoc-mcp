@@ -110,15 +110,23 @@ impl DocsRs {
     ///
     /// Returns an error when the HTTP client cannot be set up (for example, TLS).
     pub fn with_base_url(base_url: &str) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
-            .build()?;
         Ok(Self {
-            client,
+            client: client_builder().build()?,
             base_url: base_url.into(),
         })
+    }
+
+    /// A client for a test server on this machine, which bypasses any proxy that the environment
+    /// sets (`HTTP_PROXY`), so that the tests do not depend on it.
+    #[cfg(test)]
+    pub(super) fn for_local_test(base_url: &str) -> Self {
+        Self {
+            client: client_builder()
+                .no_proxy()
+                .build()
+                .expect("the client builds"),
+            base_url: base_url.into(),
+        }
     }
 
     /// Fetches the rustdoc JSON of `name` at exactly `version`, built for the docs.rs default
@@ -165,6 +173,14 @@ impl DocsRs {
         }
         decompress(body, MAX_BYTES).map(Vec::into_boxed_slice)
     }
+}
+
+/// The settings of the HTTP client.
+fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
 }
 
 /// A buffer size for a body of `expected` bytes, at most `limit` bytes. An unknown size gives no
@@ -294,7 +310,7 @@ mod tests {
         );
         let (base_url, request) = serve_once(&head, &body);
         let (name, version) = serde();
-        let docs_rs = DocsRs::with_base_url(&base_url).expect("the client builds");
+        let docs_rs = DocsRs::for_local_test(&base_url);
         let json = docs_rs
             .fetch_rustdoc_json(&name, &version)
             .await
@@ -335,7 +351,7 @@ mod tests {
         for (status, expected) in cases {
             let head = format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n");
             let (base_url, _request) = serve_once(&head, &[]);
-            let docs_rs = DocsRs::with_base_url(&base_url).expect("the client builds");
+            let docs_rs = DocsRs::for_local_test(&base_url);
             let error = docs_rs
                 .fetch_rustdoc_json(&name, &version)
                 .await
@@ -356,7 +372,7 @@ mod tests {
         let short = &body[..body.len().saturating_sub(1)];
         let (base_url, _request) = serve_once(&head, short);
         let (name, version) = serde();
-        let docs_rs = DocsRs::with_base_url(&base_url).expect("the client builds");
+        let docs_rs = DocsRs::for_local_test(&base_url);
         let error = docs_rs
             .fetch_rustdoc_json(&name, &version)
             .await

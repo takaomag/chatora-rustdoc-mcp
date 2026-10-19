@@ -72,9 +72,10 @@ pub(super) fn parse_arguments(
         },
     };
     seconds.ok_or_else(|| {
-        super::InvalidArgument::new("`seconds` must be an integer from 1 to 60", &[
-            r#"pass a whole number of seconds, for example {"seconds": 5}"#,
-        ])
+        super::InvalidArgument::new(
+            const_format::concatcp!("`seconds` must be an integer from 1 to ", MAX_SECONDS),
+            &[r#"pass a whole number of seconds, for example {"seconds": 5}"#],
+        )
     })
 }
 

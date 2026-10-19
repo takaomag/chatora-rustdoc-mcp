@@ -348,10 +348,11 @@ fn load_error(arguments: &Arguments, error: &LoadError) -> CallToolResult {
              for a release whose docs.rs build failed",
             ])
         },
-        FetchError::TooLarge { .. } | FetchError::TooManyLayers => {
-            ("docs_unavailable", Some("too_large"), false, &[])
+        FetchError::TooLarge { .. } => ("docs_unavailable", Some("too_large"), false, &[]),
+        // More zstd layers than the limit count as broken (requirement R-DS-4).
+        FetchError::TooManyLayers | FetchError::Corrupt(_) => {
+            ("docs_unavailable", Some("unparsable"), false, &[])
         },
-        FetchError::Corrupt(_) => ("docs_unavailable", Some("unparsable"), false, &[]),
         FetchError::Transient { .. } | FetchError::Network(_) => {
             ("network_error", None, true, &["try again in a while"])
         },
@@ -563,6 +564,7 @@ mod tests {
 
     #[test]
     fn the_description_fits_the_limit() {
-        assert!(DESCRIPTION.chars().count() <= 2048, "{}", DESCRIPTION.len());
+        let len = DESCRIPTION.chars().count();
+        assert!(len <= 2048, "{len} characters");
     }
 }

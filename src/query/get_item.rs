@@ -288,9 +288,10 @@ impl<'a> Query<'a> {
         };
         if parsed.newer_than_supported {
             self.warnings.push(Cow::Owned(format!(
-                "rustdoc JSON format {} is newer than this server supports; the result may be \
-                 incomplete",
-                krate.format_version
+                "rustdoc JSON format {} is newer than the supported {}; read as if its changes were \
+                 additive, so results unverified",
+                krate.format_version,
+                rustdoc_types::FORMAT_VERSION
             )));
         }
         if self.index.is_incomplete() {
@@ -462,8 +463,10 @@ impl<'a> Query<'a> {
             .collect()
     }
 
-    /// Where `item` is defined, with a docs.rs URL when the file is in the package.
-    fn source_location(&self, item: &'a Item) -> Option<SourceLocation<'a>> {
+    /// Where `item` is defined, with a docs.rs URL when the file is in the package. A file outside
+    /// it (generated in `OUT_DIR`, or a path on the build host) gets no URL and a warning
+    /// (requirement R-OUT-8).
+    fn source_location(&mut self, item: &'a Item) -> Option<SourceLocation<'a>> {
         let span = item.span.as_ref()?;
         let file = span.filename.to_str()?;
         let in_package = span
@@ -475,6 +478,11 @@ impl<'a> Query<'a> {
         } else {
             format!("{}-{}", span.begin.0, span.end.0)
         };
+        if !in_package {
+            self.warnings.push(Cow::Owned(format!(
+                "{file} is outside the package, so the definition has no docs.rs URL"
+            )));
+        }
         let url = in_package.then(|| {
             let version: &dyn fmt::Display = match &self.krate.crate_version {
                 Some(version) => version,
@@ -993,6 +1001,26 @@ mod tests {
                 },
             })
         );
+        // `Value` equality ignores the order of keys. The order is part of the response: the
+        // signature comes before the prose (requirements R-OUT-1 and R-SH-1).
+        let keys = |value: &serde_json::Value| -> Vec<String> {
+            value
+                .as_object()
+                .map(|object| object.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(keys(&response), ["provenance", "data"]);
+        assert_eq!(keys(&response["data"]), [
+            "path",
+            "kind",
+            "signature",
+            "fields",
+            "docs",
+            "docs_truncated",
+            "must_use",
+            "also_reexported_at",
+            "source_location",
+        ]);
     }
 
     #[test]
@@ -1008,6 +1036,40 @@ mod tests {
                 "signature": "pub fn lock(&self) -> u8",
                 "deprecated": { "since": "1.1.0" },
             })
+        );
+    }
+
+    #[test]
+    fn a_definition_outside_the_package_has_no_url_and_a_warning() {
+        let mut parsed = parsed();
+        let generated = "/build/out/generated.rs";
+        if let Some(span) = parsed
+            .krate
+            .index
+            .get_mut(&Id(3))
+            .and_then(|item| item.span.as_mut())
+        {
+            span.filename = PathBuf::from(generated);
+        }
+        let index = PathIndex::build(&parsed.krate);
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::parse("1.2.3").expect("a version");
+        let response = get_item(&parsed, &index, ItemRequest {
+            name: &name,
+            version: &version,
+            path: "my_crate::sync::Mutex",
+        })
+        .expect("found");
+        let response = serde_json::to_value(response).expect("serializes");
+        assert_eq!(
+            response["data"]["source_location"],
+            json!({ "file": generated, "lines": "10-12" })
+        );
+        assert_eq!(
+            response["warnings"],
+            json!([format!(
+                "{generated} is outside the package, so the definition has no docs.rs URL"
+            )])
         );
     }
 

@@ -178,7 +178,9 @@ impl Server {
         let cache = test_cache();
         let mut child = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"))
             .arg("serve")
-            .env("CHATORA_RUSTDOC_MCP_LOG__FILTER", "off")
+            // Logging stays on, so that the tests would see a log line that reached stdout
+            // (requirement R-SEC-1).
+            .env("CHATORA_RUSTDOC_MCP_LOG__FILTER", "debug")
             .env("CHATORA_RUSTDOC_MCP_CACHE__DIR", cache.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -460,7 +462,7 @@ fn protocol_errors_follow_the_2026_07_28_rules() {
 }
 
 /// rmcp behaviors that differ from the requirements and cannot be changed from the handler. If
-/// one of these assertions fails, rmcp has changed: update the requirements and `doc/m0-plan.md`.
+/// one of these assertions fails, rmcp has changed: update R-MCP-2 and R-ARG-1 in the requirements.
 #[test]
 fn rmcp_deviations_from_the_requirements() {
     let mut server = Server::start();
@@ -474,6 +476,9 @@ fn rmcp_deviations_from_the_requirements() {
         json!({ "name": "get_item", "arguments": "hi" }),
     ));
     assert_eq!(server.response(2)["error"]["code"], -32601);
+    // The same for a request without `name` (checked in M1, 2026-10-19).
+    server.send(&request(3, "tools/call", json!({ "arguments": {} })));
+    assert_eq!(server.response(3)["error"]["code"], -32601);
     assert!(server.finish().success());
 }
 

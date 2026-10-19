@@ -36,9 +36,9 @@ use crate::data::{
 /// Protocol versions this server implements (requirement R-MCP-2).
 const SUPPORTED_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
 
-/// Name shown to MCP clients in `serverInfo`. Keep it equal to the binary name
-/// (`src/bin/chatora-rustdoc-mcp.rs`): `CARGO_BIN_NAME` is not set when compiling the library.
-const SERVER_NAME: &str = "chatora-rustdoc-mcp";
+/// Name shown to MCP clients in `serverInfo`: the package name, which is also the binary name
+/// (requirement R-DIST-1).
+const SERVER_NAME: &str = env!("CARGO_PKG_NAME");
 
 /// Message of the error for `initialize`, the only hint an old client can show (requirement
 /// R-MCP-2).

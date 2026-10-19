@@ -108,7 +108,7 @@ mod tests {
         let (base_url, _request) = test_http::serve_once(&head, body);
         let dir = tempfile::tempdir().expect("a temporary directory");
         let cache = Cache::at(dir.path());
-        let docs_rs = DocsRs::with_base_url(&base_url).expect("the client builds");
+        let docs_rs = DocsRs::for_local_test(&base_url);
         let (name, version) = serde();
         let json = docs_rs_json(&cache, &docs_rs, &name, &version)
             .await
