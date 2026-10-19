@@ -1,0 +1,10 @@
+[package]
+name = "foomacro"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+proc-macro = true
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(foo)"] }

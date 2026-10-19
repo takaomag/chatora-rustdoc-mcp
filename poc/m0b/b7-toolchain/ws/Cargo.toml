@@ -1,0 +1,5 @@
+# A member whose documentation depends on RUSTFLAGS reaching its build script and its
+# proc-macro, for B7-1 (doc/m0-plan.md §4.2). Also used by B7-6, B7-7 and B7-8.
+[workspace]
+members = ["lib", "foomacro"]
+resolver = "2"

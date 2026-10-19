@@ -591,6 +591,74 @@ R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52�
 
 **v0.17 で要件に反映すること**: Q-17 を決定にする。R-WS-1 の `cargo doc` の節の「同名で版の違う依存は別々のファイルに出る」を、今回の結果 (`-p` で両方を指すとエラー、`-p` なしだと古い方が落ちる) に直す。
 
+#### B3・B6・B7-2・B7-9 (2026-10-19)
+
+環境は B1 と同じ。スクリプトは [poc/m0b/b3-features/run.sh](../poc/m0b/b3-features/run.sh)。合成の workspace [ws/](../poc/m0b/b3-features/ws/) の member は `app` だけで、`deps/` の crate を依存の種類ごとに使う: `shared` を通常の依存 (feature `normal`)・Windows でだけ使う依存 (`windows`)・build-dependency (`build`)・dev-dependency (`dev`) として、ほかに dev-dependency だけの `devonly`・build-dependency だけの `buildonly`・Windows でだけ使う `winonly`・proc-macro の `pm` とその依存 `pmdep`・どこからも使わない `outside`。どれも workspace の外の path の crate (外へ通信しない)。スクリプトは workspace を `resolver = "2"` と `"1"` に書き換えて複製する。
+
+**B3・B7-2 (feature の組)**: `shared` の feature
+
+| | resolver 2 | resolver 1 |
+| --- | --- | --- |
+| `cargo tree --workspace --target <host> -e normal -f '{p} [{f}]'` | `normal` | `build,dev,normal,windows` |
+| 同じ、`--target x86_64-pc-windows-gnu` | `normal,windows` | 同じ 4 つ |
+| `cargo tree … -e normal,dev` | `dev,normal` | 同じ 4 つ |
+| `cargo tree … -e build` | `build` | 同じ 4 つ |
+| `cargo check --workspace` の target 向けの unit | `normal` | 同じ 4 つ |
+| `cargo check --workspace --all-targets` の target 向けの unit | `dev,normal` | 同じ 4 つ |
+| `cargo rustdoc -p app --lib` の target 向けの unit (文書化するとき) | `normal` | 同じ 4 つ |
+| build-dependency 向けの host の unit | `build` (target 向けとは別の unit) | 同じ 4 つ (host 向けも target 向けも) |
+
+- `cargo tree -e normal --target <t>` の組は、`cargo rustdoc --lib` が実際に使う組と、resolver 1 でも 2 でも一致した。dev-dependency の feature は `--all-targets` のときにだけ混ざる
+
+**B6 (`cargo tree` の出力の形)**:
+
+- `cargo tree --workspace --target <host> -e all --prefix depth -f '{p} [{f}]'` の出力は、stable の cargo 1.99.1 と nightly の cargo 1.101.0 で同一だった
+- `{p}` は名前と版、path や git の取得元 (crates.io は出ない)、`(proc-macro)` の印を出す。package id は出ない。`{lib}` (lib の名前) は stable で使えた。`{r}` (repository) は path の crate では空
+- `-e normal` の木には、proc-macro (`pm`) の下の依存 (`pmdep`) も出る。実際には host 向けにビルドされるが、木の上では区別されない。host 向けかどうかは、build の辺の先と、`(proc-macro)` の印が付いた node の下で判断することになる
+- nightly の `cargo check --unit-graph -Z unstable-options` は、unit ごとに package id (`path+file:///…#0.1.0`)・`platform` (host なら null)・`mode`・feature を出す (例: resolver 2 の `shared` は `mode=build platform=host features=["build"]` と `mode=check platform=x86_64-unknown-linux-gnu features=["dev","normal"]`)
+- 実行中に一度だけ `Blocking waiting for file lock on package cache` が出た (エディタの rust-analyzer と見られる。R-WS-2 のロックの共有の実例)
+
+**B7-9 (`cargo rustdoc -p` で依存を名指し)**:
+
+| 依存の種類 | resolver 2 | resolver 1 |
+| --- | --- | --- |
+| 通常の依存 (`shared`)・proc-macro 自身 (`pm`) | 成功 | 成功 |
+| dev-dependency だけ (`devonly`) | cargo が panic | 成功 |
+| build-dependency だけ (`buildonly`) | cargo が panic | 成功 |
+| Windows でだけ使う (`winonly`)、`--target <host>` で | cargo が panic | 成功 |
+| 同じ、`--target x86_64-pc-windows-gnu` で | 成功 | 成功 |
+| proc-macro からしか使われない (`pmdep`) | cargo が panic | 成功 |
+| 依存でない (`outside`) | `package ID specification … did not match any packages` | 同じ |
+
+- panic はどれも `resolver/features.rs:326` の `did not find features for (…, NormalOrDev)` で、B2・B4 と同じ。2026-10-16 のレビューの「resolver 2 で dev だけ・build だけ・ほかの target だけの依存を名指しすると panic する」は正しく、proc-macro からしか使われない依存も同じだった。resolver 1 では起きない。R-WS-5 と R-MCP-3 の食い違いはこれで解ける
+
+**決めたこと**:
+
+- Q-20・R-FT-3: ローカルビルドの feature の組は `cargo tree -e normal --target <t>` の組を基準にする (`cargo rustdoc --lib` が使う組と一致し、v0.15 で「プロジェクトで有効」の基準にしたものとそろう)
+- R-MCP-3・Q-30: 依存が host 向けか target 向けかは、stable の `cargo tree` で判断する (build の辺の先と `(proc-macro)` の node の下が host 向け、それ以外が target 向け)。package id は `cargo tree` に出ないので、名前・版・取得元から `cargo metadata` の id に対応付ける。nightly の `--unit-graph` は使わない (B1 で stable を既定にしたため)
+- R-WS-5・Q-30: resolver 2 以上の workspace では、member から target 向けの通常の辺でたどれない依存 (dev だけ・build だけ・ほかの target だけ・proc-macro の下だけ) を `cargo tree` で判定し、cargo を起動せずに `docs_unavailable` (`reason: build_unsupported`) を返す。crates.io の依存なら docs.rs を、ほかの target だけの依存ならその `target` の指定を案内する。resolver 1 では panic しないので、そのまま cargo を起動する。stderr の panic の文言は照合しない
+
+**v0.17 で要件に反映すること**: Q-20 を決定にする。R-WS-5 の panic の記述を確かめた結果 (proc-macro の下だけの依存を足す) と、起動前の判定に改め、R-MCP-3 の記述をそろえる。Q-30 の該当項目 (`cargo tree` の形と package id、`-p` の失敗) を決定にする。
+
+#### B4 (2026-10-19)
+
+環境は B1 と同じ。スクリプトは [poc/m0b/b4-cfg-docsrs/run.sh](../poc/m0b/b4-cfg-docsrs/run.sh)。このリポジトリが host 向けにビルドする通常の依存 146 個 (`cargo tree --workspace --target <host> -e normal` の、member を除いたもの) を、1 つずつ `cargo rustdoc -p <name>@<version> --lib` で文書化した。`--cfg docsrs` は最後の rustdoc にだけ渡し (R-WS-1)、失敗したら渡さずにやり直した。stable は B1 で決めた `RUSTC_BOOTSTRAP` の値、nightly は値なしで、それぞれ専用の target dir で行った。
+
+| 結果 | stable | nightly |
+| --- | --- | --- |
+| 成功 | 135 | 135 |
+| `--cfg docsrs` のときだけ壊れる | 1 (rustls-platform-verifier 0.7.1) | 1 (同じ) |
+| どちらでも壊れる | 0 | 0 |
+| cargo が panic (`-p` で名指しできない) | 10 | 10 |
+| 合計の時間 (コールドを含む) | 71.1 s | 71.4 s |
+
+- **`--cfg docsrs` で壊れたもの**: rustls-platform-verifier は `#[cfg(any(all(doc, docsrs), target_os = "android"))] mod android;` で Android 用のモジュールを文書に入れ、その中で `jni` を使う。`jni` は Android の target の依存と、crate 自身の `docsrs` feature (optional) でだけ入る。ローカルビルドはプロジェクトの feature の組で作るので、`--cfg docsrs` だけを渡すと `jni` が無く `E0433` で壊れる (docs.rs ではこの feature を有効にしているとみられる)。渡さずにやり直すと成功した。文書化できた 136 個のうち 1 個 (0.7%) で、stable と nightly で同じだった
+- **cargo の panic**: convert_case・proc-macro2・quote・serde_derive_internals・syn (2.0.119 と 3.0.9)・synstructure・unicode-ident・unicode-segmentation・unicode-xid の 10 個。どれも proc-macro からしか使われない依存で、`-p` で名指しすると `resolver/features.rs:326` で `did not find features for (…, NormalOrDev)` の panic になる (B2 と同じ)。proc-macro の crate 自身 (serde_derive・thiserror-impl など) は文書化できた。stable の cargo 1.99.1 と nightly の cargo 1.101.0 の両方で起きた
+
+**決めたこと (Q-11)**: R-WS-1 の「既定で `--cfg docsrs` を渡し、壊れたら渡さずにやり直す」はそのままにする。やり直しの頻度はこのリポジトリで 136 個中 1 個で、原因は「`--cfg docsrs` を前提にした crate 自身の feature が、プロジェクトの組では有効でない」ことだった。壊れた crate を記録して次から渡さないかは、要件のとおり M2 で決める (頻度が低いので、記録しなくても費用はやり直し 1 回分にとどまる)。proc-macro からしか使われない依存の扱いは B7-9 で決める。
+
+**v0.17 で要件に反映すること**: Q-11 に頻度 (136 個中 1 個) と原因の型を書く。
+
 #### B5 (2026-10-19)
 
 環境は B1 と同じ。スクリプトは [poc/m0b/b5-dep-info/run.sh](../poc/m0b/b5-dep-info/run.sh)。合成の crate [probe/](../poc/m0b/b5-dep-info/probe/) は、`#![doc = include_str!(…)]`・`include_bytes!`・`#[path]`・build.rs が `OUT_DIR` に生成して `include!` するコード・`#[cfg(docsrs)]` のときだけ読むモジュールを持つ。どれも stable + B1 で決めた `RUSTC_BOOTSTRAP` で、JSON と同じ rustdoc の引数 (`--cfg docsrs` を含む) を使った。
@@ -610,6 +678,87 @@ R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52�
 **決めたこと (R-WS-4)**: dep-info は (a) で取る。JSON と同じ引数に `--emit=dep-info` を足して rustdoc をもう一度実行する。(b) は依存なら無料だが、`--cfg docsrs` のときだけ読むファイルを取りこぼし、その変更で鮮度切れにならない。(a) の費用はその crate の rustdoc 1 回分。JSON を書き換えないので、JSON を移した後に実行してよい。
 
 **v0.17 で要件に反映すること**: R-WS-4 の「どちらにするかは M0 で所要時間を測って決める」を、(a) に決めたことと理由 (`#[cfg(docsrs)]` のファイル) に改める。
+
+#### B7-1・B7-6・B7-7・B7-8 (2026-10-19)
+
+環境は B1 と同じ。スクリプトは [poc/m0b/b7-toolchain/run.sh](../poc/m0b/b7-toolchain/run.sh)。合成の workspace [ws/](../poc/m0b/b7-toolchain/ws/) の member `lib` は、`--cfg foo` が届いた場所を item で示す: crate 自身 (`lib_saw_foo`)、build script (`build_saw_foo`。build.rs が `cfg!(foo)` を見て cfg を出す)、proc-macro `foomacro` (`macro_saw_foo`。proc-macro が `cfg!(foo)` を見て関数を生成する)。
+
+**B7-1 (`RUSTFLAGS="--cfg foo"` と `--target`)**:
+
+| | build script | proc-macro | 文書化する crate 自身 |
+| --- | --- | --- | --- |
+| `--target` なし | 届いた | 届いた | 届かない |
+| `--target <host>` | 届かない | 届かない | 届かない |
+
+- `RUSTFLAGS` は rustc にだけ効き、rustdoc には効かないので、文書化する crate 自身にはどちらでも届かない (`RUSTDOCFLAGS` の領分。R-WS-1 で使わないと決めている)
+- `--target` を付けると、host 向けの build script と proc-macro にも届かなくなる。`RUSTFLAGS` や `build.rustflags` を使うプロジェクトでは、build.rs や proc-macro が生成する item が、利用者の普段のビルド (`--target` なし) と違ってくる
+
+**B7-6 (`rust-std` が無い target)**: nightly の sysroot には `lib/rustlib/aarch64-unknown-linux-gnu` が無く (rustup の一覧とも一致)、`cargo +nightly rustdoc --target aarch64-unknown-linux-gnu` は `error[E0463]: can't find crate for std` で失敗した。stable (入っている) では成功した。
+
+**B7-7 (実行ファイルの組み合わせ)**:
+
+| 組み合わせ | 結果 |
+| --- | --- |
+| stable の cargo・rustc + nightly の rustdoc (`RUSTDOC`) | `error[E0786]: found invalid metadata files for crate` |
+| stable の cargo・rustdoc + nightly の rustc (`RUSTC`) | 同じく `E0786` |
+| nightly の cargo + stable の rustc・rustdoc | 成功 |
+| rustup を通さない (PATH に toolchain の `bin` とシステムだけを置き、その cargo をパスで起動) | 成功 (PATH の rustc を使い、形式 61) |
+
+rustc と rustdoc は同じ toolchain でないと、依存のメタデータが読めずに壊れる。cargo は別の toolchain でもよい。
+
+**B7-8 (`build.target` に target の JSON 仕様)**: 合成の workspace の複製に、nightly の `--print target-spec-json` で作った host の仕様を `build.target` として書いた。
+
+| | stable (crate 名を指定した `RUSTC_BOOTSTRAP`) | nightly |
+| --- | --- | --- |
+| `cargo tree` | `.json target specs require -Zjson-target-spec` | 同じ |
+| `[unstable] json-target-spec = true` を足して `cargo tree` | 同じエラー (`[unstable]` が無視される。`RUSTC_BOOTSTRAP=1` なら通る) | 通る |
+| 同じく `cargo rustdoc` | 同じエラー | `error[E0463]: can't find crate for std` (独自の target に std が無い。`-Z build-std` が要る) |
+
+**決めたこと**:
+
+- B7-1: target が host で、プロジェクトに `build.target` も無いときは、`--target` を付けない (利用者の普段のビルドと同じく、`RUSTFLAGS` が build script と proc-macro に届く)。JSON は `<target dir>/doc/` に出る (proc-macro の JSON と同じ場所)。target が host と違うときと `build.target` があるときだけ `--target` を付ける
+- B7-6: cargo を起動する前に `<sysroot>/lib/rustlib/<target>` の有無を見て、無ければ `toolchain_missing` を返す (rustup の環境なら `rustup target add` を案内する)。cargo の `E0463` の文言は照合しない
+- B7-7: 実行ファイルのパスを一部だけ指定されたら、残りは同じディレクトリから探す (rustc と rustdoc は同じ toolchain でなければならない。見つからなければ、起動時にログと hook で知らせ、照会ではエラーにする)。cargo は別の toolchain でもよい。rustup が無く指定も無ければ、PATH の cargo・rustc・rustdoc を使い、toolchain を切り替えない (Q-30 の案のとおり)
+- B7-8: `build.target` が `.json` のプロジェクトは v1 では対応しない。cargo を起動せずに `docs_unavailable` (理由を書く) を返し、依存は docs.rs を、member は利用者が手元で作る方法を案内する。対応は要望があれば M2 以降
+
+**v0.17 で要件に反映すること**: R-WS-1 の「`--target` は常に明示する」を、host で `build.target` も無いときは付けないことに改め、出力の場所の記述 (`<target dir>/<triple>/doc/` と `<target dir>/doc/`) を直す。R-WS-1・R-WS-8 の実行ファイルのパスの節と Q-30 の該当項目 (`RUSTFLAGS`・`rust-std` の判定・一部だけの指定・rustup の無い環境・target の JSON 仕様) を決定にする。
+
+#### B7-3・B7-4 (2026-10-19)
+
+環境: stable の cargo 1.99.1、git 2.56.0。スクリプトは [poc/m0b/b7-cargo-failures/run.sh](../poc/m0b/b7-cargo-failures/run.sh)。場面ごとに小さなパッケージを作業用のディレクトリに作り、`isolate_home` (`HOME`・git の設定・`CARGO_HOME` を空のディレクトリに向ける) と `LC_ALL=C` で実行した。crates.io・github.com・名前の引けないホスト (`unreachable.invalid`) に通信する。
+
+**B7-3 (`cargo metadata --format-version 1` の失敗)**: 終了コードはどれも 101 (警告だけなら 0) で、見分けられるのは stderr の文言だけ。
+
+| 場面 | 終了コード | 文言 |
+| --- | --- | --- |
+| Cargo.toml の文法の誤り | 101 | `error: key with no value, expected =` と ` --> Cargo.toml:8:6` |
+| 知らないキー (`no-such-key = true`) | 0 | 警告だけ |
+| 存在しない版 (`=999.0.0`) | 101 | `failed to select a version for the requirement` |
+| レジストリに届かない (crates.io を置き換えて名前の引けないホストへ) | 101 | `unable to update registry` → `download of config.json failed` → `Could not resolve hostname` |
+| git のホストに届かない | 101 | `failed to resolve address for unreachable.invalid … class=Net` |
+| `--offline` でキャッシュに無い | 101 | `no matching package named itoa found` (crate 名の誤りと同じ文言) |
+
+**B7-4 (git の依存の決定的な失敗)**: `cargo fetch`・`cargo metadata`・`cargo tree`・`cargo update` の 4 つで文言は同じだった。
+
+| 場面 | libgit2 (既定) | git の CLI (`net.git-fetch-with-cli`) |
+| --- | --- | --- |
+| rev が無い | `revision <rev> not found` (加えて `network failure seems to have happened`。libgit2 は通信の失敗とみなして再試行するので遅い) | `fatal: remote error: upload-pack: not our ref <rev>` と cargo の `revision <rev> not found` |
+| ブランチが無い | `failed to find branch` と `cannot locate remote-tracking branch 'origin/<branch>'` | `fatal: couldn't find remote ref refs/heads/<branch>` |
+| GitHub の https でリポジトリが無い | `failed to authenticate when downloading repository` | `fatal: could not read Username for 'https://github.com': terminal prompts disabled` |
+| `file://` でリポジトリが無い | `failed to resolve path '…': No such file or directory` | `fatal: '…' does not appear to be a git repository` |
+
+- **要件との食い違い**: Q-30 の「rev が無い → libgit2 も CLI も `revspec '…' not found`」(2026-10-16) は、今の cargo では `revision … not found` になっていた
+- **地域化**: この環境の git には翻訳 (`git.mo`) が入っておらず、`LC_ALL` を変えても文言が変わらないので、地域化の影響は確かめられなかった
+- **資格情報の問い合わせ**: 最初の実行では、git の CLI が GitHub の存在しないリポジトリで資格情報を求められ、利用者のデスクトップの `SSH_ASKPASS` (lxqt-openssh-askpass) を起動してダイアログを出した (`GIT_TERMINAL_PROMPT=0` は端末の問い合わせしか止めない。GitHub は存在しないリポジトリにも認証を求め、https のパスワードには個人アクセストークンしか受けないので、入れるべき値は無い)。実験の環境では `SSH_ASKPASS`・`GIT_ASKPASS` を外し、`SSH_ASKPASS_REQUIRE=never`・`GCM_INTERACTIVE=never` を付けて実行し直した (`env.sh`)
+- 1 回の実行に約 5 分かかった (多くは libgit2 の再試行)
+
+**決めたこと**:
+
+- Q-30: `cargo metadata` の失敗は、どれも `build_failed` (`stage: metadata`、`retryable: true`) として cargo の診断を添えて返し、30 秒だけ否定キャッシュする (Q-30 の案のとおり。文言で分類しない)。キャッシュに無いことによる失敗は、サーバー自身が `--offline` を渡したときだけ `offline_miss` にする
+- R-WS-7・Q-30: git の取得の決定的な失敗 (`fetch_failed`) は、上の表の文言 (libgit2 と CLI の両方) で rev・ブランチ・リポジトリが無い・認証の失敗を判定し (R-WS-7 で認めた照合の例外)、文言をテストで固定する。git を取得しうる子プロセス (`cargo fetch`・`cargo metadata`・`cargo tree`・`cargo update`) には `LC_ALL=C` を渡す
+- R-WS-7: 子プロセスでは資格情報の問い合わせをすべて止める。`SSH_ASKPASS`・`GIT_ASKPASS` を外し、`GIT_TERMINAL_PROMPT=0`・`SSH_ASKPASS_REQUIRE=never`・`GCM_INTERACTIVE=never` を付ける。保存済みの資格情報 (`credential.helper`・ssh-agent) はそのまま使われ、無ければ問い合わせずに `fetch_failed` (`reason: auth`) になり、既存の案内 (利用者の端末で `cargo fetch` を実行して資格情報を通し、`refresh` で再試行) を返す。cargo の既定の経路 (libgit2) も人に問い合わせない (`credential.helper` と ssh-agent だけを試す) ので、それにそろえる。いったん「GUI の askpass は許す」と決めたが、次の理由で改めた: `net.git-fetch-with-cli` の経路では cargo が git の CLI の失敗を一時的な失敗として `net.retry` の回数だけやり直すので、1 回の照会でダイアログが何度も出うる。エージェントの照会のついでに予期せず出て、入力を待つあいだ照会が止まる。存在しない GitHub のリポジトリ (URL の誤り) でも、入れる値の無いダイアログが出る (cargo 1.99.1 のソース `src/sources/git/utils.rs` の `with_authentication` と `fetch_with_cli` で確かめた)
+
+**v0.17 で要件に反映すること**: Q-30 の該当項目 (`cargo metadata` の失敗の返し方、git の文言と `LC_ALL=C`) を決定にし、rev の文言を直す。R-WS-7 に、子プロセスの資格情報の問い合わせをすべて止めること (外す変数と付ける変数) と、その理由 (cargo の既定の経路も問い合わせない、CLI の経路では再試行でダイアログが繰り返される、存在しない GitHub のリポジトリでも出る) を書く。
 
 ---
 

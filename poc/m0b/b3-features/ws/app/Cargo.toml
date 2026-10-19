@@ -1,0 +1,21 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+shared = { path = "../../deps/shared", features = ["normal"] }
+pm = { path = "../../deps/pm" }
+
+[target.'cfg(windows)'.dependencies]
+shared = { path = "../../deps/shared", features = ["windows"] }
+winonly = { path = "../../deps/winonly" }
+
+[build-dependencies]
+shared = { path = "../../deps/shared", features = ["build"] }
+buildonly = { path = "../../deps/buildonly" }
+
+[dev-dependencies]
+shared = { path = "../../deps/shared", features = ["dev"] }
+devonly = { path = "../../deps/devonly" }

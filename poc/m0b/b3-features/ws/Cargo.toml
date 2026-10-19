@@ -1,0 +1,7 @@
+# A workspace whose only member uses one package (deps/shared) with different features as a
+# normal, target-specific, build and dev dependency, and which has dependencies of each kind to
+# name with `-p` (deps/). For B3, B6, B7-2 and B7-9 (doc/m0-plan.md §4.2). run.sh copies it with
+# `resolver = "1"` as well.
+[workspace]
+members = ["app"]
+resolver = "2"

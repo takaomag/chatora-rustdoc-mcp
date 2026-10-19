@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2034 # REPO, ELAPSED and STATUS are for the scripts that source this file.
 # Shared settings for the M0b experiments (doc/m0-plan.md §4). Source it from an experiment
 # script: `. "$(dirname "${BASH_SOURCE[0]}")/../env.sh"`.
 #
@@ -29,11 +31,21 @@ clean_target_dir() {
 # Keeps the user's git and cargo settings and credentials out of the next commands (for the
 # experiments that fetch from git or a registry). The cargo home starts empty.
 isolate_home() {
+  # rustup finds its toolchains through HOME unless RUSTUP_HOME is set, so keep it pointing at
+  # the real one before HOME moves.
+  RUSTUP_HOME="${RUSTUP_HOME:-$(rustup show home)}"
+  export RUSTUP_HOME
   export HOME="${WORK}/home"
   export XDG_CONFIG_HOME="${HOME}/.config"
   export CARGO_HOME="${WORK}/cargo-home"
   export GIT_CONFIG_NOSYSTEM=1
+  # Never ask for credentials: not on the terminal, and not through a GUI askpass program on the
+  # user's desktop (git runs SSH_ASKPASS when GitHub asks for credentials, even for a repository
+  # that does not exist).
   export GIT_TERMINAL_PROMPT=0
+  unset SSH_ASKPASS GIT_ASKPASS
+  export SSH_ASKPASS_REQUIRE=never
+  export GCM_INTERACTIVE=never
   mkdir -p "${HOME}" "${XDG_CONFIG_HOME}" "${CARGO_HOME}"
 }
 
