@@ -354,6 +354,118 @@ R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52�
 
 索引を作る時間は、tokio で約 0.5 ms、axum で約 0.3 ms、serde で約 0.1 ms。
 
+#### A8 (2026-10-19)
+
+環境: rustc 1.99.1、rmcp 3.5.1、serde_json 1.0.154 (`preserve_order`・`unbounded_depth`)、insta 1.49.0。A8-1 (描画)・A8-2 (照会)・A8-3 (MCP のツール) に分けて進めた。
+
+**JSON とまわりで確かめたこと**
+
+- qualified path (`<F as Future>::Output`) の trait の `path` は、たいてい空の文字列で、id だけが入る (tokio は 67 件中 57 件、axum は 685 件中 572 件)。`F::Output` と trait を書かずに書いたものがこうなる。名前は `Crate::paths` から引ける (rustdoc の HTML と同じ)
+- docs.rs の JSON の span の `filename` は、package root からの相対パス (`src/sync/mutex.rs`)
+- 外部 crate の `html_root_url` は `https://docs.rs/axum-macros/0.5.1/x86_64-unknown-linux-gnu/` の形で、crates.io の名前 (`-` のまま) と版が読める。JSON の `name` は `axum_macros`
+- `ItemEnum::Macro` の文字列は、`macro_rules! name { (…) => { ... }; }` の形で、規則の本体は rustdoc がもう `{ ... }` に省いている
+- docs.rs の行の指し方 (2026-10-19 に HTML と JS を取って確かめた): ソースブラウザ (`/crate/{name}/{version}/source/{file}`) も rustdoc のソースページ (`/{name}/{version}/src/{crate}/{file}.html`) も、行ごとに `id="434"` があり、どちらの JS も `/^#?(\d+)(?:-(\d+))?$/` で `#434` と `#434-466` を強調表示する
+- rmcp の `CallToolResult::structured_content` は `serde_json::Value` で、serde_json の既定の Map (BTreeMap) ではキーが辞書順に並び替わる。構造体のフィールドの順が消え、`docs` が `signature` より前に出ていた
+
+**作ったもの**
+
+- `src/query/render.rs` (A8-1): 型・ジェネリクス・境界・where 句と、item の種類ごとの宣言を Rust の文字列にする (R-OUT-2)。
+  - `ItemEnum`・`Type` などの変種は `_` でまとめずに全部書き出した
+  - この crate の型は正準パスで描き、ほかの crate の型は rustdoc が書いたまま (`Path.path`) にする
+  - `self` は `self`・`&self`・`&'a mut self` に略し、それ以外は `self: Box<Self>` の形にする
+  - `impl Trait` の引数に rustdoc が足したジェネリクスの引数 (`is_synthetic`) は出さない
+  - `&(dyn A + B)` のように、要るところに括弧を付ける
+  - 描けない形 (パターン型・名前の分からないパス) は warnings に入れる
+- `src/query/get_item.rs` (A8-2): 通信もファイルの読み書きもしない関数。parse 済みの crate と索引から、§7.3 の形の応答を作る。
+  - provenance の版・target・形式は JSON 本体から読み、要求と違えば warnings に出す (R-OUT-9)
+  - メンバーには `parent` と、impl から来たものなら impl の見出し (where 句込み) を付ける (R-SH-2)
+  - fields・variants は 1 つずつの文字列にし、非公開のものがあれば `/* private fields */`・`/* some variants omitted */` を足す。tuple struct はシグネチャに含める (R-SH-7)
+  - ドキュメントは第 1 段落だけにする (コードブロックの中の空行では切らない)。続きがあれば `docs_truncated`
+  - 属性は `deprecated`・`must_use`・`non_exhaustive` だけを出す (R-SH-6)
+  - ほかの公開パスは `also_reexported_at` に出す
+  - `source_location` に、ファイル・行・docs.rs のソースブラウザの URL を入れる (R-OUT-8)。1 行だけなら `"lines": "301"` と `#301`
+  - ほかの crate の re-export は成功として返し、`reexport_of` (`axum-macros@0.5.1` と定義パス) と、そちらを引く hint を付ける
+  - `kind` は rustdoc の `ItemKind` の語に合わせ、impl と trait の中の関数だけ `method` にする
+- `src/mcp/tool/get_item.rs` (A8-3):
+  - 引数は自前で検証する (R-ARG-1)。`crate` は `name@x.y.z` の完全な版だけで、版の省略や範囲は `invalid_argument`。`path` の先頭が crate 名でなければ crate 名を補う
+  - JSON をキャッシュか docs.rs から読み、parse・索引・照会を `spawn_blocking` で行う。parse した結果はメモリに残さない
+  - outputSchema は手で書き、全部の欄を埋めた応答のキーがすべて宣言されていることを単体テストで確かめる
+  - annotations は R-MCP-4 のとおり (`readOnlyHint: false`・`destructiveHint: false`・`idempotentHint: true`・`openWorldHint: true`)
+  - 説明文は `get_item.md` (1,236 文字) に置いて埋め込む (§6.2)
+- エラーの対応 (§8):
+
+  | 起きたこと | code |
+  | --- | --- |
+  | docs.rs の 404・400 | `docs_unavailable` (`no_json`) |
+  | 大きさの上限・zstd の層が多すぎる | `docs_unavailable` (`too_large`) |
+  | 展開できない・JSON が壊れている・形式の食い違い | `docs_unavailable` (`unparsable`) |
+  | 一時的な HTTP エラー・通信の失敗 | `network_error` (retryable) |
+  | 想定外の HTTP ステータス | `network_error` |
+  | 対応していない形式 | `unsupported_format` (`found`・`supported`) |
+  | パスが見つからない | `item_not_found` (探した経路を message に書く) |
+  | 同名の item が複数 | `ambiguous_path` (`candidates`) |
+  | キャッシュの読み出しの失敗・panic・ランタイムの終了 | `internal_error` |
+
+- サーバーは起動時に `Cache` と `DocsRs` を作り、作れなければ起動しない。echo と probe_result を消し、sleep は debug ビルドだけに残した。引数の解析は `CallToolResult` ではなく小さな `InvalidArgument` を返す (`preserve_order` で `CallToolResult` が大きくなり、`clippy::result_large_err` に当たったため)
+- `tests/stdio.rs` は、サーバーごとの一時ディレクトリをキャッシュにして、手で組み立てた crate を置く (ネットワークに出ない)。`tests/testdata.rs` の `#[ignore]` のテストで、代表の 11 件の応答を insta で固定した (`tests/snapshots/`)
+
+**決めたこと**
+
+- where 句は `detail=normal` にも入れる。rustdoc は境界の多くを where 句に移すので、入れないと `tokio::spawn` の `F: Future + Send + 'static` が消える
+- ほかの crate の型の正準パスは M1 (その crate の公開パスの索引が要る。R-PR-4)。定義パスは private module を含みうるので使わない。M1 で、prelude の型 (`Option`・`Result`・`Vec`・`String`・`Box`) を短いまま残すかを決める
+- ほかの crate の re-export は、エラーにせず行き先を返す
+- R-SH-2 の「trait」は、別の欄にせず impl の見出し (`impl<T> Trait for Type`) で示す。見出しに trait が入るので、欄を分けると同じ情報が 2 回出る
+- serde_json の `preserve_order` を有効にし、構造体のフィールドの順 (provenance → data、signature → where → docs) を JSON に残す (R-SH-1)
+- `source_location.url` は docs.rs のソースブラウザにする。span のパスがそのまま使え、src の外のファイルも指せる
+- R-ERR-2 の `request_id` は、突き合わせる相手のログ (R-OBS-1) と一緒に M1 で入れる
+
+**R-OUT-2 の膨張率** (release ビルド。`tests/testdata.rs` の `representative_items_are_returned_by_get_item`)
+
+左の比は、rustdoc の部分木 (item と、そのフィールドか variant) の compact な JSON と、応答全体 (`structuredContent`) の長さの比。右の比は、部分木から `docs`・`links`・`span` を除いたものと、描画した signature・where・fields・variants の長さの比。
+
+| item | 部分木 / 応答 | シグネチャの木 / 文字列 |
+| --- | --- | --- |
+| `tokio::sync::Mutex` | 5,302 / 489 (10.8 倍) | 547 / 53 (10.3 倍) |
+| `tokio::sync::Mutex::lock` | 1,416 / 691 (2.0 倍) | 602 / 60 (10.0 倍) |
+| `tokio::spawn` | 6,264 / 656 (9.5 倍) | 1,661 / 148 (11.2 倍) |
+| `tokio::select` | 19,952 / 768 (26.0 倍) | 597 / 255 (2.3 倍) |
+| `tokio::io::AsyncReadExt::read_buf` | 3,650 / 686 (5.3 倍) | 1,306 / 110 (11.9 倍) |
+| `tokio::runtime::RuntimeFlavor` | 1,352 / 526 (2.6 倍) | 776 / 55 (14.1 倍) |
+| `axum::Router::route` | 4,820 / 606 (8.0 倍) | 687 / 87 (7.9 倍) |
+| `axum::extract::State` | 8,552 / 445 (19.2 倍) | 501 / 29 (17.3 倍) |
+| `serde::Deserialize` | 3,471 / 565 (6.1 倍) | 1,948 / 35 (55.7 倍) |
+
+- シグネチャだけで比べると、おおむね 8〜17 倍。要件の「syphar で約 5〜6 倍、ferritin の JSON で 8〜12 倍」と同じか、それより大きい
+- 外れ値: `tokio::select` は、マクロの規則の文字列を JSON でも応答でもほぼそのまま持つので 2.3 倍。`serde::Deserialize` は、trait の JSON が実装者の id の一覧 (`implementations`) を抱えているので 55.7 倍
+- 応答全体の比は、ドキュメントを第 1 段落に絞った分も含む (`tokio::select` の 26 倍は主に長いドキュメント)
+- 描画の時間は、tokio の全 6,490 item で 3.4 ms、axum の全 4,851 item で 2.9 ms (使い捨ての example で測った。warnings は 0 件)
+
+**実際のバイナリで確かめたこと** (release ビルドに JSON-RPC を流した)
+
+- `tokio@1.53.3` の `sync::Mutex::lock`: crate 名が補われ、正準パス、`impl<T: ?Sized> tokio::sync::Mutex<T>`、`pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, T>` が返った
+- `tokio@1.0.0`: docs.rs が 404 で、`docs_unavailable` (`no_json`)
+- `clap@4.5.39`: 形式 46 で、`unsupported_format` (`found: 46`、`supported: {from: 54, to: 61}`)
+
+**M1 への申し送り**
+
+- ほかの crate の型の正準パス (上の「決めたこと」)
+- ドキュメントの intra-doc link の書き換え (R-OUT-5)、doctest の隠し行の除去 (R-OUT-6)、残りの節の見出しと行数 (R-OUT-7)。今は第 1 段落をそのまま出していて、`` [`MutexGuard`] `` がリンク先なしで残る
+- trait の impl のメソッドにドキュメントが無いとき、trait 側のドキュメントで補う
+- `item_not_found` の `did_you_mean` (類似度の下限が要る)
+- `request_id` と R-OBS-1 のログ
+- 壊れたキャッシュの取り直し (R-CA-4)。今はキャッシュの読み出しの失敗を `internal_error` にしている
+- docs.rs の 404 は「crate や版が無い」と「JSON が無い」を区別できない。`crate_not_found`・`version_not_found` に分けるには crates.io の index を見る (R-VR-4)
+
+**v0.17 で要件に反映すること**
+
+- R-OUT-7: where 句を `full` だけでなく `normal` にも入れる
+- R-SH-2: trait は impl の見出しで示すことを書く
+- R-OUT-2: 膨張率の実測 (上の表) を書き、「M0 で実測して確かめる」を消す。ほかの crate の型の正準パスは M1 からであることを書く
+- R-OUT-1: `structuredContent` のキーの順を保つため、serde_json の `preserve_order` を使うことを書く (R-SH-1 の前提)
+- R-OUT-8: `source_location` の形 (`file`・`lines`・`url`) と、docs.rs のソースブラウザの URL に行のアンカー (`#434-466`) を付けることを書く
+- R-ERR-2: `request_id` は M1 から
+- §8: docs.rs の 400 も `no_json` にすること。想定外の HTTP ステータスの扱い (`network_error`、retryable false)
+
 ### 6.2 M0b
 
 (未着手)
