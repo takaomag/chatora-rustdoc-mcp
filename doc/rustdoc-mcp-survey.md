@@ -1,6 +1,6 @@
 # Rust ドキュメント系 MCP サーバー調査
 
-- 調査日: 2026-10-13 (同日、主要な実装のソースを精読した二次調査の結果で訂正)。2026-10-14 に三次調査 (全記載の再検証、最新の変更、見落とした候補、新しい比較軸) の結果で改訂し、2026-10-15 に整理した (§11)
+- 調査日: 2026-10-13 (同日、主要な実装のソースを精読した二次調査で訂正)。2026-10-14 に三次調査 (全記載の再検証と追記。§9) で改訂し、2026-10-15 に整理した (§11)
 - 目的: Claude Code で Rust 開発をするとき、現在使っている ferritin より優れた rustdoc 系 MCP があるかを判断する
 - 調査時点の環境: ferritin のホスト版 (`https://ferritin.rs/mcp`, HTTP transport) を使っていた
 - その後: この調査を受けて自作 (chatora-rustdoc) を決めた。要件は [requirements.md](requirements.md)。§1 の推奨は調査時点の判断
@@ -35,10 +35,10 @@
 ### 推奨構成
 
 1. **主力**: `rustdoc-mcp` (jbr) をローカルに導入する。project の依存・workspace・std をまとめて引ける。
-2. **当面の併用**: ホスト版 ferritin を残す。プロジェクト外の crate を軽く引くときや、nightly ビルドが失敗したときの逃げ道になる。rustdoc-mcp は trait implementors を出さないので、implementors を聞くときもホスト版を使う。同系統のツールが 2 組並ぶと Claude がどちらを使うか迷いやすいので、使い分けを rules に書いておく。
+2. **当面の併用**: ホスト版 ferritin を残す。プロジェクト外の crate を軽く引くときや、nightly ビルドが失敗したときの逃げ道になる。rustdoc-mcp は trait implementors を出さないので、implementors を聞くときもホスト版を使う。同系統のサーバーが 2 つ並ぶと Claude がどちらを使うか迷いやすいので、使い分けを rules に書いておく。
 3. **任意で試す**: `docs-rs-mcp` (syphar)。trait の実装者や feature flags を構造化データで欲しい場面が多い場合に入れる。ただし形式 57 でビルドされたリリースしか読めないので、現時点で試す価値は限られる。
 
-Cargo.lock・workspace・std をまとめて扱えるのが依然としてこれだけなので順位は変えませんが、上の弱点 (詳細は §4 の Cons) のため、**ホスト版に対する優位は二次調査の時点の評価より小さい**です。並べて試すときの観点は §9 にあります。
+Cargo.lock・workspace・std をまとめて扱えるのは依然として rustdoc-mcp だけなので順位は変えませんが、上の弱点 (詳細は §4 の Cons) のため、**ホスト版に対する優位は二次調査の時点の評価より小さい**です。並べて試すときの観点は §9 にあります。
 
 **新しい比較軸** (三次調査で追加。§5.1): 依存のコードを実行するか、パスの検証、MCP への準拠 (`isError`・`structuredContent`)、コードを流用できるライセンスか、評価の仕組みがあるか。この軸で見ると、どの候補にも大きな穴があります (§7)。
 
@@ -104,7 +104,7 @@ Claude Code で Rust を書くときに効く順に並べています。
   - workspace と依存 crate は、ローカル nightly で生成した rustdoc JSON (`--document-private-items` は workspace member だけに付く)
   - それ以外の crate は docs.rs の rustdoc JSON
   - std は `rust-docs-json` コンポーネント
-- キャッシュ: docs.rs から取った JSON は `~/.cache/ferritin` (`$FERRITIN_HOME` → `$XDG_CACHE_HOME` → `~/.cache` の順)。**ローカルビルドの JSON はユーザーのプロジェクトの `target/doc` に書く**。rkyv の sidecar と検索索引も JSON の隣に書くので、std では rustup の toolchain ディレクトリにも書き込む。0.8.0 以降は crate 名の一覧をローカルに持ち、オフラインでもバージョンを解決できる (一覧は crates.io そのものではなく、jbr/crate-names の GitHub Releases に置かれた日次のファイル。最大で約 1 日遅れる)
+- キャッシュ: docs.rs から取った JSON は `~/.cache/ferritin` (`$FERRITIN_HOME` → `$XDG_CACHE_HOME` → `~/.cache` の順)。**ローカルビルドの JSON はユーザーのプロジェクトの `target/doc` に書く**。rkyv の sidecar と検索索引も JSON の隣に書くので、std では rustup の toolchain ディレクトリにも書き込む。0.8.0 以降は crate 名の一覧をローカルに持ち、オフラインでもバージョンを解決できる (一覧は crates.io ではなく jbr/crate-names の GitHub Releases に置かれた日次のファイルで、最大で約 1 日遅れる)
 
 **特徴**: ferritin と同じ取得・正規化のエンジン (`ferritin-common`) で動くローカル版。Cargo.lock・workspace・std をまとめて扱える唯一の選択肢です。ただし**描画処理は ferritin とは別の独自実装** (`rustdoc-mcp/src/formatting/*`) で、出力の中身は ferritin と同じではありません。ARCHITECTURE.md には、将来 rustdoc-mcp を ferritin の薄い層にするとあります。
 
@@ -133,7 +133,7 @@ Claude Code で Rust を書くときに効く順に並べています。
 - `include_source` は span のパスを検証しない。docs.rs 由来の crate では存在しないファイルか別のファイルを読むおそれがあり、std の span は黙って空になる
 - `MCP_SHARED_SESSION_PATH` を設定すると作業ディレクトリをプロセス間で共有するが、session 名が固定の "default" なので、並行する別プロジェクトのセッションと上書きしあう
 - パスの解決の問題 (定義パスの表示、Deref 経由のメソッドを引けない) は、データ層 (ferritin-common) を共有しているので下の ferritin と共通とみられる (rustdoc-mcp では未実測)。一方、本文は生の Markdown をそのまま出すので、バッククォートは残るが intra-doc link は未解決の参照形式 (`` [`Vec<T>`] ``) のまま。private フィールドや hidden・unstable なモジュールも出る
-- README のツール名がハイフン区切り (`get-item`) なのは、README の一覧が CLI の `--help` の出力 (サブコマンド名) だから。MCP のツール名はアンダースコア (`get_item`)
+- README のツール名はハイフン区切り (`get-item`) だが、これは CLI の `--help` のサブコマンド名。MCP のツール名はアンダースコア (`get_item`)
 - CI は ubuntu だけ。Windows は「手動で確認済み」と README にあるだけ
 - スター数は 38 (ferritin と同じリポジトリ)、fork は 2 で、利用者はまだ少ない
 
@@ -252,7 +252,7 @@ Claude Code で Rust を書くときに効く順に並べています。
 - ライセンス: Apache-2.0 のみ (MIT OR Apache-2.0 のプロジェクトにコードを写すと MIT 側の条件を満たせないので、発想だけを借りる)
 - 導入: `cargo install docsrs-mcp`
 - ツール (4): `lookup_crate_items` / `lookup_item` / `search_crate` (exact > prefix > 名前に含む > パスに含む > ドキュメントに含む の順で順位付け、Levenshtein で「もしかして」を提示) / `lookup_impl_block` (型の trait 実装。説明文は「trait の実装者も引ける」とするが未実装)
-- データソース: docs.rs の rustdoc JSON。format 53〜57 を 0.56 の形に正規化して読む。その際、すべての item の属性 (`attrs`) を空にする。形式の上限は判定していない (README は「53–57+」。58 以降が読めるかは未確認)
+- データソース: docs.rs の rustdoc JSON。形式 53〜57 を 0.56 の形に正規化して読む。その際、すべての item の属性 (`attrs`) を空にする。形式の上限は判定していない (README は「53–57+」。58 以降が読めるかは未確認)
 
 **特徴**: nightly 不要の docs.rs JSON 型で、**バージョン解決が「明示指定 > Cargo.lock > latest」** の順になっています。docs.rs 型の中では ferritin の弱点 (Cargo.lock を読まない) を直接埋める設計です。
 
@@ -307,7 +307,7 @@ Claude Code で Rust を書くときに効く順に並べています。
 - std には対応していない。private items も含めない (`--document-private-items` を渡さない)
 - trait implementors を出す機能が無い (`Trait.implementations` を一度も参照していない)
 - **シグネチャの描画で情報を落とす**: generics は `<...>`、引数は名前だけで型が無く、戻り値は `-> ...` になる
-- 既定は `nightly-2026-05-22` 固定。新しい MSRV の crate が失敗する Issue #64 は main で close された (固定日付の更新、環境変数での上書き、MSRV エラーの案内) が、使える toolchain は形式 57 を出すもの (rustdoc-types 0.57.3) に限られ、現行の nightly (形式 61) は使えないので、根本の問題は残る。crates.io の 0.1.1 は未修正
+- 日付を固定した nightly では新しい MSRV の crate が失敗する。この Issue #64 は main で close された (固定日付の更新、環境変数での上書き、MSRV エラーの案内) が、使える toolchain は形式 57 を出すもの (rustdoc-types 0.57.3) に限られ、現行の nightly (形式 61) は使えないので、根本の問題は残る。crates.io の 0.1.1 は未修正
 - 1 つのビルドがサーバー全体のロックを握り、その間は他の crate への問い合わせも止まる (PR #65 で variant ごとの OS ロックも足したが、全体のロックは残っている)
 - ローカルのソースは Cargo.toml の版をキーにキャッシュするので、編集しても `update=true` を渡すまで反映されない
 - ビルドごとに使い捨ての target dir を使うので、毎回コールドビルドになる
@@ -525,7 +525,7 @@ Claude Code で Rust を書くときに効く順に並べています。
 - syphar が docs.rs の主要メンテナであることは、`rust-lang/docs.rs` のコントリビューター 1 位 (1,194 commits、2026-10-14) であることで確認しました。
 - スター数・DL 数・日付は GitHub API と crates.io API の値です。日付を書いていない数値は 2026-10-13 時点、2026-10-14 に取り直したものには日付を併記しました。
 - **三次調査 (2026-10-14)**: 5 つの観点 (jbr、syphar・dmvk・possdog、Tier A〜B の残り、Tier C〜D と名前と新しい候補、docs.rs・rustdoc JSON・MCP 仕様・Claude Code の文書) に分けて、全記載をソースと API で再検証しました。各リポジトリは clone して読んだだけで、ビルドも実行もしていません。実際に実行したのは、ホスト版 (ferritin、46ki75、cratesio-mcp) への JSON-RPC の問い合わせ、docs.rs への少数のリクエスト、手元の最小の crate での実験 (stable rustdoc + `RUSTC_BOOTSTRAP`、依存の feature の統合、`cargo doc --output-format json` の出力先) だけです。主要な指摘 (rustdoc-mcp の implementors と Store の作り直し、形式 47 の欠番、`RUSTC_BOOTSTRAP`、feature の統合) は、調査をまとめた側で再度確かめました。
-- 三次調査でも確かめられなかった点: Windows での実際の動作 (snowmead は CI で 3 OS を回しているが、どれも実行はしていない)、ferritin のホスト版のレート制限の設定値、Reddit での評判 (API がブロックされた)。
+- 三次調査でも確かめられなかった点: Windows での実際の動作 (CI で 3 OS を回している snowmead を含む)、ferritin のホスト版のレート制限の設定値、Reddit での評判 (API がブロックされた)。
 - 確定させるには、rustdoc-mcp (jbr) とホスト版 ferritin を実際のプロジェクトで並べて試すのが確実です。比べる観点は、同じ質問に対する正確さ・出力トークン量・初回と 2 回目の待ち時間・trait implementors の有無です。
 
 ---

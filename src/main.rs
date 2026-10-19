@@ -1,4 +1,4 @@
-//! The `chatora-rustdoc` binary: an MCP server that looks up Rust documentation, plus a small CLI to manage its cache and install the skill.
+//! The `chatora-rustdoc` binary: an MCP server that looks up Rust documentation, plus a small CLI to manage its cache.
 
 use chatora_rustdoc as _;
 

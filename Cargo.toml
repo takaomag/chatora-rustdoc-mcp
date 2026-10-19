@@ -13,7 +13,7 @@ rust-version = "1.99"
 publish = true
 # gitignore 形式。先頭の `/` で package root に固定する (無いと任意の深さに一致する)。
 # Cargo.toml / Cargo.lock は書かなくても cargo が同梱する (README.md も `readme` の指定で同梱されるが、明示しておく)。
-# THIRD-PARTY-NOTICES (要件 R-DIST-4) を作ったら足す。`include_str!` で埋め込むファイル (説明文・skill・アイコン) も、`/src` の外に置いたら足す (要件 R-DIST-1)。
+# THIRD-PARTY-NOTICES (要件 R-DIST-4) を作ったら足す。`include_str!` で埋め込むファイル (説明文・skill など) も、`/src` の外に置いたら足す。
 include = ["/src", "/README.md", "/LICENSE-*"]
 
 [dependencies]
