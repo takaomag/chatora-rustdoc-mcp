@@ -219,6 +219,43 @@ turbomcp (alpha 版) と turul-mcp-server (約 2,500 DL) は比べる前に外�
 
 前提が崩れた項目は無いので、§7 の出力設計は今のままで A4 に進む。
 
+#### A4 (2026-10-19)
+
+環境: rustc・cargo 1.99.1、reqwest 0.13.5 (rustls + aws-lc-rs。cmake なしでビルドできた)、zstd 0.14.3。A4 の前に、名前をすべて `chatora-rustdoc-mcp` にそろえた (要件の §14 の v0.17 (作成中))。
+
+**作ったもの**
+
+- A4-1 `src/data/docs_rs.rs`: `/crate/{name}/{version}/json` の取得。User-Agent は `chatora-rustdoc-mcp/0.1.0 (+https://github.com/takaomag/chatora-rustdoc-mcp)` (R-NW-1)。接続 10 秒・無通信 120 秒のタイムアウト (R-NW-2)。200・404・400・429 と 5xx・その他を分ける。本体は 512 MiB まで (R-NW-3)。zstd はマジックナンバーで 3 段まで展開し、各段にも上限を付ける (R-DS-4)。crate 名は `src/data/crate_name.rs` の `CrateName` で検証する (R-SEC-4)
+- A4-2 `src/data/cache.rs`: 置き場所は `CHATORA_RUSTDOC_MCP_CACHE__DIR` (絶対パスだけ。空なら未設定と同じ) か OS の既定 (R-CA-1)。仮のパス `docs.rs/{crate}/{version}/rustdoc.json` に、一時ファイル・fsync・rename で書く (R-CA-4)。symlink はたどらない。`data::docs_rs_json` がキャッシュと取得をつなぐ
+- A4-3 `examples/fetch_docs_rs.rs`: 取得してキャッシュに置き、形式・大きさ・sha256・取得元を出す。`format_version` は A5 までの仮の読み方 (serde_json で全体を走査する)
+
+**docs.rs の挙動** (2026-10-19 に実測): 完全な版の JSON は 200 で `content-type: application/zstd`、`content-length` と `etag` が付く。JSON の無い版 (serde 1.0.100) と存在しない crate はどちらも 404。版として解析できない値は 400。`/crate/serde/1.0/json` は 302 で完全な版へ。
+
+**Q-30 の「通信の途中で切れた本体」**: `content-length` より短く切れた本体は、zstd の展開に届く前に、HTTP の層 (hyper) が本体のエラーにする (reqwest の `Network` のエラー)。手元の HTTP サーバーを使う単体テストで固定した。docs.rs は `content-length` を付けるので、一時的な通信の失敗と壊れた zstd は取り違えない。
+
+**キャッシュ**: 同じ版を 2 回取ると、2 回目はキャッシュから読む (serde と tokio の 2 件で、1 回目 533 ms、2 回目 291 ms。2 回目は主に serde_json の全体の走査の時間)。
+
+**形式ごとのテストデータ** (§3.2。一覧と sha256 は [testdata/docs-rs-json.txt](../testdata/docs-rs-json.txt))
+
+| 形式 | crate@版 | 備考 |
+| --- | --- | --- |
+| 46 | tokio@1.45.1、clap@4.5.39 | tokio 1.45.1 は **zstd で 2 重に圧縮されていた** (R-DS-4 と R-QA-2 の実例) |
+| 48 | syn@2.0.104 | clap には形式 48 の版が無い |
+| 53 | clap@4.5.41 | tokio 1.46.0・1.46.1 も 53 |
+| 54 | clap@4.5.42 | serde_json 1.0.141、tokio 1.47.0 も 54 |
+| 55 | clap@4.5.46 | |
+| 56 | clap@4.5.48 | 4.5.51・4.5.53 も 56 |
+| 57 | clap@4.5.56、serde@1.0.228 | 4.5.60 も 57 |
+| 60 | clap@4.6.1 | 4.6.5 も 60 |
+| 61 | clap@4.6.7 | |
+
+R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52・58・59 の形式は、今回取った版には無かった。版の形式は、docs.rs がその版をビルドした時期の nightly で決まる (clap 4.5.40 は 2025-06-09 の公開で 46、4.5.41 は 2025-07-09 の公開で 53)。
+
+**決めたこと**
+
+- データ層の同期のディスク I/O は `spawn_blocking` で回す。タスクの panic は `src/task.rs` の `resume_if_panic` で投げ直す (`mcp::serve` と共通。ツールの中なら `run_tool` が `internal_error` にする)
+- 例とテストが使う dev-dependency (`serde`・`sha2`・`tempfile`) は、lib と bin のテストのビルドにも見えるので、`#[cfg(test)] use … as _;` で並べる
+
 ### 6.2 M0b
 
 (未着手)

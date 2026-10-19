@@ -166,8 +166,9 @@ fn exceeds(len: usize, limit: u64) -> bool {
 /// trusting `content-type`, up to [`MAX_ZSTD_LAYERS`] layers of at most `limit` bytes each
 /// (requirement R-DS-4).
 fn decompress(mut data: Vec<u8>, limit: u64) -> Result<Vec<u8>, FetchError> {
-    for _ in 0..MAX_ZSTD_LAYERS {
+    for layers in 0..MAX_ZSTD_LAYERS {
         if !data.starts_with(&ZSTD_MAGIC) {
+            tracing::debug!(layers, "decompressed the rustdoc JSON");
             return Ok(data);
         }
         let mut decompressed = Vec::new();
@@ -185,6 +186,7 @@ fn decompress(mut data: Vec<u8>, limit: u64) -> Result<Vec<u8>, FetchError> {
     if data.starts_with(&ZSTD_MAGIC) {
         Err(FetchError::TooManyLayers)
     } else {
+        tracing::debug!(layers = MAX_ZSTD_LAYERS, "decompressed the rustdoc JSON");
         Ok(data)
     }
 }

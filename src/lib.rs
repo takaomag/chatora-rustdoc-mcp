@@ -11,3 +11,9 @@ pub mod logging;
 pub mod mcp;
 pub mod query;
 mod task;
+
+// Dev-dependencies that only the examples use; the library's test build sees them too.
+#[cfg(test)]
+use serde as _;
+#[cfg(test)]
+use sha2 as _;

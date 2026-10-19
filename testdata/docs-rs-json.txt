@@ -1,0 +1,22 @@
+# rustdoc JSON from docs.rs used as test data (doc/m0-plan.md, §3.2 and A4-3).
+#
+# The JSON itself is not in the repository. Fetch it into the cache with:
+#   cargo run --example fetch_docs_rs -- <crate>@<version> ...
+# Tests that use it look it up in the cache and check the sha256 of the decompressed JSON.
+#
+# docs.rs serves the latest build of a release, so a rebuild there changes the JSON (and maybe the
+# format). Then fetch it again, check the format, and update this list.
+#
+# Collected on 2026-10-19. Columns: crate, version, format_version, size in bytes, sha256, note.
+
+tokio	1.45.1	46	6058691	4783ce0c0028a3b047075eff3148ce6c90dad3baa7be5596b9bc40b9f44bc0c4	compressed with zstd twice (R-DS-4)
+clap	4.5.39	46	423619	3e0e671e19042b416a4306924855bff981d0f711e6569faf0b52d2663c76b4bc
+syn	2.0.104	48	9583133	07acd55f6e7077ae1d2fdf471fdcb5da3f9a151dd3563003788354388f95d5db	no clap release has format 48
+clap	4.5.41	53	427796	6df4e2a43e6f8ef566be9b2dae33dea820d9f2756b96023994637a27b713f7c5
+clap	4.5.42	54	428343	e926a6d5a0d934360c074b77ebf86839887b6742a8b4178b8ab62af95fa664f4
+clap	4.5.46	55	428772	342567c1b99a58053166a893e208f3a1d2c71afc2b8dfb5bc8c5dc865439f901
+clap	4.5.48	56	440222	b775c04da3783fa1d696ab941c388919b5960483a901ab076683101b194abfc3
+clap	4.5.56	57	437845	efe767e4525d1c1a44b22f33dedc8e050262f1ccdaaefed096c0ec7f29b5def2
+serde	1.0.228	57	3182242	2c835a2e893eebc2a1ed7951547a11c7444f822502465f9c49f8fdbdb37dc46d
+clap	4.6.1	60	442530	17801bb4de29e5bdd4eb704e85682405deb7779927b89f659f3fb6c8e7e0cd0d
+clap	4.6.7	61	302423	81eaaa9a97442d025d26b80ec6292368b4096244e78f8bef68e9f83c99dfaf2e

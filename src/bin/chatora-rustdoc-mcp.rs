@@ -2,14 +2,19 @@
 
 use std::{error::Error as _, ffi::OsString};
 
+// Dependencies that only the library uses. Those under `#[cfg(test)]` are dev-dependencies of the
+// tests and examples, which the binary's test build sees too.
 use const_format as _;
 use derive_more as _;
 use etcetera as _;
 use reqwest as _;
 use rmcp as _;
 use semver as _;
+#[cfg(test)]
+use serde as _;
 use serde_json as _;
-// A dev-dependency of the library; the binary's test build sees it too.
+#[cfg(test)]
+use sha2 as _;
 #[cfg(test)]
 use tempfile as _;
 use thiserror as _;

@@ -167,4 +167,6 @@ wildcard_enum_match_arm = "warn"
 unescaped_backticks = "warn"
 
 [dev-dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
 tempfile = "3.27.0"
