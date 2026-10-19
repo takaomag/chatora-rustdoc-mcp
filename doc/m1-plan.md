@@ -249,6 +249,17 @@ m0-plan.md の §7.2 の小さなものを片付けた。
 - 要件に足すこと (M1 の終わり): §8 の `docs_unavailable` の `reason` に `version_mismatch`、一時的な失敗を覚えている間の `network_error` の `retry_after_secs`、再試行の回数と待ち時間の初期値
 - テスト: 再試行 (503 の後に 200)、形式番号の URL、状態の分類 (503 は 3 回送る)、別の版を使わない、JSON が無いことと一時的な失敗を覚える、別の形式を見つけてキャッシュする、途中の一時的な失敗を返す、どの形式も無ければ `None`、証明書の失敗の判定
 
+#### B4 (2026-10-19)
+
+- `data::target`: target triple の型 `TargetTriple` (英数字・`-`・`_`・`.` だけで、`..` を含まず、英数字で始まる。URL とパスに入れても形が変わらない。R-SEC-4)
+- ホストの target (R-TG-1): キャッシュのディレクトリ (プロジェクトの設定が効かない場所) で `rustc -vV` を実行し、`host:` の行を読む。`RUSTUP_AUTO_INSTALL=0` を付け、stdin・stdout を共有せず、10 秒で打ち切る。`local` の中に置いた (tokio の `process` は `local` が有効にする)
+- 取れないとき (rustup に既定の toolchain が無い、rustc が無い、ローカル機能を外した構成) は、サーバー自身をビルドした target を使い、理由を返す (呼び出し側が warnings に書く)。musl の環境は gnu に読み替える (`x86_64-unknown-linux-musl` → `-gnu`、`armv7-unknown-linux-musleabihf` → `-gnueabihf`)。利用者が決めた。サーバーの target は build.rs で `CHATORA_RUSTDOC_MCP_BUILD_TARGET` に埋め込む (Cargo.toml の `include` に build.rs を足した)
+- docs.rs の取得に target を足した (`/crate/{name}/{version}/{target}/json`。キャッシュも `docs.rs/<name>/<version>/<target>/rustdoc.json` に分ける。target を指定しないときは今までどおり)。target 付きの URL が 404 なら、target 無しの URL に `HEAD` を送り、そちらが 200 なら「その target の JSON だけが無い」として `LoadError::NoTargetJson` (MCP では `docs_unavailable` の `no_target_json`) を返し、1 時間覚える。HEAD が失敗したら、何も覚えずに `no_json` を返す
+- ツールにつなぐのは C1 (今は target を指定しない)。今つなぐと、テスト用のキャッシュの場所が変わり、stdio の結合テストが docs.rs に問い合わせてしまうため
+- 依存: tokio の `process` で signal-hook-registry が足された (ネットワークを使わずに Cargo.lock を更新した)
+- 要件に足すこと (M1 の終わり): 代わりの値の取り方 (R-TG-1 の「M1 で決める」)、`HEAD` で JSON の有無を確かめること
+- テスト: triple の検証、musl の読み替え、`rustc -vV` の読み取り、実際の `rustc -vV` (`local` のとき)、target 付きの URL と HEAD、target の JSON だけが無いことの判定と記憶、どちらにも無いときは `no_json`
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

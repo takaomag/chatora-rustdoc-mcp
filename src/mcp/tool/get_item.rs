@@ -243,11 +243,13 @@ fn same_crate_name(a: &str, b: &str) -> bool {
 /// Loads the JSON of the crate, then looks the item up on a blocking thread, since parsing a large
 /// crate takes a large part of a second.
 pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
+    // The target is chosen in M1 C1; until then, the crate's default target on docs.rs.
     let json = match data::docs_rs_json(
         &state.cache,
         &state.docs_rs,
         &arguments.name,
         &arguments.version,
+        None,
     )
     .await
     {
@@ -265,6 +267,7 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
             &state.docs_rs,
             &arguments.name,
             &arguments.version,
+            None,
             *found,
         )
         .await
@@ -384,6 +387,21 @@ fn load_error(arguments: &Arguments, error: &LoadError) -> CallToolResult {
                 "retryable": false,
                 "suggestions": ["ask for the version with its build metadata, such as 2.1.0+zstd.1.5.6"],
                 "reason": "version_mismatch",
+            }));
+        },
+        LoadError::NoTargetJson { target } => {
+            return error_result(&json!({
+                "code": "docs_unavailable",
+                "message": format!(
+                    "docs.rs has rustdoc JSON of {release}, but not for {target}: since 2026-05-01 it \
+                     builds most new releases for one target only"
+                ),
+                "retryable": false,
+                "suggestions": [
+                    "the documentation for the target docs.rs built is there without the target \
+                     argument; items for this target only may be missing from it",
+                ],
+                "reason": "no_target_json",
             }));
         },
         LoadError::RecentFailure { retry_after } => {

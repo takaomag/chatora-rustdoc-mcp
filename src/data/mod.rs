@@ -7,6 +7,7 @@ pub mod format_version;
 mod http;
 pub mod rustdoc_json;
 pub mod sparse_index;
+pub mod target;
 #[cfg(test)]
 mod test_http;
 pub mod version;
@@ -27,6 +28,7 @@ use self::{
     docs_rs::{DocsRs, FetchError},
     format_version::Header,
     rustdoc_json::SUPPORTED,
+    target::TargetTriple,
 };
 
 /// How long it is remembered that docs.rs has no JSON for a release (requirement R-ERR-3, about
@@ -51,6 +53,14 @@ pub enum LoadError {
         /// The `crate_version` of the JSON.
         found: Box<str>,
     },
+    /// docs.rs has rustdoc JSON of the release, but not for this target: since 2026-05-01 it
+    /// builds most new releases for one target only. Documentation for another target is not
+    /// shown in its place (requirement R-TG-1).
+    #[error("docs.rs has no rustdoc JSON of this release for {target}")]
+    NoTargetJson {
+        /// The target asked for.
+        target: TargetTriple,
+    },
     /// Fetching the same JSON failed transiently a moment ago (requirement R-ERR-3).
     #[error("fetching this rustdoc JSON failed a moment ago; try again in {} seconds", retry_after.as_secs())]
     RecentFailure {
@@ -68,12 +78,17 @@ pub enum LoadError {
 struct Miss {
     /// docs.rs has no JSON for the release, rather than a transient failure.
     missing: bool,
+    /// docs.rs has JSON for the release, but not for the target asked for.
+    #[serde(default)]
+    no_target: bool,
     /// When it failed, in seconds since the Unix epoch.
     at: u64,
 }
 
-/// Returns the rustdoc JSON of `name` at exactly `version` for the docs.rs default target: from
-/// the cache if it is there, or else fetched from docs.rs and then cached.
+/// Returns the rustdoc JSON of `name` at exactly `version`, from the cache or else from docs.rs.
+///
+/// It is for `target`, or else for the crate's default target on docs.rs. If docs.rs has the
+/// release but not for `target`, that is told apart (requirement R-TG-1).
 ///
 /// Before it is cached, its `format_version` must be readable and its `crate_version` must be
 /// `version` (requirements R-CA-4 and R-VR-4). A body whose `format_version` cannot be read (such
@@ -90,10 +105,11 @@ pub async fn docs_rs_json(
     docs_rs: &DocsRs,
     name: &CrateName,
     version: &Version,
+    target: Option<&TargetTriple>,
 ) -> Result<Box<[u8]>, LoadError> {
     // The cache is read and written on a blocking thread, so that tens of megabytes of disk I/O do
     // not hold up the async workers.
-    let path = cache.docs_rs_json_path(name, version);
+    let path = json_path(cache, name, version, target);
     let miss_path = with_suffix(&path, ".miss.json");
     let (cached, miss) = {
         let (cache, path, miss_path) = (cache.clone(), path.clone(), miss_path.clone());
@@ -122,17 +138,45 @@ pub async fn docs_rs_json(
             .duration_since(system_time(miss.at))
             .unwrap_or(ttl);
         if age < ttl {
-            return Err(if miss.missing {
-                LoadError::Fetch(FetchError::NotFound)
-            } else {
-                LoadError::RecentFailure {
-                    retry_after: ttl.saturating_sub(age),
-                }
-            });
+            return Err(
+                if let (true, true, Some(target)) = (miss.missing, miss.no_target, target) {
+                    LoadError::NoTargetJson {
+                        target: target.clone(),
+                    }
+                } else if miss.missing {
+                    LoadError::Fetch(FetchError::NotFound)
+                } else {
+                    LoadError::RecentFailure {
+                        retry_after: ttl.saturating_sub(age),
+                    }
+                },
+            );
         }
     }
-    match docs_rs.fetch_rustdoc_json(name, version, None).await {
+    match docs_rs
+        .fetch_rustdoc_json(name, version, target, None)
+        .await
+    {
         Ok(json) => store(json, version, path, Some(miss_path)).await,
+        Err(FetchError::NotFound) if target.is_some() => {
+            let error = match docs_rs.has_rustdoc_json(name, version).await {
+                Ok(true) => {
+                    remember_miss(miss_path, true, true).await;
+                    target.map_or(LoadError::Fetch(FetchError::NotFound), |target| {
+                        LoadError::NoTargetJson {
+                            target: target.clone(),
+                        }
+                    })
+                },
+                Ok(false) => {
+                    remember_miss(miss_path, true, false).await;
+                    LoadError::Fetch(FetchError::NotFound)
+                },
+                // Whether the release has JSON at all is not known: nothing is remembered.
+                Err(_) => LoadError::Fetch(FetchError::NotFound),
+            };
+            Err(error)
+        },
         Err(error) => {
             let missing = match &error {
                 FetchError::NotFound | FetchError::BadRequest => Some(true),
@@ -146,7 +190,7 @@ pub async fn docs_rs_json(
                 | FetchError::Corrupt(_) => None,
             };
             if let Some(missing) = missing {
-                remember_miss(miss_path, missing).await;
+                remember_miss(miss_path, missing, false).await;
             }
             Err(LoadError::Fetch(error))
         },
@@ -171,16 +215,17 @@ pub async fn docs_rs_json_in_another_format(
     docs_rs: &DocsRs,
     name: &CrateName,
     version: &Version,
+    target: Option<&TargetTriple>,
     found: u32,
 ) -> Result<Option<Box<[u8]>>, LoadError> {
     let mut transient = None;
     for format in SUPPORTED.rev().filter(|&format| format != found) {
         let error = match docs_rs
-            .fetch_rustdoc_json(name, version, Some(format))
+            .fetch_rustdoc_json(name, version, target, Some(format))
             .await
         {
             Ok(json) => {
-                let path = cache.docs_rs_json_path(name, version);
+                let path = json_path(cache, name, version, target);
                 match store(json, version, path, None).await {
                     Ok(json) if format_version::peek(&json) == Some(format) => {
                         return Ok(Some(json));
@@ -258,11 +303,12 @@ enum Stored {
     WrongVersion(Box<str>),
 }
 
-/// Remembers at `miss_path` that fetching failed, missing or transiently. A failure to write it is
-/// logged.
-async fn remember_miss(miss_path: PathBuf, missing: bool) {
+/// Remembers at `miss_path` that fetching failed: missing (for the target only, with `no_target`)
+/// or transiently. A failure to write it is logged.
+async fn remember_miss(miss_path: PathBuf, missing: bool, no_target: bool) {
     let miss = Miss {
         missing,
+        no_target,
         at: unix_seconds(SystemTime::now()),
     };
     let written = blocking(move || {
@@ -282,6 +328,19 @@ fn remove_if_there(path: &Path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {},
         Err(error) => tracing::warn!(path = %path.display(), %error, "failed to remove a file"),
     }
+}
+
+/// Where the JSON of `name` at `version` for `target`, or the default target, is cached.
+fn json_path(
+    cache: &Cache,
+    name: &CrateName,
+    version: &Version,
+    target: Option<&TargetTriple>,
+) -> PathBuf {
+    target.map_or_else(
+        || cache.docs_rs_json_path(name, version),
+        |target| cache.docs_rs_target_json_path(name, version, target),
+    )
 }
 
 /// `path` with `suffix` added to its file name.
@@ -366,7 +425,7 @@ mod tests {
     async fn load(body: &[u8]) -> (Result<Box<[u8]>, LoadError>, Option<Box<[u8]>>) {
         let (cache, docs_rs, _requests, _dir) = setup(vec![ok(body)]);
         let (name, version) = serde();
-        let json = docs_rs_json(&cache, &docs_rs, &name, &version).await;
+        let json = docs_rs_json(&cache, &docs_rs, &name, &version, None).await;
         let cached = cache.read_docs_rs_json(&name, &version).expect("reads");
         (json, cached)
     }
@@ -405,7 +464,7 @@ mod tests {
         let (name, version) = serde();
         for _ in 0..2 {
             assert!(matches!(
-                docs_rs_json(&cache, &docs_rs, &name, &version).await,
+                docs_rs_json(&cache, &docs_rs, &name, &version, None).await,
                 Err(LoadError::Fetch(FetchError::NotFound))
             ));
         }
@@ -418,10 +477,10 @@ mod tests {
         let (cache, docs_rs, requests, _dir) = setup(vec![status("503 Service Unavailable"); 3]);
         let (name, version) = serde();
         assert!(matches!(
-            docs_rs_json(&cache, &docs_rs, &name, &version).await,
+            docs_rs_json(&cache, &docs_rs, &name, &version, None).await,
             Err(LoadError::Fetch(FetchError::Transient { .. }))
         ));
-        let again = docs_rs_json(&cache, &docs_rs, &name, &version).await;
+        let again = docs_rs_json(&cache, &docs_rs, &name, &version, None).await;
         assert!(
             matches!(&again, Err(LoadError::RecentFailure { retry_after }) if *retry_after <= TRANSIENT_TTL),
             "{again:?}"
@@ -430,11 +489,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_release_without_json_for_the_target_is_told_apart_and_remembered() {
+        // 404 for the target, 200 to `HEAD` for the default target.
+        let (cache, docs_rs, requests, _dir) =
+            setup(vec![status("404 Not Found"), status("200 OK")]);
+        let (name, version) = serde();
+        let target: TargetTriple = "aarch64-apple-darwin".parse().expect("a target");
+        for _ in 0..2 {
+            let loaded = docs_rs_json(&cache, &docs_rs, &name, &version, Some(&target)).await;
+            assert!(
+                matches!(&loaded, Err(LoadError::NoTargetJson { target: t }) if *t == target),
+                "{loaded:?}"
+            );
+        }
+        assert_eq!(requests.iter().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_release_without_any_json_is_not_found_for_a_target_either() {
+        let (cache, docs_rs, _requests, _dir) =
+            setup(vec![status("404 Not Found"), status("404 Not Found")]);
+        let (name, version) = serde();
+        let target: TargetTriple = "aarch64-apple-darwin".parse().expect("a target");
+        assert!(matches!(
+            docs_rs_json(&cache, &docs_rs, &name, &version, Some(&target)).await,
+            Err(LoadError::Fetch(FetchError::NotFound))
+        ));
+    }
+
+    #[tokio::test]
     async fn another_format_is_found_by_its_number_and_cached() {
         let json = br#"{"crate_version":"1.0.228","format_version":60}"#;
         let (cache, docs_rs, requests, _dir) = setup(vec![status("404 Not Found"), ok(json)]);
         let (name, version) = serde();
-        let found = docs_rs_json_in_another_format(&cache, &docs_rs, &name, &version, 40)
+        let found = docs_rs_json_in_another_format(&cache, &docs_rs, &name, &version, None, 40)
             .await
             .expect("no error");
         assert_eq!(found.as_deref(), Some(&json[..]));
@@ -463,7 +551,7 @@ mod tests {
         let (cache, docs_rs, _requests, _dir) = setup(responses);
         let (name, version) = serde();
         assert!(matches!(
-            docs_rs_json_in_another_format(&cache, &docs_rs, &name, &version, 40).await,
+            docs_rs_json_in_another_format(&cache, &docs_rs, &name, &version, None, 40).await,
             Err(LoadError::Fetch(FetchError::Transient { .. }))
         ));
     }
@@ -473,7 +561,7 @@ mod tests {
         let (cache, docs_rs, _requests, _dir) = setup(vec![status("404 Not Found"); 8]);
         let (name, version) = serde();
         assert_eq!(
-            docs_rs_json_in_another_format(&cache, &docs_rs, &name, &version, 40)
+            docs_rs_json_in_another_format(&cache, &docs_rs, &name, &version, None, 40)
                 .await
                 .expect("no error"),
             None

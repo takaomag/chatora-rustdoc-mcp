@@ -18,7 +18,7 @@ use std::{
 use etcetera::BaseStrategy as _;
 use semver::Version;
 
-use super::{crate_name::CrateName, docs_rs::MAX_BYTES};
+use super::{crate_name::CrateName, docs_rs::MAX_BYTES, target::TargetTriple};
 
 /// Environment variable that sets where the cache is (setting `cache.dir`, requirement R-CA-1).
 pub const DIR_ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_CACHE__DIR";
@@ -78,6 +78,30 @@ impl Cache {
             .join(name.as_str())
             .join(version.to_string())
             .join("rustdoc.json")
+    }
+
+    /// Where the rustdoc JSON fetched from docs.rs for `name` at `version`, built for `target`, is
+    /// kept. The JSON for the crate's default target is at [`Self::docs_rs_json_path`].
+    #[must_use]
+    pub fn docs_rs_target_json_path(
+        &self,
+        name: &CrateName,
+        version: &Version,
+        target: &TargetTriple,
+    ) -> PathBuf {
+        self.root
+            .join("docs.rs")
+            .join(name.as_str())
+            .join(version.to_string())
+            .join(target.as_str())
+            .join("rustdoc.json")
+    }
+
+    /// The cache directory, where nothing configures cargo or rustup: rustc runs there to tell the
+    /// host target (requirement R-TG-1).
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.root
     }
 
     /// Where the crates.io sparse index file at `index_path` (`se/rd/serde`) is kept. The record

@@ -11,6 +11,7 @@ use semver::Version;
 use super::{
     crate_name::CrateName,
     http::{self, BodyError},
+    target::TargetTriple,
 };
 
 /// Where docs.rs is. Kept in one place so that a mirror can replace it later (requirement R-CA-8).
@@ -114,10 +115,10 @@ impl DocsRs {
         }
     }
 
-    /// Fetches the rustdoc JSON of `name` at exactly `version`, built for the docs.rs default
-    /// target, and returns it decompressed. It holds no spare capacity. With `format`, it asks for
-    /// the JSON in that format, which docs.rs has only if it built the release in that format
-    /// (requirement R-DS-2).
+    /// Fetches the rustdoc JSON of `name` at exactly `version`, built for `target` or else for the
+    /// crate's default target on docs.rs, and returns it decompressed. It holds no spare capacity.
+    /// With `format`, it asks for the JSON in that format, which docs.rs has only if it built the
+    /// release in that format (requirement R-DS-2).
     ///
     /// # Errors
     ///
@@ -127,21 +128,16 @@ impl DocsRs {
         &self,
         name: &CrateName,
         version: &Version,
+        target: Option<&TargetTriple>,
         format: Option<u32>,
     ) -> Result<Box<[u8]>, FetchError> {
-        // Both parts are validated, so they cannot change the shape of the URL. The `+` of build
-        // metadata is taken as itself in a path.
-        let mut url = format!("{}/crate/{name}/{version}/json", self.base_url);
+        let mut url = self.json_url(name, version, target);
         if let Some(format) = format {
             url = format!("{url}/{format}");
         }
-        let mut response = http::send(self.client.get(&url)).await.map_err(|error| {
-            if http::is_certificate_error(&error) {
-                FetchError::Certificate(error)
-            } else {
-                FetchError::Network(error)
-            }
-        })?;
+        let mut response = http::send(self.client.get(&url))
+            .await
+            .map_err(network_error)?;
         match response.status() {
             StatusCode::OK => {},
             StatusCode::NOT_FOUND => return Err(FetchError::NotFound),
@@ -157,6 +153,56 @@ impl DocsRs {
                     BodyError::TooLarge { limit } => FetchError::TooLarge { limit },
                 })?;
         decompress(body, MAX_BYTES).map(Vec::into_boxed_slice)
+    }
+
+    /// Whether docs.rs has rustdoc JSON of `name` at `version` for the crate's default target,
+    /// asked with `HEAD` so that no body comes. It tells a release without JSON from one without
+    /// JSON for another target (requirement R-TG-1).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when docs.rs does not answer with 200 or 404.
+    pub async fn has_rustdoc_json(
+        &self,
+        name: &CrateName,
+        version: &Version,
+    ) -> Result<bool, FetchError> {
+        let url = self.json_url(name, version, None);
+        let response = http::send(self.client.head(&url))
+            .await
+            .map_err(network_error)?;
+        match response.status() {
+            StatusCode::OK => Ok(true),
+            StatusCode::NOT_FOUND => Ok(false),
+            StatusCode::BAD_REQUEST => Err(FetchError::BadRequest),
+            status if http::is_transient(status) => Err(FetchError::Transient { status }),
+            status => Err(FetchError::UnexpectedStatus { status }),
+        }
+    }
+
+    /// The URL of the rustdoc JSON of `name` at `version`, for `target` if there is one. All parts
+    /// are validated, so they cannot change the shape of the URL; the `+` of build metadata is
+    /// taken as itself in a path.
+    fn json_url(
+        &self,
+        name: &CrateName,
+        version: &Version,
+        target: Option<&TargetTriple>,
+    ) -> String {
+        let base = format!("{}/crate/{name}/{version}", self.base_url);
+        target.map_or_else(
+            || format!("{base}/json"),
+            |target| format!("{base}/{target}/json"),
+        )
+    }
+}
+
+/// A failed request as a [`FetchError`], with a rejected certificate told apart.
+fn network_error(error: reqwest::Error) -> FetchError {
+    if http::is_certificate_error(&error) {
+        FetchError::Certificate(error)
+    } else {
+        FetchError::Network(error)
     }
 }
 
@@ -271,7 +317,7 @@ mod tests {
         let (name, version) = serde();
         let docs_rs = DocsRs::for_local_test(&base_url);
         let json = docs_rs
-            .fetch_rustdoc_json(&name, &version, None)
+            .fetch_rustdoc_json(&name, &version, None, None)
             .await
             .expect("fetches");
         assert_eq!(&*json, JSON);
@@ -314,7 +360,7 @@ mod tests {
             let (base_url, _requests) = serve_sequence(vec![(head, Vec::new()); 3]);
             let docs_rs = DocsRs::for_local_test(&base_url);
             let error = docs_rs
-                .fetch_rustdoc_json(&name, &version, None)
+                .fetch_rustdoc_json(&name, &version, None, None)
                 .await
                 .expect_err("fails");
             assert!(expected(&error), "{status}: {error:?}");
@@ -338,7 +384,7 @@ mod tests {
         let (base_url, requests) = serve_sequence(vec![unavailable, ok]);
         let (name, version) = serde();
         let json = DocsRs::for_local_test(&base_url)
-            .fetch_rustdoc_json(&name, &version, None)
+            .fetch_rustdoc_json(&name, &version, None, None)
             .await
             .expect("fetched on the second attempt");
         assert_eq!(&*json, JSON);
@@ -354,7 +400,7 @@ mod tests {
         let (base_url, request) = serve_once(&head, JSON);
         let (name, version) = serde();
         DocsRs::for_local_test(&base_url)
-            .fetch_rustdoc_json(&name, &version, Some(60))
+            .fetch_rustdoc_json(&name, &version, None, Some(60))
             .await
             .expect("fetched");
         let request = request.recv().expect("the server saw the request");
@@ -362,6 +408,43 @@ mod tests {
             request.starts_with("GET /crate/serde/1.0.228/json/60 HTTP/1.1\r\n"),
             "{request}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_target_is_in_the_path_and_a_head_request_tells_if_there_is_json() {
+        let ok = (
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                JSON.len()
+            ),
+            JSON.to_vec(),
+        );
+        let head_ok = (
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned(),
+            Vec::new(),
+        );
+        let (base_url, requests) = serve_sequence(vec![ok, head_ok]);
+        let docs_rs = DocsRs::for_local_test(&base_url);
+        let (name, version) = serde();
+        let target: TargetTriple = "aarch64-apple-darwin".parse().expect("a target");
+        docs_rs
+            .fetch_rustdoc_json(&name, &version, Some(&target), None)
+            .await
+            .expect("fetched");
+        assert!(
+            docs_rs
+                .has_rustdoc_json(&name, &version)
+                .await
+                .expect("asked")
+        );
+        let requests: Vec<String> = requests
+            .iter()
+            .map(|request| request.lines().next().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(requests, [
+            "GET /crate/serde/1.0.228/aarch64-apple-darwin/json HTTP/1.1",
+            "HEAD /crate/serde/1.0.228/json HTTP/1.1",
+        ]);
     }
 
     /// A body that ends before its `content-length` is a network error, not a broken zstd body
@@ -378,7 +461,7 @@ mod tests {
         let (name, version) = serde();
         let docs_rs = DocsRs::for_local_test(&base_url);
         let error = docs_rs
-            .fetch_rustdoc_json(&name, &version, None)
+            .fetch_rustdoc_json(&name, &version, None, None)
             .await
             .expect_err("fails");
         assert!(matches!(error, FetchError::Network(_)), "{error:?}");

@@ -76,7 +76,7 @@ async fn fetch(cache: &Cache, docs_rs: &DocsRs, arg: &str) -> Result<String, Box
     // A symlink counts as not cached, as for the cache itself.
     let cached = std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file());
     let source = if cached { "cache" } else { "docs.rs" };
-    let json = data::docs_rs_json(cache, docs_rs, &name, &version).await?;
+    let json = data::docs_rs_json(cache, docs_rs, &name, &version, None).await?;
     let format_version = format_version::read(&json)?;
     let mut sha256 = String::new();
     for byte in Sha256::digest(&json) {
