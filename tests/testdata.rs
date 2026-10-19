@@ -193,6 +193,9 @@ fn describe(krate: &rustdoc_types::Crate, index: &PathIndex, path: &str) -> Stri
                 .map_or_else(|| "?".to_owned(), ToString::to_string)
         ),
         Resolution::Ambiguous(ids) => format!("ambiguous among {} items", ids.len()),
+        Resolution::AmbiguousMembers { members, .. } => {
+            format!("ambiguous among {} members", members.len())
+        },
         Resolution::NotFound => "not found".to_owned(),
     }
 }
@@ -338,6 +341,11 @@ fn representative_items_are_returned_by_get_item() {
         ("axum", "0.8.9", "axum::debug_handler"),
         ("axum", "0.8.9", "axum::body::Body"),
         ("serde", "1.0.228", "serde::Deserialize"),
+        // `impl From<ClientBuilder> for blocking::ClientBuilder` and `impl From<Elapsed> for
+        // std::io::Error` are among the `impls` of these types, but their `from` is the blanket
+        // `impl<T> From<T> for T` (R-PR-7).
+        ("reqwest", "0.13.5", "reqwest::ClientBuilder::from"),
+        ("tokio", "1.53.3", "tokio::time::error::Elapsed::from"),
     ];
     eprintln!("path | rustdoc subtree | response | signature tree | signature strings");
     for (crate_name, version, path) in cases {
@@ -358,7 +366,9 @@ fn representative_items_are_returned_by_get_item() {
         let id = match index.resolve(&parsed.krate, path) {
             Resolution::Item(id) | Resolution::Member { member: id, .. } => id,
             Resolution::ExternalReexport(_) => continue,
-            other @ (Resolution::Ambiguous(_) | Resolution::NotFound) => {
+            other @ (Resolution::Ambiguous(_)
+            | Resolution::AmbiguousMembers { .. }
+            | Resolution::NotFound) => {
                 panic!("{path}: {other:?}")
             },
         };

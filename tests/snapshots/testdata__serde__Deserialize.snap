@@ -25,5 +25,8 @@ expression: response
       "lines": "554-593",
       "url": "https://docs.rs/crate/serde/1.0.228/source/src/core/de/mod.rs#554-593"
     }
-  }
+  },
+  "hints": [
+    "serde::Deserialize also names a proc_derive of another crate; call get_item with crate serde_derive@1.0.228 and path serde_derive::Deserialize for it"
+  ]
 }

@@ -159,9 +159,16 @@ m0-plan.md の §7.2 の申し送り。
 - action は、出てから 2 週間以上たった版のコミットの SHA で固定した
 - 手元で確かめたこと: fmt・clippy (既定と `--no-default-features`)・test・doc・taplo、testdata の job と同じコマンド (取得はキャッシュから、4 件が成功)。cargo-deny と markdownlint-cli2 はホストに無いので、CI の初回で確かめる
 - CI の初回 (2026-10-19): config-lint 以外はすべて通った (Windows の aws-lc-rs のビルド、cargo-deny、docs.rs から取り直した testdata の sha256 を含む)。markdownlint-cli2 が、見出しで始まらない 2 つの Markdown (ツールの説明文 `src/mcp/tool/get_item.md` と、実験の crate の doc に取り込む `poc/m0b/b5-dep-info/probe/README.md`) を MD041 で落としたので、どちらも文書ではないとして対象から外した
+- CI の 2 回目 (同日): すべての job が通った
 
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める
 2. requirements.md を次の版にし、§14 に経緯を書く
 3. M2 の計画を立てる (着手の前に Q-32 を確かめる)
+
+#### A2 (2026-10-19)
+
+- 型のメンバーは、その型の `impl` (`for_` がその型を指すもの) の中だけで探す (`path_index::own_impls`)。プリミティブ型は `impl` の `for_` が `[T]`・`&str` などさまざまなので、今までどおりすべてを見る (M4 で見直す)。`reqwest::ClientBuilder::from` と `tokio::time::error::Elapsed::from` は、他の型の `impl From<…> for …` の `from` ではなく、その型の `impl<T> From<T> for T` の `from` を返すようになった
+- 同じ名前のメンバーが複数あるときは `AmbiguousMembers` を返し、候補はその型の `impl` から探す (データの順で決まる)。これまでは crate 全体の `HashMap` を走査して持ち主を探していたので、実行ごとに候補が変わった。項目の候補には種類を付ける (`struct c::same` と `macro c::same`)
+- 同じパスにこの crate の item と、別の crate の item の re-export があるときは、この crate の item を返し、もう一方を引く次の呼び出しを hints に載せる (利用者が決めた。`serde::Deserialize` は trait を返し、serde_derive の derive マクロを hints で示す)。候補一覧 (R-PR-7) は、この crate の中に同じパスの item が複数あるときに限る

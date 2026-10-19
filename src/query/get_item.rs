@@ -27,7 +27,7 @@ use semver::Version;
 use serde::Serialize;
 
 use super::{
-    path_index::{ExternalReexport, PathIndex, PublicPath, Resolution},
+    path_index::{self, ExternalReexport, PathIndex, PublicPath, Resolution},
     render::Renderer,
 };
 use crate::data::{crate_name::CrateName, rustdoc_json::ParsedCrate};
@@ -215,12 +215,26 @@ pub fn get_item<'a>(
     };
     let provenance = query.provenance(parsed);
     let data = match index.resolve(&parsed.krate, request.path) {
-        Resolution::Item(id) => query.item_data(id, None),
+        Resolution::Item(id) => {
+            let data = query.item_data(id, None);
+            if let Some(reexport) = index.hidden_reexport(request.path) {
+                query.hint_hidden_reexport(reexport);
+            }
+            data
+        },
         Resolution::Member { parent, member } => query.item_data(member, Some(parent)),
         Resolution::ExternalReexport(reexport) => Some(query.reexport_data(reexport)),
         Resolution::Ambiguous(ids) => {
             return Err(GetItemError::Ambiguous {
-                candidates: ids.iter().map(|&id| query.describe(id)).collect(),
+                candidates: ids.iter().map(|&id| query.describe_item(id)).collect(),
+            });
+        },
+        Resolution::AmbiguousMembers { parent, members } => {
+            return Err(GetItemError::Ambiguous {
+                candidates: members
+                    .iter()
+                    .map(|&member| query.describe_member(parent, member))
+                    .collect(),
             });
         },
         Resolution::NotFound => None,
@@ -341,34 +355,16 @@ impl<'a> Query<'a> {
     /// A re-export of an item of another crate, with the arguments to look the item up there.
     fn reexport_data(&mut self, reexport: &ExternalReexport) -> ItemData<'a> {
         let summary = self.krate.paths.get(&reexport.target);
-        let external =
-            summary.and_then(|summary| self.krate.external_crates.get(&summary.crate_id));
-        let reexport_of = if let (Some(definition), Some(external)) =
-            (&reexport.definition, external)
-        {
-            let name: Box<str> = if let Some((name, version)) =
-                external.html_root_url.as_deref().and_then(docs_rs_release)
-            {
-                format!("{name}@{version}").into()
-            } else {
-                self.warnings.push(Cow::Owned(format!(
-                    "the version of {} that is re-exported is unknown",
-                    external.name
-                )));
-                external.name.as_str().into()
-            };
-            let path = definition.joined();
+        let reexport_of = self.reexport_target(reexport);
+        if let Some(target) = &reexport_of {
             self.hints.push(
-                format!("call get_item with crate {name} and path {path} for its documentation")
-                    .into(),
+                format!(
+                    "call get_item with crate {} and path {} for its documentation",
+                    target.name, target.path
+                )
+                .into(),
             );
-            Some(ReexportOf { name, path })
-        } else {
-            self.warnings.push(Cow::Borrowed(
-                "the re-exported item is not described in this crate's data",
-            ));
-            None
-        };
+        }
         ItemData {
             path: reexport.path.joined(),
             kind: summary.map_or("unknown", |summary| summary_kind(summary.kind)),
@@ -404,10 +400,8 @@ impl<'a> Query<'a> {
     /// an item of a trait and a variant.
     fn impl_header(&mut self, parent: Id, member: Id) -> Option<Box<str>> {
         let krate = self.krate;
-        let impl_item = impls_of(krate.index.get(&parent)?)
-            .iter()
-            .filter_map(|id| krate.index.get(id))
-            .find(|item| matches!(&item.inner, ItemEnum::Impl(contents) if contents.items.contains(&member)))?;
+        let (impl_item, _) = path_index::own_impls(krate, parent)
+            .find(|(_, contents)| contents.items.contains(&member))?;
         let mut header = self.renderer.signature(impl_item);
         let predicates = self.renderer.where_predicates(impl_item);
         for (position, predicate) in predicates.iter().enumerate() {
@@ -494,56 +488,89 @@ impl<'a> Query<'a> {
         })
     }
 
-    /// What `id` is, to tell apart the items of an ambiguous path.
-    fn describe(&mut self, id: Id) -> Box<str> {
-        if let Some(path) = self.index.canonical_path(id) {
-            return path.joined();
+    /// The crate and definition path of the item that `reexport` re-exports, to look it up
+    /// there. `None`, with a warning, when the data does not describe it.
+    fn reexport_target(&mut self, reexport: &ExternalReexport) -> Option<ReexportOf> {
+        let summary = self.krate.paths.get(&reexport.target);
+        let external =
+            summary.and_then(|summary| self.krate.external_crates.get(&summary.crate_id));
+        let (Some(definition), Some(external)) = (&reexport.definition, external) else {
+            self.warnings.push(Cow::Borrowed(
+                "the re-exported item is not described in this crate's data",
+            ));
+            return None;
+        };
+        let name: Box<str> = if let Some((name, version)) =
+            external.html_root_url.as_deref().and_then(docs_rs_release)
+        {
+            format!("{name}@{version}").into()
+        } else {
+            self.warnings.push(Cow::Owned(format!(
+                "the version of {} that is re-exported is unknown",
+                external.name
+            )));
+            external.name.as_str().into()
+        };
+        Some(ReexportOf {
+            name,
+            path: definition.joined(),
+        })
+    }
+
+    /// A hint about the re-export of another crate's item that has the path of the item returned
+    /// (`serde::Deserialize` is also `serde_derive`'s derive macro).
+    fn hint_hidden_reexport(&mut self, reexport: &ExternalReexport) {
+        let kind = self
+            .krate
+            .paths
+            .get(&reexport.target)
+            .map_or("item", |summary| summary_kind(summary.kind));
+        if let Some(target) = self.reexport_target(reexport) {
+            self.hints.push(
+                format!(
+                    "{} also names a {kind} of another crate; call get_item with crate {} and path {} for it",
+                    reexport.path, target.name, target.path
+                )
+                .into(),
+            );
         }
-        let krate = self.krate;
-        let Some(item) = krate.index.get(&id) else {
+    }
+
+    /// What the item `id` is, to tell apart the items of an ambiguous path: its kind and
+    /// canonical path, which may be the same for items of different kinds.
+    fn describe_item(&self, id: Id) -> Box<str> {
+        let Some(item) = self.krate.index.get(&id) else {
             return "an item that is not in the data".into();
         };
-        let name = item.name.as_deref().unwrap_or("_");
-        let owner = krate.index.values().find(|owner| {
-            matches!(&owner.inner, ItemEnum::Impl(contents) if contents.items.contains(&id))
-        });
-        match owner {
-            Some(owner) => format!("{name} in {}", self.renderer.signature(owner)).into(),
-            None => name.into(),
-        }
+        let kind = kind_of(item, false);
+        let path = self.index.canonical_path(id).map_or_else(
+            || item.name.as_deref().unwrap_or("_").into(),
+            PublicPath::joined,
+        );
+        format!("{kind} {path}").into()
+    }
+
+    /// What the member `member` of `parent` is, to tell apart the members of the same name: the
+    /// `impl` of `parent` that has it.
+    fn describe_member(&mut self, parent: Id, member: Id) -> Box<str> {
+        let krate = self.krate;
+        let name = krate
+            .index
+            .get(&member)
+            .and_then(|item| item.name.as_deref())
+            .unwrap_or("_");
+        let owner = path_index::own_impls(krate, parent)
+            .find(|(_, contents)| contents.items.contains(&member));
+        owner.map_or_else(
+            || name.into(),
+            |(owner, _)| format!("{name} in {}", self.renderer.signature(owner)).into(),
+        )
     }
 }
 
 /// `values` as a boxed slice of boxed strings.
 fn boxed(values: Vec<String>) -> Box<[Box<str>]> {
     values.into_iter().map(String::into_boxed_str).collect()
-}
-
-/// The `impl`s of a type.
-fn impls_of(item: &Item) -> &[Id] {
-    match &item.inner {
-        ItemEnum::Struct(contents) => &contents.impls,
-        ItemEnum::Enum(contents) => &contents.impls,
-        ItemEnum::Union(contents) => &contents.impls,
-        ItemEnum::Primitive(contents) => &contents.impls,
-        ItemEnum::Module(_)
-        | ItemEnum::ExternCrate { .. }
-        | ItemEnum::Use(_)
-        | ItemEnum::StructField(_)
-        | ItemEnum::Variant(_)
-        | ItemEnum::Function(_)
-        | ItemEnum::Trait(_)
-        | ItemEnum::TraitAlias(_)
-        | ItemEnum::Impl(_)
-        | ItemEnum::TypeAlias(_)
-        | ItemEnum::Constant { .. }
-        | ItemEnum::Static(_)
-        | ItemEnum::ExternType
-        | ItemEnum::Macro(_)
-        | ItemEnum::ProcMacro(_)
-        | ItemEnum::AssocConst { .. }
-        | ItemEnum::AssocType { .. } => &[],
-    }
 }
 
 /// The kind of `item`, as rustdoc's `ItemKind` names it, except that a function that belongs to

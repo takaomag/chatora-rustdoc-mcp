@@ -14,7 +14,7 @@ use std::{
     fmt,
 };
 
-use rustdoc_types::{Crate, Id, Impl, Item, ItemEnum, Use, Visibility};
+use rustdoc_types::{Crate, Id, Impl, Item, ItemEnum, Type, Use, Visibility};
 
 /// Deepest chain of modules and re-exports to follow (requirement R-PR-3). Glob re-exports that
 /// refer to each other could otherwise go on without end.
@@ -104,8 +104,16 @@ pub enum Resolution<'a> {
     },
     /// A re-export of an item of another crate, whose documentation is not in this crate.
     ExternalReexport(&'a ExternalReexport),
-    /// More than one item has this path (requirement R-PR-7).
+    /// More than one item of this crate has this path (requirement R-PR-7).
     Ambiguous(Box<[Id]>),
+    /// More than one member of `parent` has this name, in the first group of `impl`s that has
+    /// one (requirement R-PR-7).
+    AmbiguousMembers {
+        /// The type, trait or enum.
+        parent: Id,
+        /// The members with the name.
+        members: Box<[Id]>,
+    },
     /// Nothing has this path.
     NotFound,
 }
@@ -219,7 +227,20 @@ impl PathIndex {
         }
     }
 
+    /// The re-export of another crate's item at `path` that an item of this crate hides: both
+    /// have the path, and [`Self::resolve`] returns this crate's item (`serde::Deserialize` is a
+    /// trait of serde and a derive macro of `serde_derive`).
+    #[must_use]
+    pub fn hidden_reexport(&self, path: &str) -> Option<&ExternalReexport> {
+        let key = normalize(path)?;
+        if !self.by_public_path.contains_key(key.as_ref()) {
+            return None;
+        }
+        self.external_reexports.get(key.as_ref())
+    }
+
     /// Looks `key` up as a public path, a re-export from another crate, then a definition path.
+    /// An item of this crate comes before a re-export at the same path ([`Self::hidden_reexport`]).
     fn lookup(&self, key: &str) -> Option<Resolution<'_>> {
         if let Some(ids) = self.by_public_path.get(key) {
             return Some(one_or_ambiguous(ids));
@@ -448,20 +469,31 @@ fn normalize(path: &str) -> Option<Cow<'_, str>> {
 /// Finds the member called `name` of `parent`: the variants of an enum, the items of a trait, or
 /// the items of the `impl`s of a type, first inherent ones, then trait ones, then blanket ones.
 fn find_member(krate: &Crate, parent: Id, name: &str) -> Resolution<'static> {
-    let Some(item) = krate.index.get(&parent) else {
-        return Resolution::NotFound;
-    };
-    // The members of the item itself, then its `impl`s.
-    let (own, impls): (&[Id], &[Id]) = match &item.inner {
-        ItemEnum::Enum(contents) => (&contents.variants, &contents.impls),
-        ItemEnum::Struct(contents) => (&[], &contents.impls),
-        ItemEnum::Union(contents) => (&[], &contents.impls),
-        ItemEnum::Primitive(contents) => (&[], &contents.impls),
-        ItemEnum::Trait(contents) => (&contents.items, &[]),
-        // Nothing else has members that are looked up by name.
+    let own = krate.index.get(&parent).map_or(&[][..], own_members);
+    if let Some(found) = named(krate, parent, own.iter(), name) {
+        return found;
+    }
+    for kind in [ImplKind::Inherent, ImplKind::Trait, ImplKind::Blanket] {
+        let members = own_impls(krate, parent)
+            .filter(|(_, contents)| ImplKind::of(contents) == kind)
+            .flat_map(|(_, contents)| contents.items.iter());
+        if let Some(found) = named(krate, parent, members, name) {
+            return found;
+        }
+    }
+    Resolution::NotFound
+}
+
+/// The members that `item` has itself: the variants of an enum and the items of a trait.
+fn own_members(item: &Item) -> &[Id] {
+    match &item.inner {
+        ItemEnum::Enum(contents) => &contents.variants,
+        ItemEnum::Trait(contents) => &contents.items,
         ItemEnum::Module(_)
         | ItemEnum::ExternCrate { .. }
         | ItemEnum::Use(_)
+        | ItemEnum::Union(_)
+        | ItemEnum::Struct(_)
         | ItemEnum::StructField(_)
         | ItemEnum::Variant(_)
         | ItemEnum::Function(_)
@@ -473,28 +505,67 @@ fn find_member(krate: &Crate, parent: Id, name: &str) -> Resolution<'static> {
         | ItemEnum::ExternType
         | ItemEnum::Macro(_)
         | ItemEnum::ProcMacro(_)
+        | ItemEnum::Primitive(_)
         | ItemEnum::AssocConst { .. }
-        | ItemEnum::AssocType { .. } => (&[], &[]),
-    };
-    if let Some(found) = named(krate, parent, own.iter(), name) {
-        return found;
+        | ItemEnum::AssocType { .. } => &[],
     }
-    for kind in [ImplKind::Inherent, ImplKind::Trait, ImplKind::Blanket] {
-        let members = impls
-            .iter()
-            .filter_map(|id| match krate.index.get(id) {
-                Some(Item {
-                    inner: ItemEnum::Impl(contents),
-                    ..
-                }) if ImplKind::of(contents) == kind => Some(contents.items.iter()),
-                Some(_) | None => None,
-            })
-            .flatten();
-        if let Some(found) = named(krate, parent, members, name) {
-            return found;
-        }
+}
+
+/// The `impl`s of the type `parent` that are for it, in the order of the data (requirement
+/// R-PR-7).
+///
+/// rustdoc also lists among the `impls` of a type the `impl`s for other types that mention it,
+/// such as `impl From<Elapsed> for std::io::Error` among those of `Elapsed`; their items are not
+/// members of the type. A primitive type keeps all of its `impl`s, which are for its many forms
+/// (`[T]`, `&str`).
+pub fn own_impls(krate: &Crate, parent: Id) -> impl Iterator<Item = (&Item, &Impl)> {
+    let parent_item = krate.index.get(&parent);
+    let is_primitive = matches!(
+        parent_item,
+        Some(Item {
+            inner: ItemEnum::Primitive(_),
+            ..
+        })
+    );
+    parent_item
+        .map_or(&[][..], impls_of)
+        .iter()
+        .filter_map(move |id| {
+            let item = krate.index.get(id)?;
+            let ItemEnum::Impl(contents) = &item.inner else {
+                return None;
+            };
+            let is_own = is_primitive
+                || matches!(&contents.for_, Type::ResolvedPath(path) if path.id == parent);
+            is_own.then_some((item, contents))
+        })
+}
+
+/// The `impl`s that rustdoc lists for a type.
+fn impls_of(item: &Item) -> &[Id] {
+    match &item.inner {
+        ItemEnum::Struct(contents) => &contents.impls,
+        ItemEnum::Enum(contents) => &contents.impls,
+        ItemEnum::Union(contents) => &contents.impls,
+        ItemEnum::Primitive(contents) => &contents.impls,
+        ItemEnum::Module(_)
+        | ItemEnum::ExternCrate { .. }
+        | ItemEnum::Use(_)
+        | ItemEnum::StructField(_)
+        | ItemEnum::Variant(_)
+        | ItemEnum::Function(_)
+        | ItemEnum::Trait(_)
+        | ItemEnum::TraitAlias(_)
+        | ItemEnum::Impl(_)
+        | ItemEnum::TypeAlias(_)
+        | ItemEnum::Constant { .. }
+        | ItemEnum::Static(_)
+        | ItemEnum::ExternType
+        | ItemEnum::Macro(_)
+        | ItemEnum::ProcMacro(_)
+        | ItemEnum::AssocConst { .. }
+        | ItemEnum::AssocType { .. } => &[],
     }
-    Resolution::NotFound
 }
 
 /// The member of `parent` among `members` called `name`, ambiguous if there are several, or
@@ -521,7 +592,10 @@ fn named<'a>(
             parent,
             member: *member,
         }),
-        _ => Some(Resolution::Ambiguous(found.into_boxed_slice())),
+        _ => Some(Resolution::AmbiguousMembers {
+            parent,
+            members: found.into_boxed_slice(),
+        }),
     }
 }
 
@@ -554,7 +628,6 @@ mod tests {
         Struct,
         StructKind,
         Target,
-        Type,
         Variant,
         VariantKind,
     };
@@ -622,7 +695,13 @@ mod tests {
         )
     }
 
-    fn inherent_impl(id: u32, items: &[u32]) -> Item {
+    /// An `impl` for the type `for_`, of the trait `trait_` if there is one.
+    fn an_impl(id: u32, for_: u32, trait_: Option<u32>, items: &[u32]) -> Item {
+        let path = |id: u32| rustdoc_types::Path {
+            path: String::new(),
+            id: Id(id),
+            args: None,
+        };
         item(
             id,
             None,
@@ -630,8 +709,8 @@ mod tests {
                 is_unsafe: false,
                 generics: no_generics(),
                 provided_trait_methods: Vec::new(),
-                trait_: None,
-                for_: Type::Infer,
+                trait_: trait_.map(path),
+                for_: Type::ResolvedPath(path(for_)),
                 items: items.iter().map(|&id| Id(id)).collect(),
                 is_negative: false,
                 is_synthetic: false,
@@ -822,7 +901,7 @@ mod tests {
             vec![
                 module(0, "my_crate", &[1]),
                 structure(1, "S", &[2]),
-                inherent_impl(2, &[3]),
+                an_impl(2, 1, None, &[3]),
                 assoc_const(3, "lock"),
             ],
             &[],
@@ -839,6 +918,79 @@ mod tests {
             index.resolve(&krate, "my_crate::S::unlock"),
             Resolution::NotFound
         );
+    }
+
+    #[test]
+    fn a_member_of_an_impl_for_another_type_is_not_a_member() {
+        // `impl From<S> for Other { fn from(..) }` is among the `impls` of `S` too, as with
+        // `impl From<Elapsed> for std::io::Error` in tokio.
+        let krate = krate(
+            vec![
+                module(0, "c", &[1, 4]),
+                structure(1, "S", &[2]),
+                an_impl(2, 4, Some(5), &[3]),
+                assoc_const(3, "from"),
+                structure(4, "Other", &[2]),
+            ],
+            &[],
+        );
+        let index = PathIndex::build(&krate);
+        assert_eq!(index.resolve(&krate, "c::S::from"), Resolution::NotFound);
+        assert_eq!(
+            index.resolve(&krate, "c::Other::from"),
+            Resolution::Member {
+                parent: Id(4),
+                member: Id(3),
+            }
+        );
+    }
+
+    #[test]
+    fn members_of_the_same_name_in_one_group_are_ambiguous() {
+        // Two trait `impl`s of `S` with an item each called `get`.
+        let krate = krate(
+            vec![
+                module(0, "c", &[1]),
+                structure(1, "S", &[2, 4]),
+                an_impl(2, 1, Some(6), &[3]),
+                assoc_const(3, "get"),
+                an_impl(4, 1, Some(7), &[5]),
+                assoc_const(5, "get"),
+            ],
+            &[],
+        );
+        let index = PathIndex::build(&krate);
+        assert_eq!(
+            index.resolve(&krate, "c::S::get"),
+            Resolution::AmbiguousMembers {
+                parent: Id(1),
+                members: vec![Id(3), Id(5)].into(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_item_hides_a_reexport_at_the_same_path() {
+        // `pub trait Deserialize {}` and `pub use other::Deserialize;` (a derive macro), as in
+        // serde.
+        let krate = krate(
+            vec![
+                module(0, "c", &[1, 2]),
+                item(1, Some("Deserialize"), ItemEnum::Macro(String::new())),
+                reexport(2, "other::Deserialize", "Deserialize", Some(3), false),
+            ],
+            &[(3, 1, "other::Deserialize")],
+        );
+        let index = PathIndex::build(&krate);
+        assert_eq!(
+            index.resolve(&krate, "c::Deserialize"),
+            Resolution::Item(Id(1))
+        );
+        let hidden = index
+            .hidden_reexport("c::Deserialize")
+            .expect("the re-export is found");
+        assert_eq!(hidden.target, Id(3));
+        assert_eq!(index.hidden_reexport("c::Other"), None);
     }
 
     #[test]
