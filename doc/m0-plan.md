@@ -201,6 +201,24 @@ turbomcp (alpha 版) と turul-mcp-server (約 2,500 DL) は比べる前に外�
 - R-MCP-2・R-ARG-1 に、rmcp の挙動で受け入れる違いを書く
 - R-MCP-16 に、stdio では「サーバーから閉じる」場面が起きないことを書く
 
+#### A3 (2026-10-19)
+
+環境: Claude Code 2.1.303 (Linux)、モデルは Opus 5.5。実験用のディレクトリ [poc/m0a-a3/](../poc/m0a-a3/) (手順は同じ場所の README) で、サーバーを `.mcp.json` で登録し、やりとりを `run-server.sh` で `logs/` に写した。R-OUT-1 と R-ERR-2 を見分けるため、`structuredContent` と text に違う JSON を返す仮のツール `probe_result` を足した (A8 で消す)。headless の 3 回で約 0.48 ドル。
+
+| 確かめたこと | 結果 |
+| --- | --- |
+| R-OUT-1 (headless) | 成功の結果では、モデルに渡ったのは `structuredContent` (`{"from":"structuredContent"}`) だけで、text は捨てられた。前提は変わっていない |
+| R-ERR-2 (headless) | `isError: true` の結果では `structuredContent` が無視され、`content[0].text` (`{"from":"text"}`) だけが `is_error: true` で渡った。前提は変わっていない |
+| 引数の誤り (headless) | `echo` を `{}` で呼ぶと、`invalid_argument` の JSON がそのまま `is_error: true` で渡り、モデルは内容を読めた |
+| R-MCP-2 接続 | `server/discover` (id は文字列の `server-discover-probe-1`) → `tools/list` → `tools/call` の順。どれも `_meta` で 2026-07-28 を名乗り、`clientInfo` も付いていた。`initialize` は送られなかった |
+| R-MCP-16 | `subscriptions/listen` は送られなかった (headless でも対話モードでも) |
+| `tools/call` の `_meta` | 毎回 `progressToken` (対話モードでは数値の `1`) と `claudecode/toolUseId` が付いていた |
+| ツールの読み込み | 遅延読み込み。モデルは ToolSearch で `select:mcp__chatora-rustdoc__…` を引いてから呼んだ |
+| R-WS-6 進捗 (対話モード) | `sleep` 20 秒の間、`notifications/progress` を 1 秒ごとに送り、画面に `slept 5 of 20 seconds (25%)` と出た。割合は Claude Code が `progress / total` から計算している |
+| R-WS-6 キャンセル (対話モード) | Esc で `notifications/cancelled` (`reason: "AbortError: user-cancel"`。この通知にも `_meta` が付く) が届き、サーバーはその場で `sleep` を止めた。進捗は 6 回目で止まり、結果は返さなかった。画面は `Interrupted · What should Claude do instead?` |
+
+前提が崩れた項目は無いので、§7 の出力設計は今のままで A4 に進む。
+
 ### 6.2 M0b
 
 (未着手)
