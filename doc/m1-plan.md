@@ -161,12 +161,6 @@ m0-plan.md の §7.2 の申し送り。
 - CI の初回 (2026-10-19): config-lint 以外はすべて通った (Windows の aws-lc-rs のビルド、cargo-deny、docs.rs から取り直した testdata の sha256 を含む)。markdownlint-cli2 が、見出しで始まらない 2 つの Markdown (ツールの説明文 `src/mcp/tool/get_item.md` と、実験の crate の doc に取り込む `poc/m0b/b5-dep-info/probe/README.md`) を MD041 で落としたので、どちらも文書ではないとして対象から外した
 - CI の 2 回目 (同日): すべての job が通った
 
-## 7. M1 の終わり方
-
-1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める
-2. requirements.md を次の版にし、§14 に経緯を書く
-3. M2 の計画を立てる (着手の前に Q-32 を確かめる)
-
 #### A2 (2026-10-19)
 
 - 型のメンバーは、その型の `impl` (`for_` がその型を指すもの) の中だけで探す (`path_index::own_impls`)。プリミティブ型は `impl` の `for_` が `[T]`・`&str` などさまざまなので、今までどおりすべてを見る (M4 で見直す)。`reqwest::ClientBuilder::from` と `tokio::time::error::Elapsed::from` は、他の型の `impl From<…> for …` の `from` ではなく、その型の `impl<T> From<T> for T` の `from` を返すようになった
@@ -221,4 +215,10 @@ m0-plan.md の §7.2 の小さなものを片付けた。
 - `name` の無い `tools/call` への rmcp の応答を確かめた: `-32601` (R-ARG-1 は `-32602`)。`arguments` がオブジェクトでない場合と同じく、ハンドラの外で起きるので受け入れる違いとしてテストで固定した。M1 の終わりに要件の R-MCP-2 の一覧に足す
 - 応答のキーの順を確かめるテストを足した (`Value` の比較は順を見ないため。R-OUT-1・R-SH-1)。`Map::remove` は今もテストでしか使っていない
 - そのほか: sleep のエラーの文言は上限の定数から作る、説明文の長さのテストは失敗時に文字数を出す、examples/fetch_docs_rs.rs はキャッシュの symlink をキャッシュとみなさない、tests/stdio.rs のコメントの参照先
-- §7.2 の残りは、それを扱う段で直す: TLS の検証の失敗の分類 (B3)、`log.filter` (D1)、`ambiguous_path` の候補数・応答の大きさ・親が曖昧なときのメンバー・`tokio::select!` の書き方 (C1)、キャンセルと同時実行の上限 (D2)
+- m0-plan.md の §7.2 の残りは、それを扱う段で直す: TLS の検証の失敗の分類 (B3)、`log.filter` (D1)、`ambiguous_path` の候補数・応答の大きさ・親が曖昧なときのメンバー・`tokio::select!` の書き方 (C1)、キャンセルと同時実行の上限 (D2)
+
+## 7. M1 の終わり方
+
+1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める
+2. requirements.md を次の版にし、§14 に経緯を書く
+3. M2 の計画を立てる (着手の前に Q-32 を確かめる)
