@@ -1,0 +1,16 @@
+[package]
+name = "m0a-a10"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chatora-rustdoc-mcp = { version = "0.1.0", path = "../.." }
+guppy = "0.17.26"
+rustdoc-types = "=0.61.0"
+rustdoc-types-057 = { version = "=0.57.4", package = "rustdoc-types" }
+rustdoc_processor = "=0.1.2"
+semver = "1.0.28"
+serde_json = "1.0.154"
+
+# A standalone project: keep it out of the chatora-rustdoc-mcp package.
+[workspace]

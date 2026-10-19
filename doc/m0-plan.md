@@ -485,6 +485,49 @@ R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52�
 
 前提が崩れた項目は無いので、§7 の出力設計は今のままで A10 に進む。
 
+#### A10 (2026-10-19)
+
+環境: rustdoc_processor 0.1.2 (2026-10-12 公開)。突き合わせのプロジェクトは [poc/m0a-a10/](../poc/m0a-a10/) (独立した cargo プロジェクト。使い方は同じ場所の README)。
+
+**rustdoc_processor について分かったこと** (crates.io の依存の一覧と、ソースを読んで):
+
+- rustdoc-types を `^0.57.3` に固定している (このサーバーは 0.61)。0.57 の型で直接読めるのは形式 57 だけ
+- 依存が重い: guppy (cargo metadata の依存グラフ)、rusqlite (`bundled` で SQLite の C のソースをビルド)、r2d2、rayon、rkyv 0.8、bincode、toml、globwalk など
+- API の中心は、`PackageGraph` を受けて必要なら `cargo rustdoc` を起動し、SQLite にキャッシュする一式 (`CrateCollection`)。docs.rs の JSON をそのまま渡す入口は無いが、下の層の `queries::Crate::index_without_visitor(CrateData, PackageId)` で手元の JSON から索引を作れる
+- 正準パスは「最短 → 辞書順」で、改名を避けない。索引に入れるのはモジュールと、trait・struct・enum・union・関数・型の別名・定数・static・プリミティブ。マクロは入れない
+- ライセンスは Apache-2.0 のみ (依存にはできるが、コードは写せない。R-DIST-4)
+
+**突き合わせの方法**: 同じ docs.rs の JSON を、このサーバーの parse (0.61 の型) で読み、JSON に戻して `format_version` を 57 に書き換え、0.57 の型で読み直して rustdoc_processor に渡す。形式 57〜61 の違いは stability などの欄だけで、0.57 の型は知らない欄を無視する (`deny_unknown_fields` は無い)。item ごとに、公開パスの集合と正準パスを比べた。
+
+**結果** (11 crate、どれも形式 61。release ビルド):
+
+| crate | 公開パスを持つ item (こちら / rustdoc_processor) | 完全一致 | 違い |
+| --- | --- | --- | --- |
+| tokio 1.53.3 | 319 / 314 | 314 | こちらだけ: マクロ 5 |
+| axum 0.8.9 | 185 / 185 | 185 | なし |
+| serde 1.0.228 | 60 / 59 | 59 | こちらだけ: マクロ 1 |
+| futures-util 0.3.34 | 304 / 296 | 296 | こちらだけ: マクロ 8 |
+| tracing-subscriber 0.3.23 | 120 / 120 | 117 | 正準パスの違い 3 |
+| rmcp 3.5.1 | 544 / 541 | 541 | こちらだけ: マクロ 3 |
+| reqwest 0.13.5 | 55 / 54 | 54 | こちらだけ: モジュール 1 |
+| serde_json 1.0.154 | 49 / 48 | 48 | こちらだけ: マクロ 1 |
+| hyper 1.12.0 | 140 / 140 | 140 | なし |
+| tower 0.5.3 | 172 / 170 | 170 | こちらだけ: モジュール 2 |
+| clap 4.6.7 | 21 / 21 | 20 | 公開パスの集合の違い 1 |
+
+違いの原因 (JSON で確かめた):
+
+- マクロ (18 件): rustdoc_processor は索引に入れない。こちらが正しい
+- `use` で再エクスポートしたモジュール (4 件。`reqwest::multipart`、`tower::util::future::optional` と `tower::util::error::optional` (どちらも改名)、`clap::_derive::_cookbook`): rustdoc_processor は中の item はたどるが、モジュール自身のパスを記録しない。こちらが正しい
+- 改名 (1 件。tracing-subscriber の `fmt::Subscriber` と `FmtSubscriber`): R-PR-2 の規則の違い (こちらは改名の無いパスを選ぶ)
+- `pub use Trait as _;` (2 件。tracing-subscriber の `prelude`): **両方のバグ**。どちらも `tracing_subscriber::prelude::_` を公開パスに入れていた (`_` は名前ではなく、`use` できない)。rustdoc_processor はこれを正準パスに選ぶ。こちらは正準パスには選ばないが、`also_reexported_at` に出し、`resolve` でも引けていた。`visit_use` で `as _` を飛ばすように直し、単体テストを足した。直した後は、こちらの集合からこのパスが消えた
+
+**決めたこと**: rustdoc_processor は依存にしない。理由は、rustdoc-types の版が合わないこと、依存の重さ、cargo の起動を前提にした API、突き合わせでこちらの索引のほうが正しかったこと。比較相手としては役に立ったので、M1 で公開パス索引を直したら poc/m0a-a10 でもう一度突き合わせる。突き合わせに使った 7 crate は、テストデータの一覧に足した。
+
+**M1 への申し送り**: `pub use Trait as _;` は名前を作らないが、`use tracing_subscriber::prelude::*;` で trait がスコープに入ることは利用者に役立つ。この情報 (どの glob で trait が使えるようになるか) を持つかを M1 で決める。
+
+**v0.17 で要件に反映すること**: §10 のデータ層の行の「依存にするかは M0 で評価」を、評価の結果 (依存にしない、比較相手として使う) に改める。R-PR-2 に、`as _` の再エクスポートはパスを作らないことを書く。
+
 ### 6.2 M0b
 
 (未着手)

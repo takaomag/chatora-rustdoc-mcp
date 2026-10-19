@@ -22,3 +22,10 @@ clap	4.6.1	60	442530	17801bb4de29e5bdd4eb704e85682405deb7779927b89f659f3fb6c8e7e
 clap	4.6.7	61	302423	81eaaa9a97442d025d26b80ec6292368b4096244e78f8bef68e9f83c99dfaf2e
 tokio	1.53.3	61	6465764	ba517b8811993ffcfa06afb813784cbb0a9bbaa42b6dad07979bb0cc2e313e79	representative items for the public path index (A7)
 axum	0.8.9	61	5059003	0e3c5083b29e62e55c83ac082c7697b392db5ab129bcb073258cc78f6b01c74f	representative items for the public path index (A7)
+futures-util	0.3.34	61	7584682	477a5cd2b1c93d48c1a23723359ea5588dc247deb66fcf9450d7f0994cea9aa4	compared with rustdoc_processor (A10)
+tracing-subscriber	0.3.23	61	2784617	39eb619b05516a7849c22f8e5ac106d8a075713567bb741bd8ed89a838a36296	compared with rustdoc_processor (A10); has `pub use … as _`
+rmcp	3.5.1	61	14918032	3629919b80ebecef0c270382294492772fbb28cc201372726d37731b9b2f8b7f	compared with rustdoc_processor (A10)
+reqwest	0.13.5	61	1507623	daad57897a86a1f25b2b6141afceed3b4256ea1c3c2385b5e23aa4bac3f76481	compared with rustdoc_processor (A10); re-exports a module
+serde_json	1.0.154	61	1436439	d1792ebe7ea578b113f7bbf04d8ea9bfca4d4088bb6baff5341da215a4a50686	compared with rustdoc_processor (A10)
+hyper	1.12.0	61	1274756	b38c93bf8d68c5ef818502f2a83a89e9398068602a835870e5d5b2159b8df4af	compared with rustdoc_processor (A10)
+tower	0.5.3	61	3467945	67c9af961fd475b4642a8468c61401cac480b171ef1103249290f6a7772cade7	compared with rustdoc_processor (A10); re-exports modules under other names
