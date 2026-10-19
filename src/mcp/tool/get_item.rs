@@ -2,7 +2,7 @@
 //!
 //! M0a takes only an exact version, reads only docs.rs, and parses the JSON on every call.
 
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use rmcp::model::{CallToolResult, JsonObject, Tool, ToolAnnotations};
 use semver::Version;
@@ -13,13 +13,17 @@ use crate::{
     data::{
         self,
         LoadError,
+        archive::Mapped,
+        cache::Cache,
         crate_name::CrateName,
         docs_rs::FetchError,
-        rustdoc_json::{self, ParseError},
+        rustdoc_json::ParseError,
     },
     query::{
+        across::Indexed,
         get_item::{GetItemError, ItemRequest, get_item},
-        path_index::PathIndex,
+        load,
+        view::CrateView,
     },
 };
 
@@ -240,10 +244,18 @@ fn same_crate_name(a: &str, b: &str) -> bool {
             .all(|(a, b)| normalized(&a) == normalized(&b))
 }
 
-/// Loads the JSON of the crate, then looks the item up on a blocking thread, since parsing a large
-/// crate takes a large part of a second.
+/// Looks the item up in the archive of the crate, or else loads the JSON of the crate and archives
+/// it first, on a blocking thread, since parsing a large crate takes a large part of a second.
 pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
     // The target is chosen in M1 C1; until then, the crate's default target on docs.rs.
+    let dir = state
+        .cache
+        .docs_rs_dir(&arguments.name, &arguments.version, None);
+    let arguments = match look_up_archived(state.cache.clone(), dir.clone(), arguments).await {
+        Some(Ok((looked_up, arguments))) => return finish(looked_up, &arguments, &[]),
+        Some(Err(arguments)) => arguments,
+        None => return shutting_down(),
+    };
     let loaded = match data::docs_rs_json(
         &state.cache,
         &state.docs_rs,
@@ -257,7 +269,11 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
         Err(error) => return load_error(&arguments, &error),
     };
     let mut warnings = loaded.warnings;
-    let Some((looked_up, arguments, json)) = look_up_on_blocking(loaded.json, arguments).await
+    let lookup = Lookup {
+        cache: state.cache.clone(),
+        dir,
+    };
+    let Some((looked_up, arguments, json)) = lookup.on_blocking(loaded.json, arguments).await
     else {
         return shutting_down();
     };
@@ -276,7 +292,7 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
             .await
             {
                 Ok(Some(json)) => {
-                    let Some((again, returned, _)) = look_up_on_blocking(json, arguments).await
+                    let Some((again, returned, _)) = lookup.on_blocking(json, arguments).await
                     else {
                         return shutting_down();
                     };
@@ -302,8 +318,7 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
         {
             Ok(again) => {
                 warnings.extend(again.warnings);
-                let Some((again, returned, json)) =
-                    look_up_on_blocking(again.json, arguments).await
+                let Some((again, returned, json)) = lookup.on_blocking(again.json, arguments).await
                 else {
                     return shutting_down();
                 };
@@ -323,32 +338,74 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
             },
             Err(error) => return load_error(&arguments, &error),
         },
-        Ok(_) | Err(Failure::Parse(_) | Failure::Item(_) | Failure::Serialize(_)) => {
+        Ok(_)
+        | Err(Failure::Parse(_) | Failure::Archive(_) | Failure::Item(_) | Failure::Serialize(_)) => {
             (looked_up, arguments)
         },
     };
     finish(looked_up, &arguments, &warnings)
 }
 
-/// Looks the item up in `json` on a blocking thread, since parsing a large crate takes a large
-/// part of a second. The arguments and the JSON come back with the result. `None` if the runtime
-/// is shutting down; a panic goes on to `run_tool`.
-async fn look_up_on_blocking(
-    json: Box<[u8]>,
+/// Looks the item up in the archive of the crate in `dir`, on a blocking thread. `Some(Ok(_))`
+/// with the result when the archive is there, `Some(Err(_))` with the arguments when it is not (or
+/// cannot be read, which is logged), and `None` if the runtime is shutting down.
+async fn look_up_archived(
+    cache: Cache,
+    dir: PathBuf,
     arguments: Arguments,
-) -> Option<(Result<Value, Failure>, Arguments, Box<[u8]>)> {
-    match tokio::task::spawn_blocking(move || {
-        let looked_up = look_up(&json, &arguments);
-        (looked_up, arguments, json)
-    })
-    .await
-    {
+) -> Option<Result<(Result<Value, Failure>, Arguments), Arguments>> {
+    let task = tokio::task::spawn_blocking(move || match load::open_archived(&cache, &dir) {
+        Ok(Some(mapped)) => Ok((look_up_in(&mapped, &arguments), arguments)),
+        Ok(None) => Err(arguments),
+        Err(error) => {
+            tracing::warn!(%error, "the archive of the crate could not be read");
+            Err(arguments)
+        },
+    });
+    match task.await {
         Ok(done) => Some(done),
         Err(error) => {
             let error = crate::task::resume_if_panic(error);
             tracing::error!(%error, "the get_item lookup did not finish");
             None
         },
+    }
+}
+
+/// Where the JSON of the crate is archived.
+struct Lookup {
+    cache: Cache,
+    dir: PathBuf,
+}
+
+impl Lookup {
+    /// Parses `json`, archives it, and looks the item up, on a blocking thread, since parsing a
+    /// large crate takes a large part of a second. The arguments and the JSON come back with the
+    /// result. `None` if the runtime is shutting down; a panic goes on to `run_tool`.
+    async fn on_blocking(
+        &self,
+        json: Box<[u8]>,
+        arguments: Arguments,
+    ) -> Option<(Result<Value, Failure>, Arguments, Box<[u8]>)> {
+        let (cache, dir) = (self.cache.clone(), self.dir.clone());
+        match tokio::task::spawn_blocking(move || {
+            let looked_up = load::archive_json(&cache, &dir, &json)
+                .map_err(|error| match error {
+                    load::LoadError::Parse(error) => Failure::Parse(error),
+                    load::LoadError::Archive(error) => Failure::Archive(error),
+                })
+                .and_then(|mapped| look_up_in(&mapped, &arguments));
+            (looked_up, arguments, json)
+        })
+        .await
+        {
+            Ok(done) => Some(done),
+            Err(error) => {
+                let error = crate::task::resume_if_panic(error);
+                tracing::error!(%error, "the get_item lookup did not finish");
+                None
+            },
+        }
     }
 }
 
@@ -375,6 +432,15 @@ fn finish(
         },
         Err(Failure::Parse(error)) => parse_error(arguments, &error),
         Err(Failure::Item(error)) => item_error(arguments, &error),
+        Err(Failure::Archive(error)) => {
+            tracing::error!(%error, "the crate could not be archived");
+            super::tool_error(
+                "internal_error",
+                "the server could not keep the crate in memory",
+                false,
+                &["check the server's stderr log"],
+            )
+        },
         Err(Failure::Serialize(error)) => {
             tracing::error!(%error, "the get_item response could not be serialized");
             super::tool_error(
@@ -417,35 +483,26 @@ fn add_warnings(response: &mut Value, warnings: &[Box<str>]) {
     }
 }
 
-/// Why the item could not be looked up in the JSON.
+/// Why the item could not be looked up.
 #[derive(Debug)]
 enum Failure {
     Parse(ParseError),
+    Archive(std::io::Error),
     Item(GetItemError),
     Serialize(serde_json::Error),
 }
 
-/// Parses `json`, builds the path index, looks the item up, and serializes the response while
-/// the crate that it borrows from is still there.
-fn look_up(json: &[u8], arguments: &Arguments) -> Result<Value, Failure> {
-    let parsed = rustdoc_json::parse(json).map_err(Failure::Parse)?;
-    let index = PathIndex::build(&parsed.krate);
-    let response = get_item(&parsed, &index, ItemRequest {
+/// Looks the item up in the archive `mapped`, and serializes the response while the items it
+/// borrows from are still there.
+fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Arguments) -> Result<Value, Failure> {
+    let view = CrateView::new(mapped.get());
+    get_item(&view, ItemRequest {
         name: &arguments.name,
         version: &arguments.version,
         path: &arguments.path,
     })
     .map_err(Failure::Item)
-    .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize));
-    // Freeing a parsed crate takes milliseconds (about 9 ms for rmcp's 14 MB of JSON), so the
-    // response does not wait for it.
-    drop_in_background((parsed, index));
-    response
-}
-
-/// Drops `value` on a blocking thread of its own, without waiting for it.
-fn drop_in_background<T: Send + 'static>(value: T) {
-    drop(tokio::task::spawn_blocking(move || drop(value)));
+    .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize))
 }
 
 /// `name@version` of the request.

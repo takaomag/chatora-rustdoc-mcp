@@ -30,13 +30,14 @@ pub fn supported_formats() -> impl DoubleEndedIterator<Item = u32> {
 
 /// The deepest nesting of arrays and objects that is parsed (requirement R-FV-8).
 ///
-/// Parsing has no limit of its own, but rendering and freeing the parsed crate recurse as deep as
-/// the types nest. On a thread with [`crate::task::THREAD_STACK_SIZE`] of stack, they handled
-/// 20,000 levels of `[[…]]`, the shape with the fewest levels of JSON per level of type, in a
-/// debug build and 100,000 in a release build (2026-10-19). Real crates nest a few hundred levels
-/// (typenum). Deeper JSON would overflow the stack, which aborts the process instead of
-/// panicking.
-pub const MAX_NESTING: usize = 10_000;
+/// Parsing has no limit of its own, but archiving, checking and taking items out of the archive
+/// (rkyv), rendering and freeing recurse as deep as the types nest. On a thread with
+/// [`crate::task::THREAD_STACK_SIZE`] of stack, with `[[…]]`, the shape with the fewest levels of
+/// JSON per level of type, taking an item out of the archive is the first to overflow: past 6,000
+/// levels in a debug build and past 20,000 in a release build (2026-10-19; parsing, rendering and
+/// freeing handled 20,000 and 100,000). Real crates nest a few hundred levels (typenum). Deeper
+/// JSON would overflow the stack, which aborts the process instead of panicking.
+pub const MAX_NESTING: usize = 4_000;
 
 /// rustdoc JSON parsed into the latest types.
 #[derive(Debug, rkyv::Archive, rkyv::Serialize)]

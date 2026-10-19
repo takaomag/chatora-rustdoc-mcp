@@ -15,6 +15,7 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use chatora_rustdoc_mcp::{
     data::{
+        archive::Mapped,
         cache::Cache,
         dist::{self, Dist, NightlyDate, StdCrate, StdDocs},
         rustdoc_json,
@@ -23,6 +24,7 @@ use chatora_rustdoc_mcp::{
     query::{
         across::{self, Indexed},
         path_index::Resolution,
+        view::CrateView,
     },
 };
 use rustdoc_types::{Item, StabilityLevel};
@@ -46,32 +48,43 @@ async fn std_docs(date: Option<&str>) -> (Cache, StdDocs) {
 
 /// The item that `path` leads to, followed through the crates of std as needed, with its crate.
 /// `json` reads the JSON of a crate of std.
-fn look_up(json: impl Fn(StdCrate) -> Box<[u8]>, path: &str) -> (Arc<Indexed>, Item) {
-    // The crates of std are loaded as the path goes into them, each once.
-    let mut loaded: HashMap<StdCrate, Arc<Indexed>> = HashMap::new();
+fn look_up(json: impl Fn(StdCrate) -> Box<[u8]>, path: &str) -> (Found, Item) {
+    // The crates of std are loaded as the path goes into them, each once, archived in memory.
+    let mut loaded: HashMap<StdCrate, Arc<Mapped<Indexed>>> = HashMap::new();
     let load = |name: &str| {
         let krate = StdCrate::from_name(name)?;
         if let Some(indexed) = loaded.get(&krate) {
             return Some(Arc::clone(indexed));
         }
         let parsed = rustdoc_json::parse(&json(krate)).expect("the crate parses");
-        let indexed = Arc::new(Indexed::new(parsed));
+        let indexed = Arc::new(Mapped::in_memory(&Indexed::new(parsed)).expect("archived"));
         loaded.insert(krate, Arc::clone(&indexed));
         Some(indexed)
     };
     let followed = across::follow(path, load).expect("std is loaded");
     eprintln!("{path}: through {:?}", followed.through);
-    let krate = &followed.krate.parsed.krate;
-    let resolution = followed.krate.index.resolve(krate, &followed.path);
+    let view = CrateView::new(followed.krate.get());
+    let resolution = view.index().resolve(&view, &followed.path);
     let Resolution::Item(id) = resolution else {
         panic!("{path} is one item: {resolution:?}");
     };
-    let item = krate.index[&id].clone();
-    (followed.krate, item)
+    let item = view.item(id).expect("the item").clone();
+    let root = view.item(view.root()).and_then(|root| root.name.clone());
+    let found = Found {
+        root,
+        format_version: view.format_version(),
+    };
+    (found, item)
+}
+
+/// What a look-up found besides the item: the crate it is in, and the format of its JSON.
+struct Found {
+    root: Option<String>,
+    format_version: u32,
 }
 
 /// [`look_up`] in the JSON from the distribution server.
-fn look_up_in(cache: &Cache, docs: &StdDocs, path: &str) -> (Arc<Indexed>, Item) {
+fn look_up_in(cache: &Cache, docs: &StdDocs, path: &str) -> (Found, Item) {
     look_up(
         |krate| dist::read_std_json(cache, docs, krate).expect("the JSON of the crate"),
         path,
@@ -86,11 +99,10 @@ const PATHS: [(&str, &str); 3] = [
 ];
 
 /// Checks that each of [`PATHS`] is found in its crate, with its stability.
-fn check_paths(look_up: impl Fn(&str) -> (Arc<Indexed>, Item)) {
+fn check_paths(look_up: impl Fn(&str) -> (Found, Item)) {
     for (path, defined_in) in PATHS {
-        let (krate, item) = look_up(path);
-        let root = &krate.parsed.krate.index[&krate.parsed.krate.root];
-        assert_eq!(root.name.as_deref(), Some(defined_in), "{path}");
+        let (found, item) = look_up(path);
+        assert_eq!(found.root.as_deref(), Some(defined_in), "{path}");
         assert!(item.stability.is_some(), "{path} has its stability");
     }
 }
@@ -129,9 +141,8 @@ async fn std_paths_are_followed_into_core_and_alloc_from_the_distribution_server
 async fn stability_of_formats_58_to_60_is_read() {
     for (date, format) in [("2026-06-25", 58), ("2026-06-26", 59), ("2026-07-10", 60)] {
         let (cache, docs) = std_docs(Some(date)).await;
-        let (krate, vec) = look_up_in(&cache, &docs, "std::vec::Vec");
-        let krate = &krate.parsed.krate;
-        assert_eq!(krate.format_version, format, "{date}");
+        let (found, vec) = look_up_in(&cache, &docs, "std::vec::Vec");
+        assert_eq!(found.format_version, format, "{date}");
         assert_eq!(
             vec.stability.map(|stability| stability.level),
             Some(StabilityLevel::Stable {
@@ -139,6 +150,9 @@ async fn stability_of_formats_58_to_60_is_read() {
             }),
             "{date}"
         );
+        // Every item of alloc, where Vec is, is counted in the parsed JSON.
+        let json = dist::read_std_json(&cache, &docs, StdCrate::Alloc).expect("alloc.json");
+        let krate = rustdoc_json::parse(&json).expect("alloc parses").krate;
         let unstable = krate
             .index
             .values()

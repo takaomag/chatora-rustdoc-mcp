@@ -1,4 +1,4 @@
-//! Rendering and freeing a crate whose types nest as deep as parsing allows (requirement R-PR-8,
+//! Archiving, rendering and freeing a crate whose types nest as deep as parsing allows (R-PR-8,
 //! doc/m1-plan.md A3). A stack overflow aborts the process, so this test fails by crashing.
 
 #![expect(
@@ -9,10 +9,14 @@
 use std::collections::HashMap;
 
 use chatora_rustdoc_mcp::{
-    data::rustdoc_json::{self, MAX_NESTING},
+    data::{
+        archive::Mapped,
+        rustdoc_json::{self, MAX_NESTING},
+    },
     query::{
+        across::Indexed,
         get_item::{ItemRequest, get_item},
-        path_index::PathIndex,
+        view::CrateView,
     },
     task::THREAD_STACK_SIZE,
 };
@@ -126,10 +130,11 @@ fn a_type_nested_up_to_the_limit_is_rendered_and_freed() {
         .stack_size(THREAD_STACK_SIZE)
         .spawn(move || {
             let parsed = rustdoc_json::parse(&json).expect("the JSON is within the limit");
-            let index = PathIndex::build(&parsed.krate);
+            let mapped = Mapped::in_memory(&Indexed::new(parsed)).expect("archived");
+            let view = CrateView::new(mapped.get());
             let name = "deep".parse().expect("a crate name");
             let version = semver::Version::new(1, 0, 0);
-            let response = get_item(&parsed, &index, ItemRequest {
+            let response = get_item(&view, ItemRequest {
                 name: &name,
                 version: &version,
                 path: "deep::f",

@@ -6,8 +6,11 @@
 
 use std::sync::Arc;
 
-use super::path_index::{PathIndex, Resolution};
-use crate::data::rustdoc_json::ParsedCrate;
+use super::{
+    path_index::{PathIndex, Resolution},
+    view::CrateView,
+};
+use crate::data::{archive::Mapped, rustdoc_json::ParsedCrate};
 
 /// Most crates that one lookup goes through. `std::vec::Vec` goes through two.
 const MAX_CRATES: usize = 4;
@@ -37,8 +40,8 @@ impl Indexed {
 /// Where a path was followed to.
 #[derive(Debug)]
 pub struct Followed {
-    /// The crate where the path stopped.
-    pub krate: Arc<Indexed>,
+    /// The archive of the crate where the path stopped.
+    pub krate: Arc<Mapped<Indexed>>,
     /// The path in that crate, to resolve there.
     pub path: Box<str>,
     /// The paths it went through, the one asked for first.
@@ -47,22 +50,27 @@ pub struct Followed {
 
 /// Follows `path` from the crate it starts with to the crate that has the item.
 ///
-/// It goes through re-exports of other crates' items. `load` gives the crate with a name (as
-/// `alloc`), or `None` for one that is not followed into. The path stops where it resolves, or
-/// where it cannot go on. `None` when `load` does not give the crate that `path` starts with.
-pub fn follow(path: &str, mut load: impl FnMut(&str) -> Option<Arc<Indexed>>) -> Option<Followed> {
+/// It goes through re-exports of other crates' items. `load` gives the archive of the crate with a
+/// name (as `alloc`), or `None` for one that is not followed into. The path stops where it
+/// resolves, or where it cannot go on. `None` when `load` does not give the crate that `path`
+/// starts with.
+pub fn follow(
+    path: &str,
+    mut load: impl FnMut(&str) -> Option<Arc<Mapped<Indexed>>>,
+) -> Option<Followed> {
     let mut path: Box<str> = path.into();
     let mut krate = load(crate_name(&path))?;
     let mut through = vec![path.clone()];
     for _ in 1..MAX_CRATES {
-        match krate.index.resolve(&krate.parsed.krate, &path) {
+        let view = CrateView::new(krate.get());
+        match view.index().resolve(&view, &path) {
             Resolution::ExternalReexport(_) | Resolution::NotFound => {},
             Resolution::Item(_)
             | Resolution::Member { .. }
             | Resolution::Ambiguous(_)
             | Resolution::AmbiguousMembers { .. } => break,
         }
-        let Some(crossing) = krate.index.crossing(&path) else {
+        let Some(crossing) = view.index().crossing(&path) else {
             break;
         };
         let Some(next) = load(crate_name(&crossing.continued)) else {

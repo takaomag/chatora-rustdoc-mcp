@@ -27,6 +27,7 @@ local = ["tokio/process", "tokio/sync"]
 [dependencies]
 const_format = "0.2.36"
 derive_more = { version = "2.1.1", default-features = false, features = ["display", "as_ref"] }
+elsa = "1.11.2"
 etcetera = "0.11.0"
 lzma-rust2 = { version = "0.23.0", default-features = false, features = [
   "std",

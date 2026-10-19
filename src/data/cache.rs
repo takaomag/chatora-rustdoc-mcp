@@ -175,6 +175,35 @@ impl Cache {
         Ok(CachedJson::None)
     }
 
+    /// The format and SHA-256 of the rustdoc JSON in `dir` that [`Self::read_docs_rs_json`] would
+    /// read, from the file names and the digest next to the JSON, without reading the JSON: what
+    /// an archive made from it is keyed by.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory or a digest exists but cannot be read.
+    pub fn docs_rs_source(&self, dir: &Path) -> io::Result<Option<(u32, Box<str>)>> {
+        let mut formats = match fs::read_dir(dir) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| json_format(&entry.file_name()))
+                .collect::<Vec<u32>>(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        formats.sort_by_key(|&format| (Reverse(SUPPORTED.contains(&format)), Reverse(format)));
+        for format in formats {
+            let path = dir.join(format!("{format}.json"));
+            if let Some(digest) = self.read_file(&with_suffix(&path, ".sha256"))? {
+                let digest = String::from_utf8_lossy(digest.trim_ascii());
+                if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Ok(Some((format, digest.into())));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Reads the file at `path` and checks it against the digest next to it, `<path>.sha256`
     /// (requirement R-CA-4). A file without a digest counts as not cached.
     ///

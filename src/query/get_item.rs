@@ -2,9 +2,9 @@
 //! the data came from (requirements R-OUT-2, R-OUT-7 `normal`, R-OUT-8, R-OUT-9, R-SH-1, R-SH-2
 //! and R-SH-6).
 //!
-//! This only reads the parsed crate and its path index. Loading the JSON and turning the result
-//! into an MCP tool result are done by the caller. The response borrows the strings that it shows
-//! as they are from the crate, so it is serialized while the crate is still there.
+//! This only reads the crate and its path index, from their archive. Loading them and turning the
+//! result into an MCP tool result are done by the caller. The response borrows the strings that it
+//! shows as they are from the items it takes out, so it is serialized while the view is there.
 
 use std::{
     borrow::Cow,
@@ -12,25 +12,16 @@ use std::{
     path::{Component, Path},
 };
 
-use rustdoc_types::{
-    Attribute,
-    Crate,
-    Id,
-    Item,
-    ItemEnum,
-    ItemKind,
-    MacroKind,
-    Struct,
-    StructKind,
-};
+use rustdoc_types::{Attribute, Id, Item, ItemEnum, ItemKind, MacroKind, Struct, StructKind};
 use semver::Version;
 use serde::Serialize;
 
 use super::{
-    path_index::{self, ExternalReexport, PathIndex, PublicPath, Resolution},
+    path_index::{self, ArchivedPathIndex, ExternalReexport, PublicPath, Resolution},
     render::Renderer,
+    view::CrateView,
 };
-use crate::data::{crate_name::CrateName, rustdoc_json::ParsedCrate};
+use crate::data::crate_name::CrateName;
 
 /// What to look up.
 #[derive(Debug, Clone, Copy)]
@@ -195,35 +186,35 @@ pub enum GetItemError {
     },
 }
 
-/// Looks up the item at `request.path` in `parsed`, whose public paths are in `index`.
+/// Looks up the item at `request.path` in the crate of `view`.
 ///
 /// # Errors
 ///
 /// Returns an error when no item or more than one item has the path.
 pub fn get_item<'a>(
-    parsed: &'a ParsedCrate,
-    index: &'a PathIndex,
+    view: &'a CrateView<'a>,
     request: ItemRequest<'a>,
 ) -> Result<ItemResponse<'a>, GetItemError> {
+    let index = view.index();
     let mut query = Query {
         request,
-        krate: &parsed.krate,
+        view,
         index,
-        renderer: Renderer::new(&parsed.krate, index),
+        renderer: Renderer::new(view),
         warnings: Vec::new(),
         hints: Vec::new(),
     };
-    let provenance = query.provenance(parsed);
-    let data = match index.resolve(&parsed.krate, request.path) {
+    let provenance = query.provenance();
+    let data = match index.resolve(view, request.path) {
         Resolution::Item(id) => {
             let data = query.item_data(id, None);
             if let Some(reexport) = index.hidden_reexport(request.path) {
-                query.hint_hidden_reexport(reexport);
+                query.hint_hidden_reexport(&reexport);
             }
             data
         },
         Resolution::Member { parent, member } => query.item_data(member, Some(parent)),
-        Resolution::ExternalReexport(reexport) => Some(query.reexport_data(reexport)),
+        Resolution::ExternalReexport(reexport) => Some(query.reexport_data(&reexport)),
         Resolution::Ambiguous(ids) => {
             return Err(GetItemError::Ambiguous {
                 candidates: ids.iter().map(|&id| query.describe_item(id)).collect(),
@@ -260,8 +251,8 @@ pub fn get_item<'a>(
 /// One lookup, with what it has found to warn about so far.
 struct Query<'a> {
     request: ItemRequest<'a>,
-    krate: &'a Crate,
-    index: &'a PathIndex,
+    view: &'a CrateView<'a>,
+    index: &'a ArchivedPathIndex,
     renderer: Renderer<'a>,
     warnings: Vec<Cow<'static, str>>,
     hints: Vec<Box<str>>,
@@ -269,10 +260,10 @@ struct Query<'a> {
 
 impl<'a> Query<'a> {
     /// The provenance, read from the JSON and checked against the request (§7.3).
-    fn provenance(&mut self, parsed: &ParsedCrate) -> Provenance<'a> {
-        let krate = self.krate;
+    fn provenance(&mut self) -> Provenance<'a> {
+        let view = self.view;
         let requested = self.request.version;
-        let version = if let Some(version) = krate.crate_version.as_deref() {
+        let version = if let Some(version) = view.crate_version() {
             // Compared as versions, so that the requested one is not formatted to compare it.
             if Version::parse(version).ok().as_ref() != Some(requested) {
                 self.warnings.push(Cow::Owned(format!(
@@ -286,11 +277,11 @@ impl<'a> Query<'a> {
             ));
             Cow::Owned(requested.to_string())
         };
-        if parsed.newer_than_supported {
+        if view.newer_than_supported() {
             self.warnings.push(Cow::Owned(format!(
                 "rustdoc JSON format {} is newer than the supported {}; read as if its changes were \
                  additive, so results unverified",
-                krate.format_version,
+                view.format_version(),
                 rustdoc_types::FORMAT_VERSION
             )));
         }
@@ -305,16 +296,15 @@ impl<'a> Query<'a> {
             name: self.request.name.as_str(),
             version,
             resolved_from: ResolvedFrom::Explicit,
-            target: &krate.target.triple,
-            format_version: krate.format_version,
+            target: view.target_triple(),
+            format_version: view.format_version(),
         }
     }
 
     /// The item `id`, which belongs to `parent` if it is a member. `None` if it is not in the
     /// crate, which a resolved path should not be.
     fn item_data(&mut self, id: Id, parent: Option<Id>) -> Option<ItemData<'a>> {
-        let krate = self.krate;
-        let item = krate.index.get(&id)?;
+        let item = self.view.item(id)?;
         let name = item.name.as_deref().unwrap_or("_");
         let mut data = ItemData {
             kind: kind_of(item, parent.is_some()),
@@ -361,7 +351,7 @@ impl<'a> Query<'a> {
 
     /// A re-export of an item of another crate, with the arguments to look the item up there.
     fn reexport_data(&mut self, reexport: &ExternalReexport) -> ItemData<'a> {
-        let summary = self.krate.paths.get(&reexport.target);
+        let summary = self.view.summary(reexport.target);
         let reexport_of = self.reexport_target(reexport);
         if let Some(target) = &reexport_of {
             self.hints.push(
@@ -386,11 +376,10 @@ impl<'a> Query<'a> {
         if let Some(path) = self.index.canonical_path(id) {
             return path.joined();
         }
-        let path: Box<str> = self.krate.paths.get(&id).map_or_else(
+        let path: Box<str> = self.view.summary(id).map_or_else(
             || {
-                self.krate
-                    .index
-                    .get(&id)
+                self.view
+                    .item(id)
                     .and_then(|item| item.name.as_deref())
                     .unwrap_or("_")
                     .into()
@@ -406,8 +395,7 @@ impl<'a> Query<'a> {
     /// The header of the `impl` of `parent` that has `member`, with its where clause. `None` for
     /// an item of a trait and a variant.
     fn impl_header(&mut self, parent: Id, member: Id) -> Option<Box<str>> {
-        let krate = self.krate;
-        let (impl_item, _) = path_index::own_impls(krate, parent)
+        let (impl_item, _) = path_index::own_impls(self.view, parent)
             .find(|(_, contents)| contents.items.contains(&member))?;
         let mut header = self.renderer.signature(impl_item);
         let predicates = self.renderer.where_predicates(impl_item);
@@ -458,7 +446,7 @@ impl<'a> Query<'a> {
     /// The signatures of the items `ids`, skipping any that are not in the crate.
     fn signatures(&mut self, ids: &[Id]) -> Vec<Box<str>> {
         ids.iter()
-            .filter_map(|id| self.krate.index.get(id))
+            .filter_map(|&id| self.view.item(id))
             .map(|item| self.renderer.signature(item).into())
             .collect()
     }
@@ -484,8 +472,8 @@ impl<'a> Query<'a> {
             )));
         }
         let url = in_package.then(|| {
-            let version: &dyn fmt::Display = match &self.krate.crate_version {
-                Some(version) => version,
+            let version: &dyn fmt::Display = match self.view.crate_version() {
+                Some(version) => &version.to_owned(),
                 None => self.request.version,
             };
             format!(
@@ -505,9 +493,8 @@ impl<'a> Query<'a> {
     /// The crate and definition path of the item that `reexport` re-exports, to look it up
     /// there. `None`, with a warning, when the data does not describe it.
     fn reexport_target(&mut self, reexport: &ExternalReexport) -> Option<ReexportOf> {
-        let summary = self.krate.paths.get(&reexport.target);
-        let external =
-            summary.and_then(|summary| self.krate.external_crates.get(&summary.crate_id));
+        let summary = self.view.summary(reexport.target);
+        let external = summary.and_then(|summary| self.view.external_crate(summary.crate_id));
         let (Some(definition), Some(external)) = (&reexport.definition, external) else {
             self.warnings.push(Cow::Borrowed(
                 "the re-exported item is not described in this crate's data",
@@ -535,9 +522,8 @@ impl<'a> Query<'a> {
     /// (`serde::Deserialize` is also `serde_derive`'s derive macro).
     fn hint_hidden_reexport(&mut self, reexport: &ExternalReexport) {
         let kind = self
-            .krate
-            .paths
-            .get(&reexport.target)
+            .view
+            .summary(reexport.target)
             .map_or("item", |summary| summary_kind(summary.kind));
         if let Some(target) = self.reexport_target(reexport) {
             self.hints.push(
@@ -553,13 +539,13 @@ impl<'a> Query<'a> {
     /// What the item `id` is, to tell apart the items of an ambiguous path: its kind and
     /// canonical path, which may be the same for items of different kinds.
     fn describe_item(&self, id: Id) -> Box<str> {
-        let Some(item) = self.krate.index.get(&id) else {
+        let Some(item) = self.view.item(id) else {
             return "an item that is not in the data".into();
         };
         let kind = kind_of(item, false);
         let path = self.index.canonical_path(id).map_or_else(
             || item.name.as_deref().unwrap_or("_").into(),
-            PublicPath::joined,
+            |path| path.joined(),
         );
         format!("{kind} {path}").into()
     }
@@ -567,13 +553,12 @@ impl<'a> Query<'a> {
     /// What the member `member` of `parent` is, to tell apart the members of the same name: the
     /// `impl` of `parent` that has it.
     fn describe_member(&mut self, parent: Id, member: Id) -> Box<str> {
-        let krate = self.krate;
-        let name = krate
-            .index
-            .get(&member)
+        let name = self
+            .view
+            .item(member)
             .and_then(|item| item.name.as_deref())
             .unwrap_or("_");
-        let owner = path_index::own_impls(krate, parent)
+        let owner = path_index::own_impls(self.view, parent)
             .find(|(_, contents)| contents.items.contains(&member));
         owner.map_or_else(
             || name.into(),
@@ -697,6 +682,7 @@ mod tests {
     use std::{collections::HashMap, path::PathBuf};
 
     use rustdoc_types::{
+        Crate,
         Deprecation,
         Enum,
         ExternalCrate,
@@ -718,6 +704,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::{
+        data::rustdoc_json::ParsedCrate,
+        query::view::tests::{archive, archived},
+    };
 
     fn item(id: u32, name: Option<&str>, inner: ItemEnum) -> Item {
         Item {
@@ -952,11 +942,11 @@ mod tests {
         path: &str,
         check: impl FnOnce(Result<ItemResponse<'_>, GetItemError>) -> T,
     ) -> T {
-        let parsed = parsed();
-        let index = PathIndex::build(&parsed.krate);
+        let bytes = archive(parsed().krate);
+        let view = CrateView::new(archived(&bytes));
         let name: CrateName = "my-crate".parse().expect("a crate name");
         let version = Version::parse(version).expect("a version");
-        check(get_item(&parsed, &index, ItemRequest {
+        check(get_item(&view, ItemRequest {
             name: &name,
             version: &version,
             path,
@@ -1051,10 +1041,11 @@ mod tests {
         {
             span.filename = PathBuf::from(generated);
         }
-        let index = PathIndex::build(&parsed.krate);
+        let bytes = archive(parsed.krate);
+        let view = CrateView::new(archived(&bytes));
         let name: CrateName = "my-crate".parse().expect("a crate name");
         let version = Version::parse("1.2.3").expect("a version");
-        let response = get_item(&parsed, &index, ItemRequest {
+        let response = get_item(&view, ItemRequest {
             name: &name,
             version: &version,
             path: "my_crate::sync::Mutex",

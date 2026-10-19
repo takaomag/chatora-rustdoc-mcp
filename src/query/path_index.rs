@@ -16,6 +16,8 @@ use std::{
 
 use rustdoc_types::{Crate, Id, Impl, Item, ItemEnum, Type, Use, Visibility};
 
+use super::view::{self, CrateView};
+
 /// Deepest chain of modules and re-exports to follow (requirement R-PR-3). Glob re-exports that
 /// refer to each other could otherwise go on without end.
 const MAX_DEPTH: usize = 256;
@@ -72,11 +74,11 @@ pub struct ExternalReexport {
     pub definition: Option<PublicPath>,
 }
 
-/// A path that goes on in another crate ([`PathIndex::crossing`]).
+/// A path that goes on in another crate ([`ArchivedPathIndex::crossing`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Crossing<'a> {
+pub struct Crossing {
     /// The re-export of the other crate's item that the path goes through.
-    pub reexport: &'a ExternalReexport,
+    pub reexport: ExternalReexport,
     /// The path in the other crate, starting with its name.
     pub continued: Box<str>,
 }
@@ -110,7 +112,7 @@ pub struct PathIndex {
 
 /// What a path refers to.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Resolution<'a> {
+pub enum Resolution {
     /// An item of this crate.
     Item(Id),
     /// An item that belongs to another: a method or associated item of an `impl`, an item of a
@@ -122,7 +124,7 @@ pub enum Resolution<'a> {
         member: Id,
     },
     /// A re-export of an item of another crate, whose documentation is not in this crate.
-    ExternalReexport(&'a ExternalReexport),
+    ExternalReexport(ExternalReexport),
     /// More than one item of this crate has this path (requirement R-PR-7).
     Ambiguous(Box<[Id]>),
     /// More than one member of `parent` has this name, in the first group of `impl`s that has
@@ -209,18 +211,31 @@ impl PathIndex {
             incomplete: walker.incomplete,
         }
     }
+}
 
+impl ArchivedPathIndex {
     /// The canonical path of `id`: among its public paths, one that does not rename the item,
     /// then the shortest, then the first in lexicographic order (requirement R-PR-2).
     #[must_use]
-    pub fn canonical_path(&self, id: Id) -> Option<&PublicPath> {
-        self.public_paths(id).first()
+    pub fn canonical_path(&self, id: Id) -> Option<PublicPath> {
+        self.archived_paths(id)
+            .first()
+            .map(PublicPath::from_archived)
     }
 
     /// Every public path of `id`, the canonical one first.
     #[must_use]
-    pub fn public_paths(&self, id: Id) -> &[PublicPath] {
-        self.paths_of.get(&id).map_or(&[], |paths| paths)
+    pub fn public_paths(&self, id: Id) -> Vec<PublicPath> {
+        self.archived_paths(id)
+            .iter()
+            .map(PublicPath::from_archived)
+            .collect()
+    }
+
+    fn archived_paths(&self, id: Id) -> &[ArchivedPublicPath] {
+        self.paths_of
+            .get(&view::archived_id(id))
+            .map_or(&[], |paths| paths)
     }
 
     /// Whether some public paths were not followed, because a module was reached through more
@@ -233,14 +248,20 @@ impl PathIndex {
 
     /// Glob re-exports from other crates that this index does not expand.
     #[must_use]
-    pub fn external_globs(&self) -> &[ExternalGlob] {
-        &self.external_globs
+    pub fn external_globs(&self) -> Vec<ExternalGlob> {
+        self.external_globs
+            .iter()
+            .map(|glob| ExternalGlob {
+                prefix: PublicPath::from_archived(&glob.prefix),
+                source: glob.source.as_ref().into(),
+            })
+            .collect()
     }
 
     /// Resolves `path`, which may be a public path or a definition path, and may end in a member
     /// of an item (`tokio::sync::Mutex::lock`). `-` and `_` in the crate name are the same.
     #[must_use]
-    pub fn resolve(&self, krate: &Crate, path: &str) -> Resolution<'_> {
+    pub fn resolve(&self, view: &CrateView<'_>, path: &str) -> Resolution {
         let Some(key) = normalize(path) else {
             return Resolution::NotFound;
         };
@@ -252,7 +273,7 @@ impl PathIndex {
             return Resolution::NotFound;
         };
         match self.lookup(parent) {
-            Some(Resolution::Item(parent)) => find_member(krate, parent, member),
+            Some(Resolution::Item(parent)) => find_member(view, parent, member),
             _ => Resolution::NotFound,
         }
     }
@@ -262,14 +283,13 @@ impl PathIndex {
     /// of `path` (`std::vec::Vec` goes on as `alloc::vec::Vec`). `None` when no prefix is such a
     /// re-export, or the definition path of the one that is is not known.
     #[must_use]
-    pub fn crossing(&self, path: &str) -> Option<Crossing<'_>> {
+    pub fn crossing(&self, path: &str) -> Option<Crossing> {
         let key = normalize(path)?;
         let segments: Vec<&str> = key.split("::").collect();
         (1..=segments.len()).rev().find_map(|end| {
             let (prefix, rest) = segments.split_at(end);
-            let reexport = self.external_reexports.get(prefix.join("::").as_str())?;
-            let definition = reexport.definition.as_ref()?;
-            let mut continued = definition.joined().into_string();
+            let reexport = self.external_reexport(&prefix.join("::"))?;
+            let mut continued = reexport.definition.as_ref()?.joined().into_string();
             for segment in rest {
                 continued.push_str("::");
                 continued.push_str(segment);
@@ -285,26 +305,49 @@ impl PathIndex {
     /// have the path, and [`Self::resolve`] returns this crate's item (`serde::Deserialize` is a
     /// trait of serde and a derive macro of `serde_derive`).
     #[must_use]
-    pub fn hidden_reexport(&self, path: &str) -> Option<&ExternalReexport> {
+    pub fn hidden_reexport(&self, path: &str) -> Option<ExternalReexport> {
         let key = normalize(path)?;
         if !self.by_public_path.contains_key(key.as_ref()) {
             return None;
         }
-        self.external_reexports.get(key.as_ref())
+        self.external_reexport(&key)
+    }
+
+    /// The re-export of another crate's item at the public path `key`.
+    fn external_reexport(&self, key: &str) -> Option<ExternalReexport> {
+        let reexport = self.external_reexports.get(key)?;
+        Some(ExternalReexport {
+            path: PublicPath::from_archived(&reexport.path),
+            target: view::native(&reexport.target),
+            definition: reexport.definition.as_ref().map(PublicPath::from_archived),
+        })
     }
 
     /// Looks `key` up as a public path, a re-export from another crate, then a definition path.
     /// An item of this crate comes before a re-export at the same path ([`Self::hidden_reexport`]).
-    fn lookup(&self, key: &str) -> Option<Resolution<'_>> {
+    fn lookup(&self, key: &str) -> Option<Resolution> {
         if let Some(ids) = self.by_public_path.get(key) {
             return Some(one_or_ambiguous(ids));
         }
-        if let Some(reexport) = self.external_reexports.get(key) {
+        if let Some(reexport) = self.external_reexport(key) {
             return Some(Resolution::ExternalReexport(reexport));
         }
         self.by_definition_path
             .get(key)
             .map(|ids| one_or_ambiguous(ids))
+    }
+}
+
+impl PublicPath {
+    /// The path that `archived` holds.
+    fn from_archived(archived: &ArchivedPublicPath) -> Self {
+        Self(
+            archived
+                .0
+                .iter()
+                .map(|segment| Box::from(&**segment))
+                .collect(),
+        )
     }
 }
 
@@ -504,11 +547,11 @@ fn group(pairs: impl Iterator<Item = (Box<str>, Id)>) -> HashMap<Box<str>, Box<[
         .collect()
 }
 
-fn one_or_ambiguous(ids: &[Id]) -> Resolution<'static> {
+fn one_or_ambiguous(ids: &[rustdoc_types::ArchivedId]) -> Resolution {
     match ids {
         [] => Resolution::NotFound,
-        [id] => Resolution::Item(*id),
-        _ => Resolution::Ambiguous(ids.into()),
+        [id] => Resolution::Item(view::native(id)),
+        _ => Resolution::Ambiguous(ids.iter().map(view::native).collect()),
     }
 }
 
@@ -533,16 +576,16 @@ fn normalize(path: &str) -> Option<Cow<'_, str>> {
 
 /// Finds the member called `name` of `parent`: the variants of an enum, the items of a trait, or
 /// the items of the `impl`s of a type, first inherent ones, then trait ones, then blanket ones.
-fn find_member(krate: &Crate, parent: Id, name: &str) -> Resolution<'static> {
-    let own = krate.index.get(&parent).map_or(&[][..], own_members);
-    if let Some(found) = named(krate, parent, own.iter(), name) {
+fn find_member(view: &CrateView<'_>, parent: Id, name: &str) -> Resolution {
+    let own = view.item(parent).map_or(&[][..], own_members);
+    if let Some(found) = named(view, parent, own.iter(), name) {
         return found;
     }
     for kind in [ImplKind::Inherent, ImplKind::Trait, ImplKind::Blanket] {
-        let members = own_impls(krate, parent)
+        let members = own_impls(view, parent)
             .filter(|(_, contents)| ImplKind::of(contents) == kind)
             .flat_map(|(_, contents)| contents.items.iter());
-        if let Some(found) = named(krate, parent, members, name) {
+        if let Some(found) = named(view, parent, members, name) {
             return found;
         }
     }
@@ -583,8 +626,11 @@ fn own_members(item: &Item) -> &[Id] {
 /// such as `impl From<Elapsed> for std::io::Error` among those of `Elapsed`; their items are not
 /// members of the type. A primitive type keeps all of its `impl`s, which are for its many forms
 /// (`[T]`, `&str`).
-pub fn own_impls(krate: &Crate, parent: Id) -> impl Iterator<Item = (&Item, &Impl)> {
-    let parent_item = krate.index.get(&parent);
+pub fn own_impls<'v>(
+    view: &'v CrateView<'_>,
+    parent: Id,
+) -> impl Iterator<Item = (&'v Item, &'v Impl)> {
+    let parent_item = view.item(parent);
     let is_primitive = matches!(
         parent_item,
         Some(Item {
@@ -595,8 +641,8 @@ pub fn own_impls(krate: &Crate, parent: Id) -> impl Iterator<Item = (&Item, &Imp
     parent_item
         .map_or(&[][..], impls_of)
         .iter()
-        .filter_map(move |id| {
-            let item = krate.index.get(id)?;
+        .filter_map(move |&id| {
+            let item = view.item(id)?;
             let ItemEnum::Impl(contents) = &item.inner else {
                 return None;
             };
@@ -636,18 +682,14 @@ fn impls_of(item: &Item) -> &[Id] {
 /// The member of `parent` among `members` called `name`, ambiguous if there are several, or
 /// `None` if there is none.
 fn named<'a>(
-    krate: &Crate,
+    view: &CrateView<'_>,
     parent: Id,
     members: impl Iterator<Item = &'a Id>,
     name: &str,
-) -> Option<Resolution<'static>> {
+) -> Option<Resolution> {
     let found: Vec<Id> = members
-        .filter(|member| {
-            krate
-                .index
-                .get(member)
-                .and_then(|member| member.name.as_deref())
-                == Some(name)
+        .filter(|&&member| {
+            view.item(member).and_then(|member| member.name.as_deref()) == Some(name)
         })
         .copied()
         .collect();
@@ -698,6 +740,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::query::view::tests::{archive, archived};
 
     fn item(id: u32, name: Option<&str>, inner: ItemEnum) -> Item {
         Item {
@@ -818,7 +861,7 @@ mod tests {
         }
     }
 
-    fn paths(index: &PathIndex, id: u32) -> Vec<String> {
+    fn paths(index: &ArchivedPathIndex, id: u32) -> Vec<String> {
         index
             .public_paths(Id(id))
             .iter()
@@ -839,15 +882,17 @@ mod tests {
             ],
             &[(3, 0, "c::sync::mutex::Mutex")],
         );
-        let index = PathIndex::build(&krate);
-        assert_eq!(paths(&index, 3), ["c::sync::Mutex"]);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
+        assert_eq!(paths(index, 3), ["c::sync::Mutex"]);
         assert_eq!(
-            index.resolve(&krate, "c::sync::Mutex"),
+            index.resolve(&view, "c::sync::Mutex"),
             Resolution::Item(Id(3))
         );
         // The definition path is accepted too.
         assert_eq!(
-            index.resolve(&krate, "c::sync::mutex::Mutex"),
+            index.resolve(&view, "c::sync::mutex::Mutex"),
             Resolution::Item(Id(3))
         );
     }
@@ -866,9 +911,11 @@ mod tests {
             ],
             &[],
         );
-        let index = PathIndex::build(&krate);
-        assert_eq!(paths(&index, 2), ["c::x::Foo", "c::Bar"]);
-        assert_eq!(paths(&index, 3), ["c::Baz", "c::x::Baz"]);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
+        assert_eq!(paths(index, 2), ["c::x::Foo", "c::Bar"]);
+        assert_eq!(paths(index, 3), ["c::Baz", "c::x::Baz"]);
     }
 
     #[test]
@@ -886,9 +933,11 @@ mod tests {
             ],
             &[],
         );
-        let index = PathIndex::build(&krate);
-        assert_eq!(paths(&index, 4), ["c::a::A", "c::b::A"]);
-        assert_eq!(paths(&index, 6), ["c::a::B", "c::b::B"]);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
+        assert_eq!(paths(index, 4), ["c::a::A", "c::b::A"]);
+        assert_eq!(paths(index, 6), ["c::a::B", "c::b::B"]);
     }
 
     #[test]
@@ -922,10 +971,12 @@ mod tests {
             ],
             &[],
         );
-        let index = PathIndex::build(&krate);
-        assert_eq!(paths(&index, 2), ["c::A"]);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
+        assert_eq!(paths(index, 2), ["c::A"]);
         // A variant is also found as a member of its enum.
-        assert_eq!(index.resolve(&krate, "c::E::B"), Resolution::Member {
+        assert_eq!(index.resolve(&view, "c::E::B"), Resolution::Member {
             parent: Id(1),
             member: Id(3),
         });
@@ -941,8 +992,10 @@ mod tests {
             ],
             &[(9, 1, "other::inner::Thing"), (8, 1, "other::prelude")],
         );
-        let index = PathIndex::build(&krate);
-        let Resolution::ExternalReexport(reexport) = index.resolve(&krate, "c::Thing") else {
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
+        let Resolution::ExternalReexport(reexport) = index.resolve(&view, "c::Thing") else {
             panic!("not an external re-export");
         };
         assert_eq!(reexport.target, Id(9));
@@ -970,7 +1023,9 @@ mod tests {
             ],
             &[(9, 1, "alloc::vec"), (8, 2, "core::option::Option")],
         );
-        let index = PathIndex::build(&krate);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
         let continued = |path: &str| index.crossing(path).map(|crossing| crossing.continued);
         assert_eq!(
             continued("std::vec::Vec").as_deref(),
@@ -999,16 +1054,18 @@ mod tests {
             ],
             &[],
         );
-        let index = PathIndex::build(&krate);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
         let lock = Resolution::Member {
             parent: Id(1),
             member: Id(3),
         };
-        assert_eq!(index.resolve(&krate, "my_crate::S::lock"), lock);
+        assert_eq!(index.resolve(&view, "my_crate::S::lock"), lock);
         // `-` in the crate name is the same as `_`.
-        assert_eq!(index.resolve(&krate, "my-crate::S::lock"), lock);
+        assert_eq!(index.resolve(&view, "my-crate::S::lock"), lock);
         assert_eq!(
-            index.resolve(&krate, "my_crate::S::unlock"),
+            index.resolve(&view, "my_crate::S::unlock"),
             Resolution::NotFound
         );
     }
@@ -1027,15 +1084,14 @@ mod tests {
             ],
             &[],
         );
-        let index = PathIndex::build(&krate);
-        assert_eq!(index.resolve(&krate, "c::S::from"), Resolution::NotFound);
-        assert_eq!(
-            index.resolve(&krate, "c::Other::from"),
-            Resolution::Member {
-                parent: Id(4),
-                member: Id(3),
-            }
-        );
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
+        assert_eq!(index.resolve(&view, "c::S::from"), Resolution::NotFound);
+        assert_eq!(index.resolve(&view, "c::Other::from"), Resolution::Member {
+            parent: Id(4),
+            member: Id(3),
+        });
     }
 
     #[test]
@@ -1052,9 +1108,11 @@ mod tests {
             ],
             &[],
         );
-        let index = PathIndex::build(&krate);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
         assert_eq!(
-            index.resolve(&krate, "c::S::get"),
+            index.resolve(&view, "c::S::get"),
             Resolution::AmbiguousMembers {
                 parent: Id(1),
                 members: vec![Id(3), Id(5)].into(),
@@ -1074,9 +1132,11 @@ mod tests {
             ],
             &[(3, 1, "other::Deserialize")],
         );
-        let index = PathIndex::build(&krate);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
         assert_eq!(
-            index.resolve(&krate, "c::Deserialize"),
+            index.resolve(&view, "c::Deserialize"),
             Resolution::Item(Id(1))
         );
         let hidden = index
@@ -1111,7 +1171,9 @@ mod tests {
             }
         }
         let krate = krate(items, &[]);
-        let index = PathIndex::build(&krate);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
         assert!(index.is_incomplete());
         let paths_of_s = index.public_paths(Id(1));
         assert_ne!(paths_of_s, []);
@@ -1132,10 +1194,12 @@ mod tests {
             ],
             &[],
         );
-        let index = PathIndex::build(&krate);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
         assert!(!index.is_incomplete());
-        assert_eq!(paths(&index, 2), ["c::x::T"]);
-        assert_eq!(index.resolve(&krate, "c::prelude::_"), Resolution::NotFound);
+        assert_eq!(paths(index, 2), ["c::x::T"]);
+        assert_eq!(index.resolve(&view, "c::prelude::_"), Resolution::NotFound);
     }
 
     #[test]
@@ -1149,9 +1213,11 @@ mod tests {
             ],
             &[],
         );
-        let index = PathIndex::build(&krate);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let index = view.index();
         assert_eq!(
-            index.resolve(&krate, "c::same"),
+            index.resolve(&view, "c::same"),
             Resolution::Ambiguous(vec![Id(1), Id(2)].into())
         );
     }

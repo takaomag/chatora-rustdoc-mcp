@@ -419,6 +419,25 @@ B5 は大きいので 4 つに分けた: B5a (既定のプロジェクトと wor
 - 要件に足すこと (M1 の終わり): Q-23 の答え、ヘッダの中身、rkyv の配置の選択
 - テスト: アーカイブを書いて mmap で読み戻すこと、別の形式・別の元・切り詰めたアーカイブを使わないこと、rkyv の系列と Cargo.lock
 
+### 6.3 M1c
+
+C1 は大きいので 5 つに分けた: C1a (照会の層をアーカイブの上で動かす)、C1b (応答の骨格と provenance。版の解決・target・プロジェクトの文脈・std をつなぐ)、C1c (`detail`・応答の上限と切り詰めの印・`ambiguous_path` の候補の上限)、C1d (cfg と feature の注記)、C1e (crate をまたぐ re-export と型の正準パス)。
+
+#### C1a (2026-10-19)
+
+- B9 で決めた zero-copy を、照会の層に入れた。ただし照会の層を `ArchivedCrate` の型で書き直すのではなく、R-PF-1 の「item は必要になったときに初めて取り出す」のとおりにした
+  - `query::view::CrateView`: アーカイブの `Indexed` (crate と公開パス索引) を包む。item・`ItemSummary`・`ExternalCrate` は、引かれたときにだけ rkyv で rustdoc-types の型に戻し、照会の間 (elsa の `FrozenMap` に) 覚えておく。描画 (render) と get_item は今の型のまま動き、出力は変わらない (スナップショットと testdata のスナップショットがそのまま通った)
+  - 公開パス索引: 作る側 (`PathIndex::build`) は owned の `Crate` のまま。引く側 (`resolve`・`canonical_path`・`public_paths`・`crossing`・`hidden_reexport`・`external_globs`・`is_incomplete`) を `ArchivedPathIndex` に移した。`Resolution` と `Crossing` は借用をやめて owned の `ExternalReexport` を持つ
+  - 照会の層が crate を読むのは、すべて id による点の参照だった (全体の走査は索引を作るときだけ)
+- 読み込みの流れ (`query::load`、ツール)
+  - まずアーカイブを探す: キャッシュの JSON の形式と SHA-256 は、ファイル名と横の digest から分かる (`Cache::docs_rs_source`)。JSON 本体は読まない。合うアーカイブがあれば、それだけで引く
+  - 無ければ、今までどおり JSON を用意して (取得・否定キャッシュ・取り直しはそのまま)、解析・索引・アーカイブを書いて開く。書けなければメモリ上のアーカイブで続ける (`Mapped::in_memory`)
+  - アーカイブのファイル名は `<形式>.<SHA-256 の先頭 16 文字>.v<スキーマ>.rkyv`。JSON が変われば名前も変わるので、mmap 中のファイルを上書きしない (Windows では置き換えられないため。R-CA-4)
+- 入れ子の上限 (`MAX_NESTING`) を 10,000 から 4,000 に下げた。16 MiB のスタックで `[[…]]` を測ると、アーカイブから item を取り出す (rkyv の逆直列化) のが最初に溢れる: debug ビルドで 6,000 段を超えたところ、release で 20,000 段を超えたところ (40,000 で溢れる)。書き出しと検証は debug で 9,000 段まで耐えた。実際の crate は数百段。要件の R-FV-8 に足す値 (M1 の終わり)
+- 依存: elsa 1.11 (MIT/Apache-2.0。追加専用のマップ)
+- 扱っていないこと: プロセスの中でアーカイブを使い回すこと (今は呼び出しのたびに開いて検証する。core で 42 ms)。std と docs.rs の他の crate への組み込みは C1b・C1e
+- CI の修正: 286f3f4 の push で、Windows の clippy が `src/data/cargo.rs` のテストの `use super::*` を未使用として落ちていた (テストはすべて Unix 専用だった)。テストのモジュールごと Unix 専用にした
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

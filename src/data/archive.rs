@@ -101,16 +101,36 @@ where
     cache::write_atomically(path, &contents)
 }
 
-/// An archive of `T` mapped into memory, whose bytes were checked when it was opened.
+/// An archive of `T` whose bytes were checked when it was opened: a file mapped into memory, or
+/// bytes held in memory when the file could not be written.
 pub struct Mapped<T: Archive> {
-    mmap: Mmap,
+    bytes: Bytes,
     archived: PhantomData<fn() -> T>,
+}
+
+/// Where the bytes of an archive are.
+enum Bytes {
+    /// A file of the cache, header first.
+    File(Mmap),
+    /// Memory, without a header.
+    Memory(AlignedVec),
+}
+
+impl Bytes {
+    /// The archived bytes, after the header if there is one.
+    fn body(&self) -> &[u8] {
+        match self {
+            Self::File(mmap) => mmap.get(HEADER_LEN..).unwrap_or_default(),
+            Self::Memory(bytes) => bytes,
+        }
+    }
 }
 
 impl<T: Archive> std::fmt::Debug for Mapped<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Mapped")
-            .field("len", &self.mmap.len())
+            .field("len", &self.bytes.body().len())
+            .field("in_memory", &matches!(self.bytes, Bytes::Memory(_)))
             .finish_non_exhaustive()
     }
 }
@@ -139,15 +159,31 @@ where
             tracing::debug!(path = %path.display(), "an archive with another header is made again");
             return Ok(None);
         }
-        let body = mmap.get(HEADER_LEN..).unwrap_or_default();
-        if let Err(error) = rkyv::access::<T::Archived, rancor::Error>(body) {
+        let bytes = Bytes::File(mmap);
+        if let Err(error) = rkyv::access::<T::Archived, rancor::Error>(bytes.body()) {
             tracing::warn!(path = %path.display(), %error, "an archive that does not check out is made again");
             return Ok(None);
         }
         Ok(Some(Self {
-            mmap,
+            bytes,
             archived: PhantomData,
         }))
+    }
+
+    /// `value` archived in memory, for when its file cannot be written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `value` cannot be serialized.
+    pub fn in_memory(value: &T) -> io::Result<Self>
+    where
+        T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
+    {
+        let bytes = rkyv::to_bytes::<rancor::Error>(value).map_err(io::Error::other)?;
+        Ok(Self {
+            bytes: Bytes::Memory(bytes),
+            archived: PhantomData,
+        })
     }
 
     /// The archived value.
@@ -157,10 +193,9 @@ where
         reason = "checking the bytes again on each access would cost what the archive saves"
     )]
     pub fn get(&self) -> &T::Archived {
-        let body = self.mmap.get(HEADER_LEN..).unwrap_or_default();
-        // SAFETY: `open` checked these bytes with `rkyv::access` for this type, and the mapping
-        // is read-only and lives as long as `self`.
-        unsafe { rkyv::access_unchecked::<T::Archived>(body) }
+        // SAFETY: `open` checked these bytes with `rkyv::access` for this type, or `in_memory`
+        // made them for it; they are read-only and live as long as `self`.
+        unsafe { rkyv::access_unchecked::<T::Archived>(self.bytes.body()) }
     }
 }
 
@@ -200,6 +235,8 @@ mod tests {
         let archived = mapped.get();
         assert_eq!(archived.len(), 2);
         assert_eq!(archived.get(1).map(|text| &**text), Some("bc"));
+        let in_memory = Mapped::<Vec<Box<str>>>::in_memory(&value).expect("archived");
+        assert_eq!(in_memory.get().len(), 2);
     }
 
     #[test]

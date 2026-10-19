@@ -15,14 +15,17 @@ use std::{fmt::Write as _, time::Instant};
 
 use chatora_rustdoc_mcp::{
     data::{
+        archive::Mapped,
         cache::{Cache, CachedJson},
         crate_name::CrateName,
         format_version,
         rustdoc_json::{self, ParseError},
     },
     query::{
+        across::Indexed,
         get_item::{ItemRequest, get_item},
-        path_index::{PathIndex, Resolution},
+        path_index::Resolution,
+        view::CrateView,
     },
 };
 use semver::Version;
@@ -189,22 +192,25 @@ fn every_supported_format_is_parsed_into_the_latest_types() {
     }
 }
 
-/// The canonical path and the definition path of what `path` resolves to in `index`.
-fn describe(krate: &rustdoc_types::Crate, index: &PathIndex, path: &str) -> String {
+/// The canonical path and the definition path of what `path` resolves to in the crate of `view`.
+fn describe(view: &CrateView<'_>, path: &str) -> String {
     let describe_id = |id: rustdoc_types::Id| {
-        let canonical = index
+        let canonical = view
+            .index()
             .canonical_path(id)
-            .map_or_else(|| "-".to_owned(), ToString::to_string);
-        let definition = krate
-            .paths
-            .get(&id)
+            .map_or_else(|| "-".to_owned(), |path| path.to_string());
+        let definition = view
+            .summary(id)
             .map_or_else(|| "-".to_owned(), |summary| summary.path.join("::"));
         format!("canonical {canonical}, definition {definition}")
     };
-    match index.resolve(krate, path) {
+    match view.index().resolve(view, path) {
         Resolution::Item(id) => format!("item: {}", describe_id(id)),
         Resolution::Member { parent, member } => {
-            let name = krate.index[&member].name.clone().unwrap_or_default();
+            let name = view
+                .item(member)
+                .and_then(|member| member.name.clone())
+                .unwrap_or_default();
             format!("member {name} of {}", describe_id(parent))
         },
         Resolution::ExternalReexport(reexport) => format!(
@@ -272,24 +278,25 @@ fn representative_items_are_found_by_their_public_paths() {
     ];
     for (crate_name, version, path, expected) in cases {
         let json = cached_json(&cache, &entry(crate_name, version));
-        let krate = rustdoc_json::parse(&json).expect("parses").krate;
+        let parsed = rustdoc_json::parse(&json).expect("parses");
         let started = Instant::now();
-        let index = PathIndex::build(&krate);
+        let mapped = Mapped::in_memory(&Indexed::new(parsed)).expect("archived");
         let build_time = started.elapsed();
-        let found = describe(&krate, &index, path);
-        eprintln!("{path}: {found} (index built in {build_time:?})");
+        let view = CrateView::new(mapped.get());
+        let found = describe(&view, path);
+        eprintln!("{path}: {found} (index built and archived in {build_time:?})");
         assert_eq!(found, expected, "{path}");
     }
 }
 
 /// The rustdoc subtree that the response renders: the item, and the fields or variants of a type.
-fn rendered_subtree(
-    krate: &rustdoc_types::Crate,
+fn rendered_subtree<'v>(
+    view: &'v CrateView<'_>,
     id: rustdoc_types::Id,
-) -> Vec<&rustdoc_types::Item> {
+) -> Vec<&'v rustdoc_types::Item> {
     use rustdoc_types::{ItemEnum, StructKind};
 
-    let item = &krate.index[&id];
+    let item = view.item(id).expect("the item is in the crate");
     let members: &[rustdoc_types::Id] = match &item.inner {
         ItemEnum::Struct(contents) => match &contents.kind {
             StructKind::Plain { fields, .. } => fields,
@@ -317,7 +324,7 @@ fn rendered_subtree(
         | ItemEnum::AssocType { .. } => &[],
     };
     std::iter::once(item)
-        .chain(members.iter().filter_map(|id| krate.index.get(id)))
+        .chain(members.iter().filter_map(|&id| view.item(id)))
         .collect()
 }
 
@@ -374,8 +381,9 @@ fn representative_items_are_returned_by_get_item() {
         let entry = entry(crate_name, version);
         let json = cached_json(&cache, &entry);
         let parsed = rustdoc_json::parse(&json).expect("parses");
-        let index = PathIndex::build(&parsed.krate);
-        let response = get_item(&parsed, &index, ItemRequest {
+        let mapped = Mapped::in_memory(&Indexed::new(parsed)).expect("archived");
+        let view = CrateView::new(mapped.get());
+        let response = get_item(&view, ItemRequest {
             name: &entry.name,
             version: &entry.version,
             path,
@@ -385,7 +393,7 @@ fn representative_items_are_returned_by_get_item() {
         insta::assert_json_snapshot!(path.replace("::", "__"), response);
 
         // R-OUT-2: how much larger the rustdoc subtree is than the response.
-        let id = match index.resolve(&parsed.krate, path) {
+        let id = match view.index().resolve(&view, path) {
             Resolution::Item(id) | Resolution::Member { member: id, .. } => id,
             Resolution::ExternalReexport(_) => continue,
             other @ (Resolution::Ambiguous(_)
@@ -394,7 +402,7 @@ fn representative_items_are_returned_by_get_item() {
                 panic!("{path}: {other:?}")
             },
         };
-        let subtree = rendered_subtree(&parsed.krate, id);
+        let subtree = rendered_subtree(&view, id);
         let subtree_len: usize = subtree
             .iter()
             .map(|item| serde_json::to_string(item).expect("serializes").len())

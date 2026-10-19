@@ -2,5 +2,7 @@
 
 pub mod across;
 pub mod get_item;
+pub mod load;
 pub mod path_index;
 pub mod render;
+pub mod view;

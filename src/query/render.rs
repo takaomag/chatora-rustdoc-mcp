@@ -12,7 +12,6 @@ use rustdoc_types::{
     Abi,
     AssocItemConstraint,
     AssocItemConstraintKind,
-    Crate,
     DynTrait,
     FunctionHeader,
     FunctionSignature,
@@ -42,24 +41,22 @@ use rustdoc_types::{
     WherePredicate,
 };
 
-use super::path_index::PathIndex;
+use super::view::CrateView;
 
 /// Renders items and types of one crate.
 #[derive(Debug)]
 pub struct Renderer<'a> {
-    krate: &'a Crate,
-    index: &'a PathIndex,
+    view: &'a CrateView<'a>,
     /// Forms that could not be rendered faithfully (requirement R-OUT-2).
     warnings: Vec<Cow<'static, str>>,
 }
 
 impl<'a> Renderer<'a> {
-    /// A renderer for the items of `krate`, whose public paths are in `index`.
+    /// A renderer for the items of the crate in `view`.
     #[must_use]
-    pub const fn new(krate: &'a Crate, index: &'a PathIndex) -> Self {
+    pub const fn new(view: &'a CrateView<'a>) -> Self {
         Self {
-            krate,
-            index,
+            view,
             warnings: Vec::new(),
         }
     }
@@ -356,7 +353,7 @@ impl<'a> Renderer<'a> {
             if position > 0 {
                 out.push_str(", ");
             }
-            match field.and_then(|id| self.krate.index.get(&id)) {
+            match field.and_then(|id| self.view.item(id)) {
                 Some(Item {
                     visibility,
                     inner: ItemEnum::StructField(ty),
@@ -381,7 +378,7 @@ impl<'a> Renderer<'a> {
                 name: Some(name),
                 inner: ItemEnum::StructField(ty),
                 ..
-            }) = self.krate.index.get(field)
+            }) = self.view.item(*field)
             {
                 if !first {
                     out.push_str(", ");
@@ -708,7 +705,7 @@ impl<'a> Renderer<'a> {
     /// A path, by its canonical path if it is an item of this crate, and as rustdoc gives it
     /// otherwise (requirement R-PR-2 for this crate, R-PR-4 for others in M1).
     fn push_path(&mut self, out: &mut String, path: &Path) {
-        if let Some(canonical) = self.index.canonical_path(path.id) {
+        if let Some(canonical) = self.view.index().canonical_path(path.id) {
             for (position, segment) in canonical.segments().iter().enumerate() {
                 if position > 0 {
                     out.push_str("::");
@@ -718,9 +715,8 @@ impl<'a> Renderer<'a> {
         } else if !path.path.is_empty() {
             out.push_str(&path.path);
         } else if let Some(name) = self
-            .krate
-            .paths
-            .get(&path.id)
+            .view
+            .summary(path.id)
             .and_then(|summary| summary.path.last())
         {
             // rustdoc leaves the path empty for the trait of `F::Output`, written without it.
@@ -929,6 +925,7 @@ mod tests {
 
     use rustdoc_types::{
         Constant,
+        Crate,
         Function,
         FunctionPointer,
         ItemKind,
@@ -940,6 +937,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::query::view::tests::{archive, archived};
 
     fn item(id: u32, name: &str, visibility: Visibility, inner: ItemEnum) -> Item {
         Item {
@@ -1070,17 +1068,17 @@ mod tests {
 
     /// Renders `ty` in the crate of [`krate`].
     fn render(ty: &Type) -> String {
-        let krate = krate(Vec::new());
-        let index = PathIndex::build(&krate);
-        Renderer::new(&krate, &index).render_type(ty)
+        let bytes = archive(krate(Vec::new()));
+        let view = CrateView::new(archived(&bytes));
+        Renderer::new(&view).render_type(ty)
     }
 
     /// The signature and where clause of the item `id` added to the crate of [`krate`].
     fn signature(extra: Vec<Item>, id: u32) -> (String, Vec<String>) {
-        let krate = krate(extra);
-        let index = PathIndex::build(&krate);
-        let mut renderer = Renderer::new(&krate, &index);
-        let item = &krate.index[&Id(id)];
+        let bytes = archive(krate(extra));
+        let view = CrateView::new(archived(&bytes));
+        let mut renderer = Renderer::new(&view);
+        let item = view.item(Id(id)).expect("the item");
         (renderer.signature(item), renderer.where_predicates(item))
     }
 
@@ -1170,8 +1168,9 @@ mod tests {
             path: vec!["core".to_owned(), "future".to_owned(), "Future".to_owned()],
             kind: ItemKind::Trait,
         });
-        let index = PathIndex::build(&krate);
-        let mut renderer = Renderer::new(&krate, &index);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let mut renderer = Renderer::new(&view);
         let output = |id| Type::QualifiedPath {
             name: "Output".to_owned(),
             args: None,
