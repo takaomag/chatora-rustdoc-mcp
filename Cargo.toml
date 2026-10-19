@@ -20,8 +20,9 @@ include = ["/src", "/build.rs", "/README.md", "/LICENSE-*"]
 default = ["local"]
 # プロジェクトの文脈を要する機能 (cargo・rustc の起動、ローカルビルド) をまとめる (要件 R-ARCH-2)。
 # `--no-default-features` では、cargo を起動するコードも build.rs を実行するコードもバイナリに入らない。
-# 子プロセス (`rustc -vV` など) を起動するので tokio の `process` を足す。
-local = ["tokio/process"]
+# 子プロセス (`rustc -vV`・cargo) を起動するので tokio の `process` を、`cargo metadata` の結果を
+# 共有するので tokio の `sync` を、Cargo.toml と Cargo.lock を読むので toml を足す。
+local = ["tokio/process", "tokio/sync", "dep:toml"]
 
 [dependencies]
 const_format = "0.2.36"
@@ -37,6 +38,10 @@ serde_json = { version = "1.0.154", features = ["preserve_order", "unbounded_dep
 serde_stacker = "0.1.14"
 thiserror = "2.0.21"
 tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "time"] }
+toml = { version = "1.1.8", default-features = false, features = [
+  "parse",
+  "serde",
+], optional = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [
   "fmt",

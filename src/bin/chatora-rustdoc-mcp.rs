@@ -24,6 +24,8 @@ use sha2 as _;
 #[cfg(test)]
 use tempfile as _;
 use thiserror as _;
+#[cfg(feature = "local")]
+use toml as _;
 use tracing as _;
 use tracing_subscriber as _;
 use zstd as _;

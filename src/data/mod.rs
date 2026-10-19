@@ -1,10 +1,18 @@
 //! Data layer: fetches rustdoc JSON, normalizes its format version, and caches it.
 
 pub mod cache;
+#[cfg(feature = "local")]
+pub mod cargo;
+#[cfg(feature = "local")]
+pub mod cargo_lock;
 pub mod crate_name;
 pub mod docs_rs;
 pub mod format_version;
 mod http;
+#[cfg(feature = "local")]
+pub mod metadata;
+#[cfg(feature = "local")]
+pub mod project;
 pub mod rustdoc_json;
 pub mod sparse_index;
 pub mod target;
@@ -348,6 +356,16 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().map(OsString::from).unwrap_or_default();
     name.push(suffix);
     path.with_file_name(name)
+}
+
+/// Reads a semantic version from a string, for `#[serde(deserialize_with)]`.
+#[cfg(feature = "local")]
+fn deserialize_version<'de, D>(deserializer: D) -> Result<Version, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+    text.parse().map_err(serde::de::Error::custom)
 }
 
 /// Seconds since the Unix epoch, or 0 for a time before it.

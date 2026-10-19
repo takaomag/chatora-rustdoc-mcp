@@ -260,6 +260,52 @@ m0-plan.md の §7.2 の小さなものを片付けた。
 - 要件に足すこと (M1 の終わり): 代わりの値の取り方 (R-TG-1 の「M1 で決める」)、`HEAD` で JSON の有無を確かめること
 - テスト: triple の検証、musl の読み替え、`rustc -vV` の読み取り、実際の `rustc -vV` (`local` のとき)、target 付きの URL と HEAD、target の JSON だけが無いことの判定と記憶、どちらにも無いときは `no_json`
 
+#### B5a (2026-10-19)
+
+B5 は大きいので 4 つに分けた: B5a (既定のプロジェクトと workspace のルート)、B5b (`cargo metadata --locked`・`lockfile_outdated`・Cargo.lock の直読み)、B5c (checksum の照合・extern の名前の解決・同名の複数版)、B5d (`cargo tree` の feature の組)。
+
+- `data::project` (`local` の中): 既定のプロジェクト `DefaultProject::find` は、`CLAUDE_PROJECT_DIR` (空なら無いものとする) → カレントディレクトリの順でディレクトリを決め、どちらを使ったかを `ProjectFrom` で返す。そこに Cargo.toml があればその workspace、無ければ直下の子のディレクトリ (symlink はたどらない) のうち Cargo.toml を持つものの workspace をすべて返す。子の workspace を探すときは、決めたディレクトリより上には行かない。起動時に一度だけ呼ぶ前提 (つなぐのは C 段)
+- workspace のルート `workspace_of` は、Cargo.toml を toml で読み、cargo を起動せずに決める: `[workspace]` があればそこ、`package.workspace` があればその先、どちらも無ければ上へたどる。上の workspace は、`exclude` していれば飛ばしてさらに上を見て (Cargo と同じ)、`members` に入っていればルートにし、どちらでもなければ拾わずに単独の package とする (Cargo はこの package をビルドしない)。`members` の直書きのパスは `exclude` より優先し、パターンは負ける。パターンは `*`・`?`・`**` を扱う (`[...]` は文字どおり)。これらは合成の木で `cargo metadata --no-deps --offline` と突き合わせて決めた (cargo 1.99.1)
+- 扱わないこと: path 依存で暗黙に member になるもの (ルートの package の path 依存など)。単独の package と判定する。B5b で `cargo metadata` の `workspace_root` と食い違ったら、cargo の答えを使う
+- 依存: toml 1.1.8 (`parse`・`serde` だけ。`local` の中)。toml_datetime・toml_parser・winnow が足された
+- テスト: member・exclude・パターンの各規則、`package.workspace`、Cargo.toml が無いときのエラー、既定のプロジェクト (member のディレクトリから開いたとき、Cargo.toml が無く子が複数あるとき、2 段下の workspace を拾わないこと)
+
+#### B5b (2026-10-19)
+
+- `data::cargo` (`local` の中): プロジェクトの文脈で cargo を起動する共通の部品
+  - workspace のルートで、常に `--locked` を付けて起動する。オフラインなら `--offline` と `RUSTUP_AUTO_INSTALL=0` も付ける
+  - stdin は null、stdout と stderr はパイプにする。ほかに `LC_ALL=C`、`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=never`、`SSH_ASKPASS_REQUIRE=never` を付け、`SSH_ASKPASS`・`GIT_ASKPASS` を外す
+  - Unix では `setsid` で新しいセッションに入れ、制御端末を外す。これがこのコードベースで最初の `unsafe` になる (`pre_exec`。SAFETY のコメント付き)。子がセッションの先頭になることはテストで確かめた (Linux)
+  - 30 分で止める (`build.timeout_secs` の既定)
+- 失敗の分け方 (R-WS-7 が認めた文言だけを照合する)
+  - `lockfile_outdated`: `because --locked was passed`。Cargo.lock が無いときも古いときもこの文言になる (cargo 1.99.1 で確かめた)
+  - `offline_miss`: オフラインを示す 2 つの文言。`no matching package named` は、サーバーが `--offline` を渡したときだけこれに数える (オンラインでは crate 名の誤りと同じ文言のため)
+  - `fetch_failed`: git の取得の決定的な失敗。`reason` は `auth`・`no_repository`・`no_rev` とした。要件が名前を決めていたのは `auth` だけで、残りは `no_json` などにそろえた
+  - `(signal: 9, SIGKILL` かシグナルでの終了は、一時的な失敗。それ以外も、区別できないものとして一時的な失敗にする
+  - stderr は末尾の 8,000 文字を残す
+- `data::metadata`: `cargo metadata --format-version 1` を実行し、使う部分 (packages・resolve・workspace_members・workspace_root) を読む
+  - checksum は `cargo metadata` に出ないので、Cargo.lock も常に読む (`data::cargo_lock`)
+  - 失敗したら Cargo.lock だけの結果 (`cargo_lock_raw`) を、失敗の分類と一緒に返す
+  - Cargo.lock が無ければエラーにする (`lockfile_outdated`)
+- `cargo metadata` のキャッシュ (R-VR-2 の「M1 で決める」。利用者が決めた)
+  - プロセスのメモリに、workspace のルートごとに持つ。このリポジトリ (248 パッケージ) では 1 回約 170 ms、出力は 1.2 MB だった
+  - 鍵は入力の中身で、次のものを含める: Cargo.lock、ルートの Cargo.toml、前回の結果で source が無いパッケージ (member と path 依存) の Cargo.toml、ルートの祖先の `.cargo/config(.toml)` と `rust-toolchain(.toml)`、`$CARGO_HOME/config(.toml)`、`members` の glob を展開した結果
+  - glob の展開は、1 万エントリか深さ 32 を超えたら諦め、その結果はキャッシュしない
+  - 実行中に Cargo.lock が変わったら、その結果はキャッシュしない
+  - 成功だけを持つ。失敗は毎回 cargo を起動し直す
+- 扱っていないこと
+  - cargo の設定の `include` が指すファイルは鍵に入れていない (読み方は Q-31 で M2 に決める)
+  - 子の後始末は M2 に回した: `PR_SET_PDEATHSIG` (spawn するスレッドの決め方 Q-29 と一緒に決める)、Windows の Job Object、ロック待ちの検出 (`waiting_for_lock`)
+  - 同時の呼び出しを 1 つにまとめること (singleflight) と、一時的な失敗を 30 秒抑えることは、ツールにつなぐ C 段で決める
+  - cargo の実行ファイルの指定 (設定の絶対パス) は、設定を入れるときに足す。今は PATH の `cargo` を使う
+  - B5a から持ち越した「path 依存で暗黙に member になるもの」は、`Metadata::workspace_root` と比べられるようにした。比べて使うのは C 段
+- 依存: tokio の `sync` を `local` に足した (新しい crate は増えない)
+- テスト
+  - 失敗の文言の分類、stderr の末尾、子がセッションの先頭になること
+  - Cargo.lock の読み取り
+  - 実際の cargo (`--offline`) で、結果を再利用すること、member の Cargo.toml を変えると取り直すこと、glob に合う member が増えると `lockfile_outdated` になり Cargo.lock だけの結果に落ちること、Cargo.lock が無いときのエラー
+  - `members` の glob の展開
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める
