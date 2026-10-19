@@ -80,6 +80,10 @@ pub enum ServeError {
 ///
 /// Resumes the panic of a task of the MCP session.
 pub async fn serve() -> Result<(), ServeError> {
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "starting the MCP server over stdio"
+    );
     match Server.serve(stdio()).await {
         Ok(running) => match running.waiting().await {
             Ok(QuitReason::JoinError(error)) | Err(error) => match error.try_into_panic() {

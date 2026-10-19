@@ -21,6 +21,8 @@ include = ["/src", "/README.md", "/LICENSE-*"]
 rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
 thiserror = "2.0.21"
 tokio = { version = "1.53.3", features = ["rt-multi-thread"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter"] }
 
 [profile.release]
 opt-level = 3

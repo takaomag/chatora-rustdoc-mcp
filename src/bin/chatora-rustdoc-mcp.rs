@@ -1,9 +1,11 @@
 //! The `chatora-rustdoc-mcp` binary: an MCP server that looks up Rust documentation, plus a small CLI to manage its cache.
 
-use std::{error::Error as _, ffi::OsString, process::ExitCode};
+use std::{error::Error as _, ffi::OsString};
 
 use rmcp as _;
 use thiserror as _;
+use tracing as _;
+use tracing_subscriber as _;
 
 const BIN_NAME: &str = env!("CARGO_BIN_NAME");
 
@@ -16,19 +18,23 @@ Commands:
   serve  Run the MCP server over stdio"
 );
 
-fn main() -> ExitCode {
+fn main() -> std::process::ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match args.as_slice() {
         [command] if command == "serve" => serve(),
         _ => {
             eprintln!("{USAGE}");
             // 2 is the conventional exit code for a usage error.
-            ExitCode::from(2)
+            std::process::ExitCode::from(2)
         },
     }
 }
 
-fn serve() -> ExitCode {
+fn serve() -> std::process::ExitCode {
+    if let Err(error) = chatora_rustdoc::logging::init() {
+        eprintln!("{BIN_NAME}: failed to set up logging: {error}");
+        return std::process::ExitCode::from(1);
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -36,11 +42,11 @@ fn serve() -> ExitCode {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("{BIN_NAME}: failed to start the async runtime: {error}");
-            return ExitCode::FAILURE;
+            return std::process::ExitCode::from(1);
         },
     };
     match runtime.block_on(chatora_rustdoc::mcp::serve()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => std::process::ExitCode::from(0),
         Err(error) => {
             // Print the whole chain of causes on one line.
             eprint!("{BIN_NAME}: {error}");
@@ -48,7 +54,7 @@ fn serve() -> ExitCode {
                 eprint!(": {cause}");
             }
             eprintln!();
-            ExitCode::FAILURE
+            std::process::ExitCode::from(1)
         },
     }
 }

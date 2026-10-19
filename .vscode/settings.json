@@ -82,6 +82,7 @@
     "nextest",
     "pathbuf",
     "println",
+    "rmcp",
     "rustc",
     "rustdoc",
     "RUSTDOCFLAGS",
@@ -91,6 +92,7 @@
     "supertrait",
     "tamasfe",
     "taplo",
+    "thiserror",
     "Uninit",
     "writeln"
   ]
