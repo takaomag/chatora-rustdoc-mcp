@@ -22,6 +22,24 @@ expression: response
     ],
     "docs": "Pulls some bytes from this source into the specified buffer,\nadvancing the buffer's internal cursor.",
     "docs_truncated": true,
+    "sections": [
+      {
+        "heading": "Return",
+        "lines": 8
+      },
+      {
+        "heading": "Errors",
+        "lines": 3
+      },
+      {
+        "heading": "Cancel safety",
+        "lines": 3
+      },
+      {
+        "heading": "Examples",
+        "lines": 31
+      }
+    ],
     "source_location": {
       "file": "src/io/util/async_read_ext.rs",
       "lines": "258-264",

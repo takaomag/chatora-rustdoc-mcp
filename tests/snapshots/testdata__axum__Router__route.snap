@@ -19,6 +19,32 @@ expression: response
     "signature": "pub fn route(self, path: &str, method_router: axum::routing::MethodRouter<S>) -> Self",
     "docs": "Add another route to the router.",
     "docs_truncated": true,
+    "sections": [
+      {
+        "heading": "Static paths",
+        "lines": 8
+      },
+      {
+        "heading": "Captures",
+        "lines": 18
+      },
+      {
+        "heading": "Wildcards",
+        "lines": 32
+      },
+      {
+        "heading": "Accepting multiple methods",
+        "lines": 26
+      },
+      {
+        "heading": "More examples",
+        "lines": 22
+      },
+      {
+        "heading": "Panics",
+        "lines": 14
+      }
+    ],
     "source_location": {
       "file": "src/routing/mod.rs",
       "lines": "178-182",

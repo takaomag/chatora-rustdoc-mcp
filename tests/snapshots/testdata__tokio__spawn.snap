@@ -21,6 +21,20 @@ expression: response
     ],
     "docs": "Spawns a new asynchronous task, returning a\n[`JoinHandle`] for it.",
     "docs_truncated": true,
+    "sections": [
+      {
+        "heading": "Examples",
+        "lines": 55
+      },
+      {
+        "heading": "Panics",
+        "lines": 1
+      },
+      {
+        "heading": "Using `!Send` values from a task",
+        "lines": 61
+      }
+    ],
     "also_reexported_at": [
       "tokio::task::spawn"
     ],

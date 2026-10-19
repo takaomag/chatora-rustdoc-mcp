@@ -23,7 +23,7 @@ use chatora_rustdoc_mcp::{
     },
     query::{
         across::Indexed,
-        get_item::{ItemRequest, Origin, ResolvedFrom, get_item},
+        get_item::{Detail, ItemRequest, Origin, ResolvedFrom, get_item},
         path_index::Resolution,
         view::CrateView,
     },
@@ -391,6 +391,7 @@ fn representative_items_are_returned_by_get_item() {
                 resolved_from: ResolvedFrom::Explicit,
                 project_from: None,
             },
+            detail: Detail::Normal,
             target: None,
         })
         .unwrap_or_else(|error| panic!("{path}: {error}"));

@@ -19,6 +19,16 @@ expression: response
     "signature": "pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, T>",
     "docs": "Locks this mutex, causing the current task to yield until the lock has\nbeen acquired.  When the lock has been acquired, function returns a\n[`MutexGuard`].",
     "docs_truncated": true,
+    "sections": [
+      {
+        "heading": "Cancel safety",
+        "lines": 3
+      },
+      {
+        "heading": "Examples",
+        "lines": 8
+      }
+    ],
     "source_location": {
       "file": "src/sync/mutex.rs",
       "lines": "434-466",

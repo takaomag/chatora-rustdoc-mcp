@@ -20,6 +20,16 @@ expression: response
     ],
     "docs": "An asynchronous `Mutex`-like type.",
     "docs_truncated": true,
+    "sections": [
+      {
+        "heading": "Which kind of mutex should you use?",
+        "lines": 29
+      },
+      {
+        "heading": "Examples:",
+        "lines": 69
+      }
+    ],
     "source_location": {
       "file": "src/sync/mutex.rs",
       "lines": "133-138",

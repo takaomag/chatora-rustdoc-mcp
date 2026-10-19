@@ -17,6 +17,52 @@ expression: response
     "signature": "macro_rules! select {\n    {\n        $(\n            biased;\n        )?\n        $(\n            $bind:pat = $fut:expr $(, if $cond:expr)? => $handler:expr,\n        )*\n        $(\n            else => $els:expr $(,)?\n        )?\n    } => { ... };\n}",
     "docs": "Waits on multiple concurrent branches, returning when the **first** branch\ncompletes, cancelling the remaining branches.",
     "docs_truncated": true,
+    "sections": [
+      {
+        "heading": "Runtime characteristics",
+        "lines": 8
+      },
+      {
+        "heading": "Fairness",
+        "lines": 19
+      },
+      {
+        "heading": "Panics",
+        "lines": 4
+      },
+      {
+        "heading": "Cancellation safety",
+        "lines": 60
+      },
+      {
+        "heading": "Examples",
+        "lines": 162
+      },
+      {
+        "heading": "Avoid racy `if` preconditions",
+        "lines": 61
+      },
+      {
+        "heading": "Alternatives from the Ecosystem",
+        "lines": 7
+      },
+      {
+        "heading": "Merging Streams",
+        "lines": 9
+      },
+      {
+        "heading": "Example with `select!`",
+        "lines": 28
+      },
+      {
+        "heading": "Moving to `merge`",
+        "lines": 54
+      },
+      {
+        "heading": "Racing Futures",
+        "lines": 25
+      }
+    ],
     "source_location": {
       "file": "src/macros/select.rs",
       "lines": "559-573",

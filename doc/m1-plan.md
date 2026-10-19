@@ -481,6 +481,25 @@ C1b も 3 つに分けた: C1b-1 (版・target・provenance)、C1b-2 (プロジ�
 - 実際のサーバーで確かめた (このホストの nightly には rust-docs-json が無いので dist): `std::vec::Vec`・`std::vec::Vec::push` (alloc)、`std::collections::HashMap::insert` (std)、`core::option::Option::map`、版を渡した std、無いパス。初回はアーカイブ作りで約 1.5 秒、2 回目からは約 0.1 秒
 - テスト: 解決の順 (定義パスにも載ったメンバー)、std の名前の判定、std のソースの URL への変換、鍵付きのアーカイブを一度だけ作ること。std を通しで引くテストは `tests/std_dist.rs` (ignored。CI の testdata ジョブで動く)
 
+#### C1c (2026-10-20)
+
+- `detail` 引数 (R-OUT-7): `brief`・`normal` (既定)・`full`。それ以外は `invalid_argument`
+  - `brief`: パス・種類・親・シグネチャの 1 行目 (`macro_rules!` の規則は省く) と `reexport_of` だけ
+  - `normal`: 今までの内容に、ドキュメントの見出しごとの節 (`sections`) の見出しと行数を足した。`docs` は最初の見出しより前の第 1 段落
+  - `full`: 最初の見出しより前の全文を `docs` に、各節の本文を `sections[].text` に、属性を `attrs` に出す
+- ドキュメントの整形 (`query::docs`): コードブロックの外の ATX 見出し (`#`〜`######`) で節に分ける。Rust のコードブロック (info string が無いか、doctest の属性だけ) から隠し行 (`#` だけの行と `# ` で始まる行) を除き、行頭の `##` を `#` にする (R-OUT-6)。`text` などほかの言語のブロックは触らない
+- `attrs`: rustdoc-types の `Attribute` を Rust の書き方に戻す (`#[repr(C, align(8))]` など)。`Other` はそのまま出すが、cfg の痕跡 (`#[<cfg`・`#[attr = Cfg…`・`#[doc(cfg`) は C1d の feature の注記に任せて除き、`#[doc = "…"]` と rustc 内部の属性 (`#[attr = Rustc…`。std の `RustcDiagnosticItem` など) も除く
+- 応答の上限 (R-OUT-3): 応答の JSON を 32,000 文字 (トークンの見積もりを測るまでの仮の値。約 8,000 トークン) に収める。超えたら次の順に削り、`truncated: true` を付ける
+  1. 節の本文を後ろから
+  2. `docs` を半分ずつ (200 文字までは残し、末尾に `…`)
+  3. フィールドかバリアントの多いほうを半分ずつ (`/* N more not shown */` を足し、rustdoc の `/* private fields */` は末尾に残す)。warnings に「全 N 件のうち M 件」と出す
+- `ambiguous_path` の候補は最大 20 件にし、総数を `candidates_total` で添える
+- outputSchema に `sections`・`attrs`・`truncated` を足した。ツールの説明に `detail` を足し、2,048 文字に収めるため例を 1 つ削った (2,040 文字)
+- testdata のスナップショット: 8 件すべてに `sections` (見出しと行数) が増えた。それ以外は変わらない
+- 実際のサーバーで確かめた: `tokio::sync::Mutex` (brief 267 文字、full 4,875 文字)、`tokio::select` (full 18,567 文字。節 7 つ、`#[macro_export]`)、`std::vec::Vec` (full。`#[doc(alias = "list")]` など)。実データで上限を超えるものはまだ見つけていない (切り詰めは単体テストで確かめた)
+- テスト: 節への分割と隠し行、detail の 3 段階、属性の書き方と除くもの、上限への切り詰め (節の本文・docs・フィールドの順) と上限内なら削らないこと、`detail` の解析、候補の上限
+- 扱っていないこと: 文字数とトークン数の対応の測定 (R-OUT-3 の見積もり)。MCP の応答は `structuredContent` と `content` の text に同じ JSON を二重に載せるので、送る量は上限のおよそ 2 倍になる
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

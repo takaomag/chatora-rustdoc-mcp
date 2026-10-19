@@ -17,6 +17,7 @@ use semver::Version;
 use serde::Serialize;
 
 use super::{
+    docs,
     path_index::{self, ArchivedPathIndex, ExternalReexport, PublicPath, Resolution},
     render::Renderer,
     view::CrateView,
@@ -34,8 +35,23 @@ pub struct ItemRequest<'a> {
     pub path: &'a str,
     /// Where the data comes from, and how the version was chosen.
     pub origin: Origin<'a>,
+    /// How much to show (requirement R-OUT-7).
+    pub detail: Detail,
     /// The target asked for, to warn when the data is for another.
     pub target: Option<&'a str>,
+}
+
+/// How much of an item to show (requirement R-OUT-7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Detail {
+    /// The path, the kind and the signature on one line.
+    Brief,
+    /// Also the where clause, the fields or variants, the first paragraph of the documentation and
+    /// the headings of its other sections, and where the item is defined.
+    #[default]
+    Normal,
+    /// Also the whole documentation, section by section, and the attributes.
+    Full,
 }
 
 /// Where the data comes from, for the provenance (§7.3).
@@ -145,6 +161,10 @@ pub enum ResolvedFrom {
 /// One item, as of `detail=normal` (requirement R-OUT-7), with the signature before the prose
 /// (requirement R-SH-1).
 #[derive(Debug, Default, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is a flag of the JSON that is left out when false"
+)]
 pub struct ItemData<'a> {
     /// The canonical path; for a member, that of its parent and its name.
     pub path: Box<str>,
@@ -171,10 +191,14 @@ pub struct ItemData<'a> {
     pub variants: Box<[Box<str>]>,
     /// The first paragraph of the documentation, as written.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub docs: Option<&'a str>,
+    pub docs: Option<Cow<'a, str>>,
     /// The documentation goes on after the first paragraph.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub docs_truncated: bool,
+    /// The sections of the documentation after the first paragraph: their headings and how many
+    /// lines they have, and with `detail=full` their text (requirement R-OUT-7).
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub sections: Box<[Section]>,
     /// `#[deprecated]` (requirement R-SH-6).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<Deprecated<'a>>,
@@ -184,6 +208,9 @@ pub struct ItemData<'a> {
     /// `#[non_exhaustive]` (requirement R-SH-6).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub non_exhaustive: bool,
+    /// The attributes, with `detail=full` (requirement R-OUT-7).
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub attrs: Box<[Box<str>]>,
     /// The other public paths of the item.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub also_reexported_at: Box<[Box<str>]>,
@@ -193,6 +220,21 @@ pub struct ItemData<'a> {
     /// Where the item is defined (requirement R-OUT-8).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_location: Option<SourceLocation<'a>>,
+    /// Something was cut to keep the response within its budget (requirement R-OUT-3).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+/// A section of the documentation.
+#[derive(Debug, Serialize)]
+pub struct Section {
+    /// The heading (`Examples`).
+    pub heading: Box<str>,
+    /// How many lines the section has.
+    pub lines: usize,
+    /// The text, with `detail=full`, unless it was cut to fit the budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<Box<str>>,
 }
 
 /// `#[deprecated]`.
@@ -299,13 +341,95 @@ pub fn get_item<'a>(
         ..
     } = query;
     warnings.extend(renderer.into_warnings());
-    Ok(ItemResponse {
+    let mut response = ItemResponse {
         provenance,
         warnings: warnings.into(),
         data,
         hints: hints.into(),
-    })
+    };
+    fit(&mut response, MAX_RESPONSE_CHARS);
+    Ok(response)
 }
+
+/// The most characters of a response, as JSON (requirement R-OUT-3: about 8,000 tokens until the
+/// estimate is calibrated).
+pub const MAX_RESPONSE_CHARS: usize = 32_000;
+
+/// Cuts `response` until its JSON has at most `limit` characters, marking it `truncated`
+/// (requirement R-OUT-3): first the text of the last sections of the documentation, then its
+/// first part, then the longer of the fields and the variants, with a warning of how many are
+/// shown.
+fn fit(response: &mut ItemResponse<'_>, limit: usize) {
+    let fits = |response: &ItemResponse<'_>| {
+        serde_json::to_string(response).map_or(true, |json| json.chars().count() <= limit)
+    };
+    if fits(response) {
+        return;
+    }
+    response.data.truncated = true;
+    for at in (0..response.data.sections.len()).rev() {
+        if let Some(section) = response.data.sections.get_mut(at) {
+            section.text = None;
+        }
+        if fits(response) {
+            return;
+        }
+    }
+    while let Some(docs) = response.data.docs.as_mut()
+        && docs.chars().count() > MIN_DOCS_CHARS
+    {
+        let cut: String = docs
+            .chars()
+            .take(docs.chars().count().div_euclid(2))
+            .collect();
+        *docs = Cow::Owned(format!("{cut}…"));
+        if fits(response) {
+            return;
+        }
+    }
+    let fields = response.data.fields.len() >= response.data.variants.len();
+    // What rustdoc does not show (`/* private fields */`) stays at the end.
+    let all = list_mut(&mut response.data, fields).clone();
+    let shown_by_rustdoc = all
+        .iter()
+        .take_while(|entry| !entry.starts_with("/*"))
+        .count();
+    let (entries, notes) = all.split_at(shown_by_rustdoc);
+    let mut kept = entries.len();
+    while kept > 1 && !fits(response) {
+        kept = kept.div_euclid(2);
+        let mut shown = entries.get(..kept).unwrap_or_default().to_vec();
+        shown.push(
+            format!(
+                "/* {} more not shown */",
+                entries.len().saturating_sub(kept)
+            )
+            .into(),
+        );
+        shown.extend_from_slice(notes);
+        *list_mut(&mut response.data, fields) = shown.into();
+    }
+    if kept < entries.len() {
+        let mut warnings = std::mem::take(&mut response.warnings).into_vec();
+        warnings.push(Cow::Owned(format!(
+            "only {kept} of {} fields or variants are shown, to keep the response small",
+            entries.len()
+        )));
+        response.warnings = warnings.into();
+    }
+}
+
+/// The fields of `data`, or else its variants.
+const fn list_mut<'b>(data: &'b mut ItemData<'_>, fields: bool) -> &'b mut Box<[Box<str>]> {
+    if fields {
+        &mut data.fields
+    } else {
+        &mut data.variants
+    }
+}
+
+/// The documentation is not cut shorter than this many characters.
+const MIN_DOCS_CHARS: usize = 200;
 
 /// One lookup, with what it has found to warn about so far.
 struct Query<'a> {
@@ -406,29 +530,39 @@ impl<'a> Query<'a> {
     fn item_data(&mut self, id: Id, parent: Option<Id>) -> Option<ItemData<'a>> {
         let item = self.view.item(id)?;
         let name = item.name.as_deref().unwrap_or("_");
+        let detail = self.request.detail;
+        let signature = self.renderer.signature(item);
         let mut data = ItemData {
             kind: kind_of(item, parent.is_some()),
-            signature: Some(self.renderer.signature(item).into()),
-            where_predicates: boxed(self.renderer.where_predicates(item)),
-            deprecated: item.deprecation.as_ref().map(|deprecation| Deprecated {
-                since: deprecation.since.as_deref(),
-                note: deprecation.note.as_deref(),
-            }),
-            must_use: item
-                .attrs
-                .iter()
-                .any(|attr| matches!(attr, Attribute::MustUse { .. })),
-            non_exhaustive: item.attrs.contains(&Attribute::NonExhaustive),
-            source_location: self.source_location(item),
             ..ItemData::default()
         };
         if let Some(parent) = parent {
             let parent_path = self.path_of(parent);
             data.path = format!("{parent_path}::{name}").into();
             data.parent = Some(parent_path);
-            data.impl_header = self.impl_header(parent, id);
         } else {
             data.path = self.path_of(id);
+        }
+        if detail == Detail::Brief {
+            // One line: a `macro_rules!` macro shows its rules on the lines after it.
+            data.signature = Some(signature.lines().next().unwrap_or_default().into());
+            return Some(data);
+        }
+        data.signature = Some(signature.into());
+        data.where_predicates = boxed(self.renderer.where_predicates(item));
+        data.deprecated = item.deprecation.as_ref().map(|deprecation| Deprecated {
+            since: deprecation.since.as_deref(),
+            note: deprecation.note.as_deref(),
+        });
+        data.must_use = item
+            .attrs
+            .iter()
+            .any(|attr| matches!(attr, Attribute::MustUse { .. }));
+        data.non_exhaustive = item.attrs.contains(&Attribute::NonExhaustive);
+        data.source_location = self.source_location(item);
+        if let Some(parent) = parent {
+            data.impl_header = self.impl_header(parent, id);
+        } else {
             data.also_reexported_at = self
                 .index
                 .public_paths(id)
@@ -440,11 +574,26 @@ impl<'a> Query<'a> {
         data.fields = self.fields(item);
         data.variants = self.variants(item);
         if let Some(docs) = item.docs.as_deref() {
-            let (first, truncated) = first_paragraph(docs);
-            if !first.is_empty() {
-                data.docs = Some(first);
+            let split = docs::split(docs);
+            let full = detail == Detail::Full;
+            let (first, more) = first_paragraph(&split.intro);
+            let intro = if full { split.intro.as_str() } else { first };
+            if !intro.is_empty() {
+                data.docs = Some(Cow::Owned(intro.to_owned()));
             }
-            data.docs_truncated = truncated;
+            data.docs_truncated = !full && (more || !split.sections.is_empty());
+            data.sections = split
+                .sections
+                .into_iter()
+                .map(|section| Section {
+                    heading: section.heading.into(),
+                    lines: section.text.lines().count(),
+                    text: full.then(|| section.text.into()),
+                })
+                .collect();
+        }
+        if detail == Detail::Full {
+            data.attrs = item.attrs.iter().filter_map(attribute_text).collect();
         }
         Some(data)
     }
@@ -690,6 +839,58 @@ fn std_source(file: &str) -> Option<(&str, &str)> {
     let (commit, path) = file.strip_prefix("/rustc/")?.split_once('/')?;
     (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .then_some((commit, path))
+}
+
+/// An attribute as Rust writes it, for `detail=full`. The traces of `cfg` and `doc(cfg)` are left
+/// to the feature notes (requirement R-FT-2), `#[doc = "…"]` is the documentation itself, and the
+/// attributes internal to rustc (`#[attr = RustcDiagnosticItem("Vec")]`) say nothing to a user.
+fn attribute_text(attribute: &Attribute) -> Option<Box<str>> {
+    let text = match attribute {
+        Attribute::NonExhaustive => "#[non_exhaustive]".to_owned(),
+        Attribute::MustUse { reason: None } => "#[must_use]".to_owned(),
+        Attribute::MustUse {
+            reason: Some(reason),
+        } => format!("#[must_use = {reason:?}]"),
+        Attribute::MacroExport => "#[macro_export]".to_owned(),
+        Attribute::ExportName(name) => format!("#[export_name = {name:?}]"),
+        Attribute::LinkSection(name) => format!("#[link_section = {name:?}]"),
+        Attribute::AutomaticallyDerived => "#[automatically_derived]".to_owned(),
+        Attribute::Repr(repr) => {
+            let mut hints = vec![
+                match repr.kind {
+                    rustdoc_types::ReprKind::Rust => "Rust",
+                    rustdoc_types::ReprKind::C => "C",
+                    rustdoc_types::ReprKind::Transparent => "transparent",
+                    rustdoc_types::ReprKind::Simd => "simd",
+                }
+                .to_owned(),
+            ];
+            hints.extend(repr.int.clone());
+            hints.extend(repr.align.map(|align| format!("align({align})")));
+            hints.extend(repr.packed.map(|packed| format!("packed({packed})")));
+            format!("#[repr({})]", hints.join(", "))
+        },
+        Attribute::NoMangle => "#[no_mangle]".to_owned(),
+        Attribute::TargetFeature { enable } => {
+            format!("#[target_feature(enable = {:?})]", enable.join(","))
+        },
+        Attribute::Other(text) => {
+            let left_out = [
+                "#[<cfg",
+                "#[attr = Cfg",
+                "#[doc(cfg",
+                "#[doc =",
+                "#[attr = Rustc",
+            ]
+            .iter()
+            .any(|prefix| text.starts_with(prefix));
+            if left_out {
+                return None;
+            }
+            text.clone()
+        },
+    };
+    Some(text.into())
 }
 
 /// `values` as a boxed slice of boxed strings.
@@ -1090,6 +1291,7 @@ mod tests {
                 resolved_from: ResolvedFrom::Explicit,
                 project_from: None,
             },
+            detail: Detail::Normal,
             target: None,
         }))
     }
@@ -1194,6 +1396,7 @@ mod tests {
                 resolved_from: ResolvedFrom::Explicit,
                 project_from: None,
             },
+            detail: Detail::Normal,
             target: None,
         })
         .expect("found");
@@ -1280,5 +1483,146 @@ mod tests {
         );
         assert!(docs_rs_release("https://doc.rust-lang.org/nightly/").is_none());
         assert!(docs_rs_release("https://docs.rs/serde/latest/").is_none());
+    }
+
+    /// The response for `path` in [`parsed`] with `detail`, after `change` is made to the crate.
+    fn at_detail(path: &str, detail: Detail, change: impl FnOnce(&mut Crate)) -> serde_json::Value {
+        let mut krate = parsed().krate;
+        change(&mut krate);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::new(1, 2, 3);
+        let response = get_item(&view, ItemRequest {
+            name: &name,
+            version: &version,
+            path,
+            origin: Origin::DocsRs {
+                resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
+            },
+            detail,
+            target: None,
+        })
+        .expect("found");
+        serde_json::to_value(response).expect("serializes")
+    }
+
+    /// The mutex documented with an example that has a hidden line, and with more attributes.
+    fn with_example(krate: &mut Crate) {
+        if let Some(mutex) = krate.index.get_mut(&Id(3)) {
+            mutex.docs = Some(
+                "A lock.\n\nMore.\n\n# Examples\n\n```\n# use my_crate::Mutex;\nlet m = Mutex;\n```"
+                    .to_owned(),
+            );
+            mutex.attrs.extend([
+                Attribute::Repr(rustdoc_types::AttributeRepr {
+                    kind: rustdoc_types::ReprKind::C,
+                    align: Some(8),
+                    packed: None,
+                    int: None,
+                }),
+                Attribute::Other("#[attr = CfgTrace([NameValue { name: feature }])]".to_owned()),
+                Attribute::Other("#[doc(alias = \"lock\")]".to_owned()),
+                Attribute::Other("#[attr = RustcDiagnosticItem(\"Mutex\")]".to_owned()),
+            ]);
+        }
+    }
+
+    #[test]
+    fn brief_is_the_signature_alone() {
+        let response = at_detail("my_crate::Mutex", Detail::Brief, with_example);
+        assert_eq!(
+            response["data"],
+            json!({
+                "path": "my_crate::Mutex",
+                "kind": "struct",
+                "signature": "pub struct Mutex",
+            })
+        );
+    }
+
+    #[test]
+    fn normal_lists_the_sections_and_full_has_their_text() {
+        let normal = at_detail("my_crate::Mutex", Detail::Normal, with_example);
+        assert_eq!(normal["data"]["docs"], "A lock.");
+        assert_eq!(normal["data"]["docs_truncated"], true);
+        assert_eq!(
+            normal["data"]["sections"],
+            json!([{ "heading": "Examples", "lines": 3 }])
+        );
+        assert!(normal["data"].get("attrs").is_none(), "{normal}");
+
+        let full = at_detail("my_crate::Mutex", Detail::Full, with_example);
+        assert_eq!(full["data"]["docs"], "A lock.\n\nMore.");
+        assert!(full["data"].get("docs_truncated").is_none(), "{full}");
+        assert_eq!(
+            full["data"]["sections"],
+            json!([{
+                "heading": "Examples",
+                "lines": 3,
+                "text": "```\nlet m = Mutex;\n```",
+            }])
+        );
+        assert_eq!(
+            full["data"]["attrs"],
+            json!([
+                "#[must_use]",
+                "#[repr(C, align(8))]",
+                "#[doc(alias = \"lock\")]"
+            ])
+        );
+    }
+
+    #[test]
+    fn a_large_response_is_cut_to_its_budget() {
+        let words = "word ".repeat(2_000);
+        let (size, cut) = lookup("1.2.3", "my_crate::Mutex", |result| {
+            let mut response = result.expect("found");
+            response.data.docs = Some(Cow::Owned(words.clone()));
+            response.data.sections = (0..3)
+                .map(|n| Section {
+                    heading: format!("S{n}").into(),
+                    lines: 1,
+                    text: Some(words.clone().into()),
+                })
+                .collect();
+            response.data.fields = (0..1_000).map(|n| format!("pub f{n}: u8").into()).collect();
+            fit(&mut response, 8_000);
+            let json = serde_json::to_value(&response).expect("serializes");
+            (json.to_string().chars().count(), json)
+        });
+        assert!(size <= 8_000, "{size}");
+        let data = &cut["data"];
+        assert_eq!(data["truncated"], true);
+        assert!(
+            data["sections"].as_array().is_some_and(|sections| sections
+                .iter()
+                .all(|section| section.get("text").is_none())),
+            "{data}"
+        );
+        assert!(
+            data["docs"]
+                .as_str()
+                .is_some_and(|docs| docs.ends_with('…'))
+        );
+        let fields = data["fields"].as_array().map_or(0, Vec::len);
+        assert!(fields < 1_000, "{fields}");
+        assert!(
+            cut["warnings"][0]
+                .as_str()
+                .is_some_and(|warning| warning.contains("of 1000 fields")),
+            "{cut}"
+        );
+    }
+
+    #[test]
+    fn a_small_response_is_not_cut() {
+        let cut = lookup("1.2.3", "my_crate::Mutex", |result| {
+            let mut response = result.expect("found");
+            fit(&mut response, MAX_RESPONSE_CHARS);
+            serde_json::to_value(&response).expect("serializes")
+        });
+        assert!(cut["data"].get("truncated").is_none(), "{cut}");
     }
 }

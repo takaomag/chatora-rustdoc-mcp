@@ -17,6 +17,12 @@ expression: response
     "signature": "pub trait Deserialize<'de>: Sized",
     "docs": "A **data structure** that can be deserialized from any data format supported\nby Serde.",
     "docs_truncated": true,
+    "sections": [
+      {
+        "heading": "Lifetime",
+        "lines": 5
+      }
+    ],
     "also_reexported_at": [
       "serde::de::Deserialize"
     ],

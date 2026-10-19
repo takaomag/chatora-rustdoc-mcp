@@ -36,7 +36,7 @@ use crate::{
     },
     query::{
         across::{self, Indexed},
-        get_item::{GetItemError, ItemRequest, Origin, ResolvedFrom, get_item},
+        get_item::{Detail, GetItemError, ItemRequest, Origin, ResolvedFrom, get_item},
         load,
         view::CrateView,
     },
@@ -71,6 +71,12 @@ const PROJECT_EXAMPLE: &[&str] = &[
 const PATH_EXAMPLE: &[&str] =
     &[r#"pass the path of the item, for example {"path": "tokio::sync::Mutex::lock"}"#];
 
+/// How to pass `detail`, for `invalid_argument`.
+const DETAIL_EXAMPLE: &[&str] = &[r#"pass brief, normal or full, for example {"detail": "full"}"#];
+
+/// The most candidates an `ambiguous_path` error lists (requirement R-OUT-3).
+const MAX_CANDIDATES: usize = 20;
+
 /// Checked arguments.
 #[derive(Debug)]
 pub(super) struct Arguments {
@@ -83,6 +89,8 @@ pub(super) struct Arguments {
     path: Box<str>,
     /// The target asked for.
     target: Option<TargetTriple>,
+    /// How much to show.
+    detail: Detail,
 }
 
 /// What is looked up, once the version and the target are decided.
@@ -97,6 +105,7 @@ struct Request {
     path: Box<str>,
     resolved_from: ResolvedFrom,
     target: TargetTriple,
+    detail: Detail,
 }
 
 /// Definition of the tool for `tools/list`.
@@ -128,6 +137,13 @@ pub(super) fn definition() -> Tool {
                 "type": "string",
                 "description": "The path of the item (tokio::sync::Mutex::lock). The crate name \
                                 may be left out.",
+            },
+            "detail": {
+                "type": "string",
+                "enum": ["brief", "normal", "full"],
+                "description": "brief: the signature only. normal (the default): also the first \
+                                paragraph of the documentation and the headings of its sections. \
+                                full: the whole documentation and the attributes.",
             },
         },
         "required": ["crate", "path"],
@@ -182,56 +198,80 @@ fn output_schema() -> JsonObject {
                 "required": ["source", "crate", "version", "target"],
             },
             "warnings": strings,
-            "data": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "The canonical path." },
-                    "kind": { "type": "string" },
-                    "parent": { "type": "string" },
-                    "impl": { "type": "string" },
-                    "signature": { "type": "string" },
-                    "where": strings,
-                    "fields": strings,
-                    "variants": strings,
-                    "docs": {
-                        "type": "string",
-                        "description": "The first paragraph of the documentation.",
-                    },
-                    "docs_truncated": { "type": "boolean" },
-                    "deprecated": {
-                        "type": "object",
-                        "properties": {
-                            "since": { "type": "string" },
-                            "note": { "type": "string" },
-                        },
-                    },
-                    "must_use": { "type": "boolean" },
-                    "non_exhaustive": { "type": "boolean" },
-                    "also_reexported_at": strings,
-                    "reexport_of": {
-                        "type": "object",
-                        "properties": {
-                            "crate": { "type": "string" },
-                            "path": { "type": "string" },
-                        },
-                        "required": ["crate", "path"],
-                    },
-                    "source_location": {
-                        "type": "object",
-                        "properties": {
-                            "file": { "type": "string" },
-                            "lines": { "type": "string" },
-                            "url": { "type": "string" },
-                        },
-                        "required": ["file", "lines"],
-                    },
-                },
-                "required": ["path", "kind"],
-            },
+            "data": data_schema(),
             "hints": strings,
         },
         "required": ["provenance", "data"],
     }))
+}
+
+/// The schema of `data`: `ItemData` in `query::get_item`.
+fn data_schema() -> Value {
+    let strings = json!({ "type": "array", "items": { "type": "string" } });
+    json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string", "description": "The canonical path." },
+            "kind": { "type": "string" },
+            "parent": { "type": "string" },
+            "impl": { "type": "string" },
+            "signature": { "type": "string" },
+            "where": strings,
+            "fields": strings,
+            "variants": strings,
+            "docs": {
+                "type": "string",
+                "description": "The first paragraph of the documentation, or with \
+                                detail=full what comes before its first heading.",
+            },
+            "docs_truncated": { "type": "boolean" },
+            "sections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "heading": { "type": "string" },
+                        "lines": { "type": "integer" },
+                        "text": { "type": "string" },
+                    },
+                    "required": ["heading", "lines"],
+                },
+            },
+            "attrs": strings,
+            "deprecated": {
+                "type": "object",
+                "properties": {
+                    "since": { "type": "string" },
+                    "note": { "type": "string" },
+                },
+            },
+            "must_use": { "type": "boolean" },
+            "non_exhaustive": { "type": "boolean" },
+            "also_reexported_at": strings,
+            "reexport_of": {
+                "type": "object",
+                "properties": {
+                    "crate": { "type": "string" },
+                    "path": { "type": "string" },
+                },
+                "required": ["crate", "path"],
+            },
+            "source_location": {
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string" },
+                    "lines": { "type": "string" },
+                    "url": { "type": "string" },
+                },
+                "required": ["file", "lines"],
+            },
+            "truncated": {
+                "type": "boolean",
+                "description": "Something was cut to keep the response small.",
+            },
+        },
+        "required": ["path", "kind"],
+    })
 }
 
 /// The object inside `value`, which is always an object here.
@@ -315,12 +355,24 @@ pub(super) fn parse_arguments(
         ));
     }
     let path = with_crate_name(&name, path);
+    let detail = match string("detail", DETAIL_EXAMPLE)? {
+        None | Some("normal") => Detail::Normal,
+        Some("brief") => Detail::Brief,
+        Some("full") => Detail::Full,
+        Some(other) => {
+            return Err(InvalidArgument::new(
+                format!("`detail` is {other:?}, not brief, normal or full"),
+                DETAIL_EXAMPLE,
+            ));
+        },
+    };
     Ok(Arguments {
         name,
         version,
         project,
         path,
         target,
+        detail,
     })
 }
 
@@ -333,19 +385,15 @@ async fn resolve(
     arguments: Arguments,
     target: TargetTriple,
 ) -> Result<(Request, Vec<Box<str>>), Box<CallToolResult>> {
-    let mut warnings: Vec<Box<str>> = Vec::new();
-    if arguments.target.is_none()
-        && let Some(why) = &state.host.stand_in_because
-    {
-        warnings.push(
-            format!("the target {target} is used, as the host target is not known: {why}").into(),
-        );
-    }
+    let mut warnings: Vec<Box<str>> = stand_in_warning(state, &arguments, &target)
+        .into_iter()
+        .collect();
     let Arguments {
         name,
         version,
         project,
         path,
+        detail,
         ..
     } = arguments;
     // Without a version, the project decides it (requirement R-VR-2), or else it is the latest.
@@ -392,6 +440,7 @@ async fn resolve(
             project_from: None,
             resolved_from: ResolvedFrom::Explicit,
             target,
+            detail,
         };
         return Ok((request, warnings));
     }
@@ -433,8 +482,22 @@ async fn resolve(
         path,
         resolved_from,
         target,
+        detail,
     };
     Ok((request, warnings))
+}
+
+/// The warning that `target` stands in for the host target, when no target was asked for and the
+/// host target is not known.
+fn stand_in_warning(
+    state: &ToolState,
+    arguments: &Arguments,
+    target: &TargetTriple,
+) -> Option<Box<str>> {
+    let why = state.host.stand_in_because.as_ref()?;
+    arguments.target.is_none().then(|| {
+        format!("the target {target} is used, as the host target is not known: {why}").into()
+    })
 }
 
 /// The exact version that `spec` names, if the JSON of `name` at it for `target` is cached: it is
@@ -766,6 +829,7 @@ async fn execute_std(
         path: with_lib_name(krate.as_str(), &arguments.path),
         resolved_from: ResolvedFrom::Latest,
         target,
+        detail: arguments.detail,
     };
     let cache = state.cache.clone();
     let task = tokio::task::spawn_blocking(move || {
@@ -879,6 +943,7 @@ fn look_up_std(
             why: &chosen.why,
         },
         target: Some(request.target.as_str()),
+        detail: request.detail,
     })
     .map_err(Failure::Item)
     .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize));
@@ -1078,6 +1143,7 @@ fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Request) -> Result<Value, Fa
             project_from: arguments.project_from,
         },
         target: Some(arguments.target.as_str()),
+        detail: arguments.detail,
     })
     .map_err(Failure::Item)
     .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize))
@@ -1262,7 +1328,8 @@ fn item_error(arguments: &Request, error: &GetItemError) -> CallToolResult {
             "message": format!("{release} has more than one item at {}", arguments.path),
             "retryable": false,
             "suggestions": ["call get_item again with the path of one of the candidates"],
-            "candidates": candidates,
+            "candidates": candidates.get(..MAX_CANDIDATES).unwrap_or(candidates),
+            "candidates_total": candidates.len(),
         })),
     }
 }
@@ -1369,10 +1436,51 @@ mod tests {
             (json!({ "crate": "tokio", "path": " " }), "`path`"),
             (json!({ "crate": "tokio" }), "`path`"),
             (json!({ "path": "spawn" }), "`crate`"),
+            (
+                json!({ "crate": "tokio", "path": "spawn", "detail": "all" }),
+                "`detail`",
+            ),
         ] {
             let error = arguments(value.clone()).expect_err("invalid");
             assert!(error.message.contains(about), "{value}: {error:?}");
         }
+    }
+
+    #[test]
+    fn detail_is_normal_unless_asked() {
+        let detail = |value: Value| arguments(value).map(|arguments| arguments.detail);
+        assert_eq!(
+            detail(json!({ "crate": "tokio", "path": "spawn" })).ok(),
+            Some(Detail::Normal)
+        );
+        assert_eq!(
+            detail(json!({ "crate": "tokio", "path": "spawn", "detail": "brief" })).ok(),
+            Some(Detail::Brief)
+        );
+        assert_eq!(
+            detail(json!({ "crate": "tokio", "path": "spawn", "detail": " full " })).ok(),
+            Some(Detail::Full)
+        );
+    }
+
+    #[test]
+    fn ambiguous_paths_list_at_most_twenty_candidates() {
+        let request = Request {
+            name: "tokio".parse().expect("a crate name"),
+            version: Version::new(1, 0, 0),
+            project_from: None,
+            path: "tokio::x".into(),
+            resolved_from: ResolvedFrom::Explicit,
+            target: "x86_64-unknown-linux-gnu".parse().expect("a triple"),
+            detail: Detail::Normal,
+        };
+        let candidates = (0..25).map(|n| format!("item {n}").into()).collect();
+        let result = item_error(&request, &GetItemError::Ambiguous { candidates });
+        let text = result.content[0].as_text().map(|text| text.text.clone());
+        let body: Value = serde_json::from_str(&text.unwrap_or_default()).expect("JSON");
+        assert_eq!(body["code"], "ambiguous_path");
+        assert_eq!(body["candidates"].as_array().map(Vec::len), Some(20));
+        assert_eq!(body["candidates_total"], 25);
     }
 
     /// Every property of a full response is declared in the output schema.
@@ -1385,6 +1493,7 @@ mod tests {
             Provenance,
             ReexportOf,
             ResolvedFrom,
+            Section,
             Source,
             SourceLocation,
             StdFrom,
@@ -1419,7 +1528,7 @@ mod tests {
                 where_predicates: many(),
                 fields: many(),
                 variants: many(),
-                docs: Some("x"),
+                docs: Some("x".into()),
                 docs_truncated: true,
                 deprecated: Some(Deprecated {
                     since: Some("x"),
@@ -1437,6 +1546,13 @@ mod tests {
                     lines: "1".into(),
                     url: some(),
                 }),
+                sections: Box::from([Section {
+                    heading: "x".into(),
+                    lines: 1,
+                    text: some(),
+                }]),
+                attrs: many(),
+                truncated: true,
             },
             hints: many(),
         };

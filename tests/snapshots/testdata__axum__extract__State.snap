@@ -17,6 +17,40 @@ expression: response
     "signature": "pub struct State<S>(pub S);",
     "docs": "Extractor for state.",
     "docs_truncated": true,
+    "sections": [
+      {
+        "heading": "With `Router`",
+        "lines": 31
+      },
+      {
+        "heading": "Combining stateful routers",
+        "lines": 62
+      },
+      {
+        "heading": "With `MethodRouter`",
+        "lines": 16
+      },
+      {
+        "heading": "With `Handler`",
+        "lines": 18
+      },
+      {
+        "heading": "Substates",
+        "lines": 46
+      },
+      {
+        "heading": "For library authors",
+        "lines": 33
+      },
+      {
+        "heading": "Shared mutable state",
+        "lines": 9
+      },
+      {
+        "heading": "Example",
+        "lines": 29
+      }
+    ],
     "source_location": {
       "file": "src/extract/state.rs",
       "lines": "301",
