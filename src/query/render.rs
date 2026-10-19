@@ -5,6 +5,8 @@
 //! rustdoc gives them until M1 indexes those crates too (R-PR-4). The where clauses, the fields of
 //! a struct and the variants of an enum are rendered separately, one string each (R-OUT-2).
 
+use std::borrow::Cow;
+
 use rustdoc_types::{
     Abi,
     AssocItemConstraint,
@@ -47,7 +49,7 @@ pub struct Renderer<'a> {
     krate: &'a Crate,
     index: &'a PathIndex,
     /// Forms that could not be rendered faithfully (requirement R-OUT-2).
-    warnings: Vec<String>,
+    warnings: Vec<Cow<'static, str>>,
 }
 
 impl<'a> Renderer<'a> {
@@ -63,8 +65,14 @@ impl<'a> Renderer<'a> {
 
     /// What could not be rendered faithfully so far.
     #[must_use]
-    pub fn warnings(&self) -> &[String] {
+    pub fn warnings(&self) -> &[Cow<'static, str>] {
         &self.warnings
+    }
+
+    /// What could not be rendered faithfully, taken out of the renderer.
+    #[must_use]
+    pub fn into_warnings(self) -> Vec<Cow<'static, str>> {
+        self.warnings
     }
 
     /// The declaration of `item` as Rust, without its where clause, body, fields or variants:
@@ -190,7 +198,7 @@ impl<'a> Renderer<'a> {
                     WherePredicate::LifetimePredicate { lifetime, outlives } => {
                         out.push_str(lifetime);
                         out.push_str(": ");
-                        out.push_str(&outlives.join(" + "));
+                        push_joined(&mut out, outlives, " + ");
                     },
                     WherePredicate::EqPredicate { lhs, rhs } => {
                         self.push_type(&mut out, lhs);
@@ -480,7 +488,7 @@ impl<'a> Renderer<'a> {
                 out.push_str(&param.name);
                 if !outlives.is_empty() {
                     out.push_str(": ");
-                    out.push_str(&outlives.join(" + "));
+                    push_joined(out, outlives, " + ");
                 }
             },
             GenericParamDefKind::Type {
@@ -601,7 +609,7 @@ impl<'a> Renderer<'a> {
             Type::Pat { type_, .. } => {
                 // rustdoc hides the pattern itself, so only the base type can be shown.
                 self.warnings
-                    .push("a pattern type is shown as its base type".to_owned());
+                    .push(Cow::Borrowed("a pattern type is shown as its base type"));
                 self.push_type(out, type_);
             },
             Type::ImplTrait(bounds) => {
@@ -716,8 +724,10 @@ impl<'a> Renderer<'a> {
             // rustdoc leaves the path empty for the trait of `F::Output`, written without it.
             out.push_str(name);
         } else {
-            self.warnings
-                .push(format!("the path of item {} is unknown", path.id.0));
+            self.warnings.push(Cow::Owned(format!(
+                "the path of item {} is unknown",
+                path.id.0
+            )));
             out.push('_');
         }
         if let Some(args) = &path.args {
@@ -795,6 +805,16 @@ impl<'a> Renderer<'a> {
             Term::Type(ty) => self.push_type(out, ty),
             Term::Constant(constant) => out.push_str(&constant.expr),
         }
+    }
+}
+
+/// `items` with `separator` between them, without building the joined string first.
+fn push_joined(out: &mut String, items: &[String], separator: &str) {
+    for (position, item) in items.iter().enumerate() {
+        if position > 0 {
+            out.push_str(separator);
+        }
+        out.push_str(item);
     }
 }
 

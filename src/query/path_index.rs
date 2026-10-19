@@ -9,11 +9,12 @@
 //! but not followed, and re-exports of primitive types are skipped (R-PR-3 and R-PR-4 in M1).
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt,
 };
 
-use rustdoc_types::{Crate, Id, Item, ItemEnum, Use, Visibility};
+use rustdoc_types::{Crate, Id, Impl, Item, ItemEnum, Use, Visibility};
 
 /// Deepest chain of modules and re-exports to follow (requirement R-PR-3). Glob re-exports that
 /// refer to each other could otherwise go on without end.
@@ -33,11 +34,23 @@ impl PublicPath {
     pub fn segments(&self) -> &[Box<str>] {
         &self.0
     }
+
+    /// The path joined with `::`, allocated once at its exact length.
+    #[must_use]
+    pub fn joined(&self) -> Box<str> {
+        self.0.join("::").into_boxed_str()
+    }
 }
 
 impl fmt::Display for PublicPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0.join("::"))
+        for (position, segment) in self.0.iter().enumerate() {
+            if position > 0 {
+                f.write_str("::")?;
+            }
+            f.write_str(segment)?;
+        }
+        Ok(())
     }
 }
 
@@ -127,14 +140,14 @@ impl PathIndex {
         let by_public_path = group(
             paths_of
                 .iter()
-                .flat_map(|(&id, paths)| paths.iter().map(move |path| (path.to_string(), id))),
+                .flat_map(|(&id, paths)| paths.iter().map(move |path| (path.joined(), id))),
         );
         let by_definition_path = group(
             krate
                 .paths
                 .iter()
                 .filter(|(_, summary)| summary.crate_id == 0)
-                .map(|(&id, summary)| (summary.path.join("::"), id)),
+                .map(|(&id, summary)| (summary.path.join("::").into_boxed_str(), id)),
         );
         let external_reexports = walker
             .external_reexports
@@ -147,7 +160,7 @@ impl PathIndex {
                         PublicPath(summary.path.iter().map(|s| s.as_str().into()).collect())
                     }),
                 };
-                (reexport.path.to_string().into_boxed_str(), reexport)
+                (reexport.path.joined(), reexport)
             })
             .collect();
         let external_globs = walker
@@ -389,10 +402,10 @@ fn canonical_first(paths: Vec<Vec<&str>>, name: Option<&str>) -> Box<[PublicPath
 }
 
 /// Groups ids by key, with the ids of each key in a fixed order (requirement R-OUT-4).
-fn group(pairs: impl Iterator<Item = (String, Id)>) -> HashMap<Box<str>, Box<[Id]>> {
+fn group(pairs: impl Iterator<Item = (Box<str>, Id)>) -> HashMap<Box<str>, Box<[Id]>> {
     let mut groups: HashMap<Box<str>, Vec<Id>> = HashMap::new();
     for (key, id) in pairs {
-        groups.entry(key.into_boxed_str()).or_default().push(id);
+        groups.entry(key).or_default().push(id);
     }
     groups
         .into_iter()
@@ -412,19 +425,23 @@ fn one_or_ambiguous(ids: &[Id]) -> Resolution<'static> {
     }
 }
 
-/// Trims `path`, drops a leading `::`, and writes the crate name with `_` instead of `-`.
-fn normalize(path: &str) -> Option<String> {
+/// Trims `path`, drops a leading `::`, and writes the crate name with `_` instead of `-`. The
+/// path is borrowed unless its crate name has a `-`.
+fn normalize(path: &str) -> Option<Cow<'_, str>> {
     let path = path.trim().trim_start_matches("::");
     let (crate_name, rest) = path.split_once("::").unwrap_or((path, ""));
     if crate_name.is_empty() {
         return None;
     }
+    if !crate_name.contains('-') {
+        return Some(Cow::Borrowed(path));
+    }
     let crate_name = crate_name.replace('-', "_");
-    Some(if rest.is_empty() {
+    Some(Cow::Owned(if rest.is_empty() {
         crate_name
     } else {
         format!("{crate_name}::{rest}")
-    })
+    }))
 }
 
 /// Finds the member called `name` of `parent`: the variants of an enum, the items of a trait, or
@@ -433,16 +450,13 @@ fn find_member(krate: &Crate, parent: Id, name: &str) -> Resolution<'static> {
     let Some(item) = krate.index.get(&parent) else {
         return Resolution::NotFound;
     };
-    let groups: Vec<Vec<Id>> = match &item.inner {
-        ItemEnum::Enum(contents) => {
-            let mut groups = vec![contents.variants.clone()];
-            groups.extend(impl_items(krate, &contents.impls));
-            groups
-        },
-        ItemEnum::Struct(contents) => impl_items(krate, &contents.impls).into(),
-        ItemEnum::Union(contents) => impl_items(krate, &contents.impls).into(),
-        ItemEnum::Primitive(contents) => impl_items(krate, &contents.impls).into(),
-        ItemEnum::Trait(contents) => vec![contents.items.clone()],
+    // The members of the item itself, then its `impl`s.
+    let (own, impls): (&[Id], &[Id]) = match &item.inner {
+        ItemEnum::Enum(contents) => (&contents.variants, &contents.impls),
+        ItemEnum::Struct(contents) => (&[], &contents.impls),
+        ItemEnum::Union(contents) => (&[], &contents.impls),
+        ItemEnum::Primitive(contents) => (&[], &contents.impls),
+        ItemEnum::Trait(contents) => (&contents.items, &[]),
         // Nothing else has members that are looked up by name.
         ItemEnum::Module(_)
         | ItemEnum::ExternCrate { .. }
@@ -459,52 +473,73 @@ fn find_member(krate: &Crate, parent: Id, name: &str) -> Resolution<'static> {
         | ItemEnum::Macro(_)
         | ItemEnum::ProcMacro(_)
         | ItemEnum::AssocConst { .. }
-        | ItemEnum::AssocType { .. } => Vec::new(),
+        | ItemEnum::AssocType { .. } => (&[], &[]),
     };
-    for members in groups {
-        let found: Vec<Id> = members
-            .into_iter()
-            .filter(|member| {
-                krate
-                    .index
-                    .get(member)
-                    .and_then(|member| member.name.as_deref())
-                    == Some(name)
+    if let Some(found) = named(krate, parent, own.iter(), name) {
+        return found;
+    }
+    for kind in [ImplKind::Inherent, ImplKind::Trait, ImplKind::Blanket] {
+        let members = impls
+            .iter()
+            .filter_map(|id| match krate.index.get(id) {
+                Some(Item {
+                    inner: ItemEnum::Impl(contents),
+                    ..
+                }) if ImplKind::of(contents) == kind => Some(contents.items.iter()),
+                Some(_) | None => None,
             })
-            .collect();
-        match found.as_slice() {
-            [] => {},
-            [member] => {
-                return Resolution::Member {
-                    parent,
-                    member: *member,
-                };
-            },
-            _ => return Resolution::Ambiguous(found.into_boxed_slice()),
+            .flatten();
+        if let Some(found) = named(krate, parent, members, name) {
+            return found;
         }
     }
     Resolution::NotFound
 }
 
-/// The items of `impls`, in three groups: inherent, trait, and blanket `impl`s.
-fn impl_items(krate: &Crate, impls: &[Id]) -> [Vec<Id>; 3] {
-    let mut groups: [Vec<Id>; 3] = Default::default();
-    for impl_id in impls {
-        let Some(Item {
-            inner: ItemEnum::Impl(contents),
-            ..
-        }) = krate.index.get(impl_id)
-        else {
-            continue;
-        };
-        let group = match (&contents.trait_, &contents.blanket_impl) {
-            (None, _) => &mut groups[0],
-            (Some(_), None) => &mut groups[1],
-            (Some(_), Some(_)) => &mut groups[2],
-        };
-        group.extend_from_slice(&contents.items);
+/// The member of `parent` among `members` called `name`, ambiguous if there are several, or
+/// `None` if there is none.
+fn named<'a>(
+    krate: &Crate,
+    parent: Id,
+    members: impl Iterator<Item = &'a Id>,
+    name: &str,
+) -> Option<Resolution<'static>> {
+    let found: Vec<Id> = members
+        .filter(|member| {
+            krate
+                .index
+                .get(member)
+                .and_then(|member| member.name.as_deref())
+                == Some(name)
+        })
+        .copied()
+        .collect();
+    match found.as_slice() {
+        [] => None,
+        [member] => Some(Resolution::Member {
+            parent,
+            member: *member,
+        }),
+        _ => Some(Resolution::Ambiguous(found.into_boxed_slice())),
     }
-    groups
+}
+
+/// The groups of `impl`s whose items are searched in turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplKind {
+    Inherent,
+    Trait,
+    Blanket,
+}
+
+impl ImplKind {
+    const fn of(contents: &Impl) -> Self {
+        match (&contents.trait_, &contents.blanket_impl) {
+            (None, _) => Self::Inherent,
+            (Some(_), None) => Self::Trait,
+            (Some(_), Some(_)) => Self::Blanket,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -512,7 +547,6 @@ mod tests {
     use rustdoc_types::{
         Enum,
         Generics,
-        Impl,
         ItemKind,
         ItemSummary,
         Module,

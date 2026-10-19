@@ -7,6 +7,8 @@ mod get_item;
 #[cfg(debug_assertions)]
 mod sleep;
 
+use std::{borrow::Cow, sync::Arc};
+
 use rmcp::{
     model::{
         CallToolRequestParams,
@@ -23,7 +25,7 @@ use serde_json::{Value, json};
 use crate::data::{cache::Cache, docs_rs::DocsRs};
 
 /// What the tools share for the life of the server.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct ToolState {
     /// Where rustdoc JSON is cached.
     pub(super) cache: Cache,
@@ -50,11 +52,11 @@ pub(super) fn definitions() -> Vec<Tool> {
 pub(super) async fn call(
     request: CallToolRequestParams,
     context: RequestContext<RoleServer>,
-    state: &ToolState,
+    state: &Arc<ToolState>,
 ) -> Result<CallToolResponse, ErrorData> {
     match request.name.as_ref() {
         get_item::NAME => match get_item::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => Ok(run_tool(get_item::execute(arguments, state.clone()))
+            Ok(arguments) => Ok(run_tool(get_item::execute(arguments, Arc::clone(state)))
                 .await
                 .into()),
             Err(error) => Ok(error.into_result().into()),
@@ -105,12 +107,13 @@ where
 /// (`clippy::result_large_err`); `call` turns it into the `invalid_argument` tool error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InvalidArgument {
-    message: Box<str>,
+    /// Most messages are fixed text; a few include what was wrong.
+    message: Cow<'static, str>,
     suggestions: &'static [&'static str],
 }
 
 impl InvalidArgument {
-    fn new(message: impl Into<Box<str>>, suggestions: &'static [&'static str]) -> Self {
+    fn new(message: impl Into<Cow<'static, str>>, suggestions: &'static [&'static str]) -> Self {
         Self {
             message: message.into(),
             suggestions,

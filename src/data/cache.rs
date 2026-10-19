@@ -93,16 +93,7 @@ impl Cache {
         name: &CrateName,
         version: &Version,
     ) -> io::Result<Option<Box<[u8]>>> {
-        let path = self.docs_rs_json_path(name, version);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                tracing::warn!(path = %path.display(), "ignoring a symlink in the cache");
-                Ok(None)
-            },
-            Ok(_) => fs::read(&path).map(|json| Some(json.into_boxed_slice())),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
+        read_file(&self.docs_rs_json_path(name, version))
     }
 
     /// Writes the rustdoc JSON fetched from docs.rs for `name` at `version`, replacing what was
@@ -118,6 +109,25 @@ impl Cache {
         json: &[u8],
     ) -> io::Result<()> {
         write_atomically(&self.docs_rs_json_path(name, version), json)
+    }
+}
+
+/// Reads a cached file at `path`, or `None` if there is none. A symlink in its place is not
+/// followed and counts as not cached (requirement R-CA-4).
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read.
+pub(super) fn read_file(path: &Path) -> io::Result<Option<Box<[u8]>>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            tracing::warn!(path = %path.display(), "ignoring a symlink in the cache");
+            Ok(None)
+        },
+        // `fs::read` sizes the buffer to the file, so boxing it does not copy.
+        Ok(_) => fs::read(path).map(|json| Some(json.into_boxed_slice())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -147,7 +157,7 @@ fn root_dir(
 
 /// Writes `contents` to a temporary file next to `path`, flushes it to the disk, and renames it
 /// to `path` (requirement R-CA-4).
-fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub(super) fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     let (Some(dir), Some(file_name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::other(format!(
             "not a file path: {}",

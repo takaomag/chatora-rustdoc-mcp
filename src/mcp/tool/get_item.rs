@@ -18,7 +18,7 @@ use crate::{
         rustdoc_json::{self, ParseError},
     },
     query::{
-        get_item::{GetItemError, ItemRequest, ItemResponse, get_item},
+        get_item::{GetItemError, ItemRequest, get_item},
         path_index::PathIndex,
     },
 };
@@ -223,18 +223,26 @@ pub(super) fn parse_arguments(
 /// `path`, starting with the crate name: it is added when the first segment is something else.
 /// `-` and `_` in the crate name are the same.
 fn with_crate_name(name: &CrateName, path: &str) -> Box<str> {
-    let crate_name = name.as_str().replace('-', "_");
     let first = path.split("::").next().unwrap_or_default();
-    if first.replace('-', "_") == crate_name {
+    if same_crate_name(first, name.as_str()) {
         path.into()
     } else {
-        format!("{crate_name}::{path}").into()
+        format!("{}::{path}", name.as_str().replace('-', "_")).into()
     }
+}
+
+/// Whether `a` and `b` name the same crate, with `-` and `_` the same.
+fn same_crate_name(a: &str, b: &str) -> bool {
+    let normalized = |byte: &u8| if *byte == b'-' { b'_' } else { *byte };
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .all(|(a, b)| normalized(&a) == normalized(&b))
 }
 
 /// Loads the JSON of the crate, then looks the item up on a blocking thread, since parsing a large
 /// crate takes a large part of a second.
-pub(super) async fn execute(arguments: Arguments, state: ToolState) -> CallToolResult {
+pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
     let json = match data::docs_rs_json(
         &state.cache,
         &state.docs_rs,
@@ -266,20 +274,18 @@ pub(super) async fn execute(arguments: Arguments, state: ToolState) -> CallToolR
         },
     };
     match looked_up {
-        Ok(response) => match serde_json::to_value(&response) {
-            Ok(value) => CallToolResult::structured(value),
-            Err(error) => {
-                tracing::error!(%error, "the get_item response could not be serialized");
-                super::tool_error(
-                    "internal_error",
-                    "the server could not build the response (a bug)",
-                    false,
-                    &["report the bug to the server's maintainers, with the server's stderr log"],
-                )
-            },
-        },
+        Ok(response) => CallToolResult::structured(response),
         Err(Failure::Parse(error)) => parse_error(&arguments, &error),
         Err(Failure::Item(error)) => item_error(&arguments, &error),
+        Err(Failure::Serialize(error)) => {
+            tracing::error!(%error, "the get_item response could not be serialized");
+            super::tool_error(
+                "internal_error",
+                "the server could not build the response (a bug)",
+                false,
+                &["report the bug to the server's maintainers, with the server's stderr log"],
+            )
+        },
     }
 }
 
@@ -288,18 +294,30 @@ pub(super) async fn execute(arguments: Arguments, state: ToolState) -> CallToolR
 enum Failure {
     Parse(ParseError),
     Item(GetItemError),
+    Serialize(serde_json::Error),
 }
 
-/// Parses `json`, builds the path index, and looks the item up.
-fn look_up(json: &[u8], arguments: &Arguments) -> Result<ItemResponse, Failure> {
+/// Parses `json`, builds the path index, looks the item up, and serializes the response while
+/// the crate that it borrows from is still there.
+fn look_up(json: &[u8], arguments: &Arguments) -> Result<Value, Failure> {
     let parsed = rustdoc_json::parse(json).map_err(Failure::Parse)?;
     let index = PathIndex::build(&parsed.krate);
-    get_item(&parsed, &index, ItemRequest {
+    let response = get_item(&parsed, &index, ItemRequest {
         name: &arguments.name,
         version: &arguments.version,
         path: &arguments.path,
     })
     .map_err(Failure::Item)
+    .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize));
+    // Freeing a parsed crate takes milliseconds (about 9 ms for rmcp's 14 MB of JSON), so the
+    // response does not wait for it.
+    drop_in_background((parsed, index));
+    response
+}
+
+/// Drops `value` on a blocking thread of its own, without waiting for it.
+fn drop_in_background<T: Send + 'static>(value: T) {
+    drop(tokio::task::spawn_blocking(move || drop(value)));
 }
 
 /// `name@version` of the request.
@@ -389,12 +407,13 @@ fn parse_error(arguments: &Arguments, error: &ParseError) -> CallToolResult {
 fn item_error(arguments: &Arguments, error: &GetItemError) -> CallToolResult {
     let release = release(arguments);
     match error {
-        GetItemError::NotFound { path } => error_result(&json!({
+        GetItemError::NotFound => error_result(&json!({
             "code": "item_not_found",
             "message": format!(
-                "{release} has no item at {path}: it was looked up as a public path, a re-export \
+                "{release} has no item at {}: it was looked up as a public path, a re-export \
                  from another crate, a definition path, and a member of the item at its parent \
-                 path"
+                 path",
+                arguments.path
             ),
             "retryable": false,
             "suggestions": [
@@ -403,9 +422,9 @@ fn item_error(arguments: &Arguments, error: &GetItemError) -> CallToolResult {
                  (tokio::sync::Mutex::lock)",
             ],
         })),
-        GetItemError::Ambiguous { path, candidates } => error_result(&json!({
+        GetItemError::Ambiguous { candidates } => error_result(&json!({
             "code": "ambiguous_path",
-            "message": format!("{release} has more than one item at {path}"),
+            "message": format!("{release} has more than one item at {}", arguments.path),
             "retryable": false,
             "suggestions": ["call get_item again with the path of one of the candidates"],
             "candidates": candidates,
@@ -468,6 +487,7 @@ mod tests {
         use crate::query::get_item::{
             Deprecated,
             ItemData,
+            ItemResponse,
             Provenance,
             ReexportOf,
             ResolvedFrom,
@@ -480,13 +500,13 @@ mod tests {
         let response = ItemResponse {
             provenance: Provenance {
                 source: Source::DocsRs,
-                name: "x".into(),
+                name: "x",
                 version: "1.0.0".into(),
                 resolved_from: ResolvedFrom::Explicit,
-                target: "x".into(),
+                target: "x",
                 format_version: 61,
             },
-            warnings: many(),
+            warnings: Box::from(["x".into()]),
             data: ItemData {
                 path: "x".into(),
                 kind: "struct",
@@ -496,11 +516,11 @@ mod tests {
                 where_predicates: many(),
                 fields: many(),
                 variants: many(),
-                docs: some(),
+                docs: Some("x"),
                 docs_truncated: true,
                 deprecated: Some(Deprecated {
-                    since: some(),
-                    note: some(),
+                    since: Some("x"),
+                    note: Some("x"),
                 }),
                 must_use: true,
                 non_exhaustive: true,
@@ -510,7 +530,7 @@ mod tests {
                     path: "x".into(),
                 }),
                 source_location: Some(SourceLocation {
-                    file: "x".into(),
+                    file: "x",
                     lines: "1".into(),
                     url: some(),
                 }),

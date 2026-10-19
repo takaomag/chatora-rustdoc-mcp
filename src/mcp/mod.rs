@@ -2,7 +2,7 @@
 
 mod tool;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use rmcp::{
     ServerHandler,
@@ -53,7 +53,8 @@ const LIST_TTL_MS: u64 = 60 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 struct Server {
-    tools: tool::ToolState,
+    /// Shared by every tool call, which holds it with one reference count.
+    tools: Arc<tool::ToolState>,
 }
 
 impl ServerHandler for Server {
@@ -170,10 +171,10 @@ pub async fn serve() -> Result<(), ServeError> {
         "starting the MCP server over stdio"
     );
     let server = Server {
-        tools: tool::ToolState {
+        tools: Arc::new(tool::ToolState {
             cache: Cache::open_default()?,
             docs_rs: DocsRs::new()?,
-        },
+        }),
     };
     match server.serve(stdio()).await {
         Ok(running) => match running.waiting().await {

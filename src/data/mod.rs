@@ -41,26 +41,23 @@ pub async fn docs_rs_json(
     version: &Version,
 ) -> Result<Box<[u8]>, LoadError> {
     // The cache is read and written on a blocking thread, so that tens of megabytes of disk I/O do
-    // not hold up the async workers.
-    let cached = {
-        let (cache, name, version) = (cache.clone(), name.clone(), version.clone());
-        blocking(move || cache.read_docs_rs_json(&name, &version)).await
-    }
-    .map_err(LoadError::Cache)?;
+    // not hold up the async workers. The path moves to the thread and back, rather than copies of
+    // the cache, the name and the version.
+    let path = cache.docs_rs_json_path(name, version);
+    let (path, cached) = blocking(move || cache::read_file(&path).map(|cached| (path, cached)))
+        .await
+        .map_err(LoadError::Cache)?;
     if let Some(json) = cached {
         return Ok(json);
     }
     let json = docs_rs.fetch_rustdoc_json(name, version).await?;
     // The JSON moves to the blocking thread and comes back, so that tens of megabytes are not
     // copied.
-    let (json, written) = {
-        let (cache, name, version) = (cache.clone(), name.clone(), version.clone());
-        blocking(move || {
-            let written = cache.write_docs_rs_json(&name, &version, &json);
-            Ok((json, written))
-        })
-        .await
-    }
+    let (json, written) = blocking(move || {
+        let written = cache::write_atomically(&path, &json);
+        Ok((json, written))
+    })
+    .await
     .map_err(LoadError::Cache)?;
     if let Err(error) = written {
         tracing::warn!(%name, %version, %error, "failed to write the rustdoc JSON to the cache");

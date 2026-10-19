@@ -146,7 +146,9 @@ impl DocsRs {
             status => return Err(FetchError::UnexpectedStatus { status }),
         }
         // The body is read in chunks so that it never grows past the limit (requirement R-NW-3).
-        let mut body = Vec::new();
+        // docs.rs sends `content-length`, so the buffer is sized once instead of growing; the
+        // limit caps the size taken from the header.
+        let mut body = Vec::with_capacity(capacity_for(response.content_length(), MAX_BYTES));
         while let Some(chunk) = response.chunk().await.map_err(FetchError::Network)? {
             if exceeds(body.len().saturating_add(chunk.len()), MAX_BYTES) {
                 return Err(FetchError::TooLarge { limit: MAX_BYTES });
@@ -155,6 +157,15 @@ impl DocsRs {
         }
         decompress(body, MAX_BYTES).map(Vec::into_boxed_slice)
     }
+}
+
+/// A buffer size for a body of `expected` bytes, at most `limit` bytes (plus one, to tell "at the
+/// limit" from "over it"). An unknown size gives no up-front capacity.
+fn capacity_for(expected: Option<u64>, limit: u64) -> usize {
+    expected
+        .map(|expected| expected.min(limit.saturating_add(1)))
+        .and_then(|capacity| usize::try_from(capacity).ok())
+        .unwrap_or(0)
 }
 
 /// Whether `len` bytes are more than `limit`.
@@ -171,6 +182,8 @@ fn decompress(mut data: Vec<u8>, limit: u64) -> Result<Vec<u8>, FetchError> {
             tracing::debug!(layers, "decompressed the rustdoc JSON");
             return Ok(data);
         }
+        // docs.rs does not declare the decompressed size in the frame header (checked on
+        // 2026-10-19), so the buffer grows as it is read.
         let mut decompressed = Vec::new();
         zstd::stream::read::Decoder::with_buffer(data.as_slice())
             .map_err(FetchError::Corrupt)?
@@ -209,6 +222,13 @@ mod tests {
         (0..layers).fold(data.to_vec(), |data, _| {
             zstd::stream::encode_all(data.as_slice(), 0).expect("zstd compresses")
         })
+    }
+
+    #[test]
+    fn the_body_capacity_trusts_content_length_only_up_to_the_limit() {
+        assert_eq!(capacity_for(Some(100), 1000), 100);
+        assert_eq!(capacity_for(Some(u64::MAX), 1000), 1001);
+        assert_eq!(capacity_for(None, 1000), 0);
     }
 
     #[test]

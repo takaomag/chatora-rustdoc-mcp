@@ -3,9 +3,11 @@
 //! and R-SH-6).
 //!
 //! This only reads the parsed crate and its path index. Loading the JSON and turning the result
-//! into an MCP tool result are done by the caller.
+//! into an MCP tool result are done by the caller. The response borrows the strings that it shows
+//! as they are from the crate, so it is serialized while the crate is still there.
 
 use std::{
+    borrow::Cow,
     fmt,
     path::{Component, Path},
 };
@@ -25,7 +27,7 @@ use semver::Version;
 use serde::Serialize;
 
 use super::{
-    path_index::{ExternalReexport, PathIndex, Resolution},
+    path_index::{ExternalReexport, PathIndex, PublicPath, Resolution},
     render::Renderer,
 };
 use crate::data::{crate_name::CrateName, rustdoc_json::ParsedCrate};
@@ -43,14 +45,14 @@ pub struct ItemRequest<'a> {
 
 /// The result of `get_item` (the common shape of §7.3).
 #[derive(Debug, Serialize)]
-pub struct ItemResponse {
+pub struct ItemResponse<'a> {
     /// Where the data came from (requirement R-OUT-9).
-    pub provenance: Provenance,
+    pub provenance: Provenance<'a>,
     /// What the caller should know about the data.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
-    pub warnings: Box<[Box<str>]>,
+    pub warnings: Box<[Cow<'static, str>]>,
     /// The item.
-    pub data: ItemData,
+    pub data: ItemData<'a>,
     /// What to call next.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub hints: Box<[Box<str>]>,
@@ -58,18 +60,18 @@ pub struct ItemResponse {
 
 /// Where the data came from. The version, target and format are read from the JSON itself.
 #[derive(Debug, Serialize)]
-pub struct Provenance {
+pub struct Provenance<'a> {
     /// The source that returned the data.
     pub source: Source,
     /// The crate, as requested.
     #[serde(rename = "crate")]
-    pub name: Box<str>,
+    pub name: &'a str,
     /// The version in the JSON, or the requested one if the JSON has none.
-    pub version: Box<str>,
+    pub version: Cow<'a, str>,
     /// How the version was chosen.
     pub resolved_from: ResolvedFrom,
     /// The target the JSON was built for.
-    pub target: Box<str>,
+    pub target: &'a str,
     /// The rustdoc JSON format.
     pub format_version: u32,
 }
@@ -93,7 +95,7 @@ pub enum ResolvedFrom {
 /// One item, as of `detail=normal` (requirement R-OUT-7), with the signature before the prose
 /// (requirement R-SH-1).
 #[derive(Debug, Default, Serialize)]
-pub struct ItemData {
+pub struct ItemData<'a> {
     /// The canonical path; for a member, that of its parent and its name.
     pub path: Box<str>,
     /// What the item is, in the words of rustdoc's `ItemKind`, except that a function in an
@@ -119,13 +121,13 @@ pub struct ItemData {
     pub variants: Box<[Box<str>]>,
     /// The first paragraph of the documentation, as written.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub docs: Option<Box<str>>,
+    pub docs: Option<&'a str>,
     /// The documentation goes on after the first paragraph.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub docs_truncated: bool,
     /// `#[deprecated]` (requirement R-SH-6).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub deprecated: Option<Deprecated>,
+    pub deprecated: Option<Deprecated<'a>>,
     /// `#[must_use]` (requirement R-SH-6).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub must_use: bool,
@@ -140,18 +142,18 @@ pub struct ItemData {
     pub reexport_of: Option<ReexportOf>,
     /// Where the item is defined (requirement R-OUT-8).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_location: Option<SourceLocation>,
+    pub source_location: Option<SourceLocation<'a>>,
 }
 
 /// `#[deprecated]`.
 #[derive(Debug, Serialize)]
-pub struct Deprecated {
+pub struct Deprecated<'a> {
     /// The version that deprecated the item.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub since: Option<Box<str>>,
+    pub since: Option<&'a str>,
     /// Why, or what to use instead.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<Box<str>>,
+    pub note: Option<&'a str>,
 }
 
 /// An item of another crate, by the arguments that `get_item` takes for it.
@@ -167,9 +169,9 @@ pub struct ReexportOf {
 
 /// Where an item is defined.
 #[derive(Debug, Serialize)]
-pub struct SourceLocation {
+pub struct SourceLocation<'a> {
     /// The file, relative to the package root.
-    pub file: Box<str>,
+    pub file: &'a str,
     /// The first and last lines (`434-466`), or the one line (`301`).
     pub lines: Box<str>,
     /// The file on docs.rs, when it is in the package.
@@ -177,21 +179,16 @@ pub struct SourceLocation {
     pub url: Option<Box<str>>,
 }
 
-/// Why an item could not be returned.
+/// Why an item could not be returned. The caller has the path it asked for.
 #[derive(Debug, thiserror::Error)]
 pub enum GetItemError {
     /// Nothing has the path: as a public path, a re-export from another crate, a definition path,
     /// or a member of an item at its parent path.
-    #[error("no item has the path {path}")]
-    NotFound {
-        /// The path as requested.
-        path: Box<str>,
-    },
+    #[error("no item has the path")]
+    NotFound,
     /// More than one item has the path (requirement R-PR-7).
-    #[error("{} items have the path {path}", candidates.len())]
+    #[error("{} items have the path", candidates.len())]
     Ambiguous {
-        /// The path as requested.
-        path: Box<str>,
         /// What each item is: its canonical path, or its name and `impl`.
         candidates: Box<[Box<str>]>,
     },
@@ -202,11 +199,11 @@ pub enum GetItemError {
 /// # Errors
 ///
 /// Returns an error when no item or more than one item has the path.
-pub fn get_item(
-    parsed: &ParsedCrate,
-    index: &PathIndex,
-    request: ItemRequest<'_>,
-) -> Result<ItemResponse, GetItemError> {
+pub fn get_item<'a>(
+    parsed: &'a ParsedCrate,
+    index: &'a PathIndex,
+    request: ItemRequest<'a>,
+) -> Result<ItemResponse<'a>, GetItemError> {
     let mut query = Query {
         request,
         krate: &parsed.krate,
@@ -222,16 +219,13 @@ pub fn get_item(
         Resolution::ExternalReexport(reexport) => Some(query.reexport_data(reexport)),
         Resolution::Ambiguous(ids) => {
             return Err(GetItemError::Ambiguous {
-                path: request.path.into(),
                 candidates: ids.iter().map(|&id| query.describe(id)).collect(),
             });
         },
         Resolution::NotFound => None,
     };
     let Some(data) = data else {
-        return Err(GetItemError::NotFound {
-            path: request.path.into(),
-        });
+        return Err(GetItemError::NotFound);
     };
     let Query {
         renderer,
@@ -239,12 +233,7 @@ pub fn get_item(
         hints,
         ..
     } = query;
-    warnings.extend(
-        renderer
-            .warnings()
-            .iter()
-            .map(|warning| warning.as_str().into()),
-    );
+    warnings.extend(renderer.into_warnings());
     Ok(ItemResponse {
         provenance,
         warnings: warnings.into(),
@@ -259,52 +248,49 @@ struct Query<'a> {
     krate: &'a Crate,
     index: &'a PathIndex,
     renderer: Renderer<'a>,
-    warnings: Vec<Box<str>>,
+    warnings: Vec<Cow<'static, str>>,
     hints: Vec<Box<str>>,
 }
 
-impl Query<'_> {
+impl<'a> Query<'a> {
     /// The provenance, read from the JSON and checked against the request (§7.3).
-    fn provenance(&mut self, parsed: &ParsedCrate) -> Provenance {
-        let requested = self.request.version.to_string();
-        let version = match &self.krate.crate_version {
-            Some(version) if *version == requested => requested,
-            Some(version) => {
-                self.warnings.push(
-                    format!("requested version {requested}, but the data is of version {version}")
-                        .into(),
-                );
-                version.clone()
-            },
-            None => {
-                self.warnings
-                    .push("the data has no crate version; showing the requested one".into());
-                requested
-            },
+    fn provenance(&mut self, parsed: &ParsedCrate) -> Provenance<'a> {
+        let krate = self.krate;
+        let requested = self.request.version;
+        let version = if let Some(version) = krate.crate_version.as_deref() {
+            // Compared as versions, so that the requested one is not formatted to compare it.
+            if Version::parse(version).ok().as_ref() != Some(requested) {
+                self.warnings.push(Cow::Owned(format!(
+                    "requested version {requested}, but the data is of version {version}"
+                )));
+            }
+            Cow::Borrowed(version)
+        } else {
+            self.warnings.push(Cow::Borrowed(
+                "the data has no crate version; showing the requested one",
+            ));
+            Cow::Owned(requested.to_string())
         };
         if parsed.newer_than_supported {
-            self.warnings.push(
-                format!(
-                    "rustdoc JSON format {} is newer than this server supports; the result may be \
-                     incomplete",
-                    self.krate.format_version
-                )
-                .into(),
-            );
+            self.warnings.push(Cow::Owned(format!(
+                "rustdoc JSON format {} is newer than this server supports; the result may be \
+                 incomplete",
+                krate.format_version
+            )));
         }
         Provenance {
             source: Source::DocsRs,
-            name: self.request.name.as_str().into(),
-            version: version.into(),
+            name: self.request.name.as_str(),
+            version,
             resolved_from: ResolvedFrom::Explicit,
-            target: self.krate.target.triple.as_str().into(),
-            format_version: self.krate.format_version,
+            target: &krate.target.triple,
+            format_version: krate.format_version,
         }
     }
 
     /// The item `id`, which belongs to `parent` if it is a member. `None` if it is not in the
     /// crate, which a resolved path should not be.
-    fn item_data(&mut self, id: Id, parent: Option<Id>) -> Option<ItemData> {
+    fn item_data(&mut self, id: Id, parent: Option<Id>) -> Option<ItemData<'a>> {
         let krate = self.krate;
         let item = krate.index.get(&id)?;
         let name = item.name.as_deref().unwrap_or("_");
@@ -313,8 +299,8 @@ impl Query<'_> {
             signature: Some(self.renderer.signature(item).into()),
             where_predicates: boxed(self.renderer.where_predicates(item)),
             deprecated: item.deprecation.as_ref().map(|deprecation| Deprecated {
-                since: deprecation.since.as_deref().map(Into::into),
-                note: deprecation.note.as_deref().map(Into::into),
+                since: deprecation.since.as_deref(),
+                note: deprecation.note.as_deref(),
             }),
             must_use: item
                 .attrs
@@ -336,7 +322,7 @@ impl Query<'_> {
                 .public_paths(id)
                 .iter()
                 .skip(1)
-                .map(|path| path.to_string().into())
+                .map(PublicPath::joined)
                 .collect();
         }
         data.fields = self.fields(item);
@@ -344,7 +330,7 @@ impl Query<'_> {
         if let Some(docs) = item.docs.as_deref() {
             let (first, truncated) = first_paragraph(docs);
             if !first.is_empty() {
-                data.docs = Some(first.into());
+                data.docs = Some(first);
             }
             data.docs_truncated = truncated;
         }
@@ -352,43 +338,38 @@ impl Query<'_> {
     }
 
     /// A re-export of an item of another crate, with the arguments to look the item up there.
-    fn reexport_data(&mut self, reexport: &ExternalReexport) -> ItemData {
+    fn reexport_data(&mut self, reexport: &ExternalReexport) -> ItemData<'a> {
         let summary = self.krate.paths.get(&reexport.target);
         let external =
             summary.and_then(|summary| self.krate.external_crates.get(&summary.crate_id));
         let reexport_of = if let (Some(definition), Some(external)) =
             (&reexport.definition, external)
         {
-            let name = if let Some((name, version)) =
+            let name: Box<str> = if let Some((name, version)) =
                 external.html_root_url.as_deref().and_then(docs_rs_release)
             {
-                format!("{name}@{version}")
+                format!("{name}@{version}").into()
             } else {
-                self.warnings.push(
-                    format!(
-                        "the version of {} that is re-exported is unknown",
-                        external.name
-                    )
-                    .into(),
-                );
-                external.name.clone()
+                self.warnings.push(Cow::Owned(format!(
+                    "the version of {} that is re-exported is unknown",
+                    external.name
+                )));
+                external.name.as_str().into()
             };
-            let path = definition.to_string();
+            let path = definition.joined();
             self.hints.push(
                 format!("call get_item with crate {name} and path {path} for its documentation")
                     .into(),
             );
-            Some(ReexportOf {
-                name: name.into(),
-                path: path.into(),
-            })
+            Some(ReexportOf { name, path })
         } else {
-            self.warnings
-                .push("the re-exported item is not described in this crate's data".into());
+            self.warnings.push(Cow::Borrowed(
+                "the re-exported item is not described in this crate's data",
+            ));
             None
         };
         ItemData {
-            path: reexport.path.to_string().into(),
+            path: reexport.path.joined(),
             kind: summary.map_or("unknown", |summary| summary_kind(summary.kind)),
             reexport_of,
             ..ItemData::default()
@@ -399,21 +380,23 @@ impl Query<'_> {
     /// path.
     fn path_of(&mut self, id: Id) -> Box<str> {
         if let Some(path) = self.index.canonical_path(id) {
-            return path.to_string().into();
+            return path.joined();
         }
-        let path = self.krate.paths.get(&id).map_or_else(
+        let path: Box<str> = self.krate.paths.get(&id).map_or_else(
             || {
                 self.krate
                     .index
                     .get(&id)
-                    .and_then(|item| item.name.clone())
-                    .unwrap_or_else(|| "_".to_owned())
+                    .and_then(|item| item.name.as_deref())
+                    .unwrap_or("_")
+                    .into()
             },
-            |summary| summary.path.join("::"),
+            |summary| summary.path.join("::").into_boxed_str(),
         );
-        self.warnings
-            .push(format!("{path} has no public path; it is shown as defined").into());
-        path.into()
+        self.warnings.push(Cow::Owned(format!(
+            "{path} has no public path; it is shown as defined"
+        )));
+        path
     }
 
     /// The header of the `impl` of `parent` that has `member`, with its where clause. `None` for
@@ -426,9 +409,9 @@ impl Query<'_> {
             .find(|item| matches!(&item.inner, ItemEnum::Impl(contents) if contents.items.contains(&member)))?;
         let mut header = self.renderer.signature(impl_item);
         let predicates = self.renderer.where_predicates(impl_item);
-        if !predicates.is_empty() {
-            header.push_str(" where ");
-            header.push_str(&predicates.join(", "));
+        for (position, predicate) in predicates.iter().enumerate() {
+            header.push_str(if position == 0 { " where " } else { ", " });
+            header.push_str(predicate);
         }
         Some(header.into())
     }
@@ -479,7 +462,7 @@ impl Query<'_> {
     }
 
     /// Where `item` is defined, with a docs.rs URL when the file is in the package.
-    fn source_location(&self, item: &Item) -> Option<SourceLocation> {
+    fn source_location(&self, item: &'a Item) -> Option<SourceLocation<'a>> {
         let span = item.span.as_ref()?;
         let file = span.filename.to_str()?;
         let in_package = span
@@ -504,7 +487,7 @@ impl Query<'_> {
             .into()
         });
         Some(SourceLocation {
-            file: file.into(),
+            file,
             lines: lines.into(),
             url,
         })
@@ -513,7 +496,7 @@ impl Query<'_> {
     /// What `id` is, to tell apart the items of an ambiguous path.
     fn describe(&mut self, id: Id) -> Box<str> {
         if let Some(path) = self.index.canonical_path(id) {
-            return path.to_string().into();
+            return path.joined();
         }
         let krate = self.krate;
         let Some(item) = krate.index.get(&id) else {
@@ -636,11 +619,14 @@ fn docs_rs_release(url: &str) -> Option<(CrateName, Version)> {
 
 /// `path` with `/` between its components, whatever the platform.
 fn slash_separated(path: &Path) -> String {
-    let components: Vec<_> = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect();
-    components.join("/")
+    let mut joined = String::with_capacity(path.as_os_str().len());
+    for (position, component) in path.components().enumerate() {
+        if position > 0 {
+            joined.push('/');
+        }
+        joined.push_str(&component.as_os_str().to_string_lossy());
+    }
+    joined
 }
 
 /// The first paragraph of `docs`, and whether anything follows it. A blank line inside a code
@@ -922,7 +908,7 @@ mod tests {
     fn lookup<T>(
         version: &str,
         path: &str,
-        check: impl FnOnce(Result<ItemResponse, GetItemError>) -> T,
+        check: impl FnOnce(Result<ItemResponse<'_>, GetItemError>) -> T,
     ) -> T {
         let parsed = parsed();
         let index = PathIndex::build(&parsed.krate);
@@ -1033,10 +1019,7 @@ mod tests {
         let error = lookup("1.2.3", "my_crate::Nothing", |result| {
             result.expect_err("not found")
         });
-        assert!(
-            matches!(&error, GetItemError::NotFound { path } if &**path == "my_crate::Nothing"),
-            "{error:?}"
-        );
+        assert!(matches!(error, GetItemError::NotFound), "{error:?}");
     }
 
     #[test]
