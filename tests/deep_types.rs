@@ -139,6 +139,7 @@ fn a_type_nested_up_to_the_limit_is_rendered_and_freed() {
                 version: &version,
                 path: "deep::f",
                 resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
                 target: None,
             })
             .expect("deep::f is found");

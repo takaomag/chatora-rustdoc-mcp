@@ -34,6 +34,8 @@ use crate::data::{
     sparse_index::SparseIndex,
     target,
 };
+#[cfg(feature = "local")]
+use crate::data::{metadata::Resolver, project::DefaultProject};
 
 /// Protocol versions this server implements (requirement R-MCP-2).
 const SUPPORTED_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
@@ -182,6 +184,15 @@ pub async fn serve() -> Result<(), ServeError> {
             index: SparseIndex::new(cache.clone())?,
             host,
             cache,
+            // Decided once, so that a repository cloned inside later does not join it
+            // (requirement R-MCP-3).
+            #[cfg(feature = "local")]
+            project: DefaultProject::find(
+                std::env::var_os("CLAUDE_PROJECT_DIR"),
+                std::env::current_dir().ok(),
+            ),
+            #[cfg(feature = "local")]
+            resolver: Resolver::new(false),
         }),
     };
     match server.serve(stdio()).await {

@@ -23,10 +23,24 @@ pub struct Workspace {
 /// Where the default project came from, as the provenance shows it (`project_from`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectFrom {
+    /// The `project` argument of the tool.
+    Argument,
     /// The environment variable `CLAUDE_PROJECT_DIR`.
     ClaudeProjectDir,
     /// The working directory of the server.
     Cwd,
+}
+
+impl ProjectFrom {
+    /// The value as the provenance writes it (§7.3).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Argument => "argument",
+            Self::ClaudeProjectDir => "CLAUDE_PROJECT_DIR",
+            Self::Cwd => "cwd",
+        }
+    }
 }
 
 /// The default project: the workspace of the directory Claude Code was opened in, or, when that

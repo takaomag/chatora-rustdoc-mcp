@@ -2,13 +2,23 @@
 //!
 //! M0a takes only an exact version, reads only docs.rs, and parses the JSON on every call.
 
+#[cfg(feature = "local")]
+use std::borrow::Cow;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use rmcp::model::{CallToolResult, JsonObject, Tool, ToolAnnotations};
 use semver::Version;
 use serde_json::{Value, json};
 
-use super::{InvalidArgument, ToolState, error_result};
+use super::{
+    ErrorChain,
+    InvalidArgument,
+    ToolState,
+    error_result,
+    project::{self, InProject},
+};
+#[cfg(feature = "local")]
+use crate::data::packages::{DocsRsCheck, ProjectPackage, Source};
 use crate::{
     data::{
         self,
@@ -20,7 +30,7 @@ use crate::{
         rustdoc_json::ParseError,
         sparse_index::IndexError,
         target::TargetTriple,
-        version::VersionSpec,
+        version::{NoVersion, VersionSpec},
     },
     query::{
         across::Indexed,
@@ -50,6 +60,11 @@ const VERSION_EXAMPLE: &[&str] = &[
 const TARGET_EXAMPLE: &[&str] =
     &[r#"pass a target triple, for example {"target": "x86_64-unknown-linux-gnu"}"#];
 
+/// How to pass `project`, for `invalid_argument`.
+const PROJECT_EXAMPLE: &[&str] = &[
+    r#"pass the directory or the Cargo.toml of a workspace, for example {"project": "/home/me/app"}"#,
+];
+
 /// How to pass `path`, for `invalid_argument`.
 const PATH_EXAMPLE: &[&str] =
     &[r#"pass the path of the item, for example {"path": "tokio::sync::Mutex::lock"}"#];
@@ -58,8 +73,10 @@ const PATH_EXAMPLE: &[&str] =
 #[derive(Debug)]
 pub(super) struct Arguments {
     name: CrateName,
-    /// The version asked for, in `crate` or `version`; `latest` when neither has one.
-    version: VersionSpec,
+    /// The version asked for, in `crate` or `version`. Without one, the project's is used.
+    version: Option<VersionSpec>,
+    /// The project whose Cargo.lock decides the version, when it is not the default one.
+    project: Option<PathBuf>,
     /// The path, starting with the crate name.
     path: Box<str>,
     /// The target asked for.
@@ -72,6 +89,8 @@ struct Request {
     /// The crate, as crates.io spells it when the index was read.
     name: CrateName,
     version: Version,
+    /// Where the project came from, when the project decided the version.
+    project_from: Option<&'static str>,
     /// The path, starting with the crate name.
     path: Box<str>,
     resolved_from: ResolvedFrom,
@@ -96,6 +115,12 @@ pub(super) fn definition() -> Tool {
             "target": {
                 "type": "string",
                 "description": "The target triple to document for. Defaults to the host's.",
+            },
+            "project": {
+                "type": "string",
+                "description": "The workspace (its directory or Cargo.toml) whose Cargo.lock \
+                                decides the version when none is given. Defaults to the project \
+                                Claude Code was opened in.",
             },
             "path": {
                 "type": "string",
@@ -134,7 +159,11 @@ fn output_schema() -> JsonObject {
                     "version": { "type": "string" },
                     "resolved_from": {
                         "type": "string",
-                        "enum": ["explicit", "explicit_req", "latest"],
+                        "enum": ["explicit", "explicit_req", "latest", "cargo_lock", "cargo_lock_raw"],
+                    },
+                    "project_from": {
+                        "type": "string",
+                        "enum": ["argument", "CLAUDE_PROJECT_DIR", "cwd"],
                     },
                     "target": { "type": "string" },
                     "format_version": { "type": "integer" },
@@ -250,12 +279,13 @@ pub(super) fn parse_arguments(
                     VERSION_EXAMPLE,
                 ));
             }
-            in_crate
+            Some(in_crate)
         },
-        (Some(version), None) => parse_version(version, CRATE_EXAMPLE)?,
-        (None, Some(version)) => parse_version(version, VERSION_EXAMPLE)?,
-        (None, None) => VersionSpec::Latest,
+        (Some(version), None) => Some(parse_version(version, CRATE_EXAMPLE)?),
+        (None, Some(version)) => Some(parse_version(version, VERSION_EXAMPLE)?),
+        (None, None) => None,
     };
+    let project = string("project", PROJECT_EXAMPLE)?.map(PathBuf::from);
     let target = string("target", TARGET_EXAMPLE)?
         .map(|target| {
             target.parse::<TargetTriple>().map_err(|error| {
@@ -277,6 +307,7 @@ pub(super) fn parse_arguments(
     Ok(Arguments {
         name,
         version,
+        project,
         path,
         target,
     })
@@ -301,47 +332,85 @@ async fn resolve(
     }
     let Arguments {
         name,
-        version: spec,
+        version,
+        project,
         path,
         ..
     } = arguments;
-    if let VersionSpec::Exact(version) = &spec {
-        let dir = state.cache.docs_rs_dir(&name, version, Some(&target));
-        if let Ok(Some(_)) = state.cache.docs_rs_source(&dir) {
-            let request = Request {
-                version: version.clone(),
-                path: with_lib_name(&name.cache_key(), &path),
-                name,
-                resolved_from: ResolvedFrom::Explicit,
-                target,
-            };
-            return Ok((request, warnings));
-        }
+    // Without a version, the project decides it (requirement R-VR-2), or else it is the latest.
+    #[cfg(feature = "local")]
+    let mut from_project = None;
+    let spec = match version {
+        Some(spec) => spec,
+        None => match project::version_in_project(state, &name, project.as_deref()).await {
+            #[cfg(feature = "local")]
+            InProject::Found(found) => {
+                warnings.extend(found.warnings.iter().cloned());
+                let version = found.package.version.clone();
+                from_project = Some(found);
+                VersionSpec::Exact(version)
+            },
+            InProject::Elsewhere(elsewhere) => {
+                warnings.extend(elsewhere);
+                VersionSpec::Latest
+            },
+            #[cfg(feature = "local")]
+            InProject::Error(error) => return Err(error),
+        },
+    };
+    // A package of the project that is not from crates.io is not looked for there: docs.rs does
+    // not have it, even when crates.io has a crate of that name (requirement R-VR-2).
+    #[cfg(feature = "local")]
+    if let Some(found) = &from_project
+        && found.package.source != Source::CratesIo
+    {
+        return Err(Box::new(local_build_required(
+            &found.package,
+            DocsRsCheck::NotCratesIo,
+        )));
+    }
+    #[cfg(feature = "local")]
+    let checked_later = from_project.is_some();
+    #[cfg(not(feature = "local"))]
+    let checked_later = false;
+    if !checked_later && let Some(version) = cached_exact(state, &name, &spec, &target) {
+        let request = Request {
+            version,
+            path: with_lib_name(&name.cache_key(), &path),
+            name,
+            project_from: None,
+            resolved_from: ResolvedFrom::Explicit,
+            target,
+        };
+        return Ok((request, warnings));
     }
     let entry = state
         .index
         .entry(&name)
         .await
         .map_err(|error| Box::new(index_error(&name, &error)))?;
-    let resolved = spec.resolve(&entry.versions).map_err(|no_version| {
-        Box::new(error_result(&json!({
-            "code": "version_not_found",
-            "message": format!("{} has no version {spec} on crates.io", entry.name),
-            "retryable": false,
-            "suggestions": ["ask for one of the candidates"],
-            "candidates": no_version
-                .suggestions
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-        })))
-    })?;
+    // docs.rs has the project's package only if it is the one on crates.io (requirement R-VR-2).
+    #[cfg(feature = "local")]
+    if let Some(found) = &from_project {
+        let check = found.package.docs_rs_check(&entry);
+        if check != DocsRsCheck::Allowed {
+            return Err(Box::new(local_build_required(&found.package, check)));
+        }
+    }
+    let resolved = spec
+        .resolve(&entry.versions)
+        .map_err(|no_version| Box::new(version_not_found(&entry.name, &spec, &no_version)))?;
     warnings.extend(resolved.warnings.into_iter().map(Into::into));
-    let resolved_from = match spec {
-        VersionSpec::Exact(_) => ResolvedFrom::Explicit,
-        VersionSpec::Requirement(_) => ResolvedFrom::ExplicitReq,
-        VersionSpec::Latest => ResolvedFrom::Latest,
+    let (resolved_from, project_from) = match spec {
+        VersionSpec::Exact(_) => (ResolvedFrom::Explicit, None),
+        VersionSpec::Requirement(_) => (ResolvedFrom::ExplicitReq, None),
+        VersionSpec::Latest => (ResolvedFrom::Latest, None),
     };
+    #[cfg(feature = "local")]
+    let (resolved_from, project_from) = from_project
+        .map_or((resolved_from, project_from), |found| {
+            (found.resolved_from, Some(found.project_from))
+        });
     // The name as published, for docs.rs and the cache, and at the head of the path as code writes
     // it (`Serde_Json::Value` is `serde_json::Value`).
     let published: CrateName = entry.name.parse().unwrap_or(name);
@@ -349,11 +418,80 @@ async fn resolve(
     let request = Request {
         name: published,
         version: resolved.version.version.clone(),
+        project_from,
         path,
         resolved_from,
         target,
     };
     Ok((request, warnings))
+}
+
+/// The exact version that `spec` names, if the JSON of `name` at it for `target` is cached: it is
+/// then taken without reading the crates.io index, so that it is found offline.
+fn cached_exact(
+    state: &ToolState,
+    name: &CrateName,
+    spec: &VersionSpec,
+    target: &TargetTriple,
+) -> Option<Version> {
+    let VersionSpec::Exact(version) = spec else {
+        return None;
+    };
+    let dir = state.cache.docs_rs_dir(name, version, Some(target));
+    matches!(state.cache.docs_rs_source(&dir), Ok(Some(_))).then(|| version.clone())
+}
+
+/// `version_not_found` (§8), with the versions to suggest.
+fn version_not_found(name: &str, spec: &VersionSpec, no_version: &NoVersion) -> CallToolResult {
+    error_result(&json!({
+        "code": "version_not_found",
+        "message": format!("{name} has no version {spec} on crates.io"),
+        "retryable": false,
+        "suggestions": ["ask for one of the candidates"],
+        "candidates": no_version
+            .suggestions
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// `docs_unavailable` with `reason: local_build_required`: the project's package is not the one
+/// on crates.io, and this server does not build documentation yet (decided in M1, until M2).
+#[cfg(feature = "local")]
+fn local_build_required(package: &ProjectPackage, check: DocsRsCheck) -> CallToolResult {
+    let why: Cow<'_, str> = match (check, &package.source) {
+        (DocsRsCheck::NotCratesIo, Source::Local) => {
+            "a workspace member or a path dependency".into()
+        },
+        (DocsRsCheck::NotCratesIo, Source::Git(source)) => format!("from git ({source})").into(),
+        (DocsRsCheck::NotCratesIo, Source::Registry(source)) => {
+            format!("from another registry ({source})").into()
+        },
+        (DocsRsCheck::ChecksumMismatch, _) => {
+            "a copy whose checksum in Cargo.lock differs from crates.io's (patched or vendored)"
+                .into()
+        },
+        (DocsRsCheck::NoChecksum, _) => "without a checksum in Cargo.lock".into(),
+        (DocsRsCheck::NotInIndex, _) => "a version that crates.io does not list".into(),
+        (DocsRsCheck::NotCratesIo, Source::CratesIo) | (DocsRsCheck::Allowed, _) => {
+            "not the release on crates.io".into()
+        },
+    };
+    error_result(&json!({
+        "code": "docs_unavailable",
+        "message": format!(
+            "{}@{} in the project is {why}, so docs.rs does not have it, and this server does not \
+             build documentation yet",
+            package.name, package.version
+        ),
+        "retryable": false,
+        "suggestions": [
+            "give the version, as crate@version, to read the crates.io release of that name on \
+             docs.rs, which may differ from the project's",
+        ],
+        "reason": "local_build_required",
+    }))
 }
 
 /// The tool error for an index that could not be read (§8).
@@ -719,6 +857,7 @@ fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Request) -> Result<Value, Fa
         version: &arguments.version,
         path: &arguments.path,
         resolved_from: arguments.resolved_from,
+        project_from: arguments.project_from,
         target: Some(arguments.target.as_str()),
     })
     .map_err(Failure::Item)
@@ -909,19 +1048,6 @@ fn item_error(arguments: &Request, error: &GetItemError) -> CallToolResult {
     }
 }
 
-/// An error and its sources, joined with `: `.
-struct ErrorChain<'a>(&'a dyn std::error::Error);
-
-impl std::fmt::Display for ErrorChain<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)?;
-        for source in std::iter::successors(self.0.source(), |&source| source.source()) {
-            write!(f, ": {source}")?;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,7 +1067,10 @@ mod tests {
         let parsed = arguments(json!({ "crate": "axum-core@0.5.6", "path": "::axum-core::body" }))
             .expect("valid");
         assert_eq!(&*parsed.path, "axum-core::body");
-        assert_eq!(parsed.version, VersionSpec::Exact(Version::new(0, 5, 6)));
+        assert_eq!(
+            parsed.version,
+            Some(VersionSpec::Exact(Version::new(0, 5, 6)))
+        );
     }
 
     #[test]
@@ -961,22 +1090,27 @@ mod tests {
     #[test]
     fn the_version_is_in_crate_or_version_or_left_out() {
         let version = |value: Value| arguments(value).expect("valid").version;
+        assert_eq!(version(json!({ "crate": "tokio", "path": "spawn" })), None);
         assert_eq!(
-            version(json!({ "crate": "tokio", "path": "spawn" })),
-            VersionSpec::Latest
+            version(json!({ "crate": "tokio@latest", "path": "spawn" })),
+            Some(VersionSpec::Latest)
         );
         assert_eq!(
             version(json!({ "crate": "tokio@^1.47", "path": "spawn" })),
-            "^1.47".parse().expect("a requirement")
+            Some("^1.47".parse().expect("a requirement"))
         );
         assert_eq!(
             version(json!({ "crate": "tokio", "version": "1.47.1", "path": "spawn" })),
-            VersionSpec::Exact(Version::new(1, 47, 1))
+            Some(VersionSpec::Exact(Version::new(1, 47, 1)))
         );
         assert_eq!(
             version(json!({ "crate": "tokio@1.47.1", "version": "1.47.1", "path": "spawn" })),
-            VersionSpec::Exact(Version::new(1, 47, 1))
+            Some(VersionSpec::Exact(Version::new(1, 47, 1)))
         );
+        let project = arguments(json!({ "crate": "tokio", "path": "spawn", "project": "app" }))
+            .expect("valid")
+            .project;
+        assert_eq!(project, Some(PathBuf::from("app")));
         let target = arguments(json!({
             "crate": "tokio", "path": "spawn", "target": "aarch64-apple-darwin",
         }))
@@ -1035,6 +1169,7 @@ mod tests {
                 name: "x",
                 version: "1.0.0".into(),
                 resolved_from: ResolvedFrom::Explicit,
+                project_from: Some("cwd"),
                 target: "x",
                 format_version: 61,
             },

@@ -14,6 +14,7 @@
 use std::{
     collections::HashMap,
     io::{BufRead as _, BufReader, Write as _},
+    path::Path,
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
@@ -188,9 +189,21 @@ struct Server {
 
 impl Server {
     fn start() -> Self {
+        Self::start_in(None)
+    }
+
+    /// A running server whose default project is `project`, or which has none: it then runs in
+    /// its cache directory, so that the project these tests run in is not read.
+    fn start_in(project: Option<&Path>) -> Self {
         let cache = test_cache();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"));
+        match project {
+            Some(project) => command.env("CLAUDE_PROJECT_DIR", project),
+            None => command.env_remove("CLAUDE_PROJECT_DIR"),
+        };
+        let mut child = command
             .arg("serve")
+            .current_dir(cache.path())
             // Logging stays on, so that the tests would see a log line that reached stdout
             // (requirement R-SEC-1).
             .env("CHATORA_RUSTDOC_MCP_LOG__FILTER", "debug")
@@ -456,6 +469,61 @@ fn get_item_returns_structured_content_and_tool_errors() {
     );
     // Only an unknown tool is a JSON-RPC error.
     assert_eq!(server.response(4)["error"]["code"], -32602);
+    assert!(server.finish().success());
+}
+
+/// A workspace with the package `demo` and its Cargo.lock, in a new temporary directory. crates.io
+/// has a crate named demo too, which must not be looked for in its place.
+fn demo_workspace() -> TempDir {
+    let dir = TempDir::new().expect("a temporary directory");
+    std::fs::create_dir_all(dir.path().join("src")).expect("made");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("written");
+    std::fs::write(dir.path().join("src/lib.rs"), "").expect("written");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    dir
+}
+
+/// Without a version, the project decides it (requirements R-MCP-3 and R-VR-2). The project here
+/// is the package itself, which docs.rs does not have, and one outside the default project is not
+/// read with cargo.
+#[test]
+fn without_a_version_the_project_decides_it() {
+    let project = demo_workspace();
+    let elsewhere = demo_workspace();
+    let mut server = Server::start_in(Some(project.path()));
+    server.send(&call_tool(
+        1,
+        "get_item",
+        json!({ "crate": "demo", "path": "hello", "target": TARGET }),
+    ));
+    server.send(&call_tool(
+        2,
+        "get_item",
+        json!({
+            "crate": "demo",
+            "path": "hello",
+            "target": TARGET,
+            "project": elsewhere.path(),
+        }),
+    ));
+    let error = text_json(&server.response(1)["result"]);
+    assert_eq!(error["code"], "docs_unavailable");
+    assert_eq!(error["reason"], "local_build_required", "{error}");
+    let error = text_json(&server.response(2)["result"]);
+    assert_eq!(error["reason"], "no_record", "{error}");
     assert!(server.finish().success());
 }
 

@@ -4,6 +4,7 @@
 //! checking, and `execute()`.
 
 mod get_item;
+mod project;
 #[cfg(debug_assertions)]
 mod sleep;
 
@@ -23,6 +24,8 @@ use rmcp::{
 use serde_json::{Value, json};
 
 use crate::data::{cache::Cache, docs_rs::DocsRs, sparse_index::SparseIndex, target::HostTarget};
+#[cfg(feature = "local")]
+use crate::data::{metadata::Resolver, project::DefaultProject};
 
 /// What the tools share for the life of the server.
 #[derive(Debug)]
@@ -35,6 +38,25 @@ pub(super) struct ToolState {
     pub(super) index: SparseIndex,
     /// The host target, the default target of the documentation (requirement R-TG-1).
     pub(super) host: HostTarget,
+    /// The default project, decided at startup (requirement R-MCP-3).
+    #[cfg(feature = "local")]
+    pub(super) project: Option<DefaultProject>,
+    /// Resolves the packages of projects with `cargo metadata` (requirement R-VR-2).
+    #[cfg(feature = "local")]
+    pub(super) resolver: Resolver,
+}
+
+/// An error and its sources, joined with `: `.
+pub(super) struct ErrorChain<'a>(&'a dyn std::error::Error);
+
+impl std::fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        for source in std::iter::successors(self.0.source(), |&source| source.source()) {
+            write!(f, ": {source}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Definitions of every tool, in the order `tools/list` returns them.

@@ -452,6 +452,23 @@ C1b も 3 つに分けた: C1b-1 (版・target・provenance)、C1b-2 (プロジ�
 - 実際の crates.io と docs.rs で確かめた: latest (`serde` → 1.0.229)、semver 要件 (`serde@^1.0.200`)、完全一致 (`1.0.228`、形式 57)、無い版 (候補 5 つ)、無い crate、綴りの違い、`aarch64-apple-darwin` (`no_target_json`)。2 回目からはアーカイブから引き、ほぼ 0 秒
 - テスト: 引数の解析 (版の 3 つの渡し方、食い違い、target、誤り)、パスの先頭の書き方。stdio の結合テストは `target` を明示し、キャッシュもその target の場所に置く (ホストによらないように)
 
+#### C1b-2 (2026-10-20)
+
+利用者が決めた 2 件 (どちらも推奨案): docs.rs を使えない取得元は `docs_unavailable` の新しい `reason: local_build_required` (M2 まで)、extern の名前と別のパッケージ名が衝突したら新しいコード `ambiguous_crate`。どちらも M1 の終わりに §8 へ足す。
+
+- 起動時に既定のプロジェクト (B5a) と `cargo metadata` の Resolver (B5b) を作る (`local` の中)。`project` 引数 (workspace のディレクトリか Cargo.toml。相対なら既定のプロジェクトのディレクトリから) を足した
+- 版を省いたときはプロジェクトに聞く (`mcp::tool::project`)
+  - Cargo.lock の版 (B5c の `PackageGraph::look_up`) を使い、`resolved_from` は `cargo_lock`、`cargo metadata` が失敗したら `cargo_lock_raw` (失敗の種類と、Cargo.lock が古いときは `cargo fetch` の案内を warnings に出す)。`project_from` を provenance に足した (`argument`・`CLAUDE_PROJECT_DIR`・`cwd`)
+  - 同じ crate のほかの版があれば warnings に出す。決まらなければ `ambiguous_version`、名前の衝突は `ambiguous_crate` (どちらも候補と依存元を `candidates` に)
+  - 取得元が crates.io でなければ、crates.io の index を引く前に `local_build_required` を返す (同じ名前の crate が crates.io にあっても代わりにしない。実データで、member 自身が `crate_not_found` になる不具合を見つけて直した)。crates.io なら index の `cksum` と Cargo.lock の checksum を比べ (B5c の `docs_rs_check`)、合わなければ `local_build_required`
+  - プロジェクトの依存でなければ latest にして warnings に出す (R-VR-3)。プロジェクトが無いときも latest
+  - 既定のプロジェクトの直下に workspace が複数あって `project` が無ければ `project_not_found` に候補を付ける。既定のプロジェクトの外を `project` で指したら cargo を起動せず `no_record` (R-MCP-3。外のツールの記録は M2)。Cargo.lock が無ければ `lockfile_outdated` (`cargo fetch` を案内)
+  - 版を明示したときはプロジェクトを読まない (R-VR-1 の「プロジェクトの取得元と一致すれば warnings」は、ローカルビルドを入れる M2 で扱う)
+- ローカル機能が無い構成では、プロジェクトを読まずに latest にして warnings に書く (`project` は無視する)
+- このリポジトリを既定のプロジェクトにして実際に確かめた: serde は Cargo.lock の 1.0.229 (`cargo_lock`)、windows-sys は 2 版で `ambiguous_version` (依存元付き)、member 自身は `local_build_required`、明示した `latest` は `latest`
+- 扱っていないこと: `cargo metadata` の初回の依存の取得で時間がかかるときの待ち方 (R-WS-6 の `status: building` は M2)。オフラインモードの設定
+- テスト: workspace の選び方 (既定・`project`・外・複数)。stdio の結合テストで、合成の workspace を `CLAUDE_PROJECT_DIR` にして member を引くと `local_build_required`、外の workspace を `project` で指すと `no_record`。stdio のテストのサーバーは、プロジェクトを指定しないときは `CLAUDE_PROJECT_DIR` を消してキャッシュのディレクトリで動かす (このリポジトリを読まないように)
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

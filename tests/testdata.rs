@@ -388,6 +388,7 @@ fn representative_items_are_returned_by_get_item() {
             version: &entry.version,
             path,
             resolved_from: ResolvedFrom::Explicit,
+            project_from: None,
             target: None,
         })
         .unwrap_or_else(|error| panic!("{path}: {error}"));

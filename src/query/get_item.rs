@@ -34,6 +34,8 @@ pub struct ItemRequest<'a> {
     pub path: &'a str,
     /// How the version was chosen.
     pub resolved_from: ResolvedFrom,
+    /// Where the project that decided the version came from, if one did (§7.3).
+    pub project_from: Option<&'static str>,
     /// The target asked for, to warn when the data is for another.
     pub target: Option<&'a str>,
 }
@@ -65,6 +67,10 @@ pub struct Provenance<'a> {
     pub version: Cow<'a, str>,
     /// How the version was chosen.
     pub resolved_from: ResolvedFrom,
+    /// Where the project that decided the version came from: `argument`, `CLAUDE_PROJECT_DIR` or
+    /// `cwd` (requirement R-MCP-3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_from: Option<&'static str>,
     /// The target the JSON was built for.
     pub target: &'a str,
     /// The rustdoc JSON format.
@@ -89,6 +95,12 @@ pub enum ResolvedFrom {
     ExplicitReq,
     /// The latest version on crates.io, as no version was given (requirement R-VR-3).
     Latest,
+    /// The version that the project's Cargo.lock resolves, through `cargo metadata`
+    /// (requirement R-VR-2).
+    CargoLock,
+    /// The version in the project's Cargo.lock, read directly because `cargo metadata` failed
+    /// (requirement R-VR-2).
+    CargoLockRaw,
 }
 
 /// One item, as of `detail=normal` (requirement R-OUT-7), with the signature before the prose
@@ -312,6 +324,7 @@ impl<'a> Query<'a> {
             name: self.request.name.as_str(),
             version,
             resolved_from: self.request.resolved_from,
+            project_from: self.request.project_from,
             target,
             format_version: view.format_version(),
         }
@@ -967,6 +980,7 @@ mod tests {
             version: &version,
             path,
             resolved_from: ResolvedFrom::Explicit,
+            project_from: None,
             target: None,
         }))
     }
@@ -1068,6 +1082,7 @@ mod tests {
             version: &version,
             path: "my_crate::sync::Mutex",
             resolved_from: ResolvedFrom::Explicit,
+            project_from: None,
             target: None,
         })
         .expect("found");
