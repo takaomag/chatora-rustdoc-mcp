@@ -194,14 +194,13 @@ pub(super) fn stderr_tail(output: &Output) -> Box<str> {
     stderr.chars().skip(skip).collect()
 }
 
-#[cfg(test)]
+// The tests make exit statuses as Unix has them; what they check does not depend on the OS.
+#[cfg(all(test, unix))]
 mod tests {
-    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt as _;
 
     use super::*;
 
-    #[cfg(unix)]
     fn failed(stderr: &str) -> Output {
         Output {
             status: std::process::ExitStatus::from_raw(101 << 8),
@@ -210,7 +209,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn failures_are_told_apart_by_their_messages() {
         let classify = |stderr: &str, offline| classify(&failed(stderr), offline);
@@ -264,7 +262,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_signal_is_a_kill() {
         let output = Output {
@@ -290,7 +287,6 @@ mod tests {
         assert_eq!(pid, session, "{stat}");
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_stderr_tail_keeps_the_end() {
         let long = format!("{}end", "あ".repeat(MAX_STDERR_CHARS));
