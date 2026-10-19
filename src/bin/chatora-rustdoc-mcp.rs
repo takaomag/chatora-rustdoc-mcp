@@ -33,7 +33,7 @@ fn main() -> std::process::ExitCode {
 fn serve() -> std::process::ExitCode {
     if let Err(error) = chatora_rustdoc::logging::init() {
         eprintln!("{BIN_NAME}: failed to set up logging: {error}");
-        return std::process::ExitCode::from(1);
+        return std::process::ExitCode::FAILURE;
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -42,11 +42,11 @@ fn serve() -> std::process::ExitCode {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("{BIN_NAME}: failed to start the async runtime: {error}");
-            return std::process::ExitCode::from(1);
+            return std::process::ExitCode::FAILURE;
         },
     };
     match runtime.block_on(chatora_rustdoc::mcp::serve()) {
-        Ok(()) => std::process::ExitCode::from(0),
+        Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             // Print the whole chain of causes on one line.
             eprint!("{BIN_NAME}: {error}");
@@ -54,7 +54,7 @@ fn serve() -> std::process::ExitCode {
                 eprint!(": {cause}");
             }
             eprintln!();
-            std::process::ExitCode::from(1)
+            std::process::ExitCode::FAILURE
         },
     }
 }
