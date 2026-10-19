@@ -1,0 +1,33 @@
+---
+source: tests/testdata.rs
+expression: response
+---
+{
+  "provenance": {
+    "source": "docs.rs",
+    "crate": "tokio",
+    "version": "1.53.3",
+    "resolved_from": "explicit",
+    "target": "x86_64-unknown-linux-gnu",
+    "format_version": 61
+  },
+  "data": {
+    "path": "tokio::spawn",
+    "kind": "function",
+    "signature": "pub fn spawn<F>(future: F) -> tokio::task::JoinHandle<<F as Future>::Output>",
+    "where": [
+      "F: Future + Send + 'static",
+      "<F as Future>::Output: Send + 'static"
+    ],
+    "docs": "Spawns a new asynchronous task, returning a\n[`JoinHandle`] for it.",
+    "docs_truncated": true,
+    "also_reexported_at": [
+      "tokio::task::spawn"
+    ],
+    "source_location": {
+      "file": "src/task/spawn.rs",
+      "lines": "174-185",
+      "url": "https://docs.rs/crate/tokio/1.53.3/source/src/task/spawn.rs#174-185"
+    }
+  }
+}

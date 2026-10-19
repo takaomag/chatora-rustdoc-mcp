@@ -12,6 +12,7 @@
 )]
 
 use std::{
+    collections::HashMap,
     io::{BufRead as _, BufReader, Write as _},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::mpsc::{self, Receiver},
@@ -19,7 +20,25 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chatora_rustdoc_mcp::data::{cache::Cache, crate_name::CrateName};
+use rustdoc_types::{
+    Abi,
+    Crate,
+    Function,
+    FunctionHeader,
+    FunctionSignature,
+    Generics,
+    Id,
+    Item,
+    ItemEnum,
+    Module,
+    Target,
+    Type,
+    Visibility,
+};
+use semver::Version;
 use serde_json::{Value, json};
+use tempfile::TempDir;
 
 /// Longest wait for a message the test expects.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,9 +82,90 @@ fn text_json(result: &Value) -> Value {
     serde_json::from_str(text).expect("the text is JSON")
 }
 
+/// The crate in the test cache: `demo` 0.1.0 with `/// Says hello.` `pub fn hello() -> u8`.
+fn demo_crate() -> Crate {
+    let item = |id, name: &str, docs: Option<&str>, inner| Item {
+        id: Id(id),
+        crate_id: 0,
+        name: Some(name.to_owned()),
+        span: None,
+        visibility: Visibility::Public,
+        docs: docs.map(str::to_owned),
+        links: HashMap::new(),
+        attrs: Vec::new(),
+        deprecation: None,
+        stability: None,
+        const_stability: None,
+        inner,
+    };
+    let root = item(
+        0,
+        "demo",
+        None,
+        ItemEnum::Module(Module {
+            is_crate: true,
+            items: vec![Id(1)],
+            is_stripped: false,
+        }),
+    );
+    let hello = item(
+        1,
+        "hello",
+        Some("Says hello.\n\nMore."),
+        ItemEnum::Function(Function {
+            sig: FunctionSignature {
+                inputs: Vec::new(),
+                output: Some(Type::Primitive("u8".to_owned())),
+                is_c_variadic: false,
+            },
+            generics: Generics {
+                params: Vec::new(),
+                where_predicates: Vec::new(),
+            },
+            header: FunctionHeader {
+                is_const: false,
+                is_unsafe: false,
+                is_async: false,
+                abi: Abi::Rust,
+            },
+            has_body: true,
+            default_unstable: None,
+        }),
+    );
+    Crate {
+        root: Id(0),
+        crate_version: Some("0.1.0".to_owned()),
+        includes_private: false,
+        index: [root, hello]
+            .into_iter()
+            .map(|item| (item.id, item))
+            .collect(),
+        paths: HashMap::new(),
+        external_crates: HashMap::new(),
+        target: Target {
+            triple: "x86_64-unknown-linux-gnu".to_owned(),
+            target_features: Vec::new(),
+        },
+        format_version: rustdoc_types::FORMAT_VERSION,
+    }
+}
+
+/// A cache directory that holds the JSON of [`demo_crate`], so that `get_item` needs no network.
+fn test_cache() -> TempDir {
+    let dir = TempDir::new().expect("a temporary directory");
+    let json = serde_json::to_vec(&demo_crate()).expect("serializes");
+    let name: CrateName = "demo".parse().expect("a crate name");
+    Cache::at(dir.path())
+        .write_docs_rs_json(&name, &Version::new(0, 1, 0), &json)
+        .expect("the cache is writable");
+    dir
+}
+
 /// A running server, talking JSON-RPC over its stdin and stdout.
 struct Server {
     child: Child,
+    /// The server's cache directory, removed when the server is dropped.
+    _cache: TempDir,
     stdin: Option<ChildStdin>,
     /// Lines from stdout: a parsed message, or a line that is not a JSON-RPC message.
     lines: Receiver<Result<Value, String>>,
@@ -75,9 +175,11 @@ struct Server {
 
 impl Server {
     fn start() -> Self {
+        let cache = test_cache();
         let mut child = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"))
             .arg("serve")
             .env("CHATORA_RUSTDOC_MCP_LOG__FILTER", "off")
+            .env("CHATORA_RUSTDOC_MCP_CACHE__DIR", cache.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -101,6 +203,7 @@ impl Server {
         });
         Self {
             child,
+            _cache: cache,
             stdin,
             lines,
             pending: Vec::new(),
@@ -158,6 +261,8 @@ impl Server {
     }
 
     /// Collects every message that arrives during `duration`, including those kept earlier.
+    // Only the test of `sleep` uses it, which is only in debug builds.
+    #[cfg(debug_assertions)]
     fn messages_during(&mut self, duration: Duration) -> Vec<Value> {
         let deadline = Instant::now()
             .checked_add(duration)
@@ -254,11 +359,20 @@ fn tools_list_is_cacheable_and_not_paginated() {
         .iter()
         .map(|tool| &tool["name"])
         .collect();
-    assert_eq!(names, [
-        &json!("echo"),
-        &json!("probe_result"),
-        &json!("sleep")
-    ]);
+    // `sleep` is only in debug builds.
+    let expected: &[&str] = if cfg!(debug_assertions) {
+        &["get_item", "sleep"]
+    } else {
+        &["get_item"]
+    };
+    assert_eq!(names, expected);
+    let get_item = &result["tools"][0];
+    assert_eq!(get_item["annotations"]["readOnlyHint"], false);
+    assert_eq!(get_item["annotations"]["openWorldHint"], true);
+    assert_eq!(
+        get_item["outputSchema"]["required"],
+        json!(["provenance", "data"])
+    );
     assert_eq!(result["ttlMs"], 3_600_000);
     assert_eq!(result["cacheScope"], "public");
     assert_eq!(server.response(2)["error"]["code"], -32602);
@@ -266,30 +380,67 @@ fn tools_list_is_cacheable_and_not_paginated() {
 }
 
 #[test]
-fn echo_returns_structured_content_and_tool_errors() {
+fn get_item_returns_structured_content_and_tool_errors() {
     let mut server = Server::start();
-    server.send(&call_tool(1, "echo", json!({ "text": "hi" })));
-    server.send(&call_tool(2, "echo", json!({})));
-    server.send(&call_tool(3, "nope", json!({})));
+    server.send(&call_tool(
+        1,
+        "get_item",
+        json!({ "crate": "demo@0.1.0", "path": "hello" }),
+    ));
+    server.send(&call_tool(
+        2,
+        "get_item",
+        json!({ "crate": "demo@0.1.0", "path": "demo::nothing" }),
+    ));
+    server.send(&call_tool(
+        3,
+        "get_item",
+        json!({ "crate": "demo", "path": "hello" }),
+    ));
+    server.send(&call_tool(4, "nope", json!({})));
 
     let response = server.response(1);
     let result = &response["result"];
     assert_eq!(result["isError"], false);
-    assert_eq!(result["structuredContent"], json!({ "text": "hi" }));
+    assert_eq!(
+        result["structuredContent"],
+        json!({
+            "provenance": {
+                "source": "docs.rs",
+                "crate": "demo",
+                "version": "0.1.0",
+                "resolved_from": "explicit",
+                "target": "x86_64-unknown-linux-gnu",
+                "format_version": rustdoc_types::FORMAT_VERSION,
+            },
+            "data": {
+                "path": "demo::hello",
+                "kind": "function",
+                "signature": "pub fn hello() -> u8",
+                "docs": "Says hello.",
+                "docs_truncated": true,
+            },
+        })
+    );
     assert_eq!(text_json(result), result["structuredContent"]);
 
-    // Bad arguments are a tool error whose text is self-contained JSON, with no structured
-    // content (requirements R-ARG-1, R-ERR-2 and R-OUT-1).
+    // A tool error has its JSON in the text and no structured content (requirements R-ERR-2 and
+    // R-OUT-1).
     let response = server.response(2);
     let result = &response["result"];
     assert_eq!(result["isError"], true);
     assert!(result.get("structuredContent").is_none());
     let error = text_json(result);
-    assert_eq!(error["code"], "invalid_argument");
+    assert_eq!(error["code"], "item_not_found");
     assert_eq!(error["retryable"], false);
 
+    // Bad arguments are a tool error too (requirement R-ARG-1).
+    assert_eq!(
+        text_json(&server.response(3)["result"])["code"],
+        "invalid_argument"
+    );
     // Only an unknown tool is a JSON-RPC error.
-    assert_eq!(server.response(3)["error"]["code"], -32602);
+    assert_eq!(server.response(4)["error"]["code"], -32602);
     assert!(server.finish().success());
 }
 
@@ -320,12 +471,14 @@ fn rmcp_deviations_from_the_requirements() {
     server.send(&request(
         2,
         "tools/call",
-        json!({ "name": "echo", "arguments": "hi" }),
+        json!({ "name": "get_item", "arguments": "hi" }),
     ));
     assert_eq!(server.response(2)["error"]["code"], -32601);
     assert!(server.finish().success());
 }
 
+/// `sleep` is only in debug builds.
+#[cfg(debug_assertions)]
 #[test]
 fn progress_is_reported_and_a_cancelled_request_gets_no_response() {
     let mut server = Server::start();
@@ -344,11 +497,8 @@ fn progress_is_reported_and_a_cancelled_request_gets_no_response() {
         "params": { "requestId": 1, "reason": "test" },
     }));
     // The server keeps working for other requests.
-    server.send(&call_tool(2, "echo", json!({ "text": "after" })));
-    assert_eq!(
-        server.response(2)["result"]["structuredContent"]["text"],
-        "after"
-    );
+    server.send(&request(2, "tools/list", json!({})));
+    assert!(server.response(2)["result"]["tools"].is_array());
     // Nothing is sent for the cancelled request: no result, and no more than one more progress
     // notification that may have been on its way (requirement R-WS-6).
     let later = server.messages_during(Duration::from_millis(1500));
@@ -378,8 +528,8 @@ fn subscriptions_listen_is_acknowledged_with_no_notifications() {
     );
     assert_eq!(acknowledged["params"]["notifications"], json!({}));
     // The subscription does not block other requests.
-    server.send(&call_tool(6, "echo", json!({ "text": "during listen" })));
-    assert_eq!(server.response(6)["result"]["isError"], false);
+    server.send(&request(6, "tools/list", json!({})));
+    assert!(server.response(6)["result"]["tools"].is_array());
     // A client cancels the subscription before it leaves. Otherwise rmcp waits 5 seconds for it
     // to end after stdin closes, as it does for every request still in progress.
     server.send(&json!({

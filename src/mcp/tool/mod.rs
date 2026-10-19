@@ -3,8 +3,8 @@
 //! Each tool is a module with `NAME`, `definition()`, `parse_arguments()` when its arguments need
 //! checking, and `execute()`.
 
-mod echo;
-mod probe_result;
+mod get_item;
+#[cfg(debug_assertions)]
 mod sleep;
 
 use rmcp::{
@@ -18,12 +18,25 @@ use rmcp::{
     },
     service::{RequestContext, RoleServer},
 };
+use serde_json::{Value, json};
+
+use crate::data::{cache::Cache, docs_rs::DocsRs};
+
+/// What the tools share for the life of the server.
+#[derive(Debug, Clone)]
+pub(super) struct ToolState {
+    /// Where rustdoc JSON is cached.
+    pub(super) cache: Cache,
+    /// The docs.rs client.
+    pub(super) docs_rs: DocsRs,
+}
 
 /// Definitions of every tool, in the order `tools/list` returns them.
 pub(super) fn definitions() -> Vec<Tool> {
     vec![
-        echo::definition(),
-        probe_result::definition(),
+        get_item::definition(),
+        // A tool for testing progress and cancellation, only in debug builds.
+        #[cfg(debug_assertions)]
         sleep::definition(),
     ]
 }
@@ -37,28 +50,28 @@ pub(super) fn definitions() -> Vec<Tool> {
 pub(super) async fn call(
     request: CallToolRequestParams,
     context: RequestContext<RoleServer>,
+    state: &ToolState,
 ) -> Result<CallToolResponse, ErrorData> {
     match request.name.as_ref() {
-        echo::NAME => {
-            let arguments = request.arguments;
-            Ok(run_tool(async move { echo::execute(arguments.as_ref()) })
-                .await
-                .into())
-        },
-        probe_result::NAME => match probe_result::parse_arguments(request.arguments.as_ref()) {
-            Ok(is_error) => Ok(run_tool(async move { probe_result::execute(is_error) })
+        get_item::NAME => match get_item::parse_arguments(request.arguments.as_ref()) {
+            Ok(arguments) => Ok(run_tool(get_item::execute(arguments, state.clone()))
                 .await
                 .into()),
-            Err(error) => Ok(error.into()),
+            Err(error) => Ok(error.into_result().into()),
         },
+        #[cfg(debug_assertions)]
         sleep::NAME => match sleep::parse_arguments(request.arguments.as_ref()) {
             Ok(seconds) => Ok(run_tool(sleep::execute(seconds, context)).await.into()),
-            Err(error) => Ok(error.into()),
+            Err(error) => Ok(error.into_result().into()),
         },
-        name => Err(ErrorData::invalid_params(
-            format!("unknown tool: {name}"),
-            None,
-        )),
+        name => {
+            // Only `sleep` uses the context, and release builds have no `sleep`.
+            drop(context);
+            Err(ErrorData::invalid_params(
+                format!("unknown tool: {name}"),
+                None,
+            ))
+        },
     }
 }
 
@@ -86,21 +99,45 @@ where
     }
 }
 
-/// Builds the `invalid_argument` tool error (requirement R-ARG-1).
-fn invalid_argument(message: &str, suggestions: &[&str]) -> CallToolResult {
-    tool_error("invalid_argument", message, false, suggestions)
+/// Arguments that a tool cannot use (requirement R-ARG-1).
+///
+/// Parsing returns this instead of a `CallToolResult`, which is too large to return in an `Err`
+/// (`clippy::result_large_err`); `call` turns it into the `invalid_argument` tool error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InvalidArgument {
+    message: Box<str>,
+    suggestions: &'static [&'static str],
+}
+
+impl InvalidArgument {
+    fn new(message: impl Into<Box<str>>, suggestions: &'static [&'static str]) -> Self {
+        Self {
+            message: message.into(),
+            suggestions,
+        }
+    }
+
+    /// The `invalid_argument` tool error.
+    fn into_result(self) -> CallToolResult {
+        tool_error("invalid_argument", &self.message, false, self.suggestions)
+    }
 }
 
 /// Builds a tool error whose `content[0].text` is self-contained JSON (requirement R-ERR-2).
-///
-/// It has no `structuredContent`: Claude Code ignores it on errors (requirement R-OUT-1).
 fn tool_error(code: &str, message: &str, retryable: bool, suggestions: &[&str]) -> CallToolResult {
-    let body = serde_json::json!({
+    error_result(&json!({
         "code": code,
         "message": message,
         "retryable": retryable,
         "suggestions": suggestions,
-    });
+    }))
+}
+
+/// A tool error with `body` as the JSON of its text (requirement R-ERR-2). `body` has `code`,
+/// `message`, `retryable` and `suggestions`, and may have more.
+///
+/// It has no `structuredContent`: Claude Code ignores it on errors (requirement R-OUT-1).
+fn error_result(body: &Value) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(body.to_string())])
 }
 
@@ -109,7 +146,7 @@ mod tests {
     use super::*;
 
     /// Returns the JSON in `content[0].text` of a tool result.
-    fn text_json(result: &CallToolResult) -> serde_json::Value {
+    fn text_json(result: &CallToolResult) -> Value {
         let text = &result.content[0]
             .as_text()
             .expect("the first content block is text")
@@ -127,7 +164,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_returns_the_result_of_the_tool() {
-        let expected = CallToolResult::structured(serde_json::json!({ "text": "hi" }));
+        let expected = CallToolResult::structured(json!({ "text": "hi" }));
         let result = run_tool(std::future::ready(expected.clone())).await;
         assert_eq!(result, expected);
     }

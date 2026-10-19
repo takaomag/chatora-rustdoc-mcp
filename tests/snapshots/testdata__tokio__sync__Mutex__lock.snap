@@ -1,0 +1,28 @@
+---
+source: tests/testdata.rs
+expression: response
+---
+{
+  "provenance": {
+    "source": "docs.rs",
+    "crate": "tokio",
+    "version": "1.53.3",
+    "resolved_from": "explicit",
+    "target": "x86_64-unknown-linux-gnu",
+    "format_version": 61
+  },
+  "data": {
+    "path": "tokio::sync::Mutex::lock",
+    "kind": "method",
+    "parent": "tokio::sync::Mutex",
+    "impl": "impl<T: ?Sized> tokio::sync::Mutex<T>",
+    "signature": "pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, T>",
+    "docs": "Locks this mutex, causing the current task to yield until the lock has\nbeen acquired.  When the lock has been acquired, function returns a\n[`MutexGuard`].",
+    "docs_truncated": true,
+    "source_location": {
+      "file": "src/sync/mutex.rs",
+      "lines": "434-466",
+      "url": "https://docs.rs/crate/tokio/1.53.3/source/src/sync/mutex.rs#434-466"
+    }
+  }
+}

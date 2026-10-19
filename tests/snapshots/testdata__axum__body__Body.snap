@@ -1,0 +1,25 @@
+---
+source: tests/testdata.rs
+expression: response
+---
+{
+  "provenance": {
+    "source": "docs.rs",
+    "crate": "axum",
+    "version": "0.8.9",
+    "resolved_from": "explicit",
+    "target": "x86_64-unknown-linux-gnu",
+    "format_version": 61
+  },
+  "data": {
+    "path": "axum::body::Body",
+    "kind": "struct",
+    "reexport_of": {
+      "crate": "axum-core@0.5.6",
+      "path": "axum_core::body::Body"
+    }
+  },
+  "hints": [
+    "call get_item with crate axum-core@0.5.6 and path axum_core::body::Body for its documentation"
+  ]
+}

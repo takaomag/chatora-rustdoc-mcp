@@ -7,6 +7,8 @@ use std::{error::Error as _, ffi::OsString};
 use const_format as _;
 use derive_more as _;
 use etcetera as _;
+#[cfg(test)]
+use insta as _;
 use reqwest as _;
 use rmcp as _;
 use rustdoc_types as _;

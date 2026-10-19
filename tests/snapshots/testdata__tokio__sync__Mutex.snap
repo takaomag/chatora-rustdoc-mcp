@@ -1,0 +1,29 @@
+---
+source: tests/testdata.rs
+expression: response
+---
+{
+  "provenance": {
+    "source": "docs.rs",
+    "crate": "tokio",
+    "version": "1.53.3",
+    "resolved_from": "explicit",
+    "target": "x86_64-unknown-linux-gnu",
+    "format_version": 61
+  },
+  "data": {
+    "path": "tokio::sync::Mutex",
+    "kind": "struct",
+    "signature": "pub struct Mutex<T: ?Sized>",
+    "fields": [
+      "/* private fields */"
+    ],
+    "docs": "An asynchronous `Mutex`-like type.",
+    "docs_truncated": true,
+    "source_location": {
+      "file": "src/sync/mutex.rs",
+      "lines": "133-138",
+      "url": "https://docs.rs/crate/tokio/1.53.3/source/src/sync/mutex.rs#133-138"
+    }
+  }
+}

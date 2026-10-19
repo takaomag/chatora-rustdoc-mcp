@@ -1,0 +1,29 @@
+---
+source: tests/testdata.rs
+expression: response
+---
+{
+  "provenance": {
+    "source": "docs.rs",
+    "crate": "serde",
+    "version": "1.0.228",
+    "resolved_from": "explicit",
+    "target": "x86_64-unknown-linux-gnu",
+    "format_version": 57
+  },
+  "data": {
+    "path": "serde::Deserialize",
+    "kind": "trait",
+    "signature": "pub trait Deserialize<'de>: Sized",
+    "docs": "A **data structure** that can be deserialized from any data format supported\nby Serde.",
+    "docs_truncated": true,
+    "also_reexported_at": [
+      "serde::de::Deserialize"
+    ],
+    "source_location": {
+      "file": "src/core/de/mod.rs",
+      "lines": "554-593",
+      "url": "https://docs.rs/crate/serde/1.0.228/source/src/core/de/mod.rs#554-593"
+    }
+  }
+}

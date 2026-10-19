@@ -28,6 +28,11 @@ use rmcp::{
     transport::stdio,
 };
 
+use crate::data::{
+    cache::{Cache, CacheError},
+    docs_rs::DocsRs,
+};
+
 /// Protocol versions this server implements (requirement R-MCP-2).
 const SUPPORTED_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
 
@@ -46,8 +51,10 @@ const INITIALIZE_REJECTED_MESSAGE: &str = const_format::concatcp!(
 /// How long clients may cache `server/discover` and `tools/list` (requirement R-MCP-5).
 const LIST_TTL_MS: u64 = 60 * 60 * 1000;
 
-#[derive(Debug, Clone, Copy)]
-struct Server;
+#[derive(Debug, Clone)]
+struct Server {
+    tools: tool::ToolState,
+}
 
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
@@ -122,13 +129,19 @@ impl ServerHandler for Server {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        tool::call(request, context).await
+        tool::call(request, context, &self.tools).await
     }
 }
 
 /// Errors that stop the MCP server.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
+    /// The cache directory is not usable as configured.
+    #[error("the cache directory cannot be used")]
+    Cache(#[from] CacheError),
+    /// The HTTP client for docs.rs could not be set up.
+    #[error("the HTTP client for docs.rs could not be set up")]
+    Http(#[from] reqwest::Error),
     /// The MCP session could not start, for example because the client asked for an
     /// unsupported protocol version.
     // Boxed because `ServerInitializeError` is several hundred bytes (`clippy::result_large_err`).
@@ -145,7 +158,8 @@ pub enum ServeError {
 ///
 /// # Errors
 ///
-/// Returns an error when the MCP session fails.
+/// Returns an error when the cache directory or the HTTP client cannot be set up, or when the MCP
+/// session fails.
 ///
 /// # Panics
 ///
@@ -155,7 +169,13 @@ pub async fn serve() -> Result<(), ServeError> {
         version = env!("CARGO_PKG_VERSION"),
         "starting the MCP server over stdio"
     );
-    match Server.serve(stdio()).await {
+    let server = Server {
+        tools: tool::ToolState {
+            cache: Cache::open_default()?,
+            docs_rs: DocsRs::new()?,
+        },
+    };
+    match server.serve(stdio()).await {
         Ok(running) => match running.waiting().await {
             Ok(QuitReason::JoinError(error)) | Err(error) => {
                 Err(ServeError::Cancelled(crate::task::resume_if_panic(error)))

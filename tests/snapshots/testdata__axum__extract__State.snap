@@ -1,0 +1,26 @@
+---
+source: tests/testdata.rs
+expression: response
+---
+{
+  "provenance": {
+    "source": "docs.rs",
+    "crate": "axum",
+    "version": "0.8.9",
+    "resolved_from": "explicit",
+    "target": "x86_64-unknown-linux-gnu",
+    "format_version": 61
+  },
+  "data": {
+    "path": "axum::extract::State",
+    "kind": "struct",
+    "signature": "pub struct State<S>(pub S);",
+    "docs": "Extractor for state.",
+    "docs_truncated": true,
+    "source_location": {
+      "file": "src/extract/state.rs",
+      "lines": "301",
+      "url": "https://docs.rs/crate/axum/0.8.9/source/src/extract/state.rs#301"
+    }
+  }
+}

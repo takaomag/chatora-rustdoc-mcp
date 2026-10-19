@@ -1,0 +1,31 @@
+---
+source: tests/testdata.rs
+expression: response
+---
+{
+  "provenance": {
+    "source": "docs.rs",
+    "crate": "tokio",
+    "version": "1.53.3",
+    "resolved_from": "explicit",
+    "target": "x86_64-unknown-linux-gnu",
+    "format_version": 61
+  },
+  "data": {
+    "path": "tokio::io::AsyncReadExt::read_buf",
+    "kind": "method",
+    "parent": "tokio::io::AsyncReadExt",
+    "signature": "fn read_buf<'a, B>(&'a mut self, buf: &'a mut B) -> ReadBuf<'a, Self, B>",
+    "where": [
+      "Self: Unpin",
+      "B: BufMut + ?Sized"
+    ],
+    "docs": "Pulls some bytes from this source into the specified buffer,\nadvancing the buffer's internal cursor.",
+    "docs_truncated": true,
+    "source_location": {
+      "file": "src/io/util/async_read_ext.rs",
+      "lines": "258-264",
+      "url": "https://docs.rs/crate/tokio/1.53.3/source/src/io/util/async_read_ext.rs#258-264"
+    }
+  }
+}

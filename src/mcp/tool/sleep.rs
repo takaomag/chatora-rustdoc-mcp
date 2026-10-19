@@ -1,5 +1,5 @@
-//! The temporary `sleep` tool, used to check progress notifications and cancellation in M0a
-//! (`doc/m0-plan.md`, A2 and A3). It goes away in A8 together with `echo`.
+//! The `sleep` tool, used to check progress notifications and cancellation (`doc/m0-plan.md`, A2
+//! and A3, and `tests/stdio.rs`). It is built only in debug builds.
 
 use std::{sync::Arc, time::Duration};
 
@@ -47,8 +47,8 @@ pub(super) fn definition() -> Tool {
     .collect();
     Tool::new(
         NAME,
-        "Sleep for the given number of seconds, reporting progress every second. A temporary tool \
-         for testing progress notifications and cancellation.",
+        "Sleep for the given number of seconds, reporting progress every second. A tool for \
+         testing progress notifications and cancellation, only in debug builds.",
         input_schema,
     )
     .with_title("Sleep")
@@ -56,7 +56,9 @@ pub(super) fn definition() -> Tool {
 }
 
 /// Checks the arguments and returns the number of seconds to sleep (requirement R-ARG-1).
-pub(super) fn parse_arguments(arguments: Option<&JsonObject>) -> Result<u32, CallToolResult> {
+pub(super) fn parse_arguments(
+    arguments: Option<&JsonObject>,
+) -> Result<u32, super::InvalidArgument> {
     let seconds = match arguments.and_then(|arguments| arguments.get("seconds")) {
         Some(Value::Number(number)) => number
             .as_u64()
@@ -64,13 +66,13 @@ pub(super) fn parse_arguments(arguments: Option<&JsonObject>) -> Result<u32, Cal
             .filter(|seconds| (1..=MAX_SECONDS).contains(seconds)),
         Some(_) => None,
         None => {
-            return Err(super::invalid_argument("`seconds` is required", &[
+            return Err(super::InvalidArgument::new("`seconds` is required", &[
                 r#"pass the seconds to sleep, for example {"seconds": 5}"#,
             ]));
         },
     };
     seconds.ok_or_else(|| {
-        super::invalid_argument("`seconds` must be an integer from 1 to 60", &[
+        super::InvalidArgument::new("`seconds` must be an integer from 1 to 60", &[
             r#"pass a whole number of seconds, for example {"seconds": 5}"#,
         ])
     })

@@ -12,6 +12,8 @@ pub mod mcp;
 pub mod query;
 mod task;
 
-// A dev-dependency that only the tests and examples use; the library's test build sees it too.
+// Dev-dependencies that only the tests and examples use; the library's test build sees them too.
+#[cfg(test)]
+use insta as _;
 #[cfg(test)]
 use sha2 as _;

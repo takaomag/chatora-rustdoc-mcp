@@ -20,7 +20,10 @@ use chatora_rustdoc_mcp::{
         format_version,
         rustdoc_json::{self, ParseError},
     },
-    query::path_index::{PathIndex, Resolution},
+    query::{
+        get_item::{ItemRequest, get_item},
+        path_index::{PathIndex, Resolution},
+    },
 };
 use semver::Version;
 use sha2::{Digest as _, Sha256};
@@ -252,4 +255,131 @@ fn representative_items_are_found_by_their_public_paths() {
         eprintln!("{path}: {found} (index built in {build_time:?})");
         assert_eq!(found, expected, "{path}");
     }
+}
+
+/// The rustdoc subtree that the response renders: the item, and the fields or variants of a type.
+fn rendered_subtree(
+    krate: &rustdoc_types::Crate,
+    id: rustdoc_types::Id,
+) -> Vec<&rustdoc_types::Item> {
+    use rustdoc_types::{ItemEnum, StructKind};
+
+    let item = &krate.index[&id];
+    let members: &[rustdoc_types::Id] = match &item.inner {
+        ItemEnum::Struct(contents) => match &contents.kind {
+            StructKind::Plain { fields, .. } => fields,
+            StructKind::Unit | StructKind::Tuple(_) => &[],
+        },
+        ItemEnum::Union(contents) => &contents.fields,
+        ItemEnum::Enum(contents) => &contents.variants,
+        ItemEnum::Module(_)
+        | ItemEnum::ExternCrate { .. }
+        | ItemEnum::Use(_)
+        | ItemEnum::StructField(_)
+        | ItemEnum::Variant(_)
+        | ItemEnum::Function(_)
+        | ItemEnum::Trait(_)
+        | ItemEnum::TraitAlias(_)
+        | ItemEnum::Impl(_)
+        | ItemEnum::TypeAlias(_)
+        | ItemEnum::Constant { .. }
+        | ItemEnum::Static(_)
+        | ItemEnum::ExternType
+        | ItemEnum::Macro(_)
+        | ItemEnum::ProcMacro(_)
+        | ItemEnum::Primitive(_)
+        | ItemEnum::AssocConst { .. }
+        | ItemEnum::AssocType { .. } => &[],
+    };
+    std::iter::once(item)
+        .chain(members.iter().filter_map(|id| krate.index.get(id)))
+        .collect()
+}
+
+/// The length of `items` as compact JSON, without what the response does not render the same
+/// way: the documentation, its links and the span.
+fn signature_tree_len(items: &[&rustdoc_types::Item]) -> usize {
+    items
+        .iter()
+        .map(|&item| {
+            let mut value = serde_json::to_value(item).expect("serializes");
+            if let Some(object) = value.as_object_mut() {
+                for key in ["docs", "links", "span"] {
+                    object.remove(key);
+                }
+            }
+            value.to_string().len()
+        })
+        .sum()
+}
+
+/// The length of the rendered signature, where clause, fields and variants of `data` as JSON.
+fn signature_strings_len(data: &serde_json::Value) -> usize {
+    ["signature", "where", "fields", "variants"]
+        .iter()
+        .filter_map(|key| data.get(key))
+        .map(|value| value.to_string().len())
+        .sum()
+}
+
+#[test]
+#[ignore = "needs the JSON of testdata/docs-rs-json.txt in the cache"]
+fn representative_items_are_returned_by_get_item() {
+    let cache = Cache::open_default().expect("the cache directory is known");
+    let cases = [
+        ("tokio", "1.53.3", "tokio::sync::Mutex"),
+        ("tokio", "1.53.3", "tokio::sync::Mutex::lock"),
+        ("tokio", "1.53.3", "tokio::spawn"),
+        ("tokio", "1.53.3", "tokio::select"),
+        ("tokio", "1.53.3", "tokio::io::AsyncReadExt::read_buf"),
+        ("tokio", "1.53.3", "tokio::runtime::RuntimeFlavor"),
+        ("axum", "0.8.9", "axum::Router::route"),
+        ("axum", "0.8.9", "axum::extract::State"),
+        ("axum", "0.8.9", "axum::debug_handler"),
+        ("axum", "0.8.9", "axum::body::Body"),
+        ("serde", "1.0.228", "serde::Deserialize"),
+    ];
+    eprintln!("path | rustdoc subtree | response | signature tree | signature strings");
+    for (crate_name, version, path) in cases {
+        let entry = entry(crate_name, version);
+        let json = cached_json(&cache, &entry);
+        let parsed = rustdoc_json::parse(&json).expect("parses");
+        let index = PathIndex::build(&parsed.krate);
+        let response = get_item(&parsed, &index, ItemRequest {
+            name: &entry.name,
+            version: &entry.version,
+            path,
+        })
+        .unwrap_or_else(|error| panic!("{path}: {error}"));
+        let response = serde_json::to_value(&response).expect("serializes");
+        insta::assert_json_snapshot!(path.replace("::", "__"), response);
+
+        // R-OUT-2: how much larger the rustdoc subtree is than the response.
+        let id = match index.resolve(&parsed.krate, path) {
+            Resolution::Item(id) | Resolution::Member { member: id, .. } => id,
+            Resolution::ExternalReexport(_) => continue,
+            other @ (Resolution::Ambiguous(_) | Resolution::NotFound) => {
+                panic!("{path}: {other:?}")
+            },
+        };
+        let subtree = rendered_subtree(&parsed.krate, id);
+        let subtree_len: usize = subtree
+            .iter()
+            .map(|item| serde_json::to_string(item).expect("serializes").len())
+            .sum();
+        let response_len = response.to_string().len();
+        let tree_len = signature_tree_len(&subtree);
+        let strings_len = signature_strings_len(&response["data"]);
+        eprintln!(
+            "{path} | {subtree_len} | {response_len} ({:.1}x) | {tree_len} | {strings_len} ({:.1}x)",
+            ratio(subtree_len, response_len),
+            ratio(tree_len, strings_len)
+        );
+    }
+}
+
+/// `numerator / denominator`, for the report.
+#[expect(clippy::cast_precision_loss, reason = "the lengths are far below 2^52")]
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    numerator as f64 / denominator as f64
 }

@@ -1,0 +1,31 @@
+---
+source: tests/testdata.rs
+expression: response
+---
+{
+  "provenance": {
+    "source": "docs.rs",
+    "crate": "tokio",
+    "version": "1.53.3",
+    "resolved_from": "explicit",
+    "target": "x86_64-unknown-linux-gnu",
+    "format_version": 61
+  },
+  "data": {
+    "path": "tokio::runtime::RuntimeFlavor",
+    "kind": "enum",
+    "signature": "pub enum RuntimeFlavor",
+    "variants": [
+      "CurrentThread",
+      "MultiThread"
+    ],
+    "docs": "The flavor of a `Runtime`.",
+    "docs_truncated": true,
+    "non_exhaustive": true,
+    "source_location": {
+      "file": "src/runtime/runtime.rs",
+      "lines": "113-118",
+      "url": "https://docs.rs/crate/tokio/1.53.3/source/src/runtime/runtime.rs#113-118"
+    }
+  }
+}

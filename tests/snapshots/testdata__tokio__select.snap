@@ -1,0 +1,26 @@
+---
+source: tests/testdata.rs
+expression: response
+---
+{
+  "provenance": {
+    "source": "docs.rs",
+    "crate": "tokio",
+    "version": "1.53.3",
+    "resolved_from": "explicit",
+    "target": "x86_64-unknown-linux-gnu",
+    "format_version": 61
+  },
+  "data": {
+    "path": "tokio::select",
+    "kind": "macro",
+    "signature": "macro_rules! select {\n    {\n        $(\n            biased;\n        )?\n        $(\n            $bind:pat = $fut:expr $(, if $cond:expr)? => $handler:expr,\n        )*\n        $(\n            else => $els:expr $(,)?\n        )?\n    } => { ... };\n}",
+    "docs": "Waits on multiple concurrent branches, returning when the **first** branch\ncompletes, cancelling the remaining branches.",
+    "docs_truncated": true,
+    "source_location": {
+      "file": "src/macros/select.rs",
+      "lines": "559-573",
+      "url": "https://docs.rs/crate/tokio/1.53.3/source/src/macros/select.rs#559-573"
+    }
+  }
+}
