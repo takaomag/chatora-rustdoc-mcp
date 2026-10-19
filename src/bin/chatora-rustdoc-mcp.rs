@@ -56,6 +56,7 @@ fn serve() -> std::process::ExitCode {
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(chatora_rustdoc_mcp::task::THREAD_STACK_SIZE)
         .build()
     {
         Ok(runtime) => runtime,

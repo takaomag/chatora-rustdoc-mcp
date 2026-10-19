@@ -19,6 +19,16 @@ use super::format_version::{self, FormatVersionError};
 /// The formats this server reads (requirement R-FV-4). Formats 46 to 53 come in M1.
 pub const SUPPORTED: RangeInclusive<u32> = 54..=FORMAT_VERSION;
 
+/// The deepest nesting of arrays and objects that is parsed (requirement R-FV-8).
+///
+/// Parsing has no limit of its own, but rendering and freeing the parsed crate recurse as deep as
+/// the types nest. On a thread with [`crate::task::THREAD_STACK_SIZE`] of stack, they handled
+/// 20,000 levels of `[[…]]`, the shape with the fewest levels of JSON per level of type, in a
+/// debug build and 100,000 in a release build (2026-10-19). Real crates nest a few hundred levels
+/// (typenum). Deeper JSON would overflow the stack, which aborts the process instead of
+/// panicking.
+pub const MAX_NESTING: usize = 10_000;
+
 /// rustdoc JSON parsed into the latest types.
 #[derive(Debug)]
 pub struct ParsedCrate {
@@ -64,14 +74,21 @@ pub enum ParseError {
         /// The value in the parsed JSON.
         parsed: u32,
     },
+    /// The JSON nests deeper than [`MAX_NESTING`].
+    #[error("the rustdoc JSON nests arrays and objects deeper than {MAX_NESTING} levels")]
+    TooDeep,
 }
 
 /// Parses rustdoc JSON of a supported format into the latest types.
 ///
 /// # Errors
 ///
-/// Returns an error when the format is not supported or the JSON does not match it.
+/// Returns an error when the JSON nests too deep, or when the format is not supported or the JSON
+/// does not match it.
 pub fn parse(json: &[u8]) -> Result<ParsedCrate, ParseError> {
+    if nests_deeper_than(json, MAX_NESTING) {
+        return Err(ParseError::TooDeep);
+    }
     let read_ahead = format_version::read(json)?;
     let json_error = |source| ParseError::Json {
         format_version: read_ahead,
@@ -121,6 +138,38 @@ pub fn parse(json: &[u8]) -> Result<ParsedCrate, ParseError> {
         krate,
         newer_than_supported,
     })
+}
+
+/// Whether arrays and objects in `json` nest deeper than `max`. It reads the bytes once and skips
+/// strings, without checking that `json` is valid.
+fn nests_deeper_than(json: &[u8], max: usize) -> bool {
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in json {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth = depth.saturating_add(1);
+                if depth > max {
+                    return true;
+                }
+            },
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {},
+        }
+    }
+    false
 }
 
 /// Deserializes `json` as a whole, with no limit on nesting (requirement R-FV-8): types such as
@@ -317,6 +366,29 @@ mod tests {
         assert!(matches!(
             parse(&json),
             Err(ParseError::UnsupportedFormat { found, .. }) if found == newer
+        ));
+    }
+
+    #[test]
+    fn nesting_is_counted_outside_strings() {
+        let nested = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(!nests_deeper_than(nested(3).as_bytes(), 3));
+        assert!(nests_deeper_than(nested(4).as_bytes(), 3));
+        assert!(!nests_deeper_than(br#"[{"a":[1]},{"b":{}}]"#, 3));
+        // Brackets in strings, also after an escaped quote, do not count.
+        assert!(!nests_deeper_than(br#"[["[[[[", "\"[[[[", "\\"]]"#, 2));
+    }
+
+    #[test]
+    fn json_deeper_than_the_limit_is_rejected_before_parsing() {
+        let nested = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(matches!(
+            parse(nested(MAX_NESTING + 1).as_bytes()),
+            Err(ParseError::TooDeep)
+        ));
+        assert!(matches!(
+            parse(nested(MAX_NESTING).as_bytes()),
+            Err(ParseError::NoFormatVersion(_))
         ));
     }
 

@@ -2,6 +2,13 @@
 
 use tokio::task::JoinError;
 
+/// The stack size of the threads of the Tokio runtime, its workers and its blocking threads.
+///
+/// Rendering and freeing a parsed crate recurse as deep as its types nest, up to
+/// [`crate::data::rustdoc_json::MAX_NESTING`] levels of JSON, which needs more than the default
+/// 2 MiB (requirement R-PR-8).
+pub const THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 /// Resumes the panic of a task that panicked, so that a bug is not reported as an ordinary
 /// error, and returns the error of a task that was cancelled.
 ///

@@ -4,13 +4,13 @@
 //! Its API is not stable and may change in any release, including patch releases.
 //!
 //! The code is split into three layers. Each layer depends only on the layers below it:
-//! [`mcp`] → [`query`] → [`data`]. [`logging`] and `task` are shared by all of them.
+//! [`mcp`] → [`query`] → [`data`]. [`logging`] and [`task`] are shared by all of them.
 
 pub mod data;
 pub mod logging;
 pub mod mcp;
 pub mod query;
-mod task;
+pub mod task;
 
 // Dev-dependencies that only the tests and examples use; the library's test build sees them too.
 #[cfg(test)]

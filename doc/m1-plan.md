@@ -172,3 +172,18 @@ m0-plan.md の §7.2 の申し送り。
 - 型のメンバーは、その型の `impl` (`for_` がその型を指すもの) の中だけで探す (`path_index::own_impls`)。プリミティブ型は `impl` の `for_` が `[T]`・`&str` などさまざまなので、今までどおりすべてを見る (M4 で見直す)。`reqwest::ClientBuilder::from` と `tokio::time::error::Elapsed::from` は、他の型の `impl From<…> for …` の `from` ではなく、その型の `impl<T> From<T> for T` の `from` を返すようになった
 - 同じ名前のメンバーが複数あるときは `AmbiguousMembers` を返し、候補はその型の `impl` から探す (データの順で決まる)。これまでは crate 全体の `HashMap` を走査して持ち主を探していたので、実行ごとに候補が変わった。項目の候補には種類を付ける (`struct c::same` と `macro c::same`)
 - 同じパスにこの crate の item と、別の crate の item の re-export があるときは、この crate の item を返し、もう一方を引く次の呼び出しを hints に載せる (利用者が決めた。`serde::Deserialize` は trait を返し、serde_derive の derive マクロを hints で示す)。候補一覧 (R-PR-7) は、この crate の中に同じパスの item が複数あるときに限る
+
+#### A3 (2026-10-19)
+
+- tokio のランタイムのスレッド (ワーカーと blocking) のスタックを 16 MiB にした (`task::THREAD_STACK_SIZE`。R-PR-8)。blocking のスレッドもランタイムの設定を使うことを tokio 1.53.3 のソースで確かめた
+- 解析の前に JSON の入れ子の深さを数え、10,000 段 (`rustdoc_json::MAX_NESTING`) を超えたら `ParseError::TooDeep` (MCP では `docs_unavailable` の `unparsable`) にする (利用者が決めた。R-FV-8 の「上限を設けない」は、M1 の終わりに「実際の crate より桁違いに大きい上限」に改める)
+- 上限は測って決めた。16 MiB のスタックで、解析・索引・`get_item`・解放を通せた深さ (2026-10-19):
+
+  | 形 | debug | release |
+  | --- | --- | --- |
+  | `[[…]]` (JSON の深さ = 型の段数) | JSON 2 万段まで (4 万段で落ちる) | JSON 10 万段まで (20 万段で落ちる) |
+  | `Option<Option<…>>` (型 1 段が JSON 6 段) | JSON 6 万段まで (12 万段で落ちる) | JSON 30 万段まで (60 万段で落ちる) |
+
+  2 MiB では、debug の `[[…]]` が JSON 5,000 段、`Option` が 1.2 万段で落ちた。上限の 10,000 段は、いちばん厳しい `[[…]]` でも debug で 2 倍、release で 10 倍の余裕があり、実際の crate (typenum で数百段) の数十倍
+- tests/deep_types.rs: 上限ちょうどの深さの `[[…]]` を返す関数を、16 MiB のスレッドで解析・索引・`get_item`・解放まで通し、描画した文字列を全体で比べる。上限を超えた JSON を解析の前に断る単体テストも足した
+- 実データ (testdata の 20 件) はどれも上限に掛からない。解析 (深さを数える分を含む) は rmcp の 15 MB で 139 ms (release)。深さを数える分だけは分けて測っていない (B9 で読み込みの時間を測るときに見る)

@@ -393,7 +393,8 @@ fn parse_error(arguments: &Arguments, error: &ParseError) -> CallToolResult {
         })),
         ParseError::NoFormatVersion(_)
         | ParseError::Json { .. }
-        | ParseError::FormatMismatch { .. } => error_result(&json!({
+        | ParseError::FormatMismatch { .. }
+        | ParseError::TooDeep => error_result(&json!({
             "code": "docs_unavailable",
             "message": message,
             "retryable": false,
