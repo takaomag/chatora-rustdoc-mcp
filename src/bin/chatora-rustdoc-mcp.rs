@@ -3,11 +3,15 @@
 use std::{error::Error as _, ffi::OsString};
 
 use const_format as _;
+use derive_more as _;
+use reqwest as _;
 use rmcp as _;
+use semver as _;
 use serde_json as _;
 use thiserror as _;
 use tracing as _;
 use tracing_subscriber as _;
+use zstd as _;
 
 const BIN_NAME: &str = env!("CARGO_BIN_NAME");
 

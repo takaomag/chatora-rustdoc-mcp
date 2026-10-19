@@ -18,13 +18,17 @@ include = ["/src", "/README.md", "/LICENSE-*"]
 
 [dependencies]
 const_format = "0.2.36"
+derive_more = { version = "2.1.1", default-features = false, features = ["display", "as_ref"] }
+reqwest = "0.13.5"
 # マクロ (`#[tool_router]` など) は使わず、`ServerHandler` を手で実装する (doc/m0-plan.md の D1)。
 rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
+semver = "1.0.28"
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter"] }
+zstd = { version = "0.14.3", default-features = false }
 
 [profile.release]
 opt-level = 3
