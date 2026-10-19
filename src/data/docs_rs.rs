@@ -3,41 +3,22 @@
 //! M0a fetches only the docs.rs default target of an exact version. Retries (R-NW-2), the target
 //! choice (R-TG-1), and the format-numbered URLs (R-DS-2) come in M1.
 
-use std::{io::Read as _, sync::Arc, time::Duration};
+use std::{io::Read as _, sync::Arc};
 
 use reqwest::StatusCode;
 use semver::Version;
 
-use super::crate_name::CrateName;
+use super::{
+    crate_name::CrateName,
+    http::{self, BodyError},
+};
 
 /// Where docs.rs is. Kept in one place so that a mirror can replace it later (requirement R-CA-8).
 pub const DEFAULT_BASE_URL: &str = "https://docs.rs";
 
-/// Identifies this server and how to reach its maintainers (requirement R-NW-1).
-const USER_AGENT: &str = concat!(
-    env!("CARGO_PKG_NAME"),
-    "/",
-    env!("CARGO_PKG_VERSION"),
-    " (+",
-    env!("CARGO_PKG_REPOSITORY"),
-    ")"
-);
-
-/// Longest wait for a connection (requirement R-NW-2, initial value).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Longest silence while the body is received (requirement R-NW-2, initial value). It is not a
-/// limit on the whole transfer, so that a large body over a slow line is not cut off.
-const READ_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// Largest body, before and after each zstd layer is decompressed, held in memory (requirement
 /// R-NW-3, initial value).
 pub(super) const MAX_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Most memory reserved for a body before it arrives, whatever its `content-length` says. A
-/// larger body grows the buffer as it comes, so a server cannot make the client reserve
-/// [`MAX_BYTES`] for each of many requests up front.
-const MAX_INITIAL_CAPACITY: u64 = 64 * 1024 * 1024;
 
 /// The magic number at the start of a zstd frame.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
@@ -111,7 +92,7 @@ impl DocsRs {
     /// Returns an error when the HTTP client cannot be set up (for example, TLS).
     pub fn with_base_url(base_url: &str) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            client: client_builder().build()?,
+            client: http::client_builder().build()?,
             base_url: base_url.into(),
         })
     }
@@ -121,7 +102,7 @@ impl DocsRs {
     #[cfg(test)]
     pub(super) fn for_local_test(base_url: &str) -> Self {
         Self {
-            client: client_builder()
+            client: http::client_builder()
                 .no_proxy()
                 .build()
                 .expect("the client builds"),
@@ -158,43 +139,15 @@ impl DocsRs {
             },
             status => return Err(FetchError::UnexpectedStatus { status }),
         }
-        // The body is read in chunks so that it never grows past the limit (requirement R-NW-3).
-        // docs.rs sends `content-length`, so the buffer is sized once instead of growing; the
-        // limit caps the size taken from the header.
-        let mut body = Vec::with_capacity(capacity_for(
-            response.content_length(),
-            MAX_INITIAL_CAPACITY,
-        ));
-        while let Some(chunk) = response.chunk().await.map_err(FetchError::Network)? {
-            if exceeds(body.len().saturating_add(chunk.len()), MAX_BYTES) {
-                return Err(FetchError::TooLarge { limit: MAX_BYTES });
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body =
+            http::read_body(&mut response, MAX_BYTES)
+                .await
+                .map_err(|error| match error {
+                    BodyError::Network(error) => FetchError::Network(error),
+                    BodyError::TooLarge { limit } => FetchError::TooLarge { limit },
+                })?;
         decompress(body, MAX_BYTES).map(Vec::into_boxed_slice)
     }
-}
-
-/// The settings of the HTTP client.
-fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_TIMEOUT)
-}
-
-/// A buffer size for a body of `expected` bytes, at most `limit` bytes. An unknown size gives no
-/// up-front capacity.
-fn capacity_for(expected: Option<u64>, limit: u64) -> usize {
-    expected
-        .map(|expected| expected.min(limit))
-        .and_then(|capacity| usize::try_from(capacity).ok())
-        .unwrap_or(0)
-}
-
-/// Whether `len` bytes are more than `limit`.
-fn exceeds(len: usize, limit: u64) -> bool {
-    u64::try_from(len).map_or(true, |len| len > limit)
 }
 
 /// Decompresses zstd layers for as long as the data starts with the zstd magic number, without
@@ -215,7 +168,7 @@ fn decompress(mut data: Vec<u8>, limit: u64) -> Result<Vec<u8>, FetchError> {
             .take(limit.saturating_add(1))
             .read_to_end(&mut decompressed)
             .map_err(FetchError::Corrupt)?;
-        if exceeds(decompressed.len(), limit) {
+        if http::exceeds(decompressed.len(), limit) {
             return Err(FetchError::TooLarge { limit });
         }
         data = decompressed;
@@ -239,13 +192,6 @@ mod tests {
         (0..layers).fold(data.to_vec(), |data, _| {
             zstd::stream::encode_all(data.as_slice(), 0).expect("zstd compresses")
         })
-    }
-
-    #[test]
-    fn the_body_capacity_trusts_content_length_only_up_to_the_limit() {
-        assert_eq!(capacity_for(Some(100), 1000), 100);
-        assert_eq!(capacity_for(Some(u64::MAX), 1000), 1000);
-        assert_eq!(capacity_for(None, 1000), 0);
     }
 
     #[test]
@@ -324,7 +270,7 @@ mod tests {
         assert!(
             request.to_ascii_lowercase().contains(&format!(
                 "user-agent: {}\r\n",
-                USER_AGENT.to_ascii_lowercase()
+                http::USER_AGENT.to_ascii_lowercase()
             )),
             "{request}"
         );

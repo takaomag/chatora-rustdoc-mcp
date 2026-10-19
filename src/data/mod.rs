@@ -4,7 +4,9 @@ pub mod cache;
 pub mod crate_name;
 pub mod docs_rs;
 pub mod format_version;
+mod http;
 pub mod rustdoc_json;
+pub mod sparse_index;
 #[cfg(test)]
 mod test_http;
 

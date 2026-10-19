@@ -80,6 +80,13 @@ impl Cache {
             .join("rustdoc.json")
     }
 
+    /// Where the crates.io sparse index file at `index_path` (`se/rd/serde`) is kept. The record
+    /// of how it was fetched is next to it, with `.meta.json` added (no crate name has a `.`).
+    #[must_use]
+    pub fn sparse_index_path(&self, index_path: &str) -> PathBuf {
+        self.root.join("index.crates.io").join(index_path)
+    }
+
     /// Reads the rustdoc JSON fetched from docs.rs for `name` at `version`, or returns `None` if
     /// it is not cached. A symlink in or on the way to its place, and anything but a regular file,
     /// count as not cached (requirement R-CA-4).
