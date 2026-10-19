@@ -17,6 +17,10 @@ publish = true
 include = ["/src", "/README.md", "/LICENSE-*"]
 
 [dependencies]
+# マクロ (`#[tool_router]` など) は使わず、`ServerHandler` を手で実装する (doc/m0-plan.md の D1)。
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["rt-multi-thread"] }
 
 [profile.release]
 opt-level = 3
@@ -86,7 +90,7 @@ unused_qualifications = "deny"
 useless_ptr_null_checks = "deny"
 missing_docs = "warn"
 unsafe_code = "warn"
-# bin の crate からは、lib だけが使う依存も「未使用」に見える。その分は main.rs で
+# bin の crate からは、lib だけが使う依存も「未使用」に見える。その分は src/bin/chatora-rustdoc-mcp.rs で
 # `use dep as _;` と列挙して黙らせる (allow で lint ごと切らない)。
 unused_crate_dependencies = "warn"
 

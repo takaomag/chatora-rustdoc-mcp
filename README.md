@@ -22,19 +22,19 @@ cargo install --locked chatora-rustdoc
 cargo binstall chatora-rustdoc
 ```
 
-Prebuilt binaries and installer scripts will be published on GitHub Releases. Claude Code v2.1.292 or later is required.
+The package `chatora-rustdoc` installs the `chatora-rustdoc-mcp` binary. Prebuilt binaries and installer scripts will be published on GitHub Releases. Claude Code v2.1.292 or later is required.
 
 ## Usage (planned)
 
 ```sh
 # MCP server over stdio
-chatora-rustdoc serve
+chatora-rustdoc-mcp serve
 
 # CLI for humans (syntax not final)
-chatora-rustdoc cache ls
-chatora-rustdoc cache gc
-chatora-rustdoc cache clear serde@1.0.228
-chatora-rustdoc install-skill   # optional, may come later
+chatora-rustdoc-mcp cache ls
+chatora-rustdoc-mcp cache gc
+chatora-rustdoc-mcp cache clear serde@1.0.228
+chatora-rustdoc-mcp install-skill   # optional, may come later
 ```
 
 Subagents that list their `tools` get no MCP tools unless you add `mcp__chatora-rustdoc` (or, for a plugin install, the `mcp__plugin_<plugin>_<server>` name) to the list.

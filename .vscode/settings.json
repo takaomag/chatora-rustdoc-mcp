@@ -52,6 +52,12 @@
   // なるので、空配列で打ち消して .editorconfig を唯一の source of truth にする。
   "shfmt.executableArgs": [],
   "rust-analyzer.check.command": "clippy",
+  // rust-analyzer.toml の `[rustfmt] overrideCommand` は、VS Code の保存時の整形に効かなかった
+  // (stable の rustfmt で整形された。rust-analyzer 1.99.1 で確認)。ここでも nightly を指定する。
+  "rust-analyzer.rustfmt.overrideCommand": [
+    "rustfmt",
+    "+nightly"
+  ],
   "rust-analyzer.files.exclude": [
     "tmp"
   ],

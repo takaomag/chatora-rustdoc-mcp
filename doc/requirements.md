@@ -964,7 +964,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - crates.io (`cargo install --locked chatora-rustdoc`) と、GitHub Releases のビルド済みバイナリで配る。README に正規の入手先を明記する (名前の似たプロジェクトや無断コピーが多い。survey §3)
   - 配る target (musl 版を含めるか。Q-27)、ビルド済みバイナリの作り方 (dist・`cargo binstall`・インストーラー)、リリースの流れ (release-plz など)、公式 MCP レジストリへの登録、依存の更新の bot、リリース前後の CI の検査、成果物の sha256 と attestation は M5 で決める (v0.16)
   - CI は 3 つの OS で、ビルド・テスト・clippy・rustdoc (`RUSTDOCFLAGS="-D warnings"`) を回す。OS 依存のコード (`std::os::unix` など) は lint では見つからない。toolchain は浮動の stable で、lint の多くを deny にしているので、6 週ごとの新しい stable で lint が増えるとコードを変えなくても CI が落ちうる。そのときはその都度直す (版を固定しない。v0.13 で決定)
-  - crate は 1 つにし、MCP サーバーと CLI (`cache`) を同じバイナリに入れる (R-DIST-2)。ferritin が workspace で crate を分けているのは、CLI/TUI と MCP サーバーが別のバイナリだから。分けると、バイナリが依存する crate もすべて crates.io に公開する必要がある
+  - crate は 1 つにし、MCP サーバーと CLI (`cache`) を同じバイナリ `chatora-rustdoc-mcp` に入れる (R-DIST-2。パッケージ名は `chatora-rustdoc` のまま。バイナリ名は 2026-10-19 に M0 で決めた)。ferritin が workspace で crate を分けているのは、CLI/TUI と MCP サーバーが別のバイナリだから。分けると、バイナリが依存する crate もすべて crates.io に公開する必要がある
 - R-DIST-2: サブコマンドは `serve` (stdio)、`serve --http` (M6 以降。R-MCP-1)、そして人が使う CLI。CLI で照会はしない (エージェントは MCP を使い、人は docs.rs で足りる。CI で公開 API を検査するなら cargo-public-api がある。v0.14 でやめた)
   - `cache ls` / `cache gc` / `cache clear [<crate@版>]` (R-CA-5)
   - `install-skill` (任意。R-DIST-6)
@@ -1018,7 +1018,7 @@ Claude Code (および他の MCP クライアント) が Rust のコードを書
   - 他の実装のコードを流用するのは、MIT か MIT OR Apache-2.0 のものに限り、出典と著作権表示を `THIRD-PARTY-NOTICES` に残す。AGPL (possdog)・LGPL (KevinT3Hu)・Apache-2.0 のみ (dmvk、46ki75)・ライセンス本文の無いもの (syphar、Xevion) は、設計の参考にとどめてコードを写さない
   - 依存のライセンス・既知の脆弱性・取得元・禁じる crate を、CI の cargo-deny (`licenses`・`advisories`・`sources`・`bans`) で検査する
 - R-DIST-5 **Claude Code プラグイン**として配布する:
-  - `plugin.json` の `mcpServers` でサーバーを起動する (`command: chatora-rustdoc serve`)
+  - `plugin.json` の `mcpServers` でサーバーを起動する (`command: chatora-rustdoc-mcp serve`)
   - skill を 1 つ同梱する: いつ使うかの対応表 (MCP のツールを使う。CLI は案内しない)、LSP との境界、`rustc --explain` / `cargo clippy --explain` の案内。Rust の文脈 (`.rs` と `Cargo.toml`) に限定する (書き方は M5。v0.16)。バージョンの取得元を正確に書く (ferritin の skill は「プロジェクトで解決された版」と書きつつ既定は docs.rs の latest という食い違いがある)
   - SessionStart hook では、前提が欠けていれば 1 行で知らせ、揃っていれば何も出さない。何を確かめるか (案: バイナリ、std の取得手段 (手元の `rust-docs-json` か R-STD-6 の dist)、プラグインと手動設定の重複登録、知らない設定) と確かめ方 (バイナリに確かめるためのサブコマンドを足すかなど) は M5 で決める (v0.16)
   - 任意で、依存の監査などのコマンドを同梱する
@@ -1177,6 +1177,12 @@ v1 では公開ホスティングをしない (§2 の非ゴール)。ただし�
 ---
 
 ## 14. 改訂履歴
+
+### v0.17 (作成中)
+
+M0 の結果を反映する版 ([m0-plan.md](m0-plan.md) の §7)。反映を終えたら冒頭の版と日付を改める。
+
+- バイナリ名を `chatora-rustdoc-mcp` にした (パッケージ名と lib の crate 名は `chatora-rustdoc` のまま。MCP の serverInfo の `name` もバイナリ名にそろえる。R-DIST-1・R-DIST-5)
 
 ### v0.16 (2026-10-19)
 
