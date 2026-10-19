@@ -134,7 +134,7 @@ Q-30 の内訳:
 
 #### A1・A2 (2026-10-19)
 
-環境: rustc・cargo 1.99.1 (stable)、rmcp 3.5.1、tokio 1.53.3。Claude Code からはまだ呼んでいない (A3)。挙動は、生の JSON-RPC を流す結合テスト [tests/stdio.rs](../tests/stdio.rs) と、`src/mcp/mod.rs` の単体テストで固定した。
+環境: rustc・cargo 1.99.1 (stable)、rmcp 3.5.1、tokio 1.53.3。Claude Code からはまだ呼んでいない (A3)。挙動は、生の JSON-RPC を流す結合テスト [tests/stdio.rs](../tests/stdio.rs) と、`src/mcp/tool/mod.rs` の単体テスト (当時は `src/mcp/mod.rs`)で固定した。
 
 **決めたこと** (§3.3 の D1・D3 を含む)
 
