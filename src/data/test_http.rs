@@ -42,8 +42,17 @@ pub(super) fn serve_once(head: &str, body: &[u8]) -> (String, mpsc::Receiver<Str
 pub(super) fn serve_sequence(
     responses: Vec<(String, Vec<u8>)>,
 ) -> (String, mpsc::Receiver<String>) {
+    serve_sequence_with(|_| responses)
+}
+
+/// [`serve_sequence`] with responses made from the base URL of the server, for bodies that name
+/// URLs on it.
+pub(super) fn serve_sequence_with(
+    responses: impl FnOnce(&str) -> Vec<(String, Vec<u8>)>,
+) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a local port is free");
     let base_url = format!("http://{}", listener.local_addr().expect("bound"));
+    let responses = responses(&base_url);
     let (sender, requests) = mpsc::channel();
     thread::spawn(move || {
         for (head, body) in responses {

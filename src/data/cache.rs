@@ -66,6 +66,17 @@ pub enum CachedJson {
     None,
 }
 
+/// A file read from the cache with its digest.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Verified {
+    /// The contents, which match the digest.
+    Found(Box<[u8]>),
+    /// The contents do not match the digest: they were damaged on the disk.
+    Mismatch,
+    /// The file or its digest is not there.
+    None,
+}
+
 /// Why the cache directory could not be decided.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
@@ -155,31 +166,60 @@ impl Cache {
         // Supported formats first, newest first in each group.
         formats.sort_by_key(|&format| (Reverse(SUPPORTED.contains(&format)), Reverse(format)));
         for format in formats {
-            let path = dir.join(format!("{format}.json"));
-            let (Some(json), Some(digest)) = (
-                self.read_file(&path)?,
-                self.read_file(&with_suffix(&path, ".sha256"))?,
-            ) else {
-                continue;
-            };
-            return Ok(if digest.trim_ascii() == sha256_hex(&json).as_bytes() {
-                CachedJson::Found(json)
-            } else {
-                CachedJson::Corrupt { format }
-            });
+            match self.read_verified(&dir.join(format!("{format}.json")))? {
+                Verified::Found(json) => return Ok(CachedJson::Found(json)),
+                Verified::Mismatch => return Ok(CachedJson::Corrupt { format }),
+                Verified::None => {},
+            }
         }
         Ok(CachedJson::None)
     }
 
-    /// Fails unless `dir` is under the cache directory, so that nothing outside is written or
+    /// Reads the file at `path` and checks it against the digest next to it, `<path>.sha256`
+    /// (requirement R-CA-4). A file without a digest counts as not cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a file exists but cannot be read, or is too large.
+    pub(super) fn read_verified(&self, path: &Path) -> io::Result<Verified> {
+        let (Some(contents), Some(digest)) = (
+            self.read_file(path)?,
+            self.read_file(&with_suffix(path, ".sha256"))?,
+        ) else {
+            return Ok(Verified::None);
+        };
+        Ok(if digest.trim_ascii() == sha256_hex(&contents).as_bytes() {
+            Verified::Found(contents)
+        } else {
+            Verified::Mismatch
+        })
+    }
+
+    /// Writes `contents` to `path`, under the cache directory, and then its digest to
+    /// `<path>.sha256` (requirement R-CA-4). A reader sees either the old file or the whole new
+    /// one; between the two writes, the new file does not match the old digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `path` is outside the cache, or a file cannot be written.
+    pub(super) fn write_verified(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        self.check_inside(path)?;
+        write_atomically(path, contents)?;
+        write_atomically(
+            &with_suffix(path, ".sha256"),
+            sha256_hex(contents).as_bytes(),
+        )
+    }
+
+    /// Fails unless `path` is under the cache directory, so that nothing outside is written or
     /// removed.
-    fn check_inside(&self, dir: &Path) -> io::Result<()> {
-        if dir.starts_with(&self.root) {
+    pub(super) fn check_inside(&self, path: &Path) -> io::Result<()> {
+        if path.starts_with(&self.root) {
             Ok(())
         } else {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{} is not in the cache", dir.display()),
+                format!("{} is not in the cache", path.display()),
             ))
         }
     }
@@ -200,6 +240,16 @@ impl Cache {
         read_regular_file(&self.root, path, MAX_BYTES)
     }
 
+    /// Opens the cached file at `path`, at most `max_len` bytes, with the checks of
+    /// [`Self::read_file`], to map it into memory. `None` when there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file exists but cannot be opened, or is too large.
+    pub(super) fn open_file(&self, path: &Path, max_len: u64) -> io::Result<Option<File>> {
+        open_regular_file(&self.root, path, max_len)
+    }
+
     /// Writes a rustdoc JSON fetched from docs.rs in `format` to `dir`, replacing the one in the
     /// same format, and then its digest (requirement R-CA-4). A reader sees either the old file or
     /// the whole new one; between the two writes, the new JSON does not match the old digest and
@@ -209,10 +259,7 @@ impl Cache {
     ///
     /// Returns an error when the directory or a file cannot be written.
     pub fn write_docs_rs_json(&self, dir: &Path, format: u32, json: &[u8]) -> io::Result<()> {
-        self.check_inside(dir)?;
-        let path = dir.join(format!("{format}.json"));
-        write_atomically(&path, json)?;
-        write_atomically(&with_suffix(&path, ".sha256"), sha256_hex(json).as_bytes())
+        self.write_verified(&dir.join(format!("{format}.json")), json)
     }
 
     /// Removes the rustdoc JSON in `format` from `dir`, with its digest.
@@ -236,6 +283,21 @@ impl Cache {
 
 /// [`Cache::read_file`] with the cache directory `root` and a size limit of `max_len` bytes.
 fn read_regular_file(root: &Path, path: &Path, max_len: u64) -> io::Result<Option<Box<[u8]>>> {
+    let Some(file) = open_regular_file(root, path, max_len)? else {
+        return Ok(None);
+    };
+    let mut contents = Vec::with_capacity(usize::try_from(file.metadata()?.len()).unwrap_or(0));
+    file.take(max_len.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if u64::try_from(contents.len()).map_or(true, |len| len > max_len) {
+        return Err(too_large(path, max_len));
+    }
+    Ok(Some(contents.into_boxed_slice()))
+}
+
+/// Opens the regular file at `path` under the cache directory `root`, at most `max_len` bytes,
+/// with the checks of [`Cache::read_file`]. `None` when there is none.
+fn open_regular_file(root: &Path, path: &Path, max_len: u64) -> io::Result<Option<File>> {
     if let Some(dirs) = path.strip_prefix(root).ok().and_then(Path::parent) {
         let mut dir = root.to_path_buf();
         for component in dirs.components() {
@@ -276,13 +338,7 @@ fn read_regular_file(root: &Path, path: &Path, max_len: u64) -> io::Result<Optio
         tracing::warn!(path = %path.display(), "the cached file changed while it was opened");
         return Ok(None);
     }
-    let mut contents = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
-    file.take(max_len.saturating_add(1))
-        .read_to_end(&mut contents)?;
-    if u64::try_from(contents.len()).map_or(true, |len| len > max_len) {
-        return Err(too_large(path, max_len));
-    }
-    Ok(Some(contents.into_boxed_slice()))
+    Ok(Some(file))
 }
 
 fn too_large(path: &Path, max_len: u64) -> io::Error {
@@ -434,7 +490,8 @@ fn json_format(file_name: &OsStr) -> Option<u32> {
 }
 
 /// The SHA-256 of `contents`, in lowercase hex.
-pub(super) fn sha256_hex(contents: &[u8]) -> String {
+#[must_use]
+pub fn sha256_hex(contents: &[u8]) -> String {
     let mut hex = String::with_capacity(64);
     for byte in Sha256::digest(contents) {
         for nibble in [byte >> 4, byte & 0xf] {

@@ -374,6 +374,51 @@ B5 は大きいので 4 つに分けた: B5a (既定のプロジェクトと wor
   - testdata (tokio 1.45.1・clap 4.5.39 の 46、syn 2.0.104 の 48、clap 4.5.41 の 53) で、実際に出る属性の文字列を数えて範囲を確かめた。どれも shim で読め、variant のある属性が文字列のまま残らないことを testdata のテストで確かめるようにした
 - テスト: 属性の文字列の解析 (各 variant、文字列リテラルのエスケープ、`repr` の組み合わせ、解析できないものは `Other`)、形式 46・48・51・53 の手作りの JSON、45 と 47 は非対応、testdata の 4 件
 
+#### B8 (2026-10-19)
+
+利用者が決めた 2 件 (どちらも推奨案): アーカイブは xz を純 Rust の lzma-rust2 で展開する、crate をまたぐ re-export は B8 で std の仲間の間だけたどる。
+
+- `data::dist`: nightly のチャネルの manifest から `rust-docs-json-preview` の xz のアーカイブを取り、SHA-256 を確かめてから展開する (R-STD-6)
+  - manifest は 1 時間使う (取り直せなければ、古いものを warnings 付きで使う)。日付を指定した nightly (`/dist/<日付>/…`) も取れる。日付の manifest は変わらないので、一度だけ取る。形式 58〜60 の確認に使い、M4 の「ユーザーの stable に近い nightly を選ぶ」(R-STD-6 の任意) にも使える
+  - 展開先は `std/<短いコミットハッシュ>/<アーカイブの target>/<crate>.json` (digest 付き)。最後に完了印 `complete.json` (日付・版・完全なコミットハッシュ・target) を書く (R-CA-4)。アーカイブの中の名前からは書き込み先を作らない (`..` を含むエントリを入れたテストで確かめた)。std・core・alloc・proc_macro・test だけを書き、展開の上限は合計 2 GiB、1 ファイル 512 MiB
+  - manifest が他の target のアーカイブを指す場合 (x86_64-apple-darwin → aarch64 など) は、アーカイブのファイル名から実際の target を取る (R-STD-6)。アーカイブの URL は dist のベース URL の下に限る
+  - 実測 (release ビルド、Linux x86-64、2026-10-19): アーカイブは 4.2 MB、展開後 125 MB (core.json が 96 MB)。取得・展開・書き込みで 1.1〜1.8 秒。比較として、C の liblzma (Python) の展開だけで 0.49 秒。gz のアーカイブは 15 MB
+  - 依存: lzma-rust2 0.23 (`std`・`xz`・`optimization`。テストでだけ `encoder`)、tar 0.4 (既定の機能なし)、filetime (tar の依存)。toml を `local` の外の通常の依存にした (manifest を読むため)。cargo-deny のライセンスの検査を通る
+- `data::local_std` (`local` の中): `rustup run nightly rustc -vV` と `--print sysroot` をキャッシュのディレクトリで (`RUSTUP_AUTO_INSTALL=0` で) 実行し、`share/doc/rust/json/` に std.json があれば使う。版の数字 (pre-release を除く) がプロジェクトの toolchain の版以上のときだけ使う (R-STD-1)。`rustc -vV` を走らせる部分は `data::tool` に切り出し、ホストの target (B4) と共有した
+- `data::std_json::choose`: 手元の nightly が使えて、その host が要求した target と同じならそれを、そうでなければ dist を使い、理由を返す (provenance 用)。dist に要求した target の JSON が無ければ、ホストの target のもので代用し warnings に書く (R-STD-1)。dist を無効にする設定 (古い手元の nightly を warnings 付きで使う) は、設定を入れるときに足す
+- `query::across` と `PathIndex::crossing`: 他の crate の item の re-export を通るパスを、その crate の中のパスに置き換えてたどる (`std::vec::Vec` → `alloc::vec::Vec`)。どの crate を読み込むかは呼び出し側が決める (今は std の仲間だけ)。docs.rs の crate どうしは C1 で R-PR-4 と一緒に決める
+- 終わりの印
+  - dist から: 最新の nightly で `std::vec::Vec` (alloc)・`std::option::Option` (core)・`std::collections::HashMap` (std) を引け、どれも stability がある
+  - 形式 58〜60 の `Stability` の写し: 2026-06-25 (形式 58)・06-26 (59)・07-10 (60) の nightly の std で確かめた。`Vec` は `Stable { since: "1.0.0" }`、unstable の item は 970〜991、`const_stability` は 58 で 0、59・60 で 120 (59 で入ったとおり)
+  - 手元の nightly から: このホストの nightly には `rust-docs-json` が無いので (入れるとホストの変更になる)、CI の testdata ジョブで `rustup toolchain install nightly --profile minimal --component rust-docs-json` をしてから `tests/std_dist.rs` を走らせるようにした。手元では、無いことを `NoComponent` として返し、何もインストールしないことを確かめた
+- 要件に足すこと (M1 の終わり): xz と lzma-rust2、展開の上限、キャッシュの配置、manifest が取れないときに古いものを使うこと、日付の指定、手元の nightly を使う条件 (host が target と同じ)、std の仲間の間だけ re-export をたどること
+- テスト: アーカイブの取得・検証・展開と再利用 (2 つ目の target は要求なし)、SHA-256 の不一致、target が無いとき、std の無いアーカイブ、`..` のエントリ、日付と URL の読み取り、`rustc -vV` の読み取り、版の比較、sysroot からの読み込み、ホストでの代用、`crossing`。実データは `tests/std_dist.rs` (ignored)
+
+#### B9 (2026-10-19)
+
+- 読み込みの時間を測った (`examples/measure_load.rs`。release ビルド、Core i5-1335U、ページキャッシュに載った状態、5 回の中央値)
+
+  | crate (JSON の大きさ) | 読む | SHA-256 | 解析 | 索引 | 解放 | 合計 | アーカイブを開いて検証 |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | core (96 MB) | 61 ms | 86 ms | 710 ms | 58 ms | 126 ms | 1,041 ms | 42 ms |
+  | std (17 MB) | 6 ms | 17 ms | 133 ms | 2 ms | 16 ms | 174 ms | 7 ms |
+  | rmcp (15 MB) | 4 ms | 14 ms | 125 ms | 1 ms | 16 ms | 161 ms | 6 ms |
+  | tokio 1.53.3 (6 MB) | 2 ms | 6 ms | 48 ms | 1 ms | 5 ms | 62 ms | 2 ms |
+
+  - JSON のままでは §9.1 の目安 (巨大 crate の読み込み < 50 ms) に届かないので、P4 のとおり rkyv を入れる
+  - rkyv の入れ方は利用者が決めた (推奨案): zero-copy。アーカイブを mmap し、開くときに一度だけ bytecheck で検証して、以後はコピーせずに読む。照会の層 (path_index・get_item・render) を `ArchivedCrate` の上で動かす書き換えは、`get_item` を作り直す C1 で行う
+  - 比べた案: アーカイブから今の型に全部戻す方式は、core で約 260 ms (読む 57・検証 33・逆直列化 108・索引 59。解放は別に 80 ms) で、目安に届かない
+- Q-23 (検証込みで目安に収まるか) の答え: 収まる。core のアーカイブ (公開パス索引を含めて 99 MB) を mmap し、ヘッダを比べ、bytecheck で検証するまでで 42 ms。書き出しは 362 ms (索引の作成を含む)
+- `data::archive`: 任意の rkyv の型を、128 バイトのヘッダの後に書く (`write`)。mmap して、ヘッダが合い検証に通れば使う (`Mapped::open`)。合わなければ作り直す対象として `None` を返す (R-CA-4 の「派生物は壊れていても安全」)
+  - ヘッダ (R-CA-2): マジックナンバー、スキーマの版 (`across::ARCHIVE_SCHEMA`)、rkyv の系列 (0.8)、配置の選択 (リトルエンディアン・32 ビットの相対ポインタ。rkyv の既定)、元の形式の版、元の JSON の SHA-256 (16 進)。JSON の SHA-256 は横のファイルにあるので、開くときに JSON を読まずに比べられる
+  - rkyv の系列が Cargo.lock の rkyv と一致することをテストで強制する (R-CA-2)
+  - `unsafe` が 2 か所増えた: `Mmap::map` (キャッシュの中のファイルは rename でしか置き換えないことを SAFETY に書いた。他のプロセスが同じファイルをその場で切り詰めると SIGBUS で落ちうる)、`access_unchecked` (開くときに検証済み)
+  - データの層は照会の層の型を知らない: 公開パス索引と crate をまとめた `Indexed` は照会の層 (`query::across`) に置き、データの層の部品は型を問わない
+- 依存: rkyv 0.8.18 (MIT。既定の機能 `std`・`bytecheck`)、memmap2 0.9.11、rustdoc-types の `rkyv_0_8`。bytecheck・rend・munge・ptr_meta・rancor などが入った。cargo-deny のライセンスの検査を通る。キャッシュの部品から、確かめて開くだけの `Cache::open_file` を切り出した
+- C1 に回すこと: 照会の層の書き換え、読み込みの流れへの組み込み (JSON を取ったらアーカイブを作り、次からはアーカイブを開く)。Windows では mmap しているファイルを rename で置き換えられないので、アーカイブは上書きせず新しい名前で書く (R-CA-4)。冷えたページキャッシュでの時間 (このホストでは root 権限が要るので測っていない)
+- 要件に足すこと (M1 の終わり): Q-23 の答え、ヘッダの中身、rkyv の配置の選択
+- テスト: アーカイブを書いて mmap で読み戻すこと、別の形式・別の元・切り詰めたアーカイブを使わないこと、rkyv の系列と Cargo.lock
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

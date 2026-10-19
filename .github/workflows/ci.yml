@@ -77,6 +77,10 @@ jobs:
           awk -F'\t' '!/^#/ && NF >= 2 { print $1 "@" $2 }' testdata/docs-rs-json.txt
           | xargs cargo run --locked --release --example fetch_docs_rs --
       - run: cargo test --locked --release --test testdata -- --ignored
+      # std の JSON: dist から取るもの (M1 の B8。毎回、最新の nightly の約 4 MB と、形式 58〜60 の
+      # 確認用の 3 日分) と、手元の nightly の rust-docs-json から読むもの。
+      - run: rustup toolchain install nightly --profile minimal --component rust-docs-json
+      - run: cargo test --locked --release --test std_dist -- --ignored
 
   # toml の整形 (.taplo.toml) と Markdown の lint (.markdownlint.jsonc)。
   config-lint:

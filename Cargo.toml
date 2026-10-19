@@ -21,28 +21,36 @@ default = ["local"]
 # プロジェクトの文脈を要する機能 (cargo・rustc の起動、ローカルビルド) をまとめる (要件 R-ARCH-2)。
 # `--no-default-features` では、cargo を起動するコードも build.rs を実行するコードもバイナリに入らない。
 # 子プロセス (`rustc -vV`・cargo) を起動するので tokio の `process` を、`cargo metadata` の結果を
-# 共有するので tokio の `sync` を、Cargo.toml と Cargo.lock を読むので toml を足す。
-local = ["tokio/process", "tokio/sync", "dep:toml"]
+# 共有するので tokio の `sync` を足す。
+local = ["tokio/process", "tokio/sync"]
 
 [dependencies]
 const_format = "0.2.36"
 derive_more = { version = "2.1.1", default-features = false, features = ["display", "as_ref"] }
 etcetera = "0.11.0"
+lzma-rust2 = { version = "0.23.0", default-features = false, features = [
+  "std",
+  "xz",
+  "optimization",
+] }
+memmap2 = "0.9.11"
 reqwest = "0.13.5"
+rkyv = "0.8.18"
 # マクロ (`#[tool_router]` など) は使わず、`ServerHandler` を手で実装する (doc/m0-plan.md の D1)。
 rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
-rustdoc-types = "0.61.0"
+rustdoc-types = { version = "0.61.0", features = ["rkyv_0_8"] }
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order", "unbounded_depth"] }
 serde_stacker = "0.1.14"
 sha2 = "0.11.1"
+tar = { version = "0.4.46", default-features = false }
 thiserror = "2.0.21"
 tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "time"] }
 toml = { version = "1.1.8", default-features = false, features = [
   "parse",
   "serde",
-], optional = true }
+] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [
   "fmt",
@@ -191,4 +199,5 @@ unescaped_backticks = "warn"
 
 [dev-dependencies]
 insta = { version = "1.49.0", features = ["json"] }
+lzma-rust2 = { version = "0.23.0", default-features = false, features = ["std", "xz", "encoder"] }
 tempfile = "3.27.0"

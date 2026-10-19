@@ -1,16 +1,20 @@
 //! Data layer: fetches rustdoc JSON, normalizes its format version, and caches it.
 
+pub mod archive;
 pub mod cache;
 #[cfg(feature = "local")]
 pub mod cargo;
 #[cfg(feature = "local")]
 pub mod cargo_lock;
 pub mod crate_name;
+pub mod dist;
 pub mod docs_rs;
 #[cfg(feature = "local")]
 pub mod features;
 pub mod format_version;
 mod http;
+#[cfg(feature = "local")]
+pub mod local_std;
 #[cfg(feature = "local")]
 pub mod metadata;
 #[cfg(feature = "local")]
@@ -19,9 +23,12 @@ pub mod packages;
 pub mod project;
 pub mod rustdoc_json;
 pub mod sparse_index;
+pub mod std_json;
 pub mod target;
 #[cfg(test)]
 mod test_http;
+#[cfg(feature = "local")]
+mod tool;
 pub mod version;
 
 use std::{

@@ -12,7 +12,10 @@ use etcetera as _;
 use insta as _;
 #[cfg(unix)]
 use libc as _;
+use lzma_rust2 as _;
+use memmap2 as _;
 use reqwest as _;
+use rkyv as _;
 use rmcp as _;
 use rustdoc_types as _;
 use semver as _;
@@ -20,10 +23,10 @@ use serde as _;
 use serde_json as _;
 use serde_stacker as _;
 use sha2 as _;
+use tar as _;
 #[cfg(test)]
 use tempfile as _;
 use thiserror as _;
-#[cfg(feature = "local")]
 use toml as _;
 use tracing as _;
 use tracing_subscriber as _;

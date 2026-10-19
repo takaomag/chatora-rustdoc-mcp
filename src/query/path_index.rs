@@ -28,7 +28,7 @@ const MAX_DEPTH: usize = 256;
 const MAX_MODULE_VISITS: usize = 64;
 
 /// A path that can be `use`d: the crate name, then module and item names.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize)]
 pub struct PublicPath(Box<[Box<str>]>);
 
 impl PublicPath {
@@ -62,7 +62,7 @@ impl fmt::Display for PublicPath {
 }
 
 /// A public path of this crate that re-exports an item of another crate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub struct ExternalReexport {
     /// The path in this crate.
     pub path: PublicPath,
@@ -72,8 +72,17 @@ pub struct ExternalReexport {
     pub definition: Option<PublicPath>,
 }
 
-/// A glob re-export of a module of another crate, which this index does not expand.
+/// A path that goes on in another crate ([`PathIndex::crossing`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Crossing<'a> {
+    /// The re-export of the other crate's item that the path goes through.
+    pub reexport: &'a ExternalReexport,
+    /// The path in the other crate, starting with its name.
+    pub continued: Box<str>,
+}
+
+/// A glob re-export of a module of another crate, which this index does not expand.
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub struct ExternalGlob {
     /// The path in this crate that the glob re-exports into.
     pub prefix: PublicPath,
@@ -81,8 +90,9 @@ pub struct ExternalGlob {
     pub source: Box<str>,
 }
 
-/// The public paths of the items of one crate.
-#[derive(Debug)]
+/// The public paths of the items of one crate. It is archived with the crate (requirement
+/// R-PF-2).
+#[derive(Debug, rkyv::Archive, rkyv::Serialize)]
 pub struct PathIndex {
     /// The public paths of each item, the canonical one first.
     paths_of: HashMap<Id, Box<[PublicPath]>>,
@@ -245,6 +255,30 @@ impl PathIndex {
             Some(Resolution::Item(parent)) => find_member(krate, parent, member),
             _ => Resolution::NotFound,
         }
+    }
+
+    /// Where `path` goes on in another crate: the longest prefix of `path` that re-exports an
+    /// item of another crate, and the path in that crate, its definition path followed by the rest
+    /// of `path` (`std::vec::Vec` goes on as `alloc::vec::Vec`). `None` when no prefix is such a
+    /// re-export, or the definition path of the one that is is not known.
+    #[must_use]
+    pub fn crossing(&self, path: &str) -> Option<Crossing<'_>> {
+        let key = normalize(path)?;
+        let segments: Vec<&str> = key.split("::").collect();
+        (1..=segments.len()).rev().find_map(|end| {
+            let (prefix, rest) = segments.split_at(end);
+            let reexport = self.external_reexports.get(prefix.join("::").as_str())?;
+            let definition = reexport.definition.as_ref()?;
+            let mut continued = definition.joined().into_string();
+            for segment in rest {
+                continued.push_str("::");
+                continued.push_str(segment);
+            }
+            Some(Crossing {
+                reexport,
+                continued: continued.into(),
+            })
+        })
     }
 
     /// The re-export of another crate's item at `path` that an item of this crate hides: both
@@ -924,6 +958,34 @@ mod tests {
             prefix: PublicPath::new(&["c"]),
             source: "other::prelude".into(),
         }]);
+    }
+
+    #[test]
+    fn a_path_through_a_reexport_goes_on_in_the_other_crate() {
+        let krate = krate(
+            vec![
+                module(0, "std", &[1, 2]),
+                reexport(1, "alloc::vec", "vec", Some(9), false),
+                reexport(2, "core::option::Option", "Option", Some(8), false),
+            ],
+            &[(9, 1, "alloc::vec"), (8, 2, "core::option::Option")],
+        );
+        let index = PathIndex::build(&krate);
+        let continued = |path: &str| index.crossing(path).map(|crossing| crossing.continued);
+        assert_eq!(
+            continued("std::vec::Vec").as_deref(),
+            Some("alloc::vec::Vec")
+        );
+        assert_eq!(
+            continued("std::vec::Vec::push").as_deref(),
+            Some("alloc::vec::Vec::push")
+        );
+        assert_eq!(continued("std::vec").as_deref(), Some("alloc::vec"));
+        assert_eq!(
+            continued("std::Option").as_deref(),
+            Some("core::option::Option")
+        );
+        assert_eq!(continued("std::collections::HashMap"), None);
     }
 
     #[test]

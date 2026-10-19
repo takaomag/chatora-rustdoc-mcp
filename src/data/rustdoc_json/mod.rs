@@ -39,7 +39,7 @@ pub fn supported_formats() -> impl DoubleEndedIterator<Item = u32> {
 pub const MAX_NESTING: usize = 10_000;
 
 /// rustdoc JSON parsed into the latest types.
-#[derive(Debug)]
+#[derive(Debug, rkyv::Archive, rkyv::Serialize)]
 pub struct ParsedCrate {
     /// The crate.
     pub krate: Crate,

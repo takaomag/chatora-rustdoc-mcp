@@ -3,6 +3,8 @@
 
 use std::{borrow::Cow, fmt, path::Path, str::FromStr};
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+
 /// Longest target triple accepted. The longest built into rustc is about 40 characters.
 const MAX_LEN: usize = 100;
 
@@ -41,6 +43,20 @@ impl FromStr for TargetTriple {
 impl fmt::Display for TargetTriple {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl Serialize for TargetTriple {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+/// Read with the same checks as [`FromStr`], so that a file cannot make an unchecked triple.
+impl<'de> Deserialize<'de> for TargetTriple {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let triple = <Cow<'de, str>>::deserialize(deserializer)?;
+        triple.parse().map_err(de::Error::custom)
     }
 }
 
@@ -127,38 +143,8 @@ fn musl_as_gnu(triple: &str) -> String {
 /// Runs `rustc -vV` in `dir` and reads its `host:` line.
 #[cfg(feature = "local")]
 async fn rustc_host(dir: &Path) -> Result<TargetTriple, Cow<'static, str>> {
-    use std::{process::Stdio, time::Duration};
-
-    /// Longest wait for `rustc -vV`, which takes milliseconds when it works.
-    const TIMEOUT: Duration = Duration::from_secs(10);
-
-    std::fs::create_dir_all(dir)
-        .map_err(|error| Cow::Owned(format!("the directory to run rustc in: {error}")))?;
-    let output = tokio::process::Command::new("rustc")
-        .arg("-vV")
-        .current_dir(dir)
-        // The default toolchain is used; rustup must not install one (requirement R-WS-7).
-        .env("RUSTUP_AUTO_INSTALL", "0")
-        // Never share the server's stdin and stdout (requirement R-SEC-1).
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output();
-    let output = tokio::time::timeout(TIMEOUT, output)
-        .await
-        .map_err(|_elapsed| Cow::Borrowed("rustc -vV did not finish in 10 seconds"))?
-        .map_err(|error| Cow::Owned(format!("rustc could not be run: {error}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let first_line = stderr.lines().next().unwrap_or_default();
-        return Err(Cow::Owned(format!(
-            "rustc -vV failed ({}): {first_line}",
-            output.status
-        )));
-    }
-    parse_host(&String::from_utf8_lossy(&output.stdout))
-        .ok_or(Cow::Borrowed("rustc -vV printed no valid host line"))
+    let version = super::tool::output(dir, "rustc", &["-vV"]).await?;
+    parse_host(&version).ok_or(Cow::Borrowed("rustc -vV printed no valid host line"))
 }
 
 /// The triple on the `host:` line of the output of `rustc -vV`.
