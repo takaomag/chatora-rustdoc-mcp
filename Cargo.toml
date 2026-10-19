@@ -160,3 +160,6 @@ wildcard_enum_match_arm = "warn"
 # rustc の missing_docs が crate doc の欠落も拾うので不要。
 [lints.rustdoc]
 unescaped_backticks = "warn"
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["macros", "rt"] }

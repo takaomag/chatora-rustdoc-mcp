@@ -108,20 +108,48 @@ impl ServerHandler for Server {
         std::future::ready(result)
     }
 
-    fn call_tool(
+    async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> + Send + '_ {
+    ) -> Result<CallToolResponse, ErrorData> {
         // Only an unknown tool is a JSON-RPC error; bad arguments are tool errors (requirement R-ARG-1).
-        let result = match request.name.as_ref() {
-            echo::NAME => Ok(echo::call(request.arguments.as_ref()).into()),
+        match request.name.as_ref() {
+            echo::NAME => {
+                let arguments = request.arguments;
+                Ok(run_tool(async move { echo::call(arguments.as_ref()) })
+                    .await
+                    .into())
+            },
             name => Err(ErrorData::invalid_params(
                 format!("unknown tool: {name}"),
                 None,
             )),
-        };
-        std::future::ready(result)
+        }
+    }
+}
+
+/// Runs a tool in a task of its own, so that a panic becomes an `internal_error` result
+/// (requirement R-ERR-1).
+///
+/// rmcp runs each handler in a detached task and sends no response if it panics, which would
+/// leave the client waiting until it times out.
+async fn run_tool<F>(future: F) -> CallToolResult
+where
+    F: Future<Output = CallToolResult> + Send + 'static,
+{
+    match tokio::spawn(future).await {
+        Ok(result) => result,
+        Err(error) => {
+            // The panic hook has already written the panic message to stderr.
+            tracing::error!(%error, "a tool task failed");
+            tool_error(
+                "internal_error",
+                "the server hit an internal error (a bug), so this call did not complete",
+                false,
+                &["report the bug to the server's maintainers, with the server's stderr log"],
+            )
+        },
     }
 }
 
@@ -187,5 +215,34 @@ pub async fn serve() -> Result<(), ServeError> {
         Err(ServerInitializeError::ConnectionClosed(_)) => Ok(()),
 
         Err(error) => Err(ServeError::Initialize(Box::new(error))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Returns the JSON in `content[0].text` of a tool result.
+    fn text_json(result: &CallToolResult) -> serde_json::Value {
+        let text = &result.content[0]
+            .as_text()
+            .expect("the first content block is text")
+            .text;
+        serde_json::from_str(text).expect("the text is JSON")
+    }
+
+    #[tokio::test]
+    async fn run_tool_turns_a_panic_into_internal_error() {
+        let result = run_tool(async { panic!("a tool panicked on purpose") }).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.structured_content.is_none());
+        assert_eq!(text_json(&result)["code"], "internal_error");
+    }
+
+    #[tokio::test]
+    async fn run_tool_returns_the_result_of_the_tool() {
+        let expected = CallToolResult::structured(serde_json::json!({ "text": "hi" }));
+        let result = run_tool(std::future::ready(expected.clone())).await;
+        assert_eq!(result, expected);
     }
 }
