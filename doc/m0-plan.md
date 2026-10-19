@@ -591,6 +591,26 @@ R-QA-2 の 46・53・54・56・57・60・61 はすべてそろった。49〜52�
 
 **v0.17 で要件に反映すること**: Q-17 を決定にする。R-WS-1 の `cargo doc` の節の「同名で版の違う依存は別々のファイルに出る」を、今回の結果 (`-p` で両方を指すとエラー、`-p` なしだと古い方が落ちる) に直す。
 
+#### B5 (2026-10-19)
+
+環境は B1 と同じ。スクリプトは [poc/m0b/b5-dep-info/run.sh](../poc/m0b/b5-dep-info/run.sh)。合成の crate [probe/](../poc/m0b/b5-dep-info/probe/) は、`#![doc = include_str!(…)]`・`include_bytes!`・`#[path]`・build.rs が `OUT_DIR` に生成して `include!` するコード・`#[cfg(docsrs)]` のときだけ読むモジュールを持つ。どれも stable + B1 で決めた `RUSTC_BOOTSTRAP` で、JSON と同じ rustdoc の引数 (`--cfg docsrs` を含む) を使った。
+
+| | (a) rustdoc をもう一度 (`--emit=dep-info` を足す) | (b) その crate の `cargo check` の dep-info |
+| --- | --- | --- |
+| 出る場所 | `<target dir>/<triple>/doc/<crate>.d` | `<build dir>/<triple>/debug/deps/<crate>-<hash>.d` |
+| member (chatora-rustdoc-mcp) の時間 | 0.53 s (JSON の生成と同じくらい) | 0.61 s (member の check の 1 unit が増える。文書化だけでは member の check は作られない) |
+| 依存 (tokio 1.53.3) の時間 | 0.92 s | 0.09 s (依存として check 済み。新しく作るものは無い) |
+| `include_str!`・`include_bytes!`・`#[path]`・build.rs が生成したコード | すべて載る。`# env-dep:OUT_DIR=…` も載る | すべて載る |
+| `#[cfg(docsrs)]` のときだけ読むファイル | 載る | **載らない**。tokio では 250 件のうち 5 件 (`src/doc/mod.rs`・`src/doc/os.rs`・`src/io/bsd/poll_aio.rs`・`src/net/windows/mod.rs`・`src/net/windows/named_pipe.rs`) が欠けた |
+| JSON | 書き換えない (直前の JSON が残る) | 影響なし |
+
+- build.rs 自体は、どちらにも載らない (build script 自身の dep-info `build_script_build-<hash>.d` にある。R-WS-4 は build.rs を別に鍵に入れているので問題ない)
+- (a) の後に JSON をもう一度作っても、依存は fresh のままだった (やり直すのは文書化する crate の 1 unit だけ)
+
+**決めたこと (R-WS-4)**: dep-info は (a) で取る。JSON と同じ引数に `--emit=dep-info` を足して rustdoc をもう一度実行する。(b) は依存なら無料だが、`--cfg docsrs` のときだけ読むファイルを取りこぼし、その変更で鮮度切れにならない。(a) の費用はその crate の rustdoc 1 回分。JSON を書き換えないので、JSON を移した後に実行してよい。
+
+**v0.17 で要件に反映すること**: R-WS-4 の「どちらにするかは M0 で所要時間を測って決める」を、(a) に決めたことと理由 (`#[cfg(docsrs)]` のファイル) に改める。
+
 ---
 
 ## 7. M0 の終え方

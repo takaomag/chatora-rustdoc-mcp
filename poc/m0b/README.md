@@ -14,4 +14,5 @@
 | ディレクトリ | 実験 | 実行 |
 | --- | --- | --- |
 | [b1-rustc-bootstrap/](b1-rustc-bootstrap/) | B1 (Q-12): stable + `RUSTC_BOOTSTRAP=<crate 名>` の作り直しと文書の違い | `./b1-rustc-bootstrap/run.sh`。記録は `work/b1/log.txt` |
+| [b5-dep-info/](b5-dep-info/) | B5 (R-WS-4): dep-info を rustdoc の `--emit=dep-info` で取るか、`cargo check` から取るか | `./b5-dep-info/run.sh`。記録は `work/b5/log.txt` |
 | [b2-doc-vs-rustdoc/](b2-doc-vs-rustdoc/) | B2 (Q-17): `cargo doc --output-format json` と `cargo rustdoc` | `./b2-doc-vs-rustdoc/run.sh` (記録は `work/b2/log.txt`)、`./b2-doc-vs-rustdoc/dup.sh` (同名で版の違う依存) |
