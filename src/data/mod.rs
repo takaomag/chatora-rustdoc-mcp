@@ -9,6 +9,7 @@ pub mod rustdoc_json;
 pub mod sparse_index;
 #[cfg(test)]
 mod test_http;
+pub mod version;
 
 use semver::Version;
 
