@@ -31,6 +31,8 @@ use rmcp::{
         ContentBlock,
         ErrorData,
         JsonObject,
+        ProgressNotificationParam,
+        ProgressToken,
         Tool,
         ToolAnnotations,
     },
@@ -58,6 +60,7 @@ use crate::{
         flight::Flights,
         sparse_index::SparseIndex,
         target::{self, HostTarget},
+        waits::Waits,
     },
     query::load::SharedArchive,
 };
@@ -317,19 +320,39 @@ pub(super) async fn call(
     };
     let cancelled = context.ct.clone();
     let span = call.span();
-    let running = call
-        .fetches()
-        .scope(dispatch(request, context, state).instrument(span));
+    let mut progress = Progress::of(&request, &context);
+    let waits = Waits::default();
+    let running = call.fetches().scope(
+        waits
+            .clone()
+            .scope(dispatch(request, context, state).instrument(span)),
+    );
+    // On the heap: the futures of the tools are large.
+    let mut running = Box::pin(running);
+    // The first tick one period from now.
+    let mut ticks = tokio::time::interval(PROGRESS_EVERY);
+    ticks.reset();
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // On `notifications/cancelled`, the call stops: its task is aborted, and with it what it was
-    // fetching, unless another call waits for the same (requirement R-WS-6). rmcp sends no
-    // response to a cancelled request.
-    let called = tokio::select! {
-        called = running => called,
-        () = cancelled.cancelled() => {
-            let mut result = tool_error("cancelled", "the call was cancelled", false, &[]);
-            call.finish(&mut result);
-            return Ok(result.into());
-        },
+    // fetching, unless another call waits for the same or a call has told that it goes on
+    // (requirement R-WS-6). rmcp sends no response to a cancelled request. Progress is told only
+    // in this loop, so that none follows the response or the cancellation (requirement R-WS-6).
+    let called = loop {
+        // The response and the cancellation before a tick that is due at the same time.
+        tokio::select! {
+            biased;
+            called = &mut running => break called,
+            () = cancelled.cancelled() => {
+                let mut result = tool_error("cancelled", "the call was cancelled", false, &[]);
+                call.finish(&mut result);
+                return Ok(result.into());
+            },
+            _ = ticks.tick(), if progress.is_some() => {
+                if let Some(progress) = &mut progress {
+                    progress.tell(&waits).await;
+                }
+            },
+        }
     };
     drop(entered);
     match called {
@@ -341,6 +364,54 @@ pub(super) async fn call(
             call.finish_rejected(&error);
             Err(error)
         },
+    }
+}
+
+/// How often a call that takes long tells its progress (requirement R-WS-6: from 1 to 30 seconds).
+const PROGRESS_EVERY: Duration = Duration::from_secs(3);
+
+/// The progress notifications of a call whose request has a progress token (requirement R-WS-6).
+struct Progress {
+    peer: rmcp::Peer<RoleServer>,
+    token: ProgressToken,
+    /// What the last notification said, in seconds since the call started.
+    told: u64,
+}
+
+impl Progress {
+    /// The progress notifications of the call of `request`, when its request asked for them with
+    /// a progress token. `sleep` tells its own.
+    fn of(request: &CallToolRequestParams, context: &RequestContext<RoleServer>) -> Option<Self> {
+        #[cfg(debug_assertions)]
+        if request.name == sleep::NAME {
+            return None;
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = request;
+        Some(Self {
+            peer: context.peer.clone(),
+            token: context.meta.get_progress_token()?,
+            told: 0,
+        })
+    }
+
+    /// Tells how long the call has taken and what it waits for. The progress goes up with each
+    /// notification (requirement R-WS-6), by [`PROGRESS_EVERY`].
+    async fn tell(&mut self, waits: &Waits) {
+        self.told = self.told.saturating_add(PROGRESS_EVERY.as_secs());
+        let progress = self.told;
+        let doing = waits
+            .message()
+            .unwrap_or_else(|| "looking it up".to_owned());
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "seconds that a call takes are far below 2^52"
+        )]
+        let notification = ProgressNotificationParam::new(self.token.clone(), progress as f64)
+            .with_message(format!("{doing} ({progress} s)"));
+        if let Err(error) = self.peer.notify_progress(notification).await {
+            tracing::debug!(%error, "failed to send a progress notification");
+        }
     }
 }
 
@@ -442,18 +513,27 @@ where
     }
 }
 
-/// Spawns `future` as a task of the current tool call: in its span, and noting its fetches
-/// (requirement R-OBS-1). Tokio's own `spawn` drops both.
+/// Spawns `future` as a task of the current tool call: in its span, noting its fetches
+/// (requirement R-OBS-1) and what it waits for (requirement R-WS-6). Tokio's own `spawn` drops
+/// them.
 fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     let span = tracing::Span::current();
-    match Fetches::current() {
-        Some(fetches) => tokio::spawn(fetches.scope(future).instrument(span)),
-        None => tokio::spawn(future.instrument(span)),
-    }
+    let (fetches, waits) = (Fetches::current(), Waits::current());
+    tokio::spawn(
+        async move {
+            match (fetches, waits) {
+                (Some(fetches), Some(waits)) => fetches.scope(waits.scope(future)).await,
+                (Some(fetches), None) => fetches.scope(future).await,
+                (None, Some(waits)) => waits.scope(future).await,
+                (None, None) => future.await,
+            }
+        }
+        .instrument(span),
+    )
 }
 
 /// A task that is aborted when this is dropped before it finishes. Tokio's `JoinHandle` lets the

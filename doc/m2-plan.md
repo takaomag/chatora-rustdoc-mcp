@@ -460,6 +460,21 @@ Claude Code 2.1.304、Linux で測った。
   - stdio: 遅い docs.rs で、1 回目の呼び出しは `status: building` で、outputSchema を通る。後の呼び出しは答えを受け、要求は 1 回
 - `AbortOnDrop::detach` は使われなくなったので消した
 
+**C3b (進捗の通知。2026-10-21)**:
+
+- 進捗を送るのは `tools/call` の入口 (`tool::call`) の 1 か所にした。ツールの仕事と取り消しを待つ `select!` のループに 3 秒ごとの tick を足し、そこで送る (間隔は R-WS-6 の 1〜30 秒の中で決めた)
+  - 送るのは、要求に `progressToken` があるときだけ。値はその token
+  - `progress` は送るたびに 3 ずつ増やす (経過秒数。`total` は付けない)
+  - 応答も取り消しも、このループを抜けた後にしか起きないので、その後に進捗は送られない (MUST)。同時に起きたときは、`biased` で応答と取り消しを tick より先に見る
+  - `sleep` は自分で進捗を送るので、この仕組みからは外した (2 つの送り手で値が単調でなくなるため)
+- `message` は、呼び出しが待っている仕事とその段 (`fetching demo 0.1.0 (3 s)`)。仕事が複数なら件数と最初の 1 つ (`loading 5 crates: …`)、仕事を待っていなければ `looking it up`。待っている仕事は、`Fetches` と同じくタスクローカルの `data::waits::Waits` に、`Flights::join` が待つ間だけ書く。仕事を共有しても、待っている呼び出しごとに自分の token で送る (R-WS-6)。ツールの `spawn` は `Waits` も子のタスクに渡す
+- rmcp の `RequestContext` を tool の中に渡さずに済んだ (C3 の下調べで、`dispatch` で `sleep` 以外には落としていると分かっていた)
+- テスト (stdio):
+  - 遅い docs.rs を待つ呼び出しは、3 秒目に `p1` の token で `progress: 3`・`fetching demo 0.1.0 (3 s)` を送る。応答の後には送らない。同時の token の無い呼び出しには送らない
+  - 取り消した呼び出しには、その後なにも送らない
+- clippy の `large_futures` に当たったので、ツールの future を `Box::pin` でヒープに置いた
+- テスト用の docs.rs を使う stdio のテスト (C3a のものを含む) は、口が debug ビルドだけなので `#[cfg(debug_assertions)]` にした。前提を渡さないレビュー (サブエージェント) の指摘で、`biased` と、テストの待ちの余裕 (4 秒待つ間に tick 1 回) と、応答の届く順に依らない照合を足した。応答の順の件は、手元の全体のテストで一度落ちて確かめた
+
 ### 6.5 M2d
 
 (まだ無い)

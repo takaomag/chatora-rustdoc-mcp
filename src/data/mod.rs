@@ -42,6 +42,7 @@ pub(crate) mod test_http;
 #[cfg(feature = "local")]
 mod tool;
 pub mod version;
+pub mod waits;
 
 use std::{
     io,

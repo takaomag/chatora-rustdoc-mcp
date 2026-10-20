@@ -14,16 +14,18 @@
 #[path = "common/schema.rs"]
 mod schema;
 
+// The test server for docs.rs, which only a debug build takes.
+#[cfg(debug_assertions)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::{
     collections::HashMap,
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Receiver},
-    },
+    sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant},
 };
@@ -382,7 +384,8 @@ impl Server {
     }
 
     /// Collects every message that arrives during `duration`, including those kept earlier.
-    // Only the test of `sleep` uses it, which is only in debug builds.
+    // Only the tests of `sleep` and of the test server for docs.rs use it, which are only in debug
+    // builds.
     #[cfg(debug_assertions)]
     fn messages_during(&mut self, duration: Duration) -> Vec<Value> {
         let deadline = Instant::now()
@@ -1579,6 +1582,7 @@ fn a_target_of_its_own_falls_back_to_the_host_with_a_warning() {
 
 /// The URL of a server on this machine that answers every request with `body` after `delay`, and
 /// the number of requests it has had.
+#[cfg(debug_assertions)]
 fn slow_server(body: Vec<u8>, delay: Duration) -> (String, Arc<AtomicUsize>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port is free");
     let url = format!("http://{}", listener.local_addr().expect("bound"));
@@ -1614,24 +1618,13 @@ fn slow_server(body: Vec<u8>, delay: Duration) -> (String, Arc<AtomicUsize>) {
 /// A crate whose JSON takes longer to fetch than a call waits is `status: building`, which the
 /// tool's `outputSchema` allows, and the fetch goes on without the call, so that a later call
 /// has the item: docs.rs is asked once (requirements R-ARCH-6, R-OUT-9 and R-WS-6).
+#[cfg(debug_assertions)]
 #[test]
 fn a_crate_that_takes_long_to_fetch_is_building_and_then_answered() {
     let json = serde_json::to_vec(&demo_crate()).expect("serializes");
     let (docs_rs, requests) = slow_server(json, Duration::from_secs(2));
-    let mut server = Server::start_with(None, &[
-        ("CHATORA_RUSTDOC_TEST_DOCS_RS_URL", docs_rs.as_str()),
-        // A call waits two thirds of a second.
-        ("CHATORA_RUSTDOC_MCP_LIMITS__REQUEST_TIMEOUT_SECS", "1"),
-        ("NO_PROXY", "127.0.0.1"),
-        ("no_proxy", "127.0.0.1"),
-    ]);
-    // The JSON is not cached; the index and the `.crate` are, so that only docs.rs is asked.
-    std::fs::remove_dir_all(server.cache.path().join("docs.rs")).expect("removed");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs();
-    write_demo_index(&server, now);
+    // A call waits two thirds of a second.
+    let mut server = server_with_slow_docs_rs(&docs_rs, "1");
     let arguments = json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET });
     server.send(&call_tool(1, "get_item", arguments.clone()));
     let result = server.response(1)["result"].clone();
@@ -1661,4 +1654,101 @@ fn a_crate_that_takes_long_to_fetch_is_building_and_then_answered() {
     assert_eq!(answered["isError"], false, "{answered}");
     assert_eq!(answered["structuredContent"]["data"]["path"], "demo::hello");
     assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+/// A server whose docs.rs is the server `docs_rs`, whose calls wait for work two thirds of
+/// `timeout_secs`, and whose cache has the index and the `.crate` of `demo` but not its JSON, so
+/// that only docs.rs is asked. Only a debug build takes the test server for docs.rs.
+#[cfg(debug_assertions)]
+fn server_with_slow_docs_rs(docs_rs: &str, timeout_secs: &str) -> Server {
+    let server = Server::start_with(None, &[
+        ("CHATORA_RUSTDOC_TEST_DOCS_RS_URL", docs_rs),
+        (
+            "CHATORA_RUSTDOC_MCP_LIMITS__REQUEST_TIMEOUT_SECS",
+            timeout_secs,
+        ),
+        ("NO_PROXY", "127.0.0.1"),
+        ("no_proxy", "127.0.0.1"),
+    ]);
+    std::fs::remove_dir_all(server.cache.path().join("docs.rs")).expect("removed");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    write_demo_index(&server, now);
+    server
+}
+
+/// A call that waits for a slow fetch tells its progress with the token of its request, every
+/// 3 seconds, and stops with its response; a call without a token gets none (requirement
+/// R-WS-6).
+#[cfg(debug_assertions)]
+#[test]
+fn a_call_that_waits_tells_its_progress_until_it_answers() {
+    let json = serde_json::to_vec(&demo_crate()).expect("serializes");
+    let (docs_rs, _requests) = slow_server(json, Duration::from_secs(10));
+    // A call waits four seconds: one tick, with a margin.
+    let mut server = server_with_slow_docs_rs(&docs_rs, "6");
+    let arguments = json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET });
+    let mut with_token = call_tool(1, "get_item", arguments.clone());
+    with_token["params"]["_meta"] = meta(json!({ "progressToken": "p1" }));
+    server.send(&with_token);
+    server.send(&call_tool(2, "get_item", arguments));
+    assert_eq!(
+        server.response(1)["result"]["structuredContent"]["status"],
+        "building"
+    );
+    let before = std::mem::take(&mut server.pending);
+    let progress: Vec<&Value> = before
+        .iter()
+        .filter(|message| message["method"] == "notifications/progress")
+        .collect();
+    assert_eq!(progress.len(), 1, "{before:?}");
+    assert_eq!(progress[0]["params"]["progressToken"], "p1");
+    assert_eq!(progress[0]["params"]["progress"], 3.0);
+    assert_eq!(
+        progress[0]["params"]["message"],
+        "fetching demo 0.1.0 (3 s)"
+    );
+    let after = server.messages_during(Duration::from_millis(3500));
+    assert!(
+        after
+            .iter()
+            .all(|message| message["method"] != "notifications/progress"),
+        "progress after the response: {after:?}"
+    );
+    assert!(
+        before
+            .iter()
+            .chain(&after)
+            .any(|message| message["id"] == 2),
+        "{after:?}"
+    );
+    assert!(server.finish().success());
+}
+
+/// A cancelled call tells no more progress (requirement R-WS-6).
+#[cfg(debug_assertions)]
+#[test]
+fn a_cancelled_call_tells_no_more_progress() {
+    let json = serde_json::to_vec(&demo_crate()).expect("serializes");
+    let (docs_rs, _requests) = slow_server(json, Duration::from_secs(20));
+    let mut server = server_with_slow_docs_rs(&docs_rs, "30");
+    let mut call = call_tool(
+        1,
+        "get_item",
+        json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET }),
+    );
+    call["params"]["_meta"] = meta(json!({ "progressToken": "p1" }));
+    server.send(&call);
+    let progress = server.notification("notifications/progress");
+    assert_eq!(progress["params"]["progressToken"], "p1");
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": { "requestId": 1, "reason": "test" },
+    }));
+    let later = server.messages_during(Duration::from_secs(4));
+    assert!(later.is_empty(), "sent after cancellation: {later:?}");
+    assert!(server.finish().success());
 }

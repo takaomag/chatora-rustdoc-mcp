@@ -94,8 +94,9 @@ pub async fn docs_rs_archive(
         target: target.cloned(),
         dir,
     };
+    let what = format!("{name} {version}");
     flights
-        .join(&key, until, async move |stage| {
+        .join(&key, &what, until, async move |stage| {
             release
                 .archive(&stage)
                 .await

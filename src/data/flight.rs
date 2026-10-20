@@ -62,11 +62,14 @@ impl Doing {
 #[derive(Debug)]
 pub struct Stage(AtomicU8);
 
-impl Stage {
-    const fn new() -> Self {
+impl Default for Stage {
+    /// Work starts by fetching.
+    fn default() -> Self {
         Self(AtomicU8::new(Doing::Fetching as u8))
     }
+}
 
+impl Stage {
     /// The work now does `doing`.
     pub fn set(&self, doing: Doing) {
         self.0.store(doing as u8, Ordering::Relaxed);
@@ -132,9 +135,13 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
     /// The result of the work for `key`: of the work in flight, or of the work that `start`
     /// makes, started now, which it gives the [`Stage`] to set. When the work has not ended by
     /// `until`, it goes on, and [`Joined::Going`] says what it is doing.
+    ///
+    /// Meanwhile, the call in scope notes that it waits for work on `what` (`serde 1.0.228`),
+    /// for its progress notifications (requirement R-WS-6).
     pub async fn join<F>(
         &self,
         key: &str,
+        what: &str,
         until: Instant,
         start: impl FnOnce(Arc<Stage>) -> F,
     ) -> Joined<T>
@@ -142,6 +149,7 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
         F: Future<Output = T> + Send + 'static,
     {
         let flight = self.flight(key, start);
+        let _waiting = super::waits::waiting(what, &flight.stage);
         let mut done = flight.done.clone();
         let waited = tokio::time::timeout_at(until, done.wait_for(Option::is_some))
             .await
@@ -169,7 +177,7 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
         // Forget the flights that nobody waits for any more, so that the map does not grow.
         flying.retain(|_, flight| flight.strong_count() > 0);
         let (sender, done) = watch::channel(None);
-        let stage = Arc::new(Stage::new());
+        let stage = Arc::new(Stage::default());
         let work = start(Arc::clone(&stage));
         // The requests that the work sends are noted for the call that started it (requirement
         // R-OBS-1).
@@ -235,9 +243,11 @@ mod tests {
             .map(|_| {
                 let (flights, runs, go) =
                     (Arc::clone(&flights), Arc::clone(&runs), Arc::clone(&go));
-                tokio::spawn(
-                    async move { flights.join("key", later(), |_| work(&runs, &go)).await },
-                )
+                tokio::spawn(async move {
+                    flights
+                        .join("key", "work", later(), |_| work(&runs, &go))
+                        .await
+                })
             })
             .collect();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -254,12 +264,20 @@ mod tests {
         let (runs, go) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
         let first = {
             let (flights, runs, go) = (Arc::clone(&flights), Arc::clone(&runs), Arc::clone(&go));
-            tokio::spawn(async move { flights.join("key", later(), |_| work(&runs, &go)).await })
+            tokio::spawn(async move {
+                flights
+                    .join("key", "work", later(), |_| work(&runs, &go))
+                    .await
+            })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
         let second = {
             let (flights, runs, go) = (Arc::clone(&flights), Arc::clone(&runs), Arc::clone(&go));
-            tokio::spawn(async move { flights.join("key", later(), |_| work(&runs, &go)).await })
+            tokio::spawn(async move {
+                flights
+                    .join("key", "work", later(), |_| work(&runs, &go))
+                    .await
+            })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
         // The call that started the work is called off.
@@ -279,7 +297,7 @@ mod tests {
                 let (flights, stopped) = (Arc::clone(&flights), Arc::clone(&stopped));
                 tokio::spawn(async move {
                     flights
-                        .join("key", later(), async move |_| {
+                        .join("key", "work", later(), async move |_| {
                             let _dropped = Dropped(stopped);
                             std::future::pending::<u32>().await
                         })
@@ -304,13 +322,13 @@ mod tests {
     async fn work_that_panics_gives_no_result_and_is_started_again() {
         let flights = Flights::<u32>::default();
         let panicked = flights
-            .join("key", later(), async |_| {
+            .join("key", "work", later(), async |_| {
                 panic!("the work panicked on purpose")
             })
             .await;
         assert_eq!(panicked, Joined::Ended);
         assert_eq!(
-            flights.join("key", later(), async |_| 7).await,
+            flights.join("key", "work", later(), async |_| 7).await,
             Joined::Done(7)
         );
     }
@@ -336,19 +354,19 @@ mod tests {
         };
         let soon = || Instant::now() + Duration::from_millis(50);
         assert_eq!(
-            flights.join("key", soon(), start).await,
+            flights.join("key", "work", soon(), start).await,
             Joined::Going(Doing::Fetching)
         );
         indexing.notify_one();
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
-            flights.join("key", soon(), unused).await,
+            flights.join("key", "work", soon(), unused).await,
             Joined::Going(Doing::Indexing)
         );
         // A call that waits is called off.
         let called_off = {
             let flights = Arc::clone(&flights);
-            tokio::spawn(async move { flights.join("key", later(), unused).await })
+            tokio::spawn(async move { flights.join("key", "work", later(), unused).await })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
         called_off.abort();
@@ -357,7 +375,7 @@ mod tests {
         // Joined before the work ends, which then lets the flight go.
         let last = {
             let flights = Arc::clone(&flights);
-            tokio::spawn(async move { flights.join("key", later(), unused).await })
+            tokio::spawn(async move { flights.join("key", "work", later(), unused).await })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
         go.notify_one();
