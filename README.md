@@ -41,6 +41,27 @@ chatora-rustdoc-mcp install-skill   # optional, may come later
 
 Subagents that list their `tools` get no MCP tools unless you add `mcp__chatora-rustdoc-mcp` (or, for a plugin install, the `mcp__plugin_<plugin>_<server>` name) to the list.
 
+## Logs
+
+The server writes a log file of JSON Lines, a new one for each run, in `$XDG_STATE_HOME/chatora-rustdoc-mcp/logs/` (`~/.local/state/chatora-rustdoc-mcp/logs/` when unset) on Linux and macOS, and in `%LOCALAPPDATA%\chatora-rustdoc-mcp\state\logs\` on Windows. Each tool call has a line with:
+
+- its `request_id`, which an error result also carries, so that a reported error leads to its line
+- the tool and its arguments: the crate, paths (including the project's path, which may contain your user name), and the cursor in full, and other strings cut to 200 characters
+- how long it took, the size of the response and its estimated tokens, and the error code if it failed
+- where the data came from, whether the cache had it, and the URLs fetched (without query strings)
+
+Warnings and errors go there too, with the `request_id` of the call they happened in. GitHub tokens and the contents of responses are not logged. A file larger than 20MB is followed by another; files older than 14 days, and the oldest while all of them are over 50MB, are removed, except those a running server is writing. Nothing is removed from a directory the server did not create (one with no `.chatora-rustdoc-mcp-logs` file).
+
+The server also logs to stderr. These environment variables change the logs:
+
+| Variable | Default | |
+| --- | --- | --- |
+| `CHATORA_RUSTDOC_MCP_LOG__DIR` | as above | The directory of the log files (an absolute path) |
+| `CHATORA_RUSTDOC_MCP_LOG__FILE_MAX_SIZE` | `20MB` | The size of a file before the next one (`KB`, `MB`, `GB`, `KiB`, `MiB`, `GiB`) |
+| `CHATORA_RUSTDOC_MCP_LOG__RETENTION_DAYS` | `14` | How many days files are kept |
+| `CHATORA_RUSTDOC_MCP_LOG__TOTAL_MAX_SIZE` | `50MB` | The size of all files together |
+| `CHATORA_RUSTDOC_MCP_LOG__FILTER` | `info` | Which lines stderr gets, in [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax; if any part is not valid, the default is used. The log file is not filtered |
+
 ## Security
 
 Local builds run `cargo`, and with it build scripts and procedural macros, outside Claude Code's sandbox. The server itself never asks for confirmation.

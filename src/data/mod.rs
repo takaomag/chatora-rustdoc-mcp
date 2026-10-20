@@ -12,6 +12,7 @@ pub mod dist;
 pub mod docs_rs;
 #[cfg(feature = "local")]
 pub mod features;
+pub mod fetches;
 pub mod format_version;
 mod http;
 #[cfg(feature = "local")]
@@ -582,7 +583,7 @@ where
     F: FnOnce() -> io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(work)
+    crate::task::spawn_blocking(work)
         .await
         .map_err(|error| io::Error::other(crate::task::resume_if_panic(error)))?
 }

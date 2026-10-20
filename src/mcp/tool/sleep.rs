@@ -89,7 +89,7 @@ pub(super) async fn execute(seconds: u32, context: RequestContext<RoleServer>) -
             () = tokio::time::sleep(Duration::from_secs(1)) => {},
             () = context.ct.cancelled() => {
                 // rmcp drops the response of a cancelled request, so this result is never sent.
-                tracing::info!(request_id = ?context.id, during_second = elapsed, "sleep was cancelled");
+                tracing::info!(jsonrpc_id = ?context.id, during_second = elapsed, "sleep was cancelled");
                 return super::tool_error("cancelled", "the request was cancelled", false, &[]);
             },
         }

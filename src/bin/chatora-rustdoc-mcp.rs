@@ -18,6 +18,7 @@ use insta as _;
 use libc as _;
 use lzma_rust2 as _;
 use memmap2 as _;
+use parking_lot as _;
 use reqwest as _;
 use rkyv as _;
 use rmcp as _;

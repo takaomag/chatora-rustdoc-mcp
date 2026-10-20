@@ -177,6 +177,13 @@ pub async fn serve() -> Result<(), ServeError> {
         version = env!("CARGO_PKG_VERSION"),
         "starting the MCP server over stdio"
     );
+    // The first line of the log file: the calls after it are this version's (requirement R-OBS-1).
+    crate::logging::write_record(&serde_json::json!({
+        "ts": crate::logging::now(),
+        "kind": "start",
+        "version": env!("CARGO_PKG_VERSION"),
+        "pid": std::process::id(),
+    }));
     let cache = Cache::open_default()?;
     // The cache is where nothing configures rustc (requirement R-TG-1).
     let host = target::host_target(cache.dir()).await;
@@ -199,7 +206,7 @@ pub async fn serve() -> Result<(), ServeError> {
             resolver: Resolver::new(false),
         }),
     };
-    match server.serve(stdio()).await {
+    match Box::pin(server.serve(stdio())).await {
         Ok(running) => match running.waiting().await {
             Ok(QuitReason::JoinError(error)) | Err(error) => {
                 Err(ServeError::Cancelled(crate::task::resume_if_panic(error)))

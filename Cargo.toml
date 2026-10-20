@@ -38,6 +38,7 @@ lzma-rust2 = { version = "0.23.0", default-features = false, features = [
   "optimization",
 ] }
 memmap2 = "0.9.11"
+parking_lot = "0.12.5"
 reqwest = "0.13.5"
 rkyv = "0.8.18"
 # マクロ (`#[tool_router]` など) は使わず、`ServerHandler` を手で実装する (doc/m0-plan.md の D1)。

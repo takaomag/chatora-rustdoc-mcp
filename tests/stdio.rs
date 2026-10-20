@@ -14,7 +14,7 @@
 use std::{
     collections::HashMap,
     io::{BufRead as _, BufReader, Write as _},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
@@ -204,11 +204,14 @@ fn demo_crate_file() -> Vec<u8> {
         .expect("finished")
 }
 
+/// The directory of the server's logs, in its cache directory.
+const LOG_DIR: &str = "logs";
+
 /// A running server, talking JSON-RPC over its stdin and stdout.
 struct Server {
     child: Child,
     /// The server's cache directory, removed when the server is dropped.
-    _cache: TempDir,
+    cache: TempDir,
     stdin: Option<ChildStdin>,
     /// Lines from stdout: a parsed message, or a line that is not a JSON-RPC message.
     lines: Receiver<Result<Value, String>>,
@@ -237,6 +240,7 @@ impl Server {
             // (requirement R-SEC-1).
             .env("CHATORA_RUSTDOC_MCP_LOG__FILTER", "debug")
             .env("CHATORA_RUSTDOC_MCP_CACHE__DIR", cache.path())
+            .env("CHATORA_RUSTDOC_MCP_LOG__DIR", cache.path().join(LOG_DIR))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -260,11 +264,34 @@ impl Server {
         });
         Self {
             child,
-            _cache: cache,
+            cache,
             stdin,
             lines,
             pending: Vec::new(),
         }
+    }
+
+    /// The lines of the server's log files, oldest first (requirement R-OBS-1).
+    fn log(&self) -> Vec<Value> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(self.cache.path().join(LOG_DIR))
+            .expect("the log directory")
+            .map(|entry| entry.expect("an entry").path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .flat_map(|path| {
+                std::fs::read_to_string(path)
+                    .expect("readable")
+                    .lines()
+                    .map(|line| serde_json::from_str(line).expect("a line of JSON"))
+                    .collect::<Vec<Value>>()
+            })
+            .collect()
     }
 
     /// Writes one message as a line to the server's stdin.
@@ -512,6 +539,83 @@ fn get_item_returns_structured_content_and_tool_errors() {
     );
     // Only an unknown tool is a JSON-RPC error.
     assert_eq!(server.response(4)["error"]["code"], -32602);
+    assert!(server.finish().success());
+}
+
+/// Each tool call has a line in the log file with its `request_id`, which a tool error carries
+/// too, so that a reported error leads to its line (requirements R-OBS-1 and R-ERR-2).
+#[test]
+fn errors_carry_the_request_id_of_their_log_line() {
+    let mut server = Server::start();
+    server.send(&call_tool(
+        1,
+        "get_item",
+        json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET }),
+    ));
+    server.send(&call_tool(
+        2,
+        "get_item",
+        json!({ "crate": "demo@0.1.0", "path": "demo::nothing", "target": TARGET }),
+    ));
+    server.send(&call_tool(
+        3,
+        "get_item",
+        json!({ "crate": "demo@not a version", "path": "hello" }),
+    ));
+    server.send(&call_tool(4, "nope", json!({})));
+    let found = server.response(1);
+    let not_found = text_json(&server.response(2)["result"]);
+    let invalid = text_json(&server.response(3)["result"]);
+    assert_eq!(server.response(4)["error"]["code"], -32602);
+    // A successful result carries no request_id, so that it stays the same for the same input
+    // (requirement R-ARCH-5).
+    assert!(
+        found["result"]["structuredContent"]
+            .get("request_id")
+            .is_none()
+    );
+    let (Some(not_found_id), Some(invalid_id)) = (
+        not_found["request_id"].as_str(),
+        invalid["request_id"].as_str(),
+    ) else {
+        panic!("the errors have a request_id: {not_found} {invalid}");
+    };
+    assert_ne!(not_found_id, invalid_id);
+
+    // Each record is written before its response is sent.
+    let log = server.log();
+    assert_eq!(log[0]["kind"], "start", "{log:?}");
+    let calls: Vec<&Value> = log.iter().filter(|line| line["kind"] == "call").collect();
+    assert_eq!(calls.len(), 4, "{log:?}");
+    let call = |request_id: &str| {
+        calls
+            .iter()
+            .copied()
+            .find(|call| call["request_id"] == request_id)
+            .unwrap_or_else(|| panic!("a record of {request_id}: {log:?}"))
+    };
+    let record = call(not_found_id);
+    assert_eq!(record["tool"], "get_item");
+    assert_eq!(record["error"], "item_not_found");
+    assert_eq!(record["arguments"]["path"], "demo::nothing");
+    assert_eq!(call(invalid_id)["error"], "invalid_argument");
+    // The crate was in the cache: nothing was fetched.
+    let found_record = calls
+        .iter()
+        .find(|call| call.get("error").is_none())
+        .expect("the record of the call that succeeded");
+    assert_eq!(found_record["sources"], json!(["docs.rs"]));
+    assert_eq!(found_record["cache"], "hit");
+    assert!(
+        found_record["bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call["tool"] == "nope" && call["error"] == "jsonrpc -32602")
+    );
     assert!(server.finish().success());
 }
 

@@ -1581,7 +1581,7 @@ async fn execute_std(
         hops: 0,
     };
     let cache = state.cache.clone();
-    let task = tokio::task::spawn_blocking(move || {
+    let task = crate::task::spawn_blocking(move || {
         let looked_up = look_up_std(&cache, &chosen, &request, at_least.as_ref());
         (looked_up, request)
     });
@@ -1742,7 +1742,7 @@ async fn look_up_archived(
     dir: PathBuf,
     arguments: Box<Request>,
 ) -> Option<Result<(Result<Value, Failure>, Box<Request>), Box<Request>>> {
-    let task = tokio::task::spawn_blocking(move || match load::open_archived(&cache, &dir) {
+    let task = crate::task::spawn_blocking(move || match load::open_archived(&cache, &dir) {
         Ok(Some(mapped)) => Ok((look_up_in(&mapped, &arguments), arguments)),
         Ok(None) => Err(arguments),
         Err(error) => {
@@ -1776,7 +1776,7 @@ impl Lookup {
         arguments: Request,
     ) -> Option<(Result<Value, Failure>, Request, Box<[u8]>)> {
         let (cache, dir) = (self.cache.clone(), self.dir.clone());
-        match tokio::task::spawn_blocking(move || {
+        match crate::task::spawn_blocking(move || {
             let looked_up = load::archive_json(&cache, &dir, &json)
                 .map_err(|error| match error {
                     load::LoadError::Parse(error) => Failure::Parse(error),

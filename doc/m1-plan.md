@@ -686,6 +686,26 @@ C3 を 2 つに分けた: C3a (`list_module` と一覧の共通の仕組み)、C
 
 C2〜C8 で M1 のツール (`list_crates`・`resolve_version`・`crate_overview`・`get_item`・`search_items`・`list_module`・`list_methods`・`list_impls`・`list_implementors`) が揃った。§3 の問いのうち、Q1 (`list_crates`)・Q2 (`resolve_version`)・Q3 (`crate_overview`)・Q4 (`search_items`)・Q5 (`get_item`)・Q6 (`list_module`)・Q8 (`list_impls`)・Q17 (`get_item` の `stability`)・Q20 (`get_item` の追跡) に答えられる。Q7 は固有と trait 由来だけ (Deref 先とプリミティブは M4)、Q9 は trait の crate の中だけ (依存グラフ全体は M4)。
 
+#### D1 (2026-10-20)
+
+構造化ログと `request_id` を入れた (R-OBS-1・R-OBS-2・R-ERR-2・R-DIST-3)。利用者が決めた (推奨案): ファイルには呼び出しごとの記録に加えて warn 以上のログも書き、呼び出しの中で出たものには `request_id` を付ける。ローテーションと古いログの削除も D1 で入れる。
+
+- ファイル: state のディレクトリの `logs/` (Linux・macOS は `$XDG_STATE_HOME/chatora-rustdoc-mcp/logs/`、Windows は `%LOCALAPPDATA%\chatora-rustdoc-mcp\state\logs\`)。プロセスごとに `<日付>-<PID>.jsonl`、上限を超えたら `<日付>-<PID>.2.jsonl` と続ける。書いているファイルは std の `File::try_lock` (プロセスをまたぐ勧告ロック) で押さえる
+- 古いログの削除: 起動時と次のファイルに移るときに、保持期間を過ぎたものと、合計の上限を超えている間は古い順に消す。ロックを取れないファイル (動いているサーバーが書いている) と、所有マーカー (`.chatora-rustdoc-mcp-logs`) の無いディレクトリのファイルは消さない。マーカーは、ディレクトリを作ったとき (空のとき) にだけ置く。symlink はたどらない
+- 設定は環境変数だけ (`CHATORA_RUSTDOC_MCP_LOG__DIR`・`__FILE_MAX_SIZE`・`__RETENTION_DAYS`・`__TOTAL_MAX_SIZE`・`__FILTER`)。設定ファイル (R-DIST-3) を読む仕組みはまだ無い。容量の書き方は整数と単位 (`B`・`KB`・`MB`・`GB` は 1000 の冪、`KiB`・`MiB`・`GiB` は 1024 の冪、大文字小文字は問わない)。誤った値は既定に戻してログに出す
+- `log.filter`: 誤った指定が 1 つでもあれば全体を既定 (`info`) に戻し、そのことをログに出す (それまでは誤った指定だけを捨てていた)。stderr だけを絞り、ファイルは絞らない
+- 呼び出しの記録 (`kind: call`): `ts`・`request_id`・`tool`・`arguments`・`ms`・`bytes`・`tokens`・`error` (エラーコード。JSON-RPC のエラーは `jsonrpc -32602` の形)・`sources` (provenance の取得元)・`cache`・`fetches`。起動時に `kind: start` の行 (版と PID) を書く
+  - 引数: crate・`path`・`project`・`cursor` はそのまま (2,000 文字まで)、ほかの文字列は 200 文字に切る。引数と配列の要素は 32 個まで
+  - `bytes`・`tokens`: モデルに渡る形 (`structuredContent` の JSON、エラーは text) の長さ。トークンは 4 文字で 1 と見積もる (R-OUT-3 の 32,000 文字 = 8,000 トークンと同じ初期値。校正は M5)
+  - `fetches`: 呼び出しの中で送った要求 (URL は query・fragment・資格情報を除く、最後の状態コード、試行回数、ヘッダまでの時間)。すべての要求が `http::send` を通るので、そこで task-local の記録に書く。呼び出しが生む task には `mcp::tool::spawn` で記録と span を引き継ぐ
+  - `cache`: 何もダウンロードしなかった (2xx の応答が無い) なら `hit`、あれば `miss`。sparse index の再検証 (304) はダウンロードに数えない。provenance の無い応答 (引数の誤りなど) には付けない
+- `request_id`: プロセスごとの乱数 8 桁 (16 進) と呼び出しの通し番号 (`a318412a-2`)。std の `RandomState` を乱数源に使い、依存を増やしていない。エラーの text の JSON に足し、成功の応答には入れない (同じ入力なら同じ出力 R-ARCH-5 を保つため。D3 の比較はエラーの `request_id` を除く)。呼び出しを `call` の span (`request_id`・`tool`) で包み、blocking のスレッドにも `crate::task::spawn_blocking` で span を引き継ぐ。stderr のログにも `call{request_id=…}` が付く
+- 依存: `parking_lot` を足した (std の `Mutex` は clippy で禁じている。R-ERR-1)。tracing-subscriber の `json` 機能は使わず、小さな Layer を書いた (記録の形を自由に決めるため)
+- 実データ: tokio の `get_item` は sparse index の 304 だけで `cache: hit`、存在しない crate は index の 404 2 回で `crate_not_found`、依存を横断する `search_items` は新しく入った依存 (parking_lot) の JSON の取得を記録した。誤った `log.filter` (`info,foo=bogus`) は既定に戻り、警告がファイルと stderr の両方に出た
+- README に、ログの場所・記録する項目・環境変数を書いた (R-OBS-2)
+- テスト: stdio で、エラーの `request_id` がログの行と一致し、成功の応答に `request_id` が無いこと。Layer が呼び出しの中の warn に `request_id` を付け、info を書かないこと。ファイルの切り替えと削除 (保持期間・合計・使用中・マーカー)。`log.filter` の全体の差し戻し、容量の解析、要求の記録が query と資格情報を除くこと
+- まだ: 知らない `CHATORA_RUSTDOC_MCP_*` の環境変数をログで知らせること (R-DIST-3) は、設定ファイルを読む仕組みと一緒にする
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

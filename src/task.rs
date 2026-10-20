@@ -1,6 +1,6 @@
 //! Helpers for Tokio tasks, shared by all layers.
 
-use tokio::task::JoinError;
+use tokio::task::{JoinError, JoinHandle};
 
 /// The stack size of the threads of the Tokio runtime, its workers and its blocking threads.
 ///
@@ -19,4 +19,16 @@ pub(crate) fn resume_if_panic(error: JoinError) -> JoinError {
         Ok(payload) => std::panic::resume_unwind(payload),
         Err(error) => error,
     }
+}
+
+/// Runs `work` on a blocking thread in the current span, so that what it logs carries the
+/// `request_id` of the tool call (requirement R-OBS-1). Tokio's own `spawn_blocking` drops the
+/// span.
+pub(crate) fn spawn_blocking<F, R>(work: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || span.in_scope(work))
 }

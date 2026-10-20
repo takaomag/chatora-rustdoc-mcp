@@ -71,6 +71,7 @@ pub(super) async fn send(
     let mut current = request;
     let mut delay = FIRST_RETRY_DELAY;
     let mut attempt: u32 = 1;
+    let started = std::time::Instant::now();
     loop {
         // A request without a streaming body can always be copied for the next attempt.
         let next = current.try_clone();
@@ -90,7 +91,14 @@ pub(super) async fn send(
                 delay = delay.saturating_mul(2);
                 attempt = attempt.saturating_add(1);
             },
-            _ => return outcome,
+            _ => {
+                let (url, status) = match &outcome {
+                    Ok(response) => (Some(response.url()), Some(response.status().as_u16())),
+                    Err(error) => (error.url(), error.status().map(|status| status.as_u16())),
+                };
+                super::fetches::note(url, status, attempt, started.elapsed());
+                return outcome;
+            },
         }
     }
 }

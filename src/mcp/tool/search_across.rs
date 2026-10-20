@@ -213,7 +213,7 @@ pub(super) async fn std(
     let cache = state.cache.clone();
     let chosen = Arc::new(chosen);
     let loading = Arc::clone(&chosen);
-    let task = tokio::task::spawn_blocking(move || {
+    let task = crate::task::spawn_blocking(move || {
         [StdCrate::Std, StdCrate::Alloc, StdCrate::Core].map(|krate| {
             let archived = loading
                 .json
@@ -302,7 +302,7 @@ async fn load_all(
         .map(|(name, version)| {
             let (state, target) = (Arc::clone(state), target.clone());
             let (task_name, task_version) = (name.clone(), version.clone());
-            let handle = tokio::spawn(async move {
+            let handle = super::spawn(async move {
                 load_release(&state, &task_name, &task_version, &target).await
             });
             (name, version, handle)
@@ -335,7 +335,7 @@ async fn load_release(
 ) -> Outcome {
     let dir = state.cache.docs_rs_dir(name, version, Some(target));
     let (cache, opened_dir) = (state.cache.clone(), dir.clone());
-    let opened = tokio::task::spawn_blocking(move || load::open_archived(&cache, &opened_dir))
+    let opened = crate::task::spawn_blocking(move || load::open_archived(&cache, &opened_dir))
         .await
         .ok()
         .and_then(Result::ok)
@@ -355,7 +355,7 @@ async fn load_release(
         };
     let cache = state.cache.clone();
     let archived =
-        tokio::task::spawn_blocking(move || load::archive_json(&cache, &dir, &loaded.json)).await;
+        crate::task::spawn_blocking(move || load::archive_json(&cache, &dir, &loaded.json)).await;
     match archived {
         Ok(Ok(mapped)) => Outcome::Loaded(Arc::new(mapped)),
         Ok(Err(error)) => {
@@ -394,7 +394,7 @@ async fn respond(
     context: Context,
     warnings: Vec<Box<str>>,
 ) -> CallToolResult {
-    let task = tokio::task::spawn_blocking(move || search_members(&members, &context, warnings));
+    let task = crate::task::spawn_blocking(move || search_members(&members, &context, warnings));
     task.await.unwrap_or_else(|error| {
         let error = crate::task::resume_if_panic(error);
         tracing::error!(%error, "a search across crates did not finish");

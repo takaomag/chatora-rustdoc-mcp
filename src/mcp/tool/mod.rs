@@ -3,6 +3,7 @@
 //! Each tool is a module with `NAME`, `definition()`, `parse_arguments()` when its arguments need
 //! checking, and `execute()`.
 
+mod call_log;
 mod crate_overview;
 mod get_item;
 #[cfg(feature = "local")]
@@ -32,12 +33,15 @@ use rmcp::{
     service::{RequestContext, RoleServer},
 };
 use serde_json::{Value, json};
+use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 
 use crate::data::{
     cache::Cache,
     crate_file::StaticCrates,
     dist::Dist,
     docs_rs::DocsRs,
+    fetches::Fetches,
     sparse_index::SparseIndex,
     target::HostTarget,
 };
@@ -100,7 +104,8 @@ pub(super) fn definitions() -> Vec<Tool> {
     ]
 }
 
-/// Runs the tool that `request` names.
+/// Runs the tool that `request` names, and logs the call with a new `request_id`, which an error
+/// carries too (requirements R-OBS-1 and R-ERR-2).
 ///
 /// # Errors
 ///
@@ -111,80 +116,85 @@ pub(super) async fn call(
     context: RequestContext<RoleServer>,
     state: &Arc<ToolState>,
 ) -> Result<CallToolResponse, ErrorData> {
+    let call = call_log::Call::start(&request.name, request.arguments.as_ref());
+    let span = call.span();
+    let called = call
+        .fetches()
+        .scope(dispatch(request, context, state).instrument(span))
+        .await;
+    match called {
+        Ok(mut result) => {
+            call.finish(&mut result);
+            Ok(result.into())
+        },
+        Err(error) => {
+            call.finish_rejected(&error);
+            Err(error)
+        },
+    }
+}
+
+/// Runs the tool that `request` names. See [`call`].
+async fn dispatch(
+    request: CallToolRequestParams,
+    context: RequestContext<RoleServer>,
+    state: &Arc<ToolState>,
+) -> Result<CallToolResult, ErrorData> {
     match request.name.as_ref() {
         get_item::NAME => match get_item::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => Ok(run_tool(get_item::execute(arguments, Arc::clone(state)))
-                .await
-                .into()),
-            Err(error) => Ok(error.into_result().into()),
+            Ok(arguments) => Ok(run_tool(get_item::execute(arguments, Arc::clone(state))).await),
+            Err(error) => Ok(error.into_result()),
         },
         crate_overview::NAME => match crate_overview::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => Ok(
-                run_tool(crate_overview::execute(arguments, Arc::clone(state)))
-                    .await
-                    .into(),
-            ),
-            Err(error) => Ok(error.into_result().into()),
+            Ok(arguments) => {
+                Ok(run_tool(crate_overview::execute(arguments, Arc::clone(state))).await)
+            },
+            Err(error) => Ok(error.into_result()),
         },
         #[cfg(feature = "local")]
         list_crates::NAME => match list_crates::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => Ok(run_tool(list_crates::execute(arguments, Arc::clone(state)))
-                .await
-                .into()),
-            Err(error) => Ok(error.into_result().into()),
+            Ok(arguments) => Ok(run_tool(list_crates::execute(arguments, Arc::clone(state))).await),
+            Err(error) => Ok(error.into_result()),
         },
         list_implementors::NAME => {
             match list_implementors::parse_arguments(request.arguments.as_ref()) {
-                Ok(arguments) => Ok(run_tool(list_implementors::execute(
-                    arguments,
-                    Arc::clone(state),
-                ))
-                .await
-                .into()),
-                Err(error) => Ok(error.into_result().into()),
+                Ok(arguments) => {
+                    Ok(run_tool(list_implementors::execute(arguments, Arc::clone(state))).await)
+                },
+                Err(error) => Ok(error.into_result()),
             }
         },
         list_impls::NAME => match list_impls::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => Ok(run_tool(list_impls::execute(arguments, Arc::clone(state)))
-                .await
-                .into()),
-            Err(error) => Ok(error.into_result().into()),
+            Ok(arguments) => Ok(run_tool(list_impls::execute(arguments, Arc::clone(state))).await),
+            Err(error) => Ok(error.into_result()),
         },
         list_methods::NAME => match list_methods::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => Ok(
-                run_tool(list_methods::execute(arguments, Arc::clone(state)))
-                    .await
-                    .into(),
-            ),
-            Err(error) => Ok(error.into_result().into()),
+            Ok(arguments) => {
+                Ok(run_tool(list_methods::execute(arguments, Arc::clone(state))).await)
+            },
+            Err(error) => Ok(error.into_result()),
         },
         list_module::NAME => match list_module::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => Ok(run_tool(list_module::execute(arguments, Arc::clone(state)))
-                .await
-                .into()),
-            Err(error) => Ok(error.into_result().into()),
+            Ok(arguments) => Ok(run_tool(list_module::execute(arguments, Arc::clone(state))).await),
+            Err(error) => Ok(error.into_result()),
         },
         search_items::NAME => match search_items::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => Ok(
-                run_tool(search_items::execute(arguments, Arc::clone(state)))
-                    .await
-                    .into(),
-            ),
-            Err(error) => Ok(error.into_result().into()),
+            Ok(arguments) => {
+                Ok(run_tool(search_items::execute(arguments, Arc::clone(state))).await)
+            },
+            Err(error) => Ok(error.into_result()),
         },
         resolve_version::NAME => match resolve_version::parse_arguments(request.arguments.as_ref())
         {
-            Ok(arguments) => Ok(
-                run_tool(resolve_version::execute(arguments, Arc::clone(state)))
-                    .await
-                    .into(),
-            ),
-            Err(error) => Ok(error.into_result().into()),
+            Ok(arguments) => {
+                Ok(run_tool(resolve_version::execute(arguments, Arc::clone(state))).await)
+            },
+            Err(error) => Ok(error.into_result()),
         },
         #[cfg(debug_assertions)]
         sleep::NAME => match sleep::parse_arguments(request.arguments.as_ref()) {
-            Ok(seconds) => Ok(run_tool(sleep::execute(seconds, context)).await.into()),
-            Err(error) => Ok(error.into_result().into()),
+            Ok(seconds) => Ok(run_tool(sleep::execute(seconds, context)).await),
+            Err(error) => Ok(error.into_result()),
         },
         name => {
             // Only `sleep` uses the context, and release builds have no `sleep`.
@@ -206,7 +216,7 @@ async fn run_tool<F>(future: F) -> CallToolResult
 where
     F: Future<Output = CallToolResult> + Send + 'static,
 {
-    match tokio::spawn(future).await {
+    match spawn(future).await {
         Ok(result) => result,
         Err(error) => {
             // The panic hook has already written the panic message to stderr.
@@ -218,6 +228,20 @@ where
                 &["report the bug to the server's maintainers, with the server's stderr log"],
             )
         },
+    }
+}
+
+/// Spawns `future` as a task of the current tool call: in its span, and noting its fetches
+/// (requirement R-OBS-1). Tokio's own `spawn` drops both.
+fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let span = tracing::Span::current();
+    match Fetches::current() {
+        Some(fetches) => tokio::spawn(fetches.scope(future).instrument(span)),
+        None => tokio::spawn(future.instrument(span)),
     }
 }
 
