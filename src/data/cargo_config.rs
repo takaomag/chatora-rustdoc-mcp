@@ -38,6 +38,9 @@ pub struct CargoConfig {
     /// Whether `[unstable] build-std` is set: the project builds its own std, which this server
     /// does not (`target_unsupported`, requirement R-TG-1).
     pub build_std: bool,
+    /// `net.offline` in the files (`CARGO_NET_OFFLINE` is not read here): cargo does not reach
+    /// the network, so a crate missing from the cache is `offline_miss` (requirement R-WS-7).
+    pub net_offline: bool,
 }
 
 /// `build.target`: one target, or several, which cargo builds for each.
@@ -203,6 +206,11 @@ fn merge_file(config: &mut CargoConfig, path: &Path, depth: usize) -> Result<(),
     {
         config.build_std = true;
     }
+    if let Some(offline) = table.get("net").and_then(|net| net.get("offline")) {
+        config.net_offline = offline
+            .as_bool()
+            .ok_or_else(|| malformed("net.offline is not a boolean".to_owned()))?;
+    }
     Ok(())
 }
 
@@ -361,6 +369,26 @@ mod tests {
                 config.files
             );
         }
+    }
+
+    #[test]
+    fn net_offline_of_higher_precedence_wins() {
+        let dir = tree(&[
+            ("home/config.toml", "[net]\noffline = true\n"),
+            ("a/b/.cargo/config.toml", "[net]\noffline = false\n"),
+        ]);
+        let read = |home: &str| {
+            read(
+                &dir.path().join("a/b/c"),
+                Some(&dir.path().join(home)),
+                None,
+            )
+            .expect("read")
+            .net_offline
+        };
+        assert!(!read("home"), "the project's file wins over the cargo home");
+        fs::write(dir.path().join("a/b/.cargo/config.toml"), "").expect("written");
+        assert!(read("home"));
     }
 
     #[test]

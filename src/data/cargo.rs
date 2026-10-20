@@ -118,6 +118,21 @@ pub enum Activity {
     /// Waiting for a lock that another cargo holds, as that of the package cache, which
     /// rust-analyzer and the user's own builds share (`waiting_for_lock`).
     WaitingForLock,
+    /// Fetching the index or the dependencies, as the first `cargo metadata` of a project does
+    /// (`fetching`, requirement R-WS-6).
+    Fetching,
+}
+
+/// What a line of cargo's stderr tells that cargo does: its status word, as cargo 1.99.1 writes
+/// it (`    Updating crates.io index`, `  Downloaded serde v1.0.228`).
+fn activity_of(line: &str) -> Activity {
+    if line.contains(WAITING_FOR_LOCK) {
+        return Activity::WaitingForLock;
+    }
+    match line.split_whitespace().next() {
+        Some("Updating" | "Downloading" | "Downloaded") => Activity::Fetching,
+        _ => Activity::Running,
+    }
 }
 
 /// The line that cargo writes to stderr while it waits for a lock: `Blocking waiting for file
@@ -133,8 +148,8 @@ pub(super) async fn run(command: tokio::process::Command) -> Result<Output, RunE
     run_reporting(command, |_| {}).await
 }
 
-/// [`run`], telling `on_activity` when cargo starts to wait for a lock, and when it goes on: any
-/// later line of its stderr means that it has the lock.
+/// [`run`], telling `on_activity` when what cargo does changes, as its stderr tells: it waits for
+/// a lock, fetches, or goes on. A line after the one about the lock means that it has the lock.
 ///
 /// # Errors
 ///
@@ -146,11 +161,7 @@ pub(super) async fn run_reporting(
     let child = child::spawn(command).await.map_err(RunError::NotStarted)?;
     let mut activity = Activity::Running;
     let output = child.output_watching(|line| {
-        let now = if line.contains(WAITING_FOR_LOCK) {
-            Activity::WaitingForLock
-        } else {
-            Activity::Running
-        };
+        let now = activity_of(line);
         if now != activity {
             activity = now;
             on_activity(now);
@@ -296,6 +307,26 @@ mod tests {
             stderr: Vec::new(),
         };
         assert_eq!(classify(&output, false), Failure::Killed);
+    }
+
+    #[test]
+    fn the_status_word_tells_what_cargo_does() {
+        assert_eq!(
+            activity_of("    Blocking waiting for file lock on package cache\n"),
+            Activity::WaitingForLock
+        );
+        for line in [
+            "    Updating crates.io index\n",
+            " Downloading crates ...\n",
+            "  Downloaded serde v1.0.228\n",
+        ] {
+            assert_eq!(activity_of(line), Activity::Fetching, "{line}");
+        }
+        assert_eq!(activity_of("     Locking 2 packages\n"), Activity::Running);
+        assert_eq!(
+            activity_of("warning: unused manifest key\n"),
+            Activity::Running
+        );
     }
 
     #[test]

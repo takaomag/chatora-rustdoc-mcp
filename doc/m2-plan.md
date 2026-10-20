@@ -357,6 +357,14 @@ Claude Code 2.1.304、Linux で測った。
 - 独自の target (`.json`・`[unstable] build-std`) は、利用者が決めて D7 に回した。それまでは今までどおりホストの target を使い、その旨を warnings に書く (今より悪くはならない)
 - テスト: `build.target` を `[Linux の target, wasm32]` にしたプロジェクトで、target を省いた `get_item` が Linux の target の JSON をキャッシュから引き、warnings に複数の target が出る (どの OS でも通信しない)。`.json` の target のプロジェクトで、`list_crates` の warnings に独自の target の旨が出る
 
+**B4 (プロジェクトの文脈の残り。2026-10-20)**:
+
+- 暗黙の member (M1 の B5a・B5b): ルートの package の path 依存のように、`members` に無くても member になる package は、cargo を起動しない判定 (`workspace_of`) では単独の package になる。そこを既定のプロジェクトとして版を引くと、Cargo.lock が無いので `lockfile_outdated` になっていた。Cargo.lock が無いときは `cargo metadata` を起動し、`workspace_root` がその上なら、cargo の答えのルートの Cargo.lock と入力のファイルを使う。`project` 引数で既定のプロジェクトの外から指された暗黙の member は、cargo を起動しない規則 (R-MCP-3) のまま外の扱い
+- 利用者の `net.offline`: cargo の設定 (B3a の読み方。ファイルの `net.offline`、環境変数 `CARGO_NET_OFFLINE` が勝つ) でオフラインなら、`no matching package named` を `offline_miss` に数える (`cargo metadata`・`cargo tree` の両方)
+- 合流: 同じ workspace の `resolve` は、workspace ごとのロックを持って順に行う。先のものが結果を残すので、後のものは cargo を起動しない。`features` (`cargo tree`) は、残した結果の feature の表のロックを持ったまま起動する。4 つ同時の `resolve` と 2 つ同時の `features` が、それぞれ 1 つの結果を共有することをテストで確かめた (ロックを外すと落ちることも確かめた)
+- 失敗の保持: `cargo metadata` が失敗して Cargo.lock を直接読んだ結果と、`cargo tree` の失敗は、入力が同じ間、30 秒だけ cargo を起動せずに返す (R-WS-7 の一時的な失敗の TTL)。成功は入力が同じ間ずっと
+- 取得中の印: `cargo::Activity` に `Fetching` を足し、stderr の状態の語 `Updating`・`Downloading`・`Downloaded` で知らせる (`building_reason: fetching` につなぐのは C3)。`Locking` は通信しないこともあるので数えない
+
 ### 6.4 M2c
 
 (まだ無い)

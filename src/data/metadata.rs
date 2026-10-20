@@ -7,6 +7,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use semver::Version;
@@ -181,7 +182,12 @@ pub enum FeaturesError {
     Cargo(#[from] CargoError),
 }
 
+/// How long a failure of `cargo metadata` or `cargo tree` is given again without running cargo,
+/// while its inputs stay the same (the TTL of transient failures, requirement R-WS-7).
+const FAILURE_TTL: Duration = Duration::from_secs(30);
+
 /// Resolves the packages of workspaces, and keeps each result while its inputs stay the same.
+/// Calls for the same workspace at the same time run cargo once (requirement R-VR-2).
 #[derive(Debug)]
 pub struct Resolver {
     /// Whether cargo runs with `--offline` (requirement R-CA-7).
@@ -190,15 +196,34 @@ pub struct Resolver {
     cargo_home: Option<PathBuf>,
     /// The kept results, by workspace root.
     kept: Mutex<HashMap<PathBuf, Arc<Kept>>>,
+    /// A lock for each workspace root, held while it is resolved.
+    flights: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
-/// A result of `cargo metadata`, and the inputs it was made from.
+/// A result of `cargo metadata`, or of Cargo.lock when it failed, and the inputs it was made from.
 #[derive(Debug)]
 struct Kept {
     inputs: Inputs,
+    /// The workspace root that the inputs are of: cargo's, which is above the one asked for when
+    /// that is an implicit member (requirement R-MCP-3).
+    inputs_root: PathBuf,
     resolution: Arc<Resolution>,
-    /// The feature sets from `cargo tree`, by target. The same inputs decide them.
-    features: Mutex<HashMap<TargetTriple, Arc<FeatureSets>>>,
+    /// When it was made: a failure is given again only for [`FAILURE_TTL`].
+    at: Instant,
+    /// The feature sets from `cargo tree`, or why they are not known, by target, and when. The
+    /// same inputs decide them. Held while `cargo tree` runs, so that it runs once.
+    features: Mutex<HashMap<TargetTriple, (Instant, Features)>>,
+}
+
+/// The feature sets, or why they are not known.
+type Features = Result<Arc<FeatureSets>, Arc<FeaturesError>>;
+
+impl Kept {
+    /// Whether the result may be given again: a success while its inputs stay the same, and a
+    /// failure for [`FAILURE_TTL`].
+    fn current(&self) -> bool {
+        matches!(&*self.resolution, Resolution::Metadata { .. }) || self.at.elapsed() < FAILURE_TTL
+    }
 }
 
 /// The inputs that decide the output of `cargo metadata`, by content (requirement R-VR-2).
@@ -230,6 +255,7 @@ impl Resolver {
             offline,
             cargo_home,
             kept: Mutex::new(HashMap::new()),
+            flights: Mutex::new(HashMap::new()),
         }
     }
 
@@ -250,44 +276,68 @@ impl Resolver {
     /// Returns an error when Cargo.lock is missing or cannot be read.
     pub async fn resolve(&self, workspace: &Workspace) -> Result<Arc<Resolution>, ResolveError> {
         let root = workspace.root.clone();
-        let lock_path = root.join("Cargo.lock");
-        let lock_text = blocking(move || fs::read_to_string(lock_path))
-            .await
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::NotFound {
-                    ResolveError::NoCargoLock
-                } else {
-                    ResolveError::Unreadable(error)
-                }
-            })?;
+        let flight = Arc::clone(self.flights.lock().await.entry(root.clone()).or_default());
+        let _flying = flight.lock().await;
         let kept = self.kept.lock().await.get(&root).cloned();
-        if let Some(kept) = kept {
+        if let Some(kept) = kept.filter(|kept| kept.current()) {
             let files = kept.inputs.files.iter().map(|file| file.path.clone());
-            if read_inputs(&root, files.collect()).await.as_ref() == Some(&kept.inputs) {
+            if read_inputs(&kept.inputs_root, files.collect())
+                .await
+                .as_ref()
+                == Some(&kept.inputs)
+            {
                 return Ok(Arc::clone(&kept.resolution));
             }
         }
-        let lock = CargoLock::parse(&lock_text).map_err(ResolveError::Malformed)?;
-        let metadata = match self.run_metadata(&root).await {
-            Ok(metadata) => metadata,
-            Err(because) => return Ok(Arc::new(Resolution::CargoLockRaw { lock, because })),
+        let (lock_root, lock_text, metadata) = match read_lock(&root).await {
+            Ok(text) => {
+                // Cargo.lock that cannot be parsed fails before cargo is run.
+                CargoLock::parse(&text).map_err(ResolveError::Malformed)?;
+                let metadata = self.run_metadata(&root).await;
+                (root.clone(), text, metadata)
+            },
+            // An implicit member, such as a path dependency of the root package, has no
+            // Cargo.lock of its own: cargo knows its workspace (requirement R-MCP-3).
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let metadata = self.run_metadata(&root).await;
+                let above = metadata
+                    .as_ref()
+                    .ok()
+                    .map(|metadata| {
+                        dunce::canonicalize(&metadata.workspace_root)
+                            .unwrap_or_else(|_| metadata.workspace_root.clone())
+                    })
+                    .filter(|above| *above != root && root.starts_with(above))
+                    .ok_or(ResolveError::NoCargoLock)?;
+                let text = read_lock(&above).await.map_err(ResolveError::Unreadable)?;
+                (above, text, metadata)
+            },
+            Err(error) => return Err(ResolveError::Unreadable(error)),
         };
-        let files = with_included(
-            self.input_files(&root, &metadata),
-            &root,
-            self.cargo_home.clone(),
-        )
-        .await;
-        let resolution = Arc::new(Resolution::Metadata { metadata, lock });
+        let lock = CargoLock::parse(&lock_text).map_err(ResolveError::Malformed)?;
+        let (resolution, files) = match metadata {
+            Ok(metadata) => {
+                let files = self.input_files(&lock_root, Some(&metadata));
+                (Resolution::Metadata { metadata, lock }, files)
+            },
+            Err(because) => (
+                Resolution::CargoLockRaw { lock, because },
+                self.input_files(&lock_root, None),
+            ),
+        };
+        let files = with_included(files, &lock_root, self.cargo_home.clone()).await;
+        let resolution = Arc::new(resolution);
         // Kept only if Cargo.lock did not change while cargo ran, so that a result is never kept
         // under inputs newer than it.
-        match read_inputs(&root, files).await {
-            Some(inputs) if lock_is(&inputs, &root, &lock_text) => {
+        match read_inputs(&lock_root, files).await {
+            Some(inputs) if lock_is(&inputs, &lock_root, &lock_text) => {
                 self.kept.lock().await.insert(
                     root,
                     Arc::new(Kept {
                         inputs,
+                        inputs_root: lock_root,
                         resolution: Arc::clone(&resolution),
+                        at: Instant::now(),
                         features: Mutex::new(HashMap::new()),
                     }),
                 );
@@ -309,10 +359,13 @@ impl Resolver {
         &self,
         workspace: &Workspace,
         target: &TargetTriple,
-    ) -> Result<Arc<FeatureSets>, FeaturesError> {
-        let resolution = self.resolve(workspace).await?;
+    ) -> Result<Arc<FeatureSets>, Arc<FeaturesError>> {
+        let resolution = self
+            .resolve(workspace)
+            .await
+            .map_err(|error| Arc::new(error.into()))?;
         if let Resolution::CargoLockRaw { .. } = &*resolution {
-            return Err(FeaturesError::NoMetadata);
+            return Err(Arc::new(FeaturesError::NoMetadata));
         }
         let kept = self
             .kept
@@ -321,19 +374,48 @@ impl Resolver {
             .get(&workspace.root)
             .filter(|kept| Arc::ptr_eq(&kept.resolution, &resolution))
             .cloned();
-        if let Some(kept) = &kept
-            && let Some(sets) = kept.features.lock().await.get(target)
-        {
-            return Ok(Arc::clone(sets));
-        }
-        let sets = Arc::new(features::read(&workspace.root, self.offline, target).await?);
-        if let Some(kept) = kept {
-            kept.features
-                .lock()
+        let offline = self.offline_in(&workspace.root).await;
+        let read = async || {
+            features::read(&workspace.root, offline, target)
                 .await
-                .insert(target.clone(), Arc::clone(&sets));
+                .map(Arc::new)
+                .map_err(|error| Arc::new(FeaturesError::Cargo(error)))
+        };
+        let Some(kept) = kept else {
+            return read().await;
+        };
+        // Held while `cargo tree` runs, so that the calls at the same time run it once.
+        let mut sets = kept.features.lock().await;
+        if let Some((at, sets)) = sets.get(target)
+            && (sets.is_ok() || at.elapsed() < FAILURE_TTL)
+        {
+            return sets.clone();
         }
-        Ok(sets)
+        let read = read().await;
+        sets.insert(target.clone(), (Instant::now(), read.clone()));
+        read
+    }
+
+    /// Whether cargo is offline in `root`: run with `--offline` (requirement R-CA-7), or with
+    /// `net.offline` in the user's cargo settings, read with cargo's rules (requirement R-WS-7).
+    /// Offline, `no matching package named` is a crate missing from the cache, not a misspelled
+    /// one.
+    async fn offline_in(&self, root: &Path) -> bool {
+        if self.offline {
+            return true;
+        }
+        // The environment wins over the files, as in cargo.
+        if let Some(value) = std::env::var_os("CARGO_NET_OFFLINE").filter(|value| !value.is_empty())
+        {
+            return value.eq_ignore_ascii_case("true");
+        }
+        let (root, home) = (root.to_path_buf(), self.cargo_home.clone());
+        blocking(move || {
+            Ok(cargo_config::read(&root, home.as_deref(), None)
+                .is_ok_and(|config| config.net_offline))
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Runs `cargo metadata` in `root` and reads its output.
@@ -344,7 +426,7 @@ impl Resolver {
         if !output.status.success() {
             return Err(CargoError::Failed {
                 command: "metadata",
-                failure: cargo::classify(&output, self.offline),
+                failure: cargo::classify(&output, self.offline_in(root).await),
                 stderr: cargo::stderr_tail(&output),
             });
         }
@@ -364,15 +446,15 @@ impl Resolver {
     }
 
     /// The files whose contents decide the output of `cargo metadata` in `root`, as far as
-    /// `metadata` tells: Cargo.lock, the manifests of the root and of every package that is not
-    /// from a registry or git, and the cargo and rustup settings that cargo finds from `root`. A
-    /// file that `include` in a cargo setting names is not among them.
-    fn input_files(&self, root: &Path, metadata: &Metadata) -> Vec<PathBuf> {
+    /// `metadata` tells, if it ran: Cargo.lock, the manifests of the root and of every package
+    /// that is not from a registry or git, and the cargo and rustup settings that cargo finds from
+    /// `root`. A file that `include` in a cargo setting names is not among them.
+    fn input_files(&self, root: &Path, metadata: Option<&Metadata>) -> Vec<PathBuf> {
         let mut files = vec![root.join("Cargo.lock"), root.join("Cargo.toml")];
         files.extend(
             metadata
-                .packages
-                .iter()
+                .into_iter()
+                .flat_map(|metadata| &metadata.packages)
                 .filter(|package| package.source.is_none())
                 .map(|package| package.manifest_path.clone()),
         );
@@ -435,6 +517,12 @@ async fn read_inputs(root: &Path, files: Vec<PathBuf>) -> Option<Inputs> {
     .await
     .ok()
     .flatten()
+}
+
+/// The text of the Cargo.lock of the workspace at `root`.
+async fn read_lock(root: &Path) -> io::Result<String> {
+    let path = root.join("Cargo.lock");
+    blocking(move || fs::read_to_string(path)).await
 }
 
 /// Whether `inputs` holds `text` as the Cargo.lock of the workspace at `root`.
@@ -547,6 +635,108 @@ mod tests {
             ..
         }));
         assert_eq!(lock.packages.len(), 1);
+        // The failure is given again for a while, without running cargo.
+        let again = resolver.resolve(&workspace).await.expect("resolved");
+        assert!(Arc::ptr_eq(&resolution, &again), "the failure is kept");
+    }
+
+    #[tokio::test]
+    async fn calls_at_the_same_time_run_cargo_once() {
+        let (_dir, workspace) = workspace();
+        let resolver = Resolver::new(true);
+        let results = resolve_four_at_once(&resolver, &workspace).await;
+        let first = &results[0];
+        for other in &results[1..] {
+            assert!(Arc::ptr_eq(first, other), "one result");
+        }
+        let target = crate::data::target::build_target();
+        let (one, two) = tokio::join!(
+            resolver.features(&workspace, &target),
+            resolver.features(&workspace, &target),
+        );
+        assert!(
+            Arc::ptr_eq(&one.expect("read"), &two.expect("read")),
+            "one cargo tree"
+        );
+    }
+
+    /// Four resolutions of `workspace` at the same time.
+    async fn resolve_four_at_once(
+        resolver: &Resolver,
+        workspace: &Workspace,
+    ) -> Vec<Arc<Resolution>> {
+        let all: [_; 4] = tokio::join!(
+            resolver.resolve(workspace),
+            resolver.resolve(workspace),
+            resolver.resolve(workspace),
+            resolver.resolve(workspace),
+        )
+        .into();
+        all.into_iter()
+            .map(|resolved| resolved.expect("resolved"))
+            .collect()
+    }
+
+    /// A path dependency of the root package is a member without being listed, and has no
+    /// Cargo.lock of its own: cargo's `workspace_root` tells where it is (requirement R-MCP-3).
+    #[tokio::test]
+    async fn an_implicit_member_is_resolved_in_its_workspace() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).expect("made");
+        fs::create_dir_all(root.join("sub/src")).expect("made");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"top\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [dependencies]\nsub = { path = \"sub\" }\n[workspace]\n",
+        )
+        .expect("written");
+        fs::write(root.join("src/lib.rs"), "").expect("written");
+        fs::write(
+            root.join("sub/Cargo.toml"),
+            MEMBER.replace("\"a\"", "\"sub\""),
+        )
+        .expect("written");
+        fs::write(root.join("sub/src/lib.rs"), "").expect("written");
+        let status = Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(root)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("cargo runs")
+            .status;
+        assert!(status.success(), "cargo generate-lockfile");
+        // As it is found without cargo: a package of its own.
+        let sub = project::workspace_of(&root.join("sub")).expect("a workspace");
+        assert!(sub.root.ends_with("sub"));
+        let resolution = Resolver::new(true).resolve(&sub).await.expect("resolved");
+        let Resolution::Metadata { metadata, lock } = &*resolution else {
+            panic!("cargo resolves it: {resolution:?}");
+        };
+        assert_eq!(
+            dunce::canonicalize(&metadata.workspace_root).expect("there"),
+            dunce::canonicalize(root).expect("there")
+        );
+        assert_eq!(lock.packages.len(), 2, "the Cargo.lock of the workspace");
+    }
+
+    #[tokio::test]
+    async fn net_offline_in_the_cargo_settings_is_offline() {
+        let (dir, workspace) = workspace();
+        let resolver = Resolver::new(false);
+        // Unless the environment of the tests sets it.
+        if std::env::var_os("CARGO_NET_OFFLINE").is_some() {
+            return;
+        }
+        assert!(!resolver.offline_in(&workspace.root).await);
+        fs::create_dir_all(dir.path().join(".cargo")).expect("made");
+        fs::write(
+            dir.path().join(".cargo/config.toml"),
+            "[net]\noffline = true\n",
+        )
+        .expect("written");
+        assert!(resolver.offline_in(&workspace.root).await);
     }
 
     #[tokio::test]
