@@ -255,15 +255,18 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
             },
             Err(error) => return *error,
         };
-    let target = match &arguments.target {
-        Some(target) => target.clone(),
-        None => state.host().await.triple.clone(),
+    let (target, target_warnings) = match &arguments.target {
+        Some(target) => (target.clone(), Vec::new()),
+        None => super::project::default_target(&state, arguments.project.as_deref()).await,
     };
     let resolution = match state.resolver.resolve(&workspace).await {
         Ok(resolution) => resolution,
         Err(error) => return super::project::resolve_error(&workspace, &error),
     };
-    let mut warnings: Vec<Value> = Vec::new();
+    let mut warnings: Vec<Value> = target_warnings
+        .iter()
+        .map(|warning| json!(warning))
+        .collect();
     let resolved_from = match &*resolution {
         Resolution::Metadata { .. } => "cargo_lock",
         Resolution::CargoLockRaw { .. } => {

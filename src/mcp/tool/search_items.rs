@@ -365,11 +365,13 @@ pub(super) async fn execute(arguments: SearchArguments, state: Arc<ToolState>) -
             detail,
             searching,
         } => {
-            let target = match target {
-                Some(target) => target,
-                None => state.host().await.triple.clone(),
+            // The default project's target (requirement R-TG-1); its warnings go with the
+            // search's own.
+            let (target, warnings) = match target {
+                Some(target) => (target, Vec::new()),
+                None => super::project::default_target(&state, None).await,
             };
-            search_across::std(state, target, detail, searching).await
+            search_across::std(state, target, detail, searching, warnings).await
         },
         SearchArguments::Dependencies {
             project,
@@ -377,11 +379,11 @@ pub(super) async fn execute(arguments: SearchArguments, state: Arc<ToolState>) -
             detail,
             searching,
         } => {
-            let target = match target {
-                Some(target) => target,
-                None => state.host().await.triple.clone(),
+            let (target, warnings) = match target {
+                Some(target) => (target, Vec::new()),
+                None => super::project::default_target(&state, project.as_deref()).await,
             };
-            dependencies(state, project, target, detail, searching).await
+            dependencies(state, project, target, detail, searching, warnings).await
         },
     }
 }
@@ -394,8 +396,9 @@ async fn dependencies(
     target: TargetTriple,
     detail: Detail,
     searching: Searching,
+    warnings: Vec<Box<str>>,
 ) -> CallToolResult {
-    search_across::dependencies(state, project, target, detail, searching).await
+    search_across::dependencies(state, project, target, detail, searching, warnings).await
 }
 
 /// Without local features, there is no project to search the dependencies of.
@@ -410,6 +413,7 @@ async fn dependencies(
     _target: TargetTriple,
     _detail: Detail,
     _searching: Searching,
+    _warnings: Vec<Box<str>>,
 ) -> CallToolResult {
     super::tool_error(
         "invalid_argument",

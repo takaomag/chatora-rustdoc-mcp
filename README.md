@@ -12,7 +12,7 @@ An MCP server that looks up Rust API documentation from rustdoc JSON, so that co
 
 ## Platforms: Linux for now
 
-It builds and runs on Linux, macOS and Windows, but since 2026-05-01 docs.rs builds most new releases for `x86_64-unknown-linux-gnu` only. The server looks up the documentation for the host's target, so on macOS and Windows it answers `docs_unavailable` (`no_target_json`) for most releases since then; asking with `target: "x86_64-unknown-linux-gnu"` gets the Linux documentation, which may lack items for your platform. Building documentation locally, which will cover other targets, comes in a later release.
+It builds and runs on Linux, macOS and Windows, but since 2026-05-01 docs.rs builds most new releases for `x86_64-unknown-linux-gnu` only. The server looks up the documentation for the project's `build.target` in its cargo settings (the first of several), or else for the host's target, so on macOS and Windows it answers `docs_unavailable` (`no_target_json`) for most releases since then; asking with `target: "x86_64-unknown-linux-gnu"` gets the Linux documentation, which may lack items for your platform. Building documentation locally, which will cover other targets, comes in a later release.
 
 ## Installation
 

@@ -36,7 +36,7 @@ use crate::{
         rustdoc_json::ParseError,
         sparse_index::{IndexEntry, IndexError},
         std_json::{self, Chosen},
-        target::{HostTarget, TargetTriple},
+        target::TargetTriple,
         version::{NoVersion, VersionSpec},
     },
     query::{
@@ -761,10 +761,8 @@ async fn resolve(
     state: &ToolState,
     arguments: Arguments,
     target: TargetTriple,
+    mut warnings: Vec<Box<str>>,
 ) -> Result<(Request, Vec<Box<str>>), Box<CallToolResult>> {
-    let mut warnings: Vec<Box<str>> = stand_in_warning(state.host().await, &arguments, &target)
-        .into_iter()
-        .collect();
     let Arguments {
         name,
         version,
@@ -884,19 +882,6 @@ fn cached_request(
         hops: 0,
         index_fetched_at: None,
     }
-}
-
-/// The warning that `target` stands in for the host target, when no target was asked for and the
-/// host target is not known.
-fn stand_in_warning(
-    host: &HostTarget,
-    arguments: &Arguments,
-    target: &TargetTriple,
-) -> Option<Box<str>> {
-    let why = host.stand_in_because.as_ref()?;
-    arguments.target.is_none().then(|| {
-        format!("the target {target} is used, as the host target is not known: {why}").into()
-    })
 }
 
 /// How the version was chosen, where the project came from if it chose it, and the project's
@@ -1162,11 +1147,11 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
     if let Some(krate) = std_crate(&arguments.name) {
         return execute_std(arguments, krate, state, Vec::new()).await;
     }
-    let target = match &arguments.target {
-        Some(target) => target.clone(),
-        None => state.host().await.triple.clone(),
+    let (target, warnings) = match &arguments.target {
+        Some(target) => (target.clone(), Vec::new()),
+        None => project::default_target(&state, arguments.project.as_deref()).await,
     };
-    let (arguments, warnings) = match resolve(&state, arguments, target).await {
+    let (arguments, warnings) = match resolve(&state, arguments, target, warnings).await {
         Ok(resolved) => resolved,
         Err(error) => return *error,
     };
@@ -1766,10 +1751,13 @@ async fn execute_std(
     mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
     let host = state.host().await;
-    let target = arguments
-        .target
-        .clone()
-        .unwrap_or_else(|| host.triple.clone());
+    let target = if let Some(target) = &arguments.target {
+        target.clone()
+    } else {
+        let (target, chosen) = project::default_target(&state, arguments.project.as_deref()).await;
+        warnings.extend(chosen);
+        target
+    };
     if arguments.version.is_some() {
         warnings.push(
             "std has no versions on crates.io, so the version is ignored; std is that of a nightly \

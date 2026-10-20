@@ -80,6 +80,7 @@ pub(super) async fn dependencies(
     target: TargetTriple,
     detail: Detail,
     searching: Searching,
+    mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
     let (workspace, project_from) =
         match super::project::workspace(state.project.as_ref(), project.as_deref()) {
@@ -99,7 +100,6 @@ pub(super) async fn dependencies(
         Ok(resolution) => resolution,
         Err(error) => return super::project::resolve_error(&workspace, &error),
     };
-    let mut warnings: Vec<Box<str>> = Vec::new();
     let sets = match state.resolver.features(&workspace, &target).await {
         Ok(sets) => Some(sets),
         Err(error) => {
@@ -190,6 +190,7 @@ pub(super) async fn std(
     target: TargetTriple,
     detail: Detail,
     searching: Searching,
+    mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
     let at_least = get_item::project_toolchain(&state).await;
     let chosen = match std_json::choose(
@@ -205,7 +206,7 @@ pub(super) async fn std(
         Ok(chosen) => chosen,
         Err(error) => return get_item::dist_error(StdCrate::Std, &error),
     };
-    let warnings: Vec<Box<str>> = chosen.warnings.clone();
+    warnings.extend(chosen.warnings.iter().cloned());
     let version = chosen
         .json
         .release()

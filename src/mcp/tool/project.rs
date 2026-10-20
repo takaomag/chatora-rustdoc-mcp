@@ -1,5 +1,6 @@
 //! The version of a crate in the project, when the caller gives none (requirements R-MCP-3 and
-//! R-VR-2): the project is the default one, or the one the `project` argument names.
+//! R-VR-2), and the target of a lookup that names none (requirement R-TG-1): the project is the
+//! default one, or the one the `project` argument names.
 
 use std::path::Path;
 
@@ -8,16 +9,18 @@ use rmcp::model::CallToolResult;
 #[cfg(feature = "local")]
 use serde_json::json;
 
+use super::ToolState;
 #[cfg(feature = "local")]
-use super::{ErrorChain, ToolState, error_result};
-use crate::data::crate_name::CrateName;
+use super::{ErrorChain, error_result};
 #[cfg(feature = "local")]
 use crate::data::{
     cargo::{Failure, GitFetchFailure},
+    cargo_config,
     metadata::{CargoError, Resolution, ResolveError},
     packages::{Candidate, Lookup, PackageGraph, ProjectPackage},
     project::{self, DefaultProject, ProjectFrom, Workspace},
 };
+use crate::data::{crate_name::CrateName, target::TargetTriple};
 #[cfg(feature = "local")]
 use crate::query::get_item::ResolvedFrom;
 
@@ -132,7 +135,7 @@ pub(super) async fn version_in_project(
     reason = "the same signature as with local features, where it runs cargo"
 )]
 pub(super) async fn version_in_project(
-    _state: &super::ToolState,
+    _state: &ToolState,
     _name: &CrateName,
     project: Option<&Path>,
 ) -> InProject {
@@ -145,6 +148,112 @@ pub(super) async fn version_in_project(
         warnings.push("`project` is ignored".into());
     }
     InProject::Elsewhere(warnings)
+}
+
+/// The target of a lookup that names none, with what the response warns about (requirement
+/// R-TG-1): the `build.target` of the project (the one `project` names, or the default one), the
+/// first of several; or else the host's.
+pub(super) async fn default_target(
+    state: &ToolState,
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(
+            unused_variables,
+            reason = "without local features, no project is read"
+        )
+    )]
+    project: Option<&Path>,
+) -> (TargetTriple, Vec<Box<str>>) {
+    let mut warnings = Vec::new();
+    #[cfg(feature = "local")]
+    if let Some(target) = project_target(state, project, &mut warnings).await {
+        return (target, warnings);
+    }
+    let host = state.host().await;
+    if let Some(why) = &host.stand_in_because {
+        warnings.push(
+            format!(
+                "the target {} is used, as the host target is not known: {why}",
+                host.triple
+            )
+            .into(),
+        );
+    }
+    (host.triple.clone(), warnings)
+}
+
+/// The project's `build.target`, as cargo's settings give it (Q-31), when it is a target this
+/// server documents. A target of its own (a target JSON, or with `build-std`) is not yet: the
+/// host's is used, with a warning (decided in M2's B3b, until D7).
+#[cfg(feature = "local")]
+async fn project_target(
+    state: &ToolState,
+    project: Option<&Path>,
+    warnings: &mut Vec<Box<str>>,
+) -> Option<TargetTriple> {
+    let Ok(Some((workspace, _))) = workspace(state.project.as_ref(), project) else {
+        return None;
+    };
+    let root = workspace.root.clone();
+    let home = state.resolver.cargo_home().map(Path::to_path_buf);
+    // cargo, which the server starts, sees the server's environment.
+    let env = std::env::var("CARGO_BUILD_TARGET").ok();
+    let read = crate::task::spawn_blocking(move || {
+        cargo_config::read(&root, home.as_deref(), env.as_deref())
+    })
+    .await
+    .ok()?;
+    let config = match read {
+        Ok(config) => config,
+        Err(error) => {
+            warnings.push(
+                format!(
+                    "the cargo settings of the project cannot be read ({}), so the host's target \
+                     is used",
+                    ErrorChain(&error)
+                )
+                .into(),
+            );
+            return None;
+        },
+    };
+    let build_target = config.build_target?;
+    let first = build_target.first()?;
+    let is_json = |target: &String| {
+        Path::new(target)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    };
+    if config.build_std || build_target.all().iter().any(is_json) {
+        warnings.push(
+            format!(
+                "the project builds for a target of its own ({first}) with its own std, which \
+                 this server does not document yet, so the host's target is used"
+            )
+            .into(),
+        );
+        return None;
+    }
+    let Ok(target) = first.parse::<TargetTriple>() else {
+        warnings.push(
+            format!("build.target {first:?} of the project is not a target, so the host's is used")
+                .into(),
+        );
+        return None;
+    };
+    if let [_, others @ ..] = build_target.all()
+        && !others.is_empty()
+    {
+        warnings.push(
+            format!(
+                "the project builds for several targets ({}); {first} is used: pass `target` for \
+                 another",
+                build_target.all().join(", ")
+            )
+            .into(),
+        );
+    }
+    Some(target)
 }
 
 /// The workspace to read and where it came from: the one `project` names, or the default

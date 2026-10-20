@@ -1424,3 +1424,58 @@ fn cargo_dies_with_a_killed_server() {
         drop(Command::new("kill").args(["-KILL", &pid]).status());
     }
 }
+
+/// Writes `settings` as the `.cargo/config.toml` of `project`.
+#[cfg(feature = "local")]
+fn set_cargo_settings(project: &Path, settings: &str) {
+    std::fs::create_dir_all(project.join(".cargo")).expect("made");
+    std::fs::write(project.join(".cargo/config.toml"), settings).expect("written");
+}
+
+/// Whether `response` warns about something that contains `part`.
+#[cfg(feature = "local")]
+fn warns(response: &Value, part: &str) -> bool {
+    response["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains(part))
+        })
+    })
+}
+
+/// Without `target`, a lookup is for the project's `build.target`, the first of several, which
+/// the response tells (requirement R-TG-1). The JSON for it is in the cache, on every OS.
+#[cfg(feature = "local")]
+#[test]
+fn the_build_target_of_the_project_is_the_target_of_a_lookup() {
+    let project = demo_workspace();
+    set_cargo_settings(
+        project.path(),
+        &format!("[build]\ntarget = [\"{TARGET}\", \"wasm32-unknown-unknown\"]\n"),
+    );
+    let mut server = Server::start_in(Some(project.path()));
+    server.send(&call_tool(
+        1,
+        "get_item",
+        json!({ "crate": "demo@0.1.0", "path": "hello" }),
+    ));
+    let found = server.response(1)["result"]["structuredContent"].clone();
+    assert_eq!(found["provenance"]["target"], TARGET, "{found}");
+    assert!(warns(&found, "several targets"), "{found}");
+    assert!(server.finish().success());
+}
+
+/// A project that builds for a target of its own is not documented for it yet: the host's target
+/// is used, with a warning (decided in M2's B3b, until D7).
+#[cfg(feature = "local")]
+#[test]
+fn a_target_of_its_own_falls_back_to_the_host_with_a_warning() {
+    let project = demo_workspace();
+    set_cargo_settings(project.path(), "[build]\ntarget = \"my-os.json\"\n");
+    let mut server = Server::start_in(Some(project.path()));
+    server.send(&call_tool(1, "list_crates", json!({})));
+    let listed = server.response(1)["result"]["structuredContent"].clone();
+    assert!(warns(&listed, "a target of its own"), "{listed}");
+    assert!(server.finish().success());
+}

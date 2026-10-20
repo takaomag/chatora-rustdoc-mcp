@@ -233,6 +233,12 @@ impl Resolver {
         }
     }
 
+    /// `$CARGO_HOME`, whose settings apply to every project.
+    #[must_use]
+    pub fn cargo_home(&self) -> Option<&Path> {
+        self.cargo_home.as_deref()
+    }
+
     /// The packages of `workspace`, by `cargo metadata`, or from its Cargo.lock when cargo fails
     /// (requirement R-VR-2). A result of `cargo metadata` is used again while the files it was
     /// made from have the same contents: Cargo.lock, the `Cargo.toml` of every member and path
