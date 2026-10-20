@@ -13,6 +13,8 @@ pub mod logging;
 pub mod mcp;
 pub mod query;
 pub mod task;
+#[cfg(test)]
+mod test_process;
 
 // Dev-dependencies that only the tests and examples use; the library's test build sees them too.
 #[cfg(test)]

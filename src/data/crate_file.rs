@@ -655,4 +655,98 @@ features = ["full"]
             Err(CrateError::Corrupt(_))
         ));
     }
+
+    /// The environment variables that tell [`fetch_a_crate_file_for_another_test`] what to fetch
+    /// and where to cache it.
+    const ROOT: &str = "CHATORA_RUSTDOC_TEST_CACHE_ROOT";
+    const BASE_URL: &str = "CHATORA_RUSTDOC_TEST_BASE_URL";
+    const CHECKSUM: &str = "CHATORA_RUSTDOC_TEST_CHECKSUM";
+
+    /// Not a test by itself: a process that [`two_processes_fetch_a_crate_file_once`] starts,
+    /// which fetches `demo` 0.1.0 into the cache it is given.
+    #[tokio::test]
+    #[ignore = "started by two_processes_fetch_a_crate_file_once"]
+    async fn fetch_a_crate_file_for_another_test() {
+        let (Some(root), Some(base_url), Some(checksum)) = (
+            std::env::var_os(ROOT),
+            std::env::var(BASE_URL).ok(),
+            std::env::var(CHECKSUM).ok(),
+        ) else {
+            return;
+        };
+        let crates = StaticCrates::with_base_url(&base_url, &Network::default())
+            .expect("a client")
+            .with_cargo_home(None);
+        let fetched = crates
+            .crate_file(
+                &Cache::at(Path::new(&root)),
+                &"demo".parse().expect("a name"),
+                &Version::new(0, 1, 0),
+                Some(&checksum),
+            )
+            .await
+            .expect("fetched");
+        assert!(fetched.is_some());
+    }
+
+    /// Two processes that want the same `.crate` at once take turns, and the second finds what
+    /// the first fetched: static.crates.io (a local server that answers slowly) is asked once
+    /// (requirement R-CA-4).
+    #[test]
+    fn two_processes_fetch_a_crate_file_once() {
+        use std::{
+            io::{BufRead as _, BufReader, Write as _},
+            net::TcpListener,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            thread,
+            time::Duration,
+        };
+
+        let contents = crate_file("demo", "0.1.0", "[package]\nname = \"demo\"\n");
+        let checksum = super::super::cache::sha256_hex(&contents);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a local port is free");
+        let base_url = format!("http://{}", listener.local_addr().expect("bound"));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 0) && line != "\r\n" {
+                    line.clear();
+                }
+                // Slowly, so that the other process comes while this one is fetching.
+                thread::sleep(Duration::from_millis(500));
+                let mut stream = reader.into_inner();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    contents.len()
+                );
+                // The client's view is what the test looks at.
+                let _written = stream
+                    .write_all(head.as_bytes())
+                    .and_then(|()| stream.write_all(&contents));
+            }
+        });
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let env = [
+            (ROOT, dir.path().as_os_str()),
+            (BASE_URL, std::ffi::OsStr::new(&base_url)),
+            (CHECKSUM, std::ffi::OsStr::new(&checksum)),
+        ];
+        let name = "data::crate_file::tests::fetch_a_crate_file_for_another_test";
+        let both = [
+            crate::test_process::start(name, &env),
+            crate::test_process::start(name, &env),
+        ];
+        for child in both {
+            crate::test_process::finish(child);
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
 }

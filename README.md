@@ -56,6 +56,8 @@ rustdoc JSON and what the server makes of it are cached in `$XDG_CACHE_HOME/chat
 
 The standard library takes about 175 MB for each nightly. The server uses the latest nightly (or, when it writes a rustdoc JSON format that this version of the server does not read, the newest one of the last 30 days that it reads), so a new one comes each day it is used; the standard library of a nightly unused for 7 days is removed. A large crate takes tens of MB, and nothing else is removed from the cache yet; deleting the directory is safe while no server runs. A command to manage the cache is planned.
 
+Servers that share the cache, as the sessions of Claude Code open at once do, take turns on what they fetch and make, with OS file locks on the empty files in `locks/` in the cache directory. Such locks may not work on a network file system (NFS), where two servers could then fetch the same thing at once; what they write stays whole either way.
+
 ## Logs
 
 The server writes a log file of JSON Lines, a new one for each run, in `$XDG_STATE_HOME/chatora-rustdoc-mcp/logs/` (`~/.local/state/chatora-rustdoc-mcp/logs/` when unset) on Linux and macOS, and in `%LOCALAPPDATA%\chatora-rustdoc-mcp\state\logs\` on Windows. Each tool call has a line with:

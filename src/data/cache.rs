@@ -26,6 +26,7 @@ use tokio::sync::OwnedMutexGuard;
 use super::{
     crate_name::CrateName,
     docs_rs::MAX_BYTES,
+    process_lock::{self, LockMode, ProcessLock},
     rustdoc_json::SUPPORTED,
     target::TargetTriple,
 };
@@ -55,14 +56,20 @@ pub struct Cache {
 
 /// Locks on paths in the cache, within this process: tasks that fetch or make the same thing take
 /// turns, so that the second finds what the first made instead of fetching and parsing it again
-/// (requirements R-NW-2 and R-WS-6). Locks across processes come in M2 (R-CA-4).
+/// (requirements R-NW-2 and R-WS-6). Across processes, [`Cache::lock`] adds an OS lock
+/// (requirement R-CA-4).
 #[derive(Debug, Default)]
 struct DirLocks(parking_lot::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>);
 
 /// The lock on a path in the cache, held until it is dropped. See [`Cache::lock`].
 #[derive(Debug)]
 #[must_use = "the lock is released when the guard is dropped"]
-pub struct PathGuard(#[expect(dead_code, reason = "held for its drop")] OwnedMutexGuard<()>);
+pub struct PathGuard {
+    /// Among the tasks of this process.
+    _within: OwnedMutexGuard<()>,
+    /// Among the processes, when the OS could lock the file.
+    _across: Option<ProcessLock>,
+}
 
 impl DirLocks {
     /// The lock of `path`, made when no task holds or waits for it.
@@ -77,6 +84,15 @@ impl DirLocks {
         locks.insert(path.into(), Arc::downgrade(&lock));
         lock
     }
+}
+
+/// Logs that the OS could not lock `path` in the cache.
+fn lock_failed(path: &Path, error: &io::Error) {
+    tracing::warn!(
+        path = %path.display(),
+        %error,
+        "the cache could not be locked against other processes"
+    );
 }
 
 /// A rustdoc JSON read from the cache.
@@ -152,16 +168,54 @@ impl Cache {
         }
     }
 
-    /// Waits until no other task of this process holds `path`, and holds it: the directory of a
-    /// crate's JSON while it is fetched and archived, for example. The path is only a name, which
-    /// need not exist. A task must not take a path it holds already.
+    /// Waits until no other task of this process and no other process holds `path`, and holds
+    /// it: the directory of a crate's JSON while it is fetched and archived, for example. The path
+    /// is only a name, which need not exist. A task must not take a path it holds already. The
+    /// holder looks in the cache again before it fetches or makes anything, as another may have
+    /// done it meanwhile (requirement R-CA-4).
+    ///
+    /// The tasks of this process take turns first, so that one of them at a time waits for the
+    /// OS lock (`process_lock`). When the OS cannot lock, as on a cache that refuses the lock
+    /// files, the processes do not exclude each other, which costs only fetching twice, and a log
+    /// line tells it.
     pub async fn lock(&self, path: &Path) -> PathGuard {
-        PathGuard(self.locks.of(path).lock_owned().await)
+        let within = self.locks.of(path).lock_owned().await;
+        let across = process_lock::lock(&self.root, &self.lock_key(path), LockMode::Exclusive)
+            .await
+            .inspect_err(|error| lock_failed(path, error))
+            .ok();
+        PathGuard {
+            _within: within,
+            _across: across,
+        }
     }
 
     /// [`Self::lock`] for a blocking thread. It must not be called from async code.
     pub fn lock_blocking(&self, path: &Path) -> PathGuard {
-        PathGuard(self.locks.of(path).blocking_lock_owned())
+        let within = self.locks.of(path).blocking_lock_owned();
+        let across =
+            process_lock::lock_blocking(&self.root, &self.lock_key(path), LockMode::Exclusive)
+                .inspect_err(|error| lock_failed(path, error))
+                .ok();
+        PathGuard {
+            _within: within,
+            _across: across,
+        }
+    }
+
+    /// The key of the OS lock of `path`: its path in the cache with `/`, the same in every
+    /// process and on every OS.
+    fn lock_key(&self, path: &Path) -> String {
+        path.strip_prefix(&self.root).map_or_else(
+            |_| path.display().to_string(),
+            |relative| {
+                relative
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            },
+        )
     }
 
     /// The directory of the rustdoc JSON fetched from docs.rs for `name` at `version`, built for

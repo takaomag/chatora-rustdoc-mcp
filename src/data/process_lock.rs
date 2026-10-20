@@ -83,6 +83,20 @@ pub async fn lock(root: &Path, key: &str, mode: LockMode) -> io::Result<ProcessL
     }
 }
 
+/// [`lock`] for a blocking thread, which waits in the OS. It must not be called from async code.
+///
+/// # Errors
+///
+/// Returns an error when the lock file cannot be made or opened, or the OS fails to lock it.
+pub fn lock_blocking(root: &Path, key: &str, mode: LockMode) -> io::Result<ProcessLock> {
+    let file = open(&lock_path(root, key))?;
+    match mode {
+        LockMode::Exclusive => file.lock()?,
+        LockMode::Shared => file.lock_shared()?,
+    }
+    Ok(ProcessLock { _file: file })
+}
+
 /// Locks `file` in `mode` if no other holder stands in the way.
 fn try_lock_file(file: File, mode: LockMode) -> io::Result<Option<ProcessLock>> {
     let locked = match mode {
@@ -117,7 +131,6 @@ fn open(path: &Path) -> io::Result<File> {
 mod tests {
     use std::{
         io::{BufRead as _, BufReader},
-        process::{Command, Stdio},
         time::Instant,
     };
 
@@ -232,19 +245,10 @@ mod tests {
     fn a_lock_goes_with_its_process() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let root = dir.path();
-        let mut holder = Command::new(std::env::current_exe().expect("the test binary"))
-            .args([
-                "data::process_lock::tests::hold_a_lock_until_killed",
-                "--exact",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env(HOLDER_ROOT, root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("the test binary starts");
+        let mut holder = crate::test_process::start(
+            "data::process_lock::tests::hold_a_lock_until_killed",
+            &[(HOLDER_ROOT, root.as_os_str())],
+        );
         let stdout = holder.stdout.take().expect("piped");
         let locked = BufReader::new(stdout)
             .lines()

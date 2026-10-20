@@ -355,4 +355,50 @@ mod tests {
             Err(LoadError::Parse(_))
         ));
     }
+
+    /// The environment variable that tells [`archive_for_another_test`] where the cache is.
+    const ROOT: &str = "CHATORA_RUSTDOC_TEST_CACHE_ROOT";
+
+    /// Not a test by itself: a process that [`two_processes_archive_a_crate_once`] starts, which
+    /// archives the JSON slowly and prints `parsed` when it reads it.
+    #[test]
+    #[ignore = "started by two_processes_archive_a_crate_once"]
+    fn archive_for_another_test() {
+        let Some(root) = std::env::var_os(ROOT) else {
+            return;
+        };
+        let root = Path::new(&root);
+        let mapped = archive_of(&Cache::at(root), root, "std", &"cd".repeat(32), || {
+            println!("parsed");
+            // Slowly, so that the other process comes while this one archives.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Ok(Box::from(JSON))
+        })
+        .expect("archived");
+        assert_eq!(CrateView::new(mapped.get()).crate_version(), Some("1.0.0"));
+    }
+
+    /// Two processes that archive the same JSON at once take turns, and the second opens the
+    /// archive of the first: the JSON is read once, and neither fails, on Windows too, where a
+    /// file that another process maps cannot be replaced (requirement R-CA-4).
+    #[test]
+    fn two_processes_archive_a_crate_once() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let env = [(ROOT, dir.path().as_os_str())];
+        let name = "query::load::tests::archive_for_another_test";
+        let both = [
+            crate::test_process::start(name, &env),
+            crate::test_process::start(name, &env),
+        ];
+        let parsed: usize = both
+            .into_iter()
+            .map(|child| {
+                crate::test_process::finish(child)
+                    .iter()
+                    .filter(|line| line.ends_with("parsed"))
+                    .count()
+            })
+            .sum();
+        assert_eq!(parsed, 1);
+    }
 }
