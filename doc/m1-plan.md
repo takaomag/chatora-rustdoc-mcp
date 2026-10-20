@@ -533,6 +533,17 @@ C1d も 3 つに分けた: C1d-1 (cfg を読んで item の条件を出す)、C1
 - 直した不具合: stdio の `without_a_version_the_project_decides_it` は、ローカル機能なしの構成 (`--no-default-features`) では毎回落ちていた (プロジェクトを読まないので latest になり、crates.io の本物の `demo` 0.1.1 を引いて `no_json` になる)。C1b-2 で足したテストで、CI では C1b-2 から落ちるはずだった。C1c の報告で「たまに落ちる」としたのは誤りで、再現を試したのが既定の構成だけだったため。テストをローカル機能のときだけにした
 - テスト: feature の求め方 (`all-features`、名指し、`default`、`no-default-features`、`--cfg` の 2 つの書き方)、推移的にたどって欠けた feature を求めること、`Cargo.toml` の無い `.crate`、stdio での provenance
 
+#### C1d-3 (2026-10-20)
+
+- `enabled_in_project` (`true`・`false`・`"unknown"`) と `enabled_in_dev_only` (真のときだけ) を出す (R-FT-2)。プロジェクトが版を決めたとき (`cargo_lock`) だけ。B5d の `cargo tree` の feature の組 (通常のビルドと、dev を含むビルド。評価する target のもの) を使う。組を取れなければ (`cargo metadata` が失敗して `cargo_lock_raw` になったときなど) 出さず、warnings に書く。`detail=brief` でも出す
+- 評価 (C1d-2 の利用者の決定どおり): item の条件の一番外の「かつ」の各項を 3 値で評価して「かつ」で結ぶ
+  - feature を含む項: プロジェクトの組で評価する。`doc`・`docsrs` は偽、ほかの cfg は不明
+  - feature を含まない項: docs.rs のビルドで成り立っていたので、真とみなす。ただし docs.rs が `--cfg` で立てた名前 (C1d-2 の `cfg`) を含むか、JSON の target が評価する target と違えば、上と同じく評価する (多くは不明)。`docsrs` だけの項 (文書にだけある item) は偽
+  - 通常のビルドがその crate を作らなければ `false`。通常のビルドで真でなく、dev を含むビルドで真なら `enabled_in_dev_only`
+- このリポジトリで確かめた (tokio 1.53.3。プロジェクトの組は `bytes,default,io-std,io-util,…,net,process,rt,rt-multi-thread,sync,time`): `tokio::spawn`・`tokio::net::TcpStream` (`not(loom)` があっても)・`tokio::sync::Mutex`・`tokio::process::Command` は `true`、`tokio::fs::File` は `false`、`tokio::task::Builder` (`tokio_unstable` と `tracing`) は `tracing` が無いので `false`、`RuntimeMetrics::spawned_tasks_count` (`tokio_unstable`) は `"unknown"`。dev-dependency だけの `tempfile::TempDir`・`insta::assert_json_snapshot` は `false` で `enabled_in_dev_only`。初回は `cargo tree` で約 0.6 秒、2 回目からは 0.01 秒
+- 扱っていないこと: 版を明示して、それがプロジェクトの版と同じときの評価 (今はプロジェクトが版を決めたときだけ)。feature とそれ以外が混ざった項 (`any(feature = "a", unix)`) の、feature 以外の部分の評価 (不明として扱う)。プロジェクトの `build.target` (C1d-2 の記録のとおり)。一覧系のツールの各項目への注記 (C2 以降)
+- テスト: feature で決まること、docs.rs が立てた cfg で不明になること、欠けた feature が不明より勝つこと、dev だけの item と crate、他の target の JSON で不明になること
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

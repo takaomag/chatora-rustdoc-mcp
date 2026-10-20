@@ -8,6 +8,7 @@
 
 use std::{
     borrow::Cow,
+    collections::BTreeSet,
     fmt,
     path::{Component, Path},
 };
@@ -38,8 +39,42 @@ pub struct ItemRequest<'a> {
     pub origin: Origin<'a>,
     /// How much to show (requirement R-OUT-7).
     pub detail: Detail,
+    /// The features that the project builds the crate with, when the project decided the
+    /// version, for `enabled_in_project` (requirement R-FT-2).
+    pub project_features: Option<ProjectFeatures<'a>>,
     /// The target asked for, to warn when the data is for another.
     pub target: Option<&'a str>,
+}
+
+/// The features that the project's build for the target enables on the crate (requirement
+/// R-FT-2).
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectFeatures<'a> {
+    /// In the normal build. `None` when the normal build does not build the crate.
+    pub normal: Option<&'a BTreeSet<Box<str>>>,
+    /// In the build with the members' dev-dependencies, as in the tests.
+    pub with_dev: Option<&'a BTreeSet<Box<str>>>,
+}
+
+/// Whether an item is in the project's build: `true`, `false` or `unknown` (requirement R-FT-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enabled {
+    /// It is.
+    Yes,
+    /// It is not.
+    No,
+    /// It needs a condition that the project may or may not set (`tokio_unstable`).
+    Unknown,
+}
+
+impl Serialize for Enabled {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Yes => serializer.serialize_bool(true),
+            Self::No => serializer.serialize_bool(false),
+            Self::Unknown => serializer.serialize_str("unknown"),
+        }
+    }
 }
 
 /// How much of an item to show (requirement R-OUT-7).
@@ -213,6 +248,13 @@ pub struct ItemData<'a> {
     /// modules, re-exports, type or `impl` it is in), or `unknown` (some could not be read).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cfg_source: Option<&'static str>,
+    /// Whether the project's normal build for the target has the item, when the project decided
+    /// the version (requirement R-FT-2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_in_project: Option<Enabled>,
+    /// The item is not in the normal build, but in the build with the dev-dependencies.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub enabled_in_dev_only: bool,
     /// The first paragraph of the documentation, as written.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docs: Option<Cow<'a, str>>,
@@ -722,6 +764,17 @@ impl<'a> Query<'a> {
                 }
             }
         }
+        if let Some(project) = self.request.project_features {
+            let in_build = |features| self.in_build(&conjuncts, features);
+            let normal = in_build(project.normal);
+            data.enabled_in_project = Some(match normal {
+                Some(true) => Enabled::Yes,
+                Some(false) => Enabled::No,
+                None => Enabled::Unknown,
+            });
+            data.enabled_in_dev_only =
+                normal != Some(true) && in_build(project.with_dev) == Some(true);
+        }
         let (features, other): (Vec<_>, Vec<_>) =
             conjuncts.into_iter().partition(Cfg::is_features_only);
         let inherited = !(features.is_empty() && other.is_empty());
@@ -738,6 +791,58 @@ impl<'a> Query<'a> {
             data.required_features = Some(Cfg::all(features).features_text().into());
         }
         data.other_cfg = other.iter().map(|cfg| cfg.to_string().into()).collect();
+    }
+
+    /// Whether the conditions `conjuncts` hold in a build of the crate with `features` (`None`
+    /// when it is not built), or `None` if that is not known (requirement R-FT-2).
+    ///
+    /// A condition without features held when docs.rs built the JSON, which is for the target of
+    /// the build, so it holds in the build too, unless it needs a `--cfg` that docs.rs set
+    /// (`tokio_unstable`), or the JSON is for another target. `doc` and `docsrs` are false.
+    fn in_build(&self, conjuncts: &[Cfg], features: Option<&BTreeSet<Box<str>>>) -> Option<bool> {
+        let Some(features) = features else {
+            return Some(false);
+        };
+        let docs_rs_cfg: &[Box<str>] = match self.request.origin {
+            Origin::DocsRs {
+                build: Some(build), ..
+            } => &build.cfg,
+            Origin::DocsRs { build: None, .. } | Origin::Std { .. } => &[],
+        };
+        let same_target = self
+            .request
+            .target
+            .is_none_or(|target| target == self.view.target_triple());
+        let only_in_docs = |name: &str| matches!(name, "doc" | "docsrs");
+        let value_of = |cfg: &Cfg| match cfg {
+            Cfg::NameValue(name, value) if &**name == "feature" => Some(features.contains(value)),
+            Cfg::Name(name) if only_in_docs(name) => Some(false),
+            Cfg::Bool(_)
+            | Cfg::Name(_)
+            | Cfg::NameValue(..)
+            | Cfg::All(_)
+            | Cfg::Any(_)
+            | Cfg::Not(_) => None,
+        };
+        let mut known = Some(true);
+        for conjunct in conjuncts {
+            let set_by_docs_rs =
+                conjunct.mentions(&|name: &str| docs_rs_cfg.iter().any(|cfg| &**cfg == name));
+            let value = if !conjunct.has_no_features() || set_by_docs_rs || !same_target {
+                conjunct.eval(&value_of)
+            } else if conjunct.mentions(&only_in_docs) {
+                // Kept as it is only when it is false in a build (`Cfg::for_build`).
+                Some(false)
+            } else {
+                Some(true)
+            };
+            match value {
+                Some(false) => return Some(false),
+                Some(true) => {},
+                None => known = None,
+            }
+        }
+        known
     }
 
     /// The canonical path of `id`, or its definition path with a warning if it has no public
@@ -1414,6 +1519,7 @@ mod tests {
                 build: None,
             },
             detail: Detail::Normal,
+            project_features: None,
             target: None,
         }))
     }
@@ -1520,6 +1626,7 @@ mod tests {
                 build: None,
             },
             detail: Detail::Normal,
+            project_features: None,
             target: None,
         })
         .expect("found");
@@ -1626,6 +1733,7 @@ mod tests {
                 build: None,
             },
             detail,
+            project_features: None,
             target: None,
         })
         .expect("found");
@@ -1812,5 +1920,120 @@ mod tests {
         let data = at_detail("my_crate::Mutex", Detail::Normal, |_| {})["data"].clone();
         assert!(data.get("cfg_source").is_none(), "{data}");
         assert!(data.get("required_features").is_none(), "{data}");
+    }
+
+    /// `enabled_in_project` and `enabled_in_dev_only` of `path` in [`parsed`] with
+    /// [`with_cfgs`], when the project builds the crate with `normal` and `with_dev` (`None` when
+    /// it does not), docs.rs set `docs_rs_cfg`, and the target asked for is `target`.
+    fn in_project(
+        path: &str,
+        normal: Option<&[&str]>,
+        with_dev: Option<&[&str]>,
+        docs_rs_cfg: &[&str],
+        target: Option<&str>,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let mut krate = parsed().krate;
+        with_cfgs(&mut krate);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::new(1, 2, 3);
+        let set = |features: Option<&[&str]>| {
+            features.map(|features| {
+                features
+                    .iter()
+                    .map(|&feature| Box::from(feature))
+                    .collect::<BTreeSet<_>>()
+            })
+        };
+        let (normal, with_dev) = (set(normal), set(with_dev));
+        let build = DocsRsBuild {
+            cfg: docs_rs_cfg.iter().map(|&cfg| Box::from(cfg)).collect(),
+            ..DocsRsBuild::default()
+        };
+        let response = get_item(&view, ItemRequest {
+            name: &name,
+            version: &version,
+            path,
+            origin: Origin::DocsRs {
+                resolved_from: ResolvedFrom::CargoLock,
+                project_from: Some("cwd"),
+                build: Some(&build),
+            },
+            detail: Detail::Brief,
+            project_features: Some(ProjectFeatures {
+                normal: normal.as_ref(),
+                with_dev: with_dev.as_ref(),
+            }),
+            target,
+        })
+        .expect("found");
+        let data = serde_json::to_value(response).expect("serializes")["data"].clone();
+        (
+            data["enabled_in_project"].clone(),
+            data["enabled_in_dev_only"].clone(),
+        )
+    }
+
+    #[test]
+    fn an_item_is_in_the_build_if_its_features_are() {
+        // `lock` needs `sync` (from the re-export) and `tokio_unstable` (from its `impl`), which
+        // held when docs.rs built it.
+        let lock = "my_crate::Mutex::lock";
+        assert_eq!(
+            in_project(lock, Some(&["sync"]), Some(&["sync"]), &[], None),
+            (json!(true), json!(null))
+        );
+        assert_eq!(
+            in_project(lock, Some(&[]), Some(&[]), &[], None),
+            (json!(false), json!(null))
+        );
+        // Unless docs.rs set it with `--cfg`: the project may not.
+        assert_eq!(
+            in_project(lock, Some(&["sync"]), None, &["tokio_unstable"], None),
+            (json!("unknown"), json!(null))
+        );
+        // A missing feature decides it all the same.
+        assert_eq!(
+            in_project(lock, Some(&[]), None, &["tokio_unstable"], None),
+            (json!(false), json!(null))
+        );
+    }
+
+    #[test]
+    fn an_item_only_in_the_tests_is_enabled_in_dev_only() {
+        let lock = "my_crate::Mutex::lock";
+        assert_eq!(
+            in_project(lock, Some(&[]), Some(&["sync"]), &[], None),
+            (json!(false), json!(true))
+        );
+        // A crate that only the dev-dependencies build.
+        assert_eq!(
+            in_project("my_crate::sync", None, Some(&[]), &[], None),
+            (json!(false), json!(true))
+        );
+        assert_eq!(
+            in_project("my_crate::sync", None, None, &[], None),
+            (json!(false), json!(null))
+        );
+    }
+
+    #[test]
+    fn conditions_other_than_features_are_unknown_for_another_target() {
+        // `E` needs `any(a, b)` and `unix`.
+        assert_eq!(
+            in_project("my_crate::E", Some(&["b"]), None, &[], None),
+            (json!(true), json!(null))
+        );
+        assert_eq!(
+            in_project(
+                "my_crate::E",
+                Some(&["b"]),
+                None,
+                &[],
+                Some("aarch64-apple-darwin")
+            ),
+            (json!("unknown"), json!(null))
+        );
     }
 }

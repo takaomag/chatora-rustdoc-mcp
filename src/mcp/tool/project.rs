@@ -47,6 +47,8 @@ pub(super) struct Found {
     pub(super) project_from: &'static str,
     /// What the response warns about.
     pub(super) warnings: Vec<Box<str>>,
+    /// The workspace, whose build decides `enabled_in_project` (requirement R-FT-2).
+    pub(super) workspace: Workspace,
 }
 
 /// The package that `name` means in the project: the one `project` names (a `Cargo.toml` or a
@@ -119,6 +121,7 @@ pub(super) async fn version_in_project(
         resolved_from,
         project_from: project_from.as_str(),
         warnings,
+        workspace,
     }))
 }
 

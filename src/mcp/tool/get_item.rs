@@ -18,7 +18,11 @@ use super::{
     project::{self, InProject},
 };
 #[cfg(feature = "local")]
-use crate::data::packages::{DocsRsCheck, ProjectPackage, Source};
+use crate::data::{
+    features::FeatureSets,
+    packages::{DocsRsCheck, ProjectPackage, Source},
+    project::Workspace,
+};
 use crate::{
     data::{
         self,
@@ -37,7 +41,15 @@ use crate::{
     },
     query::{
         across::{self, Indexed},
-        get_item::{Detail, GetItemError, ItemRequest, Origin, ResolvedFrom, get_item},
+        get_item::{
+            Detail,
+            GetItemError,
+            ItemRequest,
+            Origin,
+            ProjectFeatures,
+            ResolvedFrom,
+            get_item,
+        },
         load,
         view::CrateView,
     },
@@ -111,6 +123,42 @@ struct Request {
     checksum: Option<Box<str>>,
     /// How docs.rs built it, once its `.crate` is read (requirement R-FT-1).
     build: Option<Box<DocsRsBuild>>,
+    /// The project's build of it, when the project decided the version.
+    in_build: InBuild,
+}
+
+/// The project's build of the crate, for `enabled_in_project` (requirement R-FT-2). Empty when
+/// the project did not decide the version, and without local features.
+#[derive(Debug, Default)]
+struct InBuild {
+    /// The workspace that decided the version.
+    #[cfg(feature = "local")]
+    workspace: Option<Workspace>,
+    /// The features of its packages in its build for the target, once read.
+    #[cfg(feature = "local")]
+    sets: Option<Arc<FeatureSets>>,
+}
+
+impl InBuild {
+    /// The features of `name` at `version` in the build, if they were read.
+    #[cfg(feature = "local")]
+    fn features(&self, name: &str, version: &Version) -> Option<ProjectFeatures<'_>> {
+        let sets = self.sets.as_ref()?;
+        Some(ProjectFeatures {
+            normal: sets.normal(name, version),
+            with_dev: sets.with_dev(name, version),
+        })
+    }
+
+    /// Without local features, there is no project.
+    #[cfg(not(feature = "local"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "the same signature as with local features"
+    )]
+    const fn features(&self, _name: &str, _version: &Version) -> Option<ProjectFeatures<'_>> {
+        None
+    }
 }
 
 /// Definition of the tool for `tools/list`.
@@ -236,6 +284,11 @@ fn data_schema() -> Value {
                 "type": "string",
                 "enum": ["doc_cfg", "cfg_trace", "inherited", "unknown"],
             },
+            "enabled_in_project": {
+                "enum": [true, false, "unknown"],
+                "description": "Whether the project's normal build has the item.",
+            },
+            "enabled_in_dev_only": { "type": "boolean" },
             "docs": {
                 "type": "string",
                 "description": "The first paragraph of the documentation, or with \
@@ -460,6 +513,7 @@ async fn resolve(
             detail,
             checksum: None,
             build: None,
+            in_build: InBuild::default(),
         };
         return Ok((request, warnings));
     }
@@ -480,16 +534,10 @@ async fn resolve(
         .resolve(&entry.versions)
         .map_err(|no_version| Box::new(version_not_found(&entry.name, &spec, &no_version)))?;
     warnings.extend(resolved.warnings.into_iter().map(Into::into));
-    let (resolved_from, project_from) = match spec {
-        VersionSpec::Exact(_) => (ResolvedFrom::Explicit, None),
-        VersionSpec::Requirement(_) => (ResolvedFrom::ExplicitReq, None),
-        VersionSpec::Latest => (ResolvedFrom::Latest, None),
-    };
     #[cfg(feature = "local")]
-    let (resolved_from, project_from) = from_project
-        .map_or((resolved_from, project_from), |found| {
-            (found.resolved_from, Some(found.project_from))
-        });
+    let (resolved_from, project_from, in_build) = chosen_by(&spec, from_project);
+    #[cfg(not(feature = "local"))]
+    let (resolved_from, project_from, in_build) = chosen_by(&spec);
     // The name as published, for docs.rs and the cache, and at the head of the path as code writes
     // it (`Serde_Json::Value` is `serde_json::Value`).
     let published: CrateName = entry.name.parse().unwrap_or(name);
@@ -499,6 +547,7 @@ async fn resolve(
         version: resolved.version.version.clone(),
         checksum: Some(resolved.version.checksum.clone()),
         build: None,
+        in_build,
         project_from,
         path,
         resolved_from,
@@ -519,6 +568,41 @@ fn stand_in_warning(
     arguments.target.is_none().then(|| {
         format!("the target {target} is used, as the host target is not known: {why}").into()
     })
+}
+
+/// How the version was chosen, where the project came from if it chose it, and the project's
+/// build of the crate.
+#[cfg(feature = "local")]
+fn chosen_by(
+    spec: &VersionSpec,
+    from_project: Option<Box<project::Found>>,
+) -> (ResolvedFrom, Option<&'static str>, InBuild) {
+    from_project.map_or_else(
+        || chosen_by_argument(spec),
+        |found| {
+            let in_build = InBuild {
+                workspace: Some(found.workspace),
+                sets: None,
+            };
+            (found.resolved_from, Some(found.project_from), in_build)
+        },
+    )
+}
+
+/// How the version was chosen: without local features, by the argument.
+#[cfg(not(feature = "local"))]
+fn chosen_by(spec: &VersionSpec) -> (ResolvedFrom, Option<&'static str>, InBuild) {
+    chosen_by_argument(spec)
+}
+
+/// How the version was chosen by the argument `spec`.
+fn chosen_by_argument(spec: &VersionSpec) -> (ResolvedFrom, Option<&'static str>, InBuild) {
+    let resolved_from = match spec {
+        VersionSpec::Exact(_) => ResolvedFrom::Explicit,
+        VersionSpec::Requirement(_) => ResolvedFrom::ExplicitReq,
+        VersionSpec::Latest => ResolvedFrom::Latest,
+    };
+    (resolved_from, None, InBuild::default())
 }
 
 /// The exact version that `spec` names, if the JSON of `name` at it for `target` is cached: it is
@@ -686,6 +770,10 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
     arguments.build = docs_rs_build(&state, &arguments, &mut warnings)
         .await
         .map(Box::new);
+    #[cfg(feature = "local")]
+    {
+        arguments.in_build.sets = feature_sets(&state, &arguments, &mut warnings).await;
+    }
     let target = Some(&arguments.target);
     let dir = state
         .cache
@@ -720,6 +808,31 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
     match recover(&state, &lookup, looked_up, arguments, &json, &mut warnings).await {
         Ok((looked_up, arguments)) => finish(looked_up, &arguments, &warnings),
         Err(result) => *result,
+    }
+}
+
+/// The features of the packages in the build of the workspace that decided the version of
+/// `request`, for its target (requirement R-FT-2). `None`, with a warning, when they cannot be
+/// read, as when `cargo metadata` failed.
+#[cfg(feature = "local")]
+async fn feature_sets(
+    state: &ToolState,
+    request: &Request,
+    warnings: &mut Vec<Box<str>>,
+) -> Option<Arc<FeatureSets>> {
+    let workspace = request.in_build.workspace.as_ref()?;
+    match state.resolver.features(workspace, &request.target).await {
+        Ok(sets) => Some(sets),
+        Err(error) => {
+            warnings.push(
+                format!(
+                    "whether items are in the project's build is not known: {}",
+                    ErrorChain(&error)
+                )
+                .into(),
+            );
+            None
+        },
     }
 }
 
@@ -919,6 +1032,7 @@ async fn execute_std(
         detail: arguments.detail,
         checksum: None,
         build: None,
+        in_build: InBuild::default(),
     };
     let cache = state.cache.clone();
     let task = tokio::task::spawn_blocking(move || {
@@ -1033,6 +1147,7 @@ fn look_up_std(
         },
         target: Some(request.target.as_str()),
         detail: request.detail,
+        project_features: None,
     })
     .map_err(Failure::Item)
     .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize));
@@ -1234,6 +1349,9 @@ fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Request) -> Result<Value, Fa
         },
         target: Some(arguments.target.as_str()),
         detail: arguments.detail,
+        project_features: arguments
+            .in_build
+            .features(arguments.name.as_str(), &arguments.version),
     })
     .map_err(Failure::Item)
     .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize))
@@ -1565,6 +1683,7 @@ mod tests {
             detail: Detail::Normal,
             checksum: None,
             build: None,
+            in_build: InBuild::default(),
         };
         let candidates = (0..25).map(|n| format!("item {n}").into()).collect();
         let result = item_error(&request, &GetItemError::Ambiguous { candidates });
@@ -1580,6 +1699,7 @@ mod tests {
     fn the_output_schema_covers_the_response() {
         use crate::query::get_item::{
             Deprecated,
+            Enabled,
             ItemData,
             ItemResponse,
             Provenance,
@@ -1627,6 +1747,8 @@ mod tests {
                 required_features: some(),
                 other_cfg: many(),
                 cfg_source: Some("doc_cfg"),
+                enabled_in_project: Some(Enabled::Unknown),
+                enabled_in_dev_only: true,
                 docs: Some("x".into()),
                 docs_truncated: true,
                 deprecated: Some(Deprecated {

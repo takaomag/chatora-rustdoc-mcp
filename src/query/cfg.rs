@@ -133,6 +133,18 @@ impl Cfg {
         }
     }
 
+    /// Whether a name in it (`unix` in `unix`, `feature` in `feature = "rt"`) is one that
+    /// `wanted` takes.
+    #[must_use]
+    pub fn mentions(&self, wanted: &impl Fn(&str) -> bool) -> bool {
+        match self {
+            Self::Bool(_) => false,
+            Self::Name(name) | Self::NameValue(name, _) => wanted(name),
+            Self::All(cfgs) | Self::Any(cfgs) => cfgs.iter().any(|cfg| cfg.mentions(wanted)),
+            Self::Not(cfg) => cfg.mentions(wanted),
+        }
+    }
+
     /// The condition in a normal build, where `doc` and `docsrs` are false (docs.rs sets them
     /// only to document). If it is then false, the condition is kept as it is, so that it shows
     /// that the item is only in documentation.

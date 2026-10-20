@@ -414,6 +414,7 @@ fn representative_items_are_returned_by_get_item() {
                 build: None,
             },
             detail: Detail::Normal,
+            project_features: None,
             target: None,
         })
         .unwrap_or_else(|error| panic!("{path}: {error}"));
