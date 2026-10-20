@@ -29,6 +29,7 @@ pub mod local_std;
 pub mod metadata;
 #[cfg(feature = "local")]
 pub mod packages;
+pub mod process_lock;
 #[cfg(feature = "local")]
 pub mod project;
 pub mod rustdoc_json;
