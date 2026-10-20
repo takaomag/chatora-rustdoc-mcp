@@ -93,6 +93,9 @@ pub(super) fn project_command(root: &Path, offline: bool) -> tokio::process::Com
         .stderr(Stdio::piped())
         // git translates its messages, which `classify` matches.
         .env("LC_ALL", "C")
+        // The messages are matched, and colors would cut them, as `Blocking` of `Blocking
+        // waiting for file lock` with `CARGO_TERM_COLOR=always` in the user's environment.
+        .env("CARGO_TERM_COLOR", "never")
         // Nothing may stop to ask for credentials (requirement R-WS-6). Stored credentials are
         // still used.
         .env("GIT_TERMINAL_PROMPT", "0")

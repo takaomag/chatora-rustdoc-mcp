@@ -334,7 +334,7 @@ Claude Code 2.1.304、Linux で測った。
 
 **B2 (ロック待ちの検出。2026-10-20、cargo 1.99.1)**:
 
-- cargo は、ほかの cargo がパッケージキャッシュのロックを持っていると、stderr に `    Blocking waiting for file lock on package cache` を出して待つ (隔離した `CARGO_HOME` の `.package-cache` を `flock` で握って `cargo metadata` で確かめた)。ロックの対象で `on build directory` などに変わるので、照合は `Blocking waiting for file lock` までにした
+- cargo は、ほかの cargo がパッケージキャッシュのロックを持っていると、stderr に `Blocking waiting for file lock on package cache` (行頭に空白が付く) を出して待つ (隔離した `CARGO_HOME` の `.package-cache` を `flock` で握って `cargo metadata` で確かめた)。ロックの対象で `on build directory` などに変わるので、照合は `Blocking waiting for file lock` までにした
 - `data::child::Child::output_watching` で stderr を 1 行ずつ読みながら待ち、`data::cargo::run_reporting` が `Activity` (`Running`・`WaitingForLock`) の変わり目を知らせる。ロック待ちの行の後にほかの行が出たら、ロックが取れて動いているとみなして `Running` に戻す。応答の `building_reason: waiting_for_lock` につなぐのは C3・D3
 - テスト: std の `File::lock` でパッケージキャッシュのロックを握り (cargo と同じく Unix は `flock`、Windows は `LockFileEx`)、本物の cargo が `WaitingForLock` を知らせ、ロックを外すと正常に終わることを 3 つの OS で確かめる
 
