@@ -174,10 +174,14 @@ pub(super) async fn run_reporting(
         .map_err(RunError::NotStarted)
 }
 
-/// What a failed cargo command's `stderr` says about the failure. `offline` is whether the server
-/// passed `--offline`. The exit code does not tell these apart, so the messages are matched
-/// (requirement R-WS-7, which lists the only matches allowed).
-pub(super) fn classify(output: &Output, offline: bool) -> Failure {
+/// What a failed cargo command's `stderr` says about the failure.
+///
+/// `offline` is whether cargo was offline: the server passed `--offline`, or the user's settings
+/// make it so. The exit code does not tell these apart, so the messages are matched (requirement
+/// R-WS-7, which lists the only matches allowed). The messages of git, through libgit2 and
+/// through the git CLI, are checked in `tests/local/git_failures.rs`.
+#[must_use]
+pub fn classify(output: &Output, offline: bool) -> Failure {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let has = |text: &str| stderr.contains(text);
     if has("because --locked was passed") {
@@ -205,10 +209,13 @@ fn git_fetch_failure(stderr: &str) -> Option<GitFetchFailure> {
         line.contains("revision ") && line.contains(" not found")
             || line.contains("revspec '") && line.contains("' not found")
     });
+    // libgit2 tells a missing tag only as a missing reference, after cargo's own line.
     if missing_revision
         || has("not our ref")
         || has("cannot locate remote-tracking branch")
         || has("couldn't find remote ref")
+        || has("failed to find tag `")
+        || has("failed to find branch `")
     {
         Some(GitFetchFailure::NoRev)
     } else if has("failed to resolve path") || has("does not appear to be a git repository") {

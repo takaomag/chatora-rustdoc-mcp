@@ -11,6 +11,8 @@
 
 #[path = "../common/git.rs"]
 mod git;
+#[cfg(feature = "local")]
+mod git_failures;
 #[path = "../common/isolated.rs"]
 mod isolated;
 #[path = "../common/registry.rs"]

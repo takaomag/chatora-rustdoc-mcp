@@ -365,6 +365,18 @@ Claude Code 2.1.304、Linux で測った。
 - 失敗の保持: `cargo metadata` が失敗して Cargo.lock を直接読んだ結果と、`cargo tree` の失敗は、入力が同じ間、30 秒だけ cargo を起動せずに返す (R-WS-7 の一時的な失敗の TTL)。成功は入力が同じ間ずっと
 - 取得中の印: `cargo::Activity` に `Fetching` を足し、stderr の状態の語 `Updating`・`Downloading`・`Downloaded` で知らせる (`building_reason: fetching` につなぐのは C3)。`Locking` は通信しないこともあるので数えない
 
+**B5 (git の取得の失敗の文言。2026-10-20、cargo 1.99.1・git 2.56.0)**:
+
+- 隔離した環境で、`file://` の bare リポジトリと 401 を返すローカルの HTTP サーバーを相手に、libgit2 (cargo の既定) と git の CLI (`net.git-fetch-with-cli`) の両方で、`cargo metadata`・`cargo fetch`・`cargo tree` の失敗の文言を集めた (`LC_ALL=C`・色なし)
+  - 無いブランチ: libgit2 は `cannot locate remote-tracking branch`、CLI は `couldn't find remote ref refs/heads/…`
+  - 無いタグ: libgit2 は `failed to find tag` と `reference 'refs/remotes/origin/tags/…' not found`、CLI は `couldn't find remote ref refs/tags/…`
+  - 無い rev (40 桁): どちらも `revspec '…' not found` (CLI でも cargo が libgit2 で引く)
+  - 無いリポジトリ: libgit2 は `failed to resolve path`、CLI は `does not appear to be a git repository`
+  - 認証: libgit2 は `failed to authenticate when downloading repository`、CLI は `could not read Username for '…': terminal prompts disabled`
+- M1 の照合は libgit2 の無いタグを拾えず (`Other` になっていた)、`failed to find tag` と `failed to find branch` (cargo 自身の行。後ろにバッククォートで囲んだ名前が続く) を足した。R-WS-7 の照合の一覧に足す (§7)
+- テスト (`tests/local/git_failures.rs`): 5 つの失敗 × 2 つの取り方 × 3 つのコマンドの 30 通りで `classify` が `fetch_failed` の理由を当てることと、同じリポジトリのタグ `v1` は取れること (対照) を、3 つの OS で確かめる。`classify` を公開した (統合テストから呼ぶため)
+- cargo は、git の CLI の失敗と、一時的かもしれない要求の失敗を、`net.retry` (既定 3) の回数だけ間を置いて試し直す。無いブランチのような決定的な失敗も試し直すので、30 通りで合計 170 秒 (1 回あたり平均約 6 秒) かかった。テストは `net.retry = 0` にした。製品は利用者の設定のまま (C3 の時間の上限と `status: building` がこの待ちを受け止める)
+
 ### 6.4 M2c
 
 (まだ無い)
@@ -389,6 +401,7 @@ Claude Code 2.1.304、Linux で測った。
    - §7.3 の `project_from` の値 (P8)
    - R-MCP-3 のサブディレクトリでの起動 (git の作業ツリーの中で上へ探す。直下の子の workspace も作業ツリーのルートまで上を見る。§6.2 の A2)
    - Q-29・Q-31 の答え (§4 の各行)
+   - R-WS-7 の照合の一覧: git の無いタグとブランチの `failed to find tag`・`failed to find branch` (B5)。cargo に `CARGO_TERM_COLOR=never` を渡すこと (B2)
    - §8: `local_build_required` の扱い (M2 で使われなくなるか)、ビルドの状態の値 (R-OUT-9)
    - R-SC-4 の `readme` の扱いを M3 に送る
    - §12 の M2 の到達点と、M3 以降に回したもの
