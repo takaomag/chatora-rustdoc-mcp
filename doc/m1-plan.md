@@ -649,6 +649,18 @@ C3 を 2 つに分けた: C3a (`list_module` と一覧の共通の仕組み)、C
 - 扱っていないこと: trait 側の境界情報 (`sealed`・`dyn_compatible`・required / provided。R-TI-5) は C7 (`list_implementors`) で扱う。`Arc<Mutex<T>>` のような型の式をそのまま引くことはできない (型ごとに引いて組み合わせる)
 - テスト: 条件の作り方 (型引数の境界・where 句・`?Sized`・入れ子の `<>`)、型の impl、モジュールを指したときのエラー、引数
 
+#### C6 (2026-10-20)
+
+`list_methods` を足した (R-TI-1 の M1 の分・R-LS-3・R-SH-4。§3 Q7 のうち固有と trait 由来)。Deref 先のメソッドとプリミティブ型の core・alloc・std にまたがるメソッドは計画どおり M4。
+
+- 対象は `list_impls` と同じ impl (合成と negative の impl はメソッドを持たないので除く)。固有の impl の関数 → `inherent`。trait の impl → `trait`: impl に書かれたメソッドと、上書きされていない既定のメソッド (`provided_trait_methods`。rustdoc は上書きしたものもここに入れるので、impl に書かれた名前は除く)。trait が同じ crate にあれば既定のメソッドもシグネチャ付きで、別の crate なら名前だけ
+- 各メソッドに `from`・`trait`・`needs_use` (trait が std の prelude (2021・2024) に無いとき。prelude の trait は名前の一覧で持つ)・`provided` (trait が同じ crate にあるか、上書きされていない既定のメソッドのときだけ分かる) を付ける。パスは `Type::method`
+- blanket impl (R-SH-4): std の汎用 trait (`From`・`Into`・`Any` など) のものは `std_blanket` にメソッド名だけ (`to_string`・`into`・`type_id` など)。ほかの blanket impl は、`expand_blanket` が無ければ `blanket` に trait ごとに 1 行 (メソッド名の一覧) で、あれば 1 つずつ `from: blanket` で並べる
+- 絞り込み (R-LS-3): `name` (名前の部分一致。大文字小文字を区別しない) と `from` (`inherent`・`trait`・`blanket`) を切る前に適用し、`total` は絞り込んだ後の件数。並びは固有 → trait (trait のパス順) → blanket、その中は名前順 (R-OUT-4)。ページングは `list_module` と同じカーソル
+- trait の示し方を直した (`list_impls` も): 同じ crate の trait は、private なモジュールを通る定義パス (`tokio::io::util::async_read_ext::AsyncReadExt`) ではなく `use` できる正準パス (`tokio::io::AsyncReadExt`) で示す。同じ crate の trait で公開パスの無いもの (std 内部の `SpecExtend`・`BufferedWriterSpec` など) の impl は出さない (R-TI-2)。別の crate の trait は公開かどうかを判定できない (`core::mem::SizedTypeProperties` のような隠された trait や、`Eq::assert_fields_are_eq` のような隠されたメソッドが名前で出うる)
+- 実データ: `tokio::sync::Mutex` は固有メソッド 10 個 (`lock` など)、`Debug`・`Default`・`From` 由来、tracing の `Instrument`・`WithSubscriber` が blanket。`std::time::Duration` の `name: checked` → `checked_add`・`checked_sub`・`checked_mul`・`checked_div`。`tokio::fs::File` の blanket を展開すると `AsyncReadExt::read` などがシグネチャ付きで 65 個
+- テスト: 固有メソッド、`from`・`name` の絞り込み、引数
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

@@ -54,6 +54,7 @@ use crate::{
         impls::{ImplOptions, list_impls},
         list_module::{ListOptions, list_module},
         load,
+        methods::{MethodOptions, list_methods},
         overview::crate_overview,
         search::{Fields, SearchOptions, search_items},
         view::CrateView,
@@ -132,6 +133,17 @@ pub(super) enum What {
     Search(Box<Searching>),
     /// The traits that the type implements (`list_impls`).
     Impls(Box<Paging>),
+    /// The methods that can be called on the type (`list_methods`).
+    Methods(Box<MethodFilter>),
+}
+
+/// Which methods `list_methods` lists (requirement R-LS-3), and the page.
+#[derive(Debug, Clone)]
+pub(super) struct MethodFilter {
+    pub(super) name: Option<Box<str>>,
+    pub(super) from: Box<[&'static str]>,
+    pub(super) expand_blanket: bool,
+    pub(super) paging: Paging,
 }
 
 /// A page of a list: how many items, from where, and what the cursor was made for
@@ -236,6 +248,27 @@ impl Arguments {
             shape: Shape {
                 detail: Detail::Normal,
                 what: What::Impls(Box::new(paging)),
+            },
+        }
+    }
+
+    /// The arguments of `list_methods`: those that name a release, the type's path, how much
+    /// to show, and which methods.
+    pub(super) fn for_methods(
+        release: ReleaseArguments,
+        path: &str,
+        detail: Detail,
+        filter: MethodFilter,
+    ) -> Self {
+        Self {
+            path: with_crate_name(&release.name, path.trim_start_matches("::")),
+            name: release.name,
+            version: release.version,
+            project: release.project,
+            target: release.target,
+            shape: Shape {
+                detail,
+                what: What::Methods(Box::new(filter)),
             },
         }
     }
@@ -1903,6 +1936,20 @@ fn respond_in(
                 offset: paging.offset,
                 cursor_request: &paging.request_digest,
                 cursor_data: paging.cursor_data.as_deref(),
+            })
+            .map_err(Failure::Item)?;
+            return serde_json::to_value(&response).map_err(Failure::Serialize);
+        },
+        What::Methods(filter) => {
+            let from: Vec<&str> = filter.from.to_vec();
+            let response = list_methods(view, request, MethodOptions {
+                name: filter.name.as_deref(),
+                from: &from,
+                expand_blanket: filter.expand_blanket,
+                limit: filter.paging.limit,
+                offset: filter.paging.offset,
+                cursor_request: &filter.paging.request_digest,
+                cursor_data: filter.paging.cursor_data.as_deref(),
             })
             .map_err(Failure::Item)?;
             return serde_json::to_value(&response).map_err(Failure::Serialize);

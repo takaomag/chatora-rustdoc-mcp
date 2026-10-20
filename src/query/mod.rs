@@ -7,6 +7,7 @@ pub mod get_item;
 pub mod impls;
 pub mod list_module;
 pub mod load;
+pub mod methods;
 pub mod overview;
 pub mod path_index;
 pub mod render;

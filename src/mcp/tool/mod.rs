@@ -6,6 +6,7 @@
 mod crate_overview;
 mod get_item;
 mod list_impls;
+mod list_methods;
 mod list_module;
 mod project;
 mod resolve_version;
@@ -82,6 +83,7 @@ pub(super) fn definitions() -> Vec<Tool> {
         crate_overview::definition(),
         get_item::definition(),
         list_impls::definition(),
+        list_methods::definition(),
         list_module::definition(),
         resolve_version::definition(),
         search_items::definition(),
@@ -121,6 +123,14 @@ pub(super) async fn call(
             Ok(arguments) => Ok(run_tool(list_impls::execute(arguments, Arc::clone(state)))
                 .await
                 .into()),
+            Err(error) => Ok(error.into_result().into()),
+        },
+        list_methods::NAME => match list_methods::parse_arguments(request.arguments.as_ref()) {
+            Ok(arguments) => Ok(
+                run_tool(list_methods::execute(arguments, Arc::clone(state)))
+                    .await
+                    .into(),
+            ),
             Err(error) => Ok(error.into_result().into()),
         },
         list_module::NAME => match list_module::parse_arguments(request.arguments.as_ref()) {

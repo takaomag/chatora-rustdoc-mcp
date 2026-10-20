@@ -275,7 +275,13 @@ fn classify(view: &CrateView<'_>, query: &mut Query<'_>, item: &Item, ty: Id) ->
                 .unwrap_or(&path.path)
                 .to_owned()
         });
-        let (trait_path, trait_crate) = trait_id.map_or((None, None), |id| trait_origin(view, id));
+        let Some(TraitOrigin {
+            path: trait_path,
+            krate: trait_crate,
+        }) = trait_id.map_or_else(|| Some(TraitOrigin::default()), |id| trait_origin(view, id))
+        else {
+            continue;
+        };
         if let (Some(id), Some(name)) = (trait_id, &trait_name)
             && (how == How::Auto || auto_ids.contains(&id))
         {
@@ -378,7 +384,7 @@ fn without_maybe_sized(bound: &str) -> Option<String> {
 }
 
 /// The type at `path`: a struct, an enum, a union or a primitive type.
-fn find_type(
+pub(super) fn find_type(
     view: &CrateView<'_>,
     query: &mut Query<'_>,
     path: &str,
@@ -466,17 +472,35 @@ fn auto_traits_of(view: &CrateView<'_>) -> Vec<Id> {
     ids
 }
 
-/// The path of the trait `id` where it is defined, and its crate when that is another.
-fn trait_origin(view: &CrateView<'_>, id: Id) -> (Option<Box<str>>, Option<Box<str>>) {
+/// The trait of an impl, as a response names it.
+#[derive(Debug, Default)]
+pub(super) struct TraitOrigin {
+    /// For a trait of this crate its canonical path, which can be `use`d; for another's the
+    /// path where it is defined.
+    pub(super) path: Option<Box<str>>,
+    /// Its crate, when that is another.
+    pub(super) krate: Option<Box<str>>,
+}
+
+/// The trait `id` as a response names it. `None` for a trait of this crate without a public
+/// path, which is not public API (std's `SpecExtend`; requirement R-TI-2).
+pub(super) fn trait_origin(view: &CrateView<'_>, id: Id) -> Option<TraitOrigin> {
     let Some(summary) = view.summary(id) else {
-        return (None, None);
+        return Some(TraitOrigin::default());
     };
-    let path = summary.path.join("::").into_boxed_str();
-    let krate = (summary.crate_id != 0)
-        .then(|| view.external_crate(summary.crate_id))
-        .flatten()
-        .map(|external| external.name.as_str().into());
-    (Some(path), krate)
+    if summary.crate_id == 0 {
+        let canonical = view.index().canonical_path(id)?;
+        return Some(TraitOrigin {
+            path: Some(canonical.joined()),
+            krate: None,
+        });
+    }
+    Some(TraitOrigin {
+        path: Some(summary.path.join("::").into()),
+        krate: view
+            .external_crate(summary.crate_id)
+            .map(|external| external.name.as_str().into()),
+    })
 }
 
 /// Whether the type is `#[non_exhaustive]`, and whether it has fields that are not public.
