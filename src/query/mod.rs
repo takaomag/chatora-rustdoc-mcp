@@ -9,4 +9,5 @@ pub mod load;
 pub mod overview;
 pub mod path_index;
 pub mod render;
+pub mod search;
 pub mod view;

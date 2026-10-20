@@ -423,6 +423,7 @@ fn tools_list_is_cacheable_and_not_paginated() {
             "get_item",
             "list_module",
             "resolve_version",
+            "search_items",
             "sleep",
         ]
     } else {
@@ -431,6 +432,7 @@ fn tools_list_is_cacheable_and_not_paginated() {
             "get_item",
             "list_module",
             "resolve_version",
+            "search_items",
         ]
     };
     assert_eq!(names, expected);
@@ -546,6 +548,35 @@ fn list_module_lists_a_cached_crate() {
     );
     let error = text_json(&server.response(2)["result"]);
     assert_eq!(error["code"], "invalid_argument", "{error}");
+    assert!(server.finish().success());
+}
+
+/// `search_items` finds an item of a cached crate by name, and suggests a spelling when nothing
+/// matches (requirements R-SR-1 and R-SR-5).
+#[test]
+fn search_items_searches_a_cached_crate() {
+    let mut server = Server::start();
+    server.send(&call_tool(
+        1,
+        "search_items",
+        json!({ "crate": "demo@0.1.0", "target": TARGET, "query": "hello" }),
+    ));
+    server.send(&call_tool(
+        2,
+        "search_items",
+        json!({ "crate": "demo@0.1.0", "target": TARGET, "query": "helo" }),
+    ));
+    let response = server.response(1);
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(
+        content["data"]["items"][0]["path"], "demo::hello",
+        "{response}"
+    );
+    assert_eq!(content["page"]["total"], 1);
+    let response = server.response(2);
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["data"]["items"], json!([]), "{response}");
+    assert_eq!(content["data"]["did_you_mean"], json!(["demo::hello"]));
     assert!(server.finish().success());
 }
 

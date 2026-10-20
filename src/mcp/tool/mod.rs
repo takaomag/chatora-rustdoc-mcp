@@ -8,6 +8,7 @@ mod get_item;
 mod list_module;
 mod project;
 mod resolve_version;
+mod search_items;
 #[cfg(debug_assertions)]
 mod sleep;
 
@@ -80,6 +81,7 @@ pub(super) fn definitions() -> Vec<Tool> {
         get_item::definition(),
         list_module::definition(),
         resolve_version::definition(),
+        search_items::definition(),
         // A tool for testing progress and cancellation, only in debug builds.
         #[cfg(debug_assertions)]
         sleep::definition(),
@@ -116,6 +118,14 @@ pub(super) async fn call(
             Ok(arguments) => Ok(run_tool(list_module::execute(arguments, Arc::clone(state)))
                 .await
                 .into()),
+            Err(error) => Ok(error.into_result().into()),
+        },
+        search_items::NAME => match search_items::parse_arguments(request.arguments.as_ref()) {
+            Ok(arguments) => Ok(
+                run_tool(search_items::execute(arguments, Arc::clone(state)))
+                    .await
+                    .into(),
+            ),
             Err(error) => Ok(error.into_result().into()),
         },
         resolve_version::NAME => match resolve_version::parse_arguments(request.arguments.as_ref())

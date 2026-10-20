@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use super::{
     path_index::{PathIndex, Resolution},
+    search::SearchIndex,
     view::CrateView,
 };
 use crate::data::{archive::Mapped, rustdoc_json::ParsedCrate};
@@ -17,7 +18,7 @@ const MAX_CRATES: usize = 4;
 
 /// The version of the schema of [`Indexed`] in an archive (requirement R-CA-2). Change it with the
 /// types that it holds, other than those of rustdoc-types, whose format version is in the header.
-pub const ARCHIVE_SCHEMA: u32 = 3;
+pub const ARCHIVE_SCHEMA: u32 = 4;
 
 /// A parsed crate with its path index, which is archived as one (requirements R-PF-1 and R-PF-2).
 #[derive(Debug, rkyv::Archive, rkyv::Serialize)]
@@ -26,6 +27,8 @@ pub struct Indexed {
     pub parsed: ParsedCrate,
     /// Its public paths.
     pub index: PathIndex,
+    /// Its items, for search (requirement R-SR-1).
+    pub search: SearchIndex,
     /// What the data was made from: the SHA-256 of the JSON, or another key of 64 hex digits
     /// that changes with it. Empty when not known. Cursors are bound to it (requirement R-OUT-3).
     pub source: Box<str>,
@@ -36,9 +39,11 @@ impl Indexed {
     #[must_use]
     pub fn new(parsed: ParsedCrate) -> Self {
         let index = PathIndex::build(&parsed.krate);
+        let search = SearchIndex::build(&parsed.krate, &index);
         Self {
             parsed,
             index,
+            search,
             source: Box::default(),
         }
     }

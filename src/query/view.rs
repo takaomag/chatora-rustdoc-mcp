@@ -8,7 +8,7 @@ use elsa::FrozenMap;
 use rkyv::{Archived, rancor};
 use rustdoc_types::{ExternalCrate, Id, Item, ItemSummary};
 
-use super::{across::ArchivedIndexed, path_index::ArchivedPathIndex};
+use super::{across::ArchivedIndexed, path_index::ArchivedPathIndex, search::ArchivedSearchIndex};
 
 /// A crate and its public path index, read from their archive.
 pub struct CrateView<'a> {
@@ -49,6 +49,12 @@ impl<'a> CrateView<'a> {
     #[must_use]
     pub const fn root(&self) -> Id {
         native(&self.archived.parsed.krate.root)
+    }
+
+    /// The search index of the crate (requirement R-SR-1).
+    #[must_use]
+    pub const fn search_index(&self) -> &'a ArchivedSearchIndex {
+        &self.archived.search
     }
 
     /// What the data was made from (the SHA-256 of the JSON), or empty when not known.
@@ -155,7 +161,7 @@ pub(super) mod tests {
     use super::*;
     use crate::{
         data::rustdoc_json::ParsedCrate,
-        query::{across::Indexed, path_index::PathIndex},
+        query::{across::Indexed, path_index::PathIndex, search::SearchIndex},
     };
 
     /// `krate` and its index, archived as the cache keeps them.
@@ -167,6 +173,7 @@ pub(super) mod tests {
                 newer_than_supported: false,
             },
             source: "ab".repeat(32).into(),
+            search: SearchIndex::default(),
         };
         rkyv::to_bytes::<rancor::Error>(&indexed).expect("archived")
     }

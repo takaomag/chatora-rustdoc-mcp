@@ -35,10 +35,10 @@ const DEFAULT_DEPTH: usize = 3;
 const MAX_DEPTH: usize = 8;
 
 /// What every cursor starts with: the form of this server's cursors.
-const CURSOR_FORM: &str = "c1";
+pub(super) const CURSOR_FORM: &str = "c1";
 
 /// How to pass `cursor`, for `invalid_argument`.
-const CURSOR_EXAMPLE: &[&str] =
+pub(super) const CURSOR_EXAMPLE: &[&str] =
     &["pass the next_cursor of the previous page as it is, with the same other arguments"];
 
 /// How to pass `kind`, for `invalid_argument`.
@@ -253,7 +253,7 @@ pub(super) fn parse_arguments(
 }
 
 /// The kinds that `kind` asks for: none for all.
-fn parse_kinds(kind: Option<&Value>) -> Result<Box<[&'static str]>, InvalidArgument> {
+pub(super) fn parse_kinds(kind: Option<&Value>) -> Result<Box<[&'static str]>, InvalidArgument> {
     let names: Vec<&Value> = match kind {
         None => return Ok(Box::default()),
         Some(Value::Array(kinds)) => kinds.iter().collect(),
@@ -280,7 +280,7 @@ fn parse_kinds(kind: Option<&Value>) -> Result<Box<[&'static str]>, InvalidArgum
 /// The digest of the arguments but `cursor` and `limit`, which a cursor is bound to, so that it
 /// is not used for another list (requirement R-OUT-3). The order of the arguments does not
 /// matter.
-fn request_digest(arguments: Option<&JsonObject>) -> String {
+pub(super) fn request_digest(arguments: Option<&JsonObject>) -> String {
     let kept: BTreeMap<&str, &Value> = arguments
         .into_iter()
         .flatten()
@@ -294,7 +294,7 @@ fn request_digest(arguments: Option<&JsonObject>) -> String {
 
 /// The offset and the data digest of `cursor`, which must be one this tool made for these
 /// arguments: `c1.<request>.<data>.<offset>`.
-fn parse_cursor(
+pub(super) fn parse_cursor(
     cursor: &str,
     request_digest: &str,
 ) -> Result<(usize, Option<Box<str>>), InvalidArgument> {
@@ -307,7 +307,7 @@ fn parse_cursor(
         parts.next(),
     ) else {
         return Err(InvalidArgument::new(
-            "`cursor` is not a cursor of list_module",
+            "`cursor` is not a cursor of this tool",
             CURSOR_EXAMPLE,
         ));
     };
@@ -317,7 +317,7 @@ fn parse_cursor(
         .filter(|_| form == CURSOR_FORM && data.chars().all(|c| c.is_ascii_hexdigit()));
     let Some(offset) = offset else {
         return Err(InvalidArgument::new(
-            "`cursor` is not a cursor of list_module",
+            "`cursor` is not a cursor of this tool",
             CURSOR_EXAMPLE,
         ));
     };

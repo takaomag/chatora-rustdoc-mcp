@@ -34,6 +34,11 @@ const MAX_MODULE_VISITS: usize = 64;
 pub struct PublicPath(Box<[Box<str>]>);
 
 impl PublicPath {
+    /// The path written `path`, joined with `::`.
+    pub(super) fn parse(path: &str) -> Self {
+        Self(path.split("::").map(Into::into).collect())
+    }
+
     fn new(segments: &[&str]) -> Self {
         Self(segments.iter().map(|&segment| segment.into()).collect())
     }
@@ -224,6 +229,27 @@ impl PathIndex {
             external_globs,
             incomplete: walker.incomplete,
         }
+    }
+}
+
+impl PathIndex {
+    /// The canonical path of `id`, before archiving.
+    pub(super) fn canonical(&self, id: Id) -> Option<&PublicPath> {
+        self.paths_of.get(&id).and_then(|paths| paths.first())
+    }
+
+    /// The items with a public path, sorted by id, before archiving.
+    pub(super) fn public_ids(&self) -> Vec<Id> {
+        let mut ids: Vec<Id> = self.paths_of.keys().copied().collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        ids
+    }
+
+    /// The re-exports of other crates' items, sorted by path, before archiving.
+    pub(super) fn external_reexports(&self) -> Vec<&ExternalReexport> {
+        let mut reexports: Vec<&ExternalReexport> = self.external_reexports.values().collect();
+        reexports.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        reexports
     }
 }
 
@@ -780,7 +806,7 @@ pub fn own_impls<'v>(
 }
 
 /// The `impl`s that rustdoc lists for a type.
-fn impls_of(item: &Item) -> &[Id] {
+pub(super) fn impls_of(item: &Item) -> &[Id] {
     match &item.inner {
         ItemEnum::Struct(contents) => &contents.impls,
         ItemEnum::Enum(contents) => &contents.impls,

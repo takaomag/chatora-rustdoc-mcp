@@ -608,6 +608,20 @@ C3 を 2 つに分けた: C3a (`list_module` と一覧の共通の仕組み)、C
 - 実データ: tokio (このリポジトリの Cargo.lock の 1.53.3) は struct 162・function 73・module 37 など、モジュール 11 個にそれぞれ必要な feature、feature 26 個でプロジェクトで有効な 16 個。axum は `default` が有効にする 11 個。serde は `not_in_docs: [alloc]`。std はモジュール 60 余り・ルートの item 75 件で、残りを `list_module` に案内
 - テスト: 数・モジュール・item の並び、最初の 1 文の切り方、引数、説明文の長さ
 
+#### C4a (2026-10-20)
+
+利用者が決めた (推奨案): C4 を C4a (crate を指定した検索) と C4b (`crate` を省いたときのプロジェクトの直接依存の横断。`partial`・`sources`) に分ける。workspace の分は計画どおり M2。C4a の間は `crate` を省くと `invalid_argument`。
+
+- 索引 (R-TI-4 の「M1 で決める」の一部): アーカイブを作るときに検索の索引も作り、一緒に持つ (アーカイブのスキーマを 4 に上げた)。対象は、公開パスを持つ item、型のメンバー (固有の impl の item・trait の item・enum の variant。trait の impl の item は trait 側と重なるので除く)、他の crate からの re-export (名前とパスだけ。std の公開 item の多くは core・alloc の re-export なので、名前で引けるように)。std の unstable な item は除く (R-SR-4)。各 item について、トークンごとに名前・`doc(alias)`・ドキュメントの第 1 段落・残り・祖先のパス名 (近い順に 3・2・1) の出現数を持つ (`fields` で欄を選べるように)。コードブロックは索引しない。core では作り直しが初回に約 2.5 秒、アーカイブが 100MB から 113MB (+13%) になった
+- トークン: 語を丸ごとと、`_` と CamelCase の切れ目 (頭字語を含む。`HTTPServer` は `http`・`server`) で分けたもの。1 文字の部分は捨てる。最後の語を前方一致で展開しない (R-SR-3)
+- 順位 (R-SR-3。数値は初期案): 段の順に、パスの一致 (クエリが `sync::Mutex` のようなパスで、正準パスの末尾と一致)、名前の完全一致 (大文字小文字を除いて。語をつないだ名前 `unwrap or default` → `unwrap_or_default`・`hash map` → `HashMap` も)、最後の語の一致、別名の一致、部分一致。同じ段の中では大文字小文字まで一致するものが先。部分一致は BM25 (k1 = 1.2、b = 0、Lucene 型の IDF)。重みは名前 20・別名 10・第 1 段落 3・残り 1・祖先のパス名 3/2/1。被参照数 (intra-doc link の入次数) を `1 + 0.1 × ln(1 + n)` で掛け、`__`・`_private`・`internal` を含むパスは半分にする。並びは段、スコアを 1000 倍して丸めた値、パスの順で決定的にする (R-OUT-4)
+- 打ち切り (R-SR-4): `limit` を省くと、最初のページは部分一致より上の段の全部と、部分一致を、最上位の 5% 未満・直前の半分未満・それまでの累積が全体の 30% を超えた、のどれかで切ったところまで (少なくとも 1 件、多くて 50 件)。続きは `limit` が無ければ 20 件ずつ。カーソルは `list_module` と同じ形 (要求とデータのダイジェストに束縛)
+- 0 件のとき (R-SR-5): 名前との編集距離 (文字で数える) が 3 以下で、長いほうの 70% 以上が一致するものを、距離・名前の順に 5 件まで `did_you_mean` に返す (同じ名前ならメンバーでない短いパス)。似ていなければ返さない (R-PR-7)
+- 引数: `crate` (C4a では必須)・`query` (必須)・`version`・`project`・`target`・`fields` (`name`・`alias`・`docs`・`path`)・`kind`・`detail` (`brief` (既定。1 行のシグネチャ・cfg の注記・ドキュメントの最初の 1 文)・`normal`)・`limit` (最大 200)・`cursor`
+- 実データ: tokio で `Mutex` → `tokio::sync::Mutex`、`spawn blocking` → `tokio::task::spawn_blocking`、`timeout` → `tokio::time::timeout`、`read file to string` → `tokio::fs::read_to_string`、`Mutx` → `did_you_mean: [tokio::sync::Mutex]`。core で `Option map` → `Option::map`、`unwrap or default` → `Result::unwrap_or_default`・`Option::unwrap_or_default`。std の `average` (fields: alias) → 整数型の `midpoint`。2 回目からの検索は 0.01〜0.1 秒
+- 分かっている限り: std を検索しても、core・alloc の item のメンバー (`Vec::push` など) は出ない (std の JSON には名前とパスしか無いため)。std の仲間の横断は C4b で扱う。今の nightly の `HashMap` には `doc(alias = "dict")` が無い
+- テスト: トークンの分け方、名前の一致が上に来ること、メンバーと他の crate の re-export、別名、語をつないだ名前、`did_you_mean` (似ていなければ出さない)、最初のページの打ち切り、引数の誤り、stdio で合成の crate を検索すること
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

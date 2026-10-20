@@ -54,6 +54,7 @@ use crate::{
         list_module::{ListOptions, list_module},
         load,
         overview::crate_overview,
+        search::{Fields, SearchOptions, search_items},
         view::CrateView,
     },
 };
@@ -126,6 +127,22 @@ pub(super) enum What {
     List(Box<Listing>),
     /// The overview of the crate (`crate_overview`).
     Overview,
+    /// The items that match a query (`search_items`).
+    Search(Box<Searching>),
+}
+
+/// How `search_items` searches (requirements R-SR-1 to R-SR-5).
+#[derive(Debug, Clone)]
+pub(super) struct Searching {
+    pub(super) query: Box<str>,
+    pub(super) fields: Fields,
+    pub(super) kinds: Box<[&'static str]>,
+    pub(super) limit: Option<usize>,
+    pub(super) offset: usize,
+    /// What cursors start with: the form and the digest of the arguments.
+    pub(super) request_digest: Box<str>,
+    /// The digest of the data that the cursor was made for, when there is a cursor.
+    pub(super) cursor_data: Option<Box<str>>,
 }
 
 /// How `list_module` lists a module (requirements R-LS-1, R-LS-2 and R-OUT-3).
@@ -170,6 +187,25 @@ impl Arguments {
             shape: Shape {
                 detail,
                 what: What::List(Box::new(listing)),
+            },
+        }
+    }
+
+    /// The arguments of `search_items`: those that name a release, and how to search.
+    pub(super) fn for_search(
+        release: ReleaseArguments,
+        detail: Detail,
+        searching: Searching,
+    ) -> Self {
+        Self {
+            path: release.name.as_str().replace('-', "_").into(),
+            name: release.name,
+            version: release.version,
+            project: release.project,
+            target: release.target,
+            shape: Shape {
+                detail,
+                what: What::Search(Box::new(searching)),
             },
         }
     }
@@ -1817,6 +1853,20 @@ fn respond_in(
             let response = crate_overview(view, request).map_err(Failure::Item)?;
             return serde_json::to_value(&response).map_err(Failure::Serialize);
         },
+        What::Search(searching) => {
+            let kinds: Vec<&str> = searching.kinds.to_vec();
+            let response = search_items(view, request, SearchOptions {
+                query: &searching.query,
+                fields: searching.fields,
+                kinds: &kinds,
+                limit: searching.limit,
+                offset: searching.offset,
+                cursor_request: &searching.request_digest,
+                cursor_data: searching.cursor_data.as_deref(),
+            })
+            .map_err(Failure::Item)?;
+            return serde_json::to_value(&response).map_err(Failure::Serialize);
+        },
         What::List(listing) => listing,
     };
     let kinds: Vec<&str> = listing.kinds.to_vec();
@@ -2027,7 +2077,7 @@ fn item_error(arguments: &Request, error: &GetItemError) -> CallToolResult {
             "code": "invalid_argument",
             "message": format!("the cursor does not fit: {why}"),
             "retryable": false,
-            "suggestions": ["call list_module again without cursor"],
+            "suggestions": ["call the tool again without cursor"],
         })),
         GetItemError::Ambiguous { candidates } => error_result(&json!({
             "code": "ambiguous_path",
