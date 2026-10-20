@@ -9,6 +9,8 @@
     reason = "an integration test uses only some of the package's dependencies"
 )]
 
+#[cfg(feature = "local")]
+mod build_scope;
 #[path = "../common/git.rs"]
 mod git;
 #[cfg(feature = "local")]

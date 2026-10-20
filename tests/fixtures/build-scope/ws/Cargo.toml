@@ -1,0 +1,7 @@
+# The workspace of the scope of the local builds (doc/m2-plan.md B7). The test copies it and sets
+# `resolver` to "1" and "2". `helper` is a member that the proc-macro member `macros` uses, and
+# `bhelper` one that `app` uses as a build-dependency: both are built for the target and for the
+# host. The crates in ../deps are path dependencies outside the workspace, of each kind.
+[workspace]
+members = ["app", "helper", "bhelper", "macros"]
+resolver = "2"

@@ -76,6 +76,45 @@ impl Isolated {
     }
 }
 
+/// The environment variable that tells a test run by [`in_isolated_child`] where its isolated
+/// directory is.
+const ISOLATED_DIR: &str = "CHATORA_RUSTDOC_TEST_ISOLATED_DIR";
+
+/// Runs the test `name` (its path in the test binary, as `module::test`) again, alone, in a child
+/// process in a new [`Isolated`] environment: for a test that calls the library, which starts
+/// cargo in the environment of its own process. In that child, it returns the directory of the
+/// environment, for the test's projects, and the test goes on. In the test itself, it waits for
+/// the child, fails if the child fails, and returns `None`.
+#[cfg_attr(
+    not(feature = "local"),
+    expect(
+        dead_code,
+        reason = "only the tests of local features call the library's cargo"
+    )
+)]
+pub(crate) fn in_isolated_child(name: &str) -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(ISOLATED_DIR) {
+        return Some(PathBuf::from(dir));
+    }
+    let isolated = Isolated::new();
+    let binary = std::env::current_exe().expect("the test binary");
+    let output = isolated
+        .apply(&mut Command::new(binary))
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env(ISOLATED_DIR, isolated.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the test binary runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // A name that matches no test passes, too.
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{name} in an isolated child:\n{stdout}\n{stderr}"
+    );
+    None
+}
+
 /// Whether the variable `name` of the test's environment is kept from the children.
 fn is_removed(name: &OsString) -> bool {
     let name = name.to_string_lossy();

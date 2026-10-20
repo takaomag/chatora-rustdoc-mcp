@@ -383,6 +383,18 @@ Claude Code 2.1.304、Linux で測った。
 - static.crates.io からの取得がダウンロード数に数えられるか (レビュアーが挙げた件): crates.io は 2024-03 から static.crates.io の CDN のログでダウンロードを数え ([crates.io: Download changes](https://blog.rust-lang.org/2024/03/11/crates-io-download-changes/))、2025-10-29 に cargo の User-Agent の要求だけを数えるようにした ([rust-lang/crates.io#12210](https://github.com/rust-lang/crates.io/pull/12210))。このサーバーは自分の User-Agent (`chatora-rustdoc-mcp/<版> (+<リポジトリ>)`。R-NW-1) を送るので、数えられない。README の通信の節に書いた
 - テスト: cargo のキャッシュに置いた `.crate` を、オフラインの (要求すればエラーになる) クライアントが読めること、checksum の合わないものは使わないこと
 
+**B7 (ビルドの範囲の判定。2026-10-20、cargo 1.99.1)**:
+
+- `--target` を付けない形での M0 の再確認 (Q-31): M0 の合成の workspace とこのリポジトリで、M0 と同じ結論になった。`cargo tree -e normal` の出力は `--target <host>` の有無で同じ。`cargo rustdoc -p app --lib` の feature の組も M0 と同じで、resolver 2 では `--target` が無くても host 用と target 用を別の unit にする。`-p` で依存を名指しすると、resolver 2 では dev だけ・build だけ・ほかの target だけ・proc-macro の下だけの依存で panic し、resolver 1 ではすべて通る (B3・B7-9)。`RUSTC_BOOTSTRAP` の値を固定すれば、依存を 2 つ文書化した後の member の作り直しは 1 unit (B1)。dep-info は `<target dir>/doc/<crate>.d` に出て、`#[cfg(docsrs)]` のときだけ読むファイルも載る (B5。`--target` を付けると `<triple>/doc/`)
+- `cargo tree` の形:
+  - build と dev の辺は、`--prefix indent` の見出し (`[build-dependencies]`・`[dev-dependencies]`) にしか出ない。`--prefix depth` では出ないので、範囲の判定は indent の形を読む (`data::cargo_tree`)。見出しは、その子を持つ行と同じ深さの字下げで出る
+  - `{p}` の取得元: crates.io は無し、path は `(<ディレクトリ>)`、git は `(<URL>?<参照>#<commit の先頭 8 桁>)`、別のレジストリは ``(registry `<設定での名前>`)``。名前と版が同じで取得元だけ違う package は実際にある (同じリポジトリの branch と tag) ので、`cargo metadata` の package id への対応付けは、名前と版で 1 つに決まらなければ取得元でも照合し、それでも決まらなければ範囲を判定できないものとする
+- member の根が 2 つ出る件: proc-macro (member を含む) や build-dependency として使われる member は、`--workspace` の木で target 用と host 用の 2 つの根になり、出力からはどちらがどちらか分からない (並びは cargo が node を足した順で、dedupe の `(*)` もその順で決まる)。位置だけで判定すると host 用の部分木を target 用と誤る。その member だけ `-i <id> --no-dedupe` の逆向きの木を取り、根の下に proc-macro の行か `[build-dependencies]` の見出しがあれば host 用とする (target 用の node をたどった先はどちらにも行き着かない)。逆向きの木の根の並びと feature の組は順向きの木と同じだったので、順に対応付け、合わなければ範囲を判定できないものとする。`--no-dedupe` を順向きの木に使わないのは、このリポジトリでも 476 行が 6,545 行 (380 KB) になったため
+- 名指しできる依存 (resolver 2 以上) の境目を測った: build の依存の下の proc-macro は名指しでき、build の依存の lib、dev の依存の先の依存、dev の feature でだけ有効になる optional の依存は panic した。そこで、dev を含まない解決 (`-e normal,build`) で target 用に出る package と proc-macro を名指しできるものとした。proc-macro の member の下の依存は、cargo は名指しできる (要求した proc-macro の member の依存の feature を target 用にも有効にする) が、`cargo check --all-targets` は host 用にしか作らないので、安全側に倒して名指しできないものとした。多くは crates.io の crate (syn など) で docs.rs に JSON がある
+- `data::build_scope`: `Resolver::scope(workspace, target)` が `BuildScope` を返し、package id ごとに `ForTarget`・`ForHost`・`Unnameable` (`build_unsupported`)・`NotBuilt` を答える。`cargo tree` の起動は 2 回 (member の根が 2 つ出るときは 3 回)。`cargo metadata` の結果と一緒に target ごとに保持し、feature の組と同じく合流と失敗の保持をする。resolver の版は、ルートの Cargo.toml の `resolver` (`[workspace]` か `[package]`)、無ければルートの package の edition (2021 以降なら 2 以上)、仮想 workspace で無ければ 1 として読む。照会のツールにつなぐのは D7
+- テスト (`tests/local/build_scope.rs`、fixture は `tests/fixtures/build-scope/`): resolver 1 と 2 の workspace (proc-macro の member が使う member、build の依存の member、OS ごとの依存、dev だけ・build だけ・proc-macro の下だけの依存) で、範囲 (package と host 用か target 用か) が `cargo check --workspace --all-targets --target <host>` の作る unit と一致すること、名指しできるかの判定が `cargo rustdoc -p` の panic の有無と一致すること (proc-macro の member の下の依存だけは上のとおり安全側に違う)、wasm32 では wasm32 だけの依存が範囲に入ることを確かめる。ライブラリが cargo をテストのプロセスの環境で起動するので、テストのバイナリをこのテストだけ隔離した環境の子として起動し直す (`isolated::in_isolated_child`)
+- feature の組 (`data::features`) の、同じ package が host 用と target 用の両方の根に出るときの選び方 (M1 の B5d) は変えていない。上の逆向きの木で正確にできるが、D3 で feature の組を見直すときに合わせる
+
 ### 6.4 M2c
 
 (まだ無い)
@@ -408,6 +420,7 @@ Claude Code 2.1.304、Linux で測った。
    - R-MCP-3 のサブディレクトリでの起動 (git の作業ツリーの中で上へ探す。直下の子の workspace も作業ツリーのルートまで上を見る。§6.2 の A2)
    - Q-29・Q-31 の答え (§4 の各行)
    - R-WS-7 の照合の一覧: git の無いタグとブランチの `failed to find tag`・`failed to find branch` (B5)。cargo に `CARGO_TERM_COLOR=never` を渡すこと (B2)
+   - R-MCP-3・R-WS-5・R-FT-2 の範囲の判定 (B7): `--target` を付けない形でも M0 と同じだったこと (「付けない形での再確認は M2」の文を改める)。`--prefix indent` の見出しで辺の種類を読むこと、2 つ出る member の根を逆向きの木で決めること、取得元での対応付け、名指しできる依存の定め方 (dev を含まない解決で target 用か proc-macro) と、proc-macro の member の下の依存を安全側に名指しできないとすること
    - §8: `local_build_required` の扱い (M2 で使われなくなるか)、ビルドの状態の値 (R-OUT-9)
    - R-SC-4 の `readme` の扱いを M3 に送る
    - §12 の M2 の到達点と、M3 以降に回したもの

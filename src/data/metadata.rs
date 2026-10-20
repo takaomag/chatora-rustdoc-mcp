@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 
 use super::{
     blocking,
+    build_scope::{self, BuildScope, ScopeError},
     cargo::{self, Failure, RunError},
     cargo_config,
     cargo_lock::CargoLock,
@@ -212,11 +213,13 @@ struct Kept {
     at: Instant,
     /// The feature sets from `cargo tree`, or why they are not known, by target, and when. The
     /// same inputs decide them. Held while `cargo tree` runs, so that it runs once.
-    features: Mutex<HashMap<TargetTriple, (Instant, Features)>>,
+    features: PerTarget<FeatureSets, FeaturesError>,
+    /// The scopes of the local builds from `cargo tree`, as the feature sets.
+    scopes: PerTarget<BuildScope, ScopeError>,
 }
 
-/// The feature sets, or why they are not known.
-type Features = Result<Arc<FeatureSets>, Arc<FeaturesError>>;
+/// Results by target, and when each was made.
+type PerTarget<T, E> = Mutex<HashMap<TargetTriple, (Instant, Result<Arc<T>, Arc<E>>)>>;
 
 impl Kept {
     /// Whether the result may be given again: a success while its inputs stay the same, and a
@@ -336,6 +339,7 @@ impl Resolver {
                         resolution: Arc::clone(&resolution),
                         at: Instant::now(),
                         features: Mutex::new(HashMap::new()),
+                        scopes: Mutex::new(HashMap::new()),
                     }),
                 );
             },
@@ -372,25 +376,56 @@ impl Resolver {
             .filter(|kept| Arc::ptr_eq(&kept.resolution, &resolution))
             .cloned();
         let offline = self.offline_in(&workspace.root).await;
-        let read = async || {
+        let read = async {
             features::read(&workspace.root, offline, target)
                 .await
                 .map(Arc::new)
                 .map_err(|error| Arc::new(FeaturesError::Cargo(error)))
         };
-        let Some(kept) = kept else {
-            return read().await;
-        };
-        // Held while `cargo tree` runs, so that the calls at the same time run it once.
-        let mut sets = kept.features.lock().await;
-        if let Some((at, sets)) = sets.get(target)
-            && (sets.is_ok() || at.elapsed() < FAILURE_TTL)
-        {
-            return sets.clone();
+        match kept {
+            Some(kept) => per_target(&kept.features, target, read).await,
+            None => read.await,
         }
-        let read = read().await;
-        sets.insert(target.clone(), (Instant::now(), read.clone()));
-        read
+    }
+
+    /// Which packages the query tools may build locally for `target`, an actual build target of
+    /// `workspace`, the default project (requirement R-MCP-3). It is kept as the feature sets
+    /// are.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the packages cannot be resolved by `cargo metadata`, or `cargo tree`
+    /// fails or does not tell the scope (`scope_unknown`).
+    pub async fn scope(
+        &self,
+        workspace: &Workspace,
+        target: &TargetTriple,
+    ) -> Result<Arc<BuildScope>, Arc<ScopeError>> {
+        let resolution = self
+            .resolve(workspace)
+            .await
+            .map_err(|error| Arc::new(error.into()))?;
+        let Resolution::Metadata { metadata, .. } = &*resolution else {
+            return Err(Arc::new(ScopeError::NoMetadata));
+        };
+        let kept = self
+            .kept
+            .lock()
+            .await
+            .get(&workspace.root)
+            .filter(|kept| Arc::ptr_eq(&kept.resolution, &resolution))
+            .cloned();
+        let offline = self.offline_in(&workspace.root).await;
+        let read = async {
+            build_scope::read(&workspace.root, offline, target, metadata)
+                .await
+                .map(Arc::new)
+                .map_err(Arc::new)
+        };
+        match kept {
+            Some(kept) => per_target(&kept.scopes, target, read).await,
+            None => read.await,
+        }
     }
 
     /// Whether cargo is offline in `root`: run with `--offline` (requirement R-CA-7), or with
@@ -472,6 +507,25 @@ impl Resolver {
         files.dedup();
         files
     }
+}
+
+/// The result for `target` in `results`, kept while it is a success, and a failure for
+/// [`FAILURE_TTL`], or else `read`'s, kept. `read` runs only then, and the lock is held while it
+/// does, so that the calls at the same time run cargo once.
+async fn per_target<T: Send + Sync, E: Send + Sync>(
+    results: &PerTarget<T, E>,
+    target: &TargetTriple,
+    read: impl Future<Output = Result<Arc<T>, Arc<E>>> + Send,
+) -> Result<Arc<T>, Arc<E>> {
+    let mut results = results.lock().await;
+    if let Some((at, result)) = results.get(target)
+        && (result.is_ok() || at.elapsed() < FAILURE_TTL)
+    {
+        return result.clone();
+    }
+    let result = read.await;
+    results.insert(target.clone(), (Instant::now(), result.clone()));
+    result
 }
 
 /// `files` with those that cargo's settings for the workspace at `root` include (Q-31), sorted.

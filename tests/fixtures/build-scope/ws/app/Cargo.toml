@@ -1,0 +1,22 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+shared = { path = "../../deps/shared", features = ["normal"] }
+helper = { path = "../helper" }
+macros = { path = "../macros" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasmonly = { path = "../../deps/wasmonly" }
+
+[build-dependencies]
+shared = { path = "../../deps/shared", features = ["build"] }
+buildonly = { path = "../../deps/buildonly" }
+bhelper = { path = "../bhelper" }
+
+[dev-dependencies]
+shared = { path = "../../deps/shared", features = ["dev"] }
+devonly = { path = "../../deps/devonly" }

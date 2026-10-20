@@ -1,6 +1,8 @@
 //! Data layer: fetches rustdoc JSON, normalizes its format version, and caches it.
 
 pub mod archive;
+#[cfg(feature = "local")]
+pub mod build_scope;
 pub mod cache;
 #[cfg(feature = "local")]
 pub mod cargo;
@@ -8,6 +10,8 @@ pub mod cargo;
 pub mod cargo_config;
 #[cfg(feature = "local")]
 pub mod cargo_lock;
+#[cfg(feature = "local")]
+mod cargo_tree;
 #[cfg(feature = "local")]
 pub mod child;
 pub mod crate_file;
