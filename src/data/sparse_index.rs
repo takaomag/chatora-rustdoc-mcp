@@ -57,6 +57,8 @@ pub struct SparseIndex {
     ttl: Duration,
     /// The crates found missing from the index, by the name asked for, and when.
     missing: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Whether no request may be sent (`network.offline`, requirement R-CA-7).
+    offline: bool,
 }
 
 /// The index entry of a crate.
@@ -69,9 +71,20 @@ pub struct IndexEntry {
     pub versions: Box<[IndexVersion]>,
     /// When the index file was fetched or last confirmed unchanged.
     pub fetched_at: SystemTime,
-    /// Why a file in the cache older than the TTL was used: the index could not be reached. The
-    /// latest versions may be missing from it.
+    /// Why a file in the cache older than the TTL was used: the index could not be reached, or the
+    /// server is offline. The latest versions may be missing from it.
     pub stale: Option<Box<str>>,
+}
+
+impl IndexEntry {
+    /// When the index file was fetched, in RFC 3339, if it is [`Self::stale`]: for the provenance
+    /// (requirement R-CA-7).
+    #[must_use]
+    pub fn stale_since(&self) -> Option<Box<str>> {
+        self.stale
+            .as_ref()
+            .map(|_| super::rfc3339(self.fetched_at).into())
+    }
 }
 
 /// One published version of a crate.
@@ -120,6 +133,10 @@ pub enum IndexError {
     /// The cached index file could not be read or written.
     #[error("the cache of the crates.io index could not be used")]
     Cache(#[source] io::Error),
+    /// No request may be sent (`network.offline`), and the cache does not have the crate
+    /// (requirement R-CA-7).
+    #[error("the server is offline (network.offline), and the cache does not have the crate")]
+    Offline,
 }
 
 /// A line of an index file that could not be parsed.
@@ -204,6 +221,7 @@ impl SparseIndex {
             cache,
             ttl: TTL,
             missing: Arc::default(),
+            offline: network.offline,
         })
     }
 
@@ -219,7 +237,14 @@ impl SparseIndex {
             cache,
             ttl,
             missing: Arc::default(),
+            offline: false,
         }
+    }
+
+    /// Whether no request may be sent (`network.offline`, requirement R-CA-7).
+    #[must_use]
+    pub const fn is_offline(&self) -> bool {
+        self.offline
     }
 
     /// The index entry of the crate `name`, which may be spelled with `-` and `_` swapped or in
@@ -239,11 +264,17 @@ impl SparseIndex {
         {
             return Err(IndexError::NotFound);
         }
+        let mut offline = false;
         for spelling in spellings(name) {
             match self.entry_at(&spelling).await {
                 Err(IndexError::NotFound) => {},
+                Err(IndexError::Offline) => offline = true,
                 found => return found,
             }
+        }
+        // Offline, the crate is not known to be missing.
+        if offline {
+            return Err(IndexError::Offline);
         }
         let mut missing = self.missing.lock();
         missing.retain(|_, at| at.elapsed() < MISSING_TTL);
@@ -272,25 +303,35 @@ impl SparseIndex {
             }
         }
 
-        let fetched = self
-            .fetch(name, cached.as_ref(), body_path, record_path, now)
-            .await;
+        let fetched = if self.offline {
+            Err(IndexError::Offline)
+        } else {
+            self.fetch(name, cached.as_ref(), body_path, record_path, now)
+                .await
+        };
         match (fetched, cached) {
-            // The index cannot be reached: the file in the cache is used, however old.
+            // The index cannot be reached, or may not be: the file in the cache is used, however
+            // old (requirements R-CA-3 and R-CA-7).
             (
                 Err(
                     error @ (IndexError::Network(_)
                     | IndexError::Transient { .. }
-                    | IndexError::UnexpectedStatus { .. }),
+                    | IndexError::UnexpectedStatus { .. }
+                    | IndexError::Offline),
                 ),
                 Some(cached),
             ) => {
                 let fetched_at = system_time(cached.record.fetched_at);
                 let mut entry = parse(&cached.body, fetched_at).map_err(IndexError::Malformed)?;
+                let why = if matches!(error, IndexError::Offline) {
+                    "the server is offline (network.offline)".to_owned()
+                } else {
+                    format!("the crates.io index could not be reached ({error})")
+                };
                 entry.stale = Some(
                     format!(
-                        "the crates.io index could not be reached ({error}), so the versions are \
-                         those it listed when it was last read; newer ones may be missing"
+                        "{why}, so the versions are those the index listed when it was last \
+                         read; newer ones may be missing"
                     )
                     .into(),
                 );
@@ -634,6 +675,32 @@ mod tests {
             "{:?}",
             stale.stale
         );
+    }
+
+    /// Offline, the cached file is used however old, and a crate that is not cached is not taken
+    /// as missing from the index (requirement R-CA-7).
+    #[tokio::test]
+    async fn offline_the_cached_file_is_used_and_nothing_is_asked() {
+        let (mut index, requests, _dir) = index(vec![ok(SERDE_INDEX, "\"v1\"")], Duration::ZERO);
+        let fresh = index.entry(&name("serde")).await.expect("found");
+        assert_eq!(requests.iter().take(1).count(), 1);
+        index.offline = true;
+        let stale = index.entry(&name("serde")).await.expect("from the cache");
+        assert_eq!(stale.versions, fresh.versions);
+        assert!(
+            stale
+                .stale
+                .as_deref()
+                .is_some_and(|why| why.contains("offline (network.offline)")),
+            "{:?}",
+            stale.stale
+        );
+        assert!(matches!(
+            index.entry(&name("tokio")).await,
+            Err(IndexError::Offline)
+        ));
+        assert!(index.missing.lock().is_empty(), "not remembered as missing");
+        assert!(requests.try_recv().is_err(), "nothing was asked offline");
     }
 
     #[tokio::test]

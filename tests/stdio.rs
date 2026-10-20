@@ -1120,3 +1120,146 @@ fn the_config_file_is_read_and_its_problems_are_logged() {
     }
     assert!(server.finish().success());
 }
+
+/// Offline, what the cache has is looked up, and what it lacks is `offline_miss` with the
+/// versions the cache has, without asking any source. The index in the cache is used however
+/// old, with when it was read (requirement R-CA-7).
+#[test]
+fn offline_the_cache_answers_and_what_it_lacks_is_an_offline_miss() {
+    let mut server = Server::start_with(None, &[("CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE", "true")]);
+    write_old_demo_index(&server);
+
+    let get_item = |id, krate: &str| {
+        call_tool(
+            id,
+            "get_item",
+            json!({ "crate": krate, "path": "hello", "target": TARGET }),
+        )
+    };
+    server.send(&get_item(1, "demo"));
+    let found = server.response(1)["result"]["structuredContent"].clone();
+    assert_eq!(found["provenance"]["version"], "0.1.0", "{found}");
+    assert_eq!(
+        found["provenance"]["index_fetched_at"], "2023-11-14T22:13:20Z",
+        "{found}"
+    );
+    assert!(
+        found["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("offline (network.offline)")))),
+        "{found}"
+    );
+
+    server.send(&get_item(2, "demo@0.2.0"));
+    let missed = text_json(&server.response(2)["result"]);
+    assert_eq!(missed["code"], "offline_miss", "{missed}");
+    assert_eq!(missed["retryable"], false);
+    assert!(
+        missed["suggestions"][0]
+            .as_str()
+            .is_some_and(|suggestion| suggestion.contains("demo@0.1.0")),
+        "{missed}"
+    );
+    server.send(&get_item(3, "uncached"));
+    let unresolved = text_json(&server.response(3)["result"]);
+    assert_eq!(unresolved["code"], "offline_miss", "{unresolved}");
+
+    server.send(&call_tool(4, "resolve_version", json!({ "crate": "demo" })));
+    let resolved = server.response(4)["result"]["structuredContent"].clone();
+    assert_eq!(
+        resolved["provenance"]["index_fetched_at"], "2023-11-14T22:13:20Z",
+        "{resolved}"
+    );
+    assert!(server.finish().success());
+}
+
+/// The URL of a proxy on this machine that answers every request, `CONNECT` included, with 503.
+fn refusing_proxy() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port is free");
+    let url = format!("http://{}", listener.local_addr().expect("bound"));
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|read| read > 0) && line != "\r\n" {
+                line.clear();
+            }
+            // The client's failure is what the test waits for.
+            let _written = reader.into_inner().write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    url
+}
+
+/// Puts in the server's cache the crates.io index file of `demo`, which lists only 0.1.0, as read
+/// long ago (2023-11-14T22:13:20Z), past its TTL.
+fn write_old_demo_index(server: &Server) {
+    let index = server.cache.path().join("index.crates.io/de/mo/demo");
+    std::fs::create_dir_all(index.parent().expect("a parent")).expect("made");
+    let line = json!({
+        "name": "demo",
+        "vers": "0.1.0",
+        "deps": [],
+        "cksum": sha256_hex(&demo_crate_file()),
+        "features": {},
+        "yanked": false,
+    });
+    std::fs::write(&index, format!("{line}\n")).expect("written");
+    std::fs::write(
+        index.with_file_name("demo.meta.json"),
+        json!({ "etag": null, "last_modified": null, "fetched_at": 1_700_000_000 }).to_string(),
+    )
+    .expect("written");
+}
+
+/// Online, when the index cannot be reached, the old index file in the cache is used, and a
+/// version that it does not list is a transient `network_error`, not `version_not_found`: it may
+/// have come after the file was read (requirement R-CA-3).
+#[test]
+fn a_version_missing_from_an_old_index_that_cannot_be_refreshed_is_a_network_error() {
+    // Every request goes to a proxy on this machine that refuses them all at once, so the index
+    // cannot be reached on any OS without waiting, and nothing leaves the machine.
+    let unreachable = refusing_proxy();
+    let unreachable = unreachable.as_str();
+    let mut server = Server::start_with(None, &[
+        ("HTTPS_PROXY", unreachable),
+        ("https_proxy", unreachable),
+        ("ALL_PROXY", unreachable),
+        ("all_proxy", unreachable),
+        ("NO_PROXY", ""),
+        ("no_proxy", ""),
+    ]);
+    write_old_demo_index(&server);
+    server.send(&call_tool(
+        1,
+        "resolve_version",
+        json!({ "crate": "demo@0.2.0" }),
+    ));
+    let missed = text_json(&server.response(1)["result"]);
+    assert_eq!(missed["code"], "network_error", "{missed}");
+    assert_eq!(missed["retryable"], true, "{missed}");
+    assert!(
+        missed["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("could not be reached")),
+        "{missed}"
+    );
+    // A version that the old file lists is answered from it, with when it was read.
+    server.send(&call_tool(
+        2,
+        "resolve_version",
+        json!({ "crate": "demo@0.1.0" }),
+    ));
+    let found = server.response(2)["result"]["structuredContent"].clone();
+    assert_eq!(found["data"]["version"], "0.1.0", "{found}");
+    assert_eq!(
+        found["provenance"]["index_fetched_at"], "2023-11-14T22:13:20Z",
+        "{found}"
+    );
+    assert!(server.finish().success());
+}

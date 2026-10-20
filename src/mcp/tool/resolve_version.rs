@@ -88,6 +88,11 @@ fn output_schema() -> JsonObject {
                         "type": "string",
                         "enum": ["argument", "claude_project_dir", "cwd"],
                     },
+                    "index_fetched_at": {
+                        "type": "string",
+                        "description": "When the crates.io index was read (RFC 3339), when it \
+                                        was older than it is trusted for, as offline.",
+                    },
                     "target": { "type": "string" },
                 },
                 "required": ["source", "crate", "version", "target"],
@@ -225,13 +230,15 @@ async fn from_crates_io(
 ) -> CallToolResult {
     let entry = match state.index.entry(&name).await {
         Ok(entry) => entry,
-        Err(error) => return get_item::index_error(&name, &error),
+        Err(error) => return get_item::index_error(&state.cache, &name, &error),
     };
     warnings.extend(entry.stale.clone());
     let spec = &decided.spec;
     let resolved = match spec.resolve(&entry.versions) {
         Ok(resolved) => resolved,
-        Err(no_version) => return get_item::version_not_found(&entry.name, spec, &no_version),
+        Err(no_version) => {
+            return get_item::version_not_found(state, &entry, spec, &no_version);
+        },
     };
     warnings.extend(resolved.warnings.into_iter().map(Into::into));
     let found = resolved.version;
@@ -279,6 +286,7 @@ async fn from_crates_io(
             "version": found.version.to_string(),
             "resolved_from": resolved_from,
             "project_from": project_from,
+            "index_fetched_at": entry.stale_since(),
             "target": target.as_str(),
         }),
         Value::Object(data),

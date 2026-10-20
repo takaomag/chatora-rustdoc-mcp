@@ -34,6 +34,8 @@ pub struct DocsRs {
     client: reqwest::Client,
     // `Arc` so that cloning the client does not copy the URL (`reqwest::Client` is an `Arc` too).
     base_url: Arc<str>,
+    /// Whether no request may be sent (`network.offline`, requirement R-CA-7).
+    offline: bool,
     /// Places for the fetches of rustdoc JSON at once, at most [`MAX_FETCHES`].
     fetches: Arc<Semaphore>,
 }
@@ -85,6 +87,10 @@ pub enum FetchError {
     /// A zstd layer could not be decompressed.
     #[error("the rustdoc JSON could not be decompressed")]
     Corrupt(#[source] std::io::Error),
+    /// No request may be sent (`network.offline`), and the cache does not have it (requirement
+    /// R-CA-7).
+    #[error("the server is offline (network.offline), and the cache does not have it")]
+    Offline,
 }
 
 impl DocsRs {
@@ -107,8 +113,16 @@ impl DocsRs {
         Ok(Self {
             client: http::client_builder(network).build()?,
             base_url: base_url.into(),
+            offline: network.offline,
             fetches: Arc::new(Semaphore::new(MAX_FETCHES)),
         })
+    }
+
+    /// The client offline (`network.offline`).
+    #[cfg(test)]
+    pub(super) const fn offline(mut self) -> Self {
+        self.offline = true;
+        self
     }
 
     /// A client for a test server on this machine, which bypasses any proxy that the environment
@@ -121,6 +135,7 @@ impl DocsRs {
                 .build()
                 .expect("the client builds"),
             base_url: base_url.into(),
+            offline: false,
             fetches: Arc::new(Semaphore::new(MAX_FETCHES)),
         }
     }
@@ -149,6 +164,9 @@ impl DocsRs {
         let place = self.fetches.acquire().await.map_err(|_closed| {
             FetchError::Corrupt(std::io::Error::other("the fetches were shut down"))
         })?;
+        if self.offline {
+            return Err(FetchError::Offline);
+        }
         let mut response = http::send(self.client.get(&url))
             .await
             .map_err(network_error)?;
@@ -203,6 +221,9 @@ impl DocsRs {
 
     /// Whether docs.rs answers `HEAD` of `url` with 200 rather than 404.
     async fn has_json_at(&self, url: &str) -> Result<bool, FetchError> {
+        if self.offline {
+            return Err(FetchError::Offline);
+        }
         let response = http::send(self.client.head(url))
             .await
             .map_err(network_error)?;

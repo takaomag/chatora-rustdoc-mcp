@@ -356,7 +356,12 @@ async fn load_release(
         {
             Ok(loaded) => loaded,
             Err(error) => {
-                let result = get_item::load_error_of(&format!("{name}@{version}"), &error);
+                let result = get_item::load_error_of(
+                    &state.cache,
+                    name,
+                    &format!("{name}@{version}"),
+                    &error,
+                );
                 return Outcome::Failed(failure_of(&result));
             },
         };

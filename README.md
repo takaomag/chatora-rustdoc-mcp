@@ -91,6 +91,7 @@ and in the environment as `CHATORA_RUSTDOC_MCP_LOG__DIR`: the key in capitals, w
 | `log.total_max_size` | `"50MB"` | The size of all files together |
 | `log.filter` | `"info"` | Which lines stderr gets, in [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax; if any part is not valid, the default is used. The log file is not filtered |
 | `network.connect_timeout_secs` | `10` | How long a connection to docs.rs and the other sources may take |
+| `network.offline` | `false` | Whether the server is offline: it sends no request, uses only what the cache has (the crates.io index however old, with a warning), runs cargo with `--offline`, and answers `offline_miss` for what the cache lacks |
 | `network.read_timeout_secs` | `120` | How long a response may stay silent while it is received (not a limit on the whole transfer) |
 | `std.fetch_from_dist` | `true` | Whether the standard library may be downloaded from static.rust-lang.org; with `false`, only a nightly toolchain with `rust-docs-json` installed here gives it, even one older than the project's toolchain |
 

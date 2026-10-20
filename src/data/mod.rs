@@ -298,10 +298,11 @@ pub async fn docs_rs_json(
                 | FetchError::UnexpectedStatus { .. }
                 | FetchError::Network(_)
                 | FetchError::Certificate(_) => Some(MissKind::Transient),
-                // A broken body may be fetched whole next time.
+                // A broken body may be fetched whole next time, and offline nothing was asked.
                 FetchError::TooLarge { .. }
                 | FetchError::TooManyLayers
-                | FetchError::Corrupt(_) => None,
+                | FetchError::Corrupt(_)
+                | FetchError::Offline => None,
             };
             if let Some(kind) = kind {
                 remember_miss(&dir, kind).await;
@@ -368,10 +369,12 @@ pub async fn docs_rs_json_in_another_format(
             | FetchError::TooLarge { .. }
             | FetchError::TooManyLayers
             | FetchError::Corrupt(_) => {},
+            // Offline, no format was looked for, so none is known to be missing.
             FetchError::Transient { .. }
             | FetchError::UnexpectedStatus { .. }
             | FetchError::Network(_)
-            | FetchError::Certificate(_) => transient = Some(error),
+            | FetchError::Certificate(_)
+            | FetchError::Offline => transient = Some(error),
         }
     }
     if let Some(error) = transient {
@@ -563,6 +566,32 @@ where
 {
     let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
     text.parse().map_err(serde::de::Error::custom)
+}
+
+/// `time` in RFC 3339 and UTC, to the second: `2026-10-20T01:02:03Z`. A time before the Unix
+/// epoch is the epoch.
+#[must_use]
+pub fn rfc3339(time: SystemTime) -> String {
+    const DAY: u64 = 24 * 60 * 60;
+    let seconds = unix_seconds(time);
+    let (days, of_day) = (
+        seconds.checked_div(DAY).unwrap_or_default(),
+        seconds.checked_rem(DAY).unwrap_or_default(),
+    );
+    let (year, month, day) = i64::try_from(days)
+        .ok()
+        .and_then(std_json::civil_from_days)
+        .unwrap_or((1970, 1, 1));
+    let (hour, minute, second) = (
+        of_day.checked_div(3600).unwrap_or_default(),
+        of_day
+            .checked_rem(3600)
+            .unwrap_or_default()
+            .checked_div(60)
+            .unwrap_or_default(),
+        of_day.checked_rem(60).unwrap_or_default(),
+    );
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// Seconds since the Unix epoch, or 0 for a time before it.
@@ -807,6 +836,38 @@ mod tests {
         }
         // The second load did not ask docs.rs again.
         assert_eq!(requests.iter().count(), 1);
+    }
+
+    /// Offline, docs.rs is not asked: the cache still gives what it has, and what it lacks is not
+    /// remembered as missing (requirement R-CA-7).
+    #[tokio::test]
+    async fn offline_only_the_cache_is_read_and_nothing_is_remembered() {
+        let (cache, docs_rs, requests, _dir) = setup(vec![ok(SERDE_61)]);
+        let (name, version) = serde();
+        docs_rs_json(&cache, &docs_rs, &name, &version, None)
+            .await
+            .expect("loads");
+        let offline = docs_rs.offline();
+        docs_rs_json(&cache, &offline, &name, &version, None)
+            .await
+            .expect("from the cache");
+        let other = Version::new(1, 0, 227);
+        for _ in 0..2 {
+            assert!(matches!(
+                docs_rs_json(&cache, &offline, &name, &other, None).await,
+                Err(LoadError::Fetch(FetchError::Offline))
+            ));
+        }
+        assert_eq!(requests.iter().count(), 1);
+    }
+
+    #[test]
+    fn times_are_written_in_rfc_3339() {
+        let at = |seconds| rfc3339(system_time(seconds));
+        assert_eq!(at(0), "1970-01-01T00:00:00Z");
+        assert_eq!(at(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(at(1_709_164_799), "2024-02-28T23:59:59Z");
+        assert_eq!(at(1_709_164_800), "2024-02-29T00:00:00Z");
     }
 
     #[tokio::test]

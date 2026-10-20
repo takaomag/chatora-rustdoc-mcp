@@ -257,7 +257,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
                 std::env::current_dir().ok(),
             ),
             #[cfg(feature = "local")]
-            resolver: Resolver::new(false),
+            // cargo runs with `--offline` in offline mode (requirement R-CA-7).
+            resolver: Resolver::new(network.offline),
             calls: tool::CallLimit::from_settings(settings),
         }),
     };

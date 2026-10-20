@@ -298,6 +298,17 @@ Claude Code 2.1.304、Linux で測った。
 - `limits.extract_max_size` (既定 4GiB): 今ディスクに展開するのは std の dist のアーカイブだけなので、その合計の上限 (M1 の固定の 2GiB) を置き換えた。1 ファイルの上限 (512MiB。メモリで解析する上限) はそのまま。`.crate` の展開 (R-SC-2) は M3
 - `std.fetch_from_dist` (既定 true): false なら dist に要求を出さない。手元の nightly は、プロジェクトの toolchain より古くても warnings を付けて使う (R-STD-1)。手元に無ければ (または使えなければ) `toolchain_missing` に導入コマンドを添えて返す (R-STD-4。`DistError::Disabled`)。dist から前に取ってキャッシュにある std も使わない (設定の意味を「dist のものを使わない」と読んだ)
 
+**A3b-2 (オフラインモード `network.offline`。2026-10-20)**:
+
+- `data::Network` に `offline` を持たせ、各取得元 (docs.rs・sparse index・static.crates.io・dist) は要求を送る関数の入口で `Offline` のエラーを返す。cargo の解決 (`Resolver`) には M1 からある `--offline` を渡す
+- sparse index: キャッシュにあれば TTL を過ぎていても使い、`stale` に「オフライン」を書く (R-CA-7。通信できなかったときの M1 の扱いと同じ経路)。どの綴りもキャッシュに無ければ `offline_miss`。オフラインの失敗は「index に無い」否定キャッシュに入れない
+- docs.rs: キャッシュに無ければ `offline_miss`。オフラインの失敗は失敗の記録 (否定キャッシュ) に残さない (オンラインに戻したときにすぐ取れるように)。別の形式を探す処理でも、見つからないと記録しない
+- dist: manifest がキャッシュにあれば古くても使い (M1 の、取れなかったときの経路。warnings に理由を書く)、無ければ `offline_miss` に導入コマンドを添える (R-STD-4)
+- static.crates.io (`.crate`): キャッシュに無ければ、docs.rs のビルドの feature が分からない旨の warnings だけで照会を続ける (M1 の扱いのまま)
+- `offline_miss` の suggestions (§8 の「キャッシュにあるバージョン」): その crate の docs.rs の JSON がキャッシュにある版を、新しい順に 5 つまで (`name@version`) と、`network.offline` を外す案内。失敗の記録だけの版は数えない
+- 古い index を使ったときの provenance (R-CA-7。M1 から抜けていた): `index_fetched_at` (UTC の RFC 3339、秒まで) を、TTL を過ぎた index で版を決めたときだけ出す。`get_item` と、その経路を使う一覧のツール (mcp の `look_up_in` で足す)、`resolve_version`。名前は要件に無かったので決めた。オフラインのときと、通信できずに古いものを使ったときの両方
+- 古い index に無い版を求められたとき: M1 は `version_not_found` (「crates.io に無い」) を返していたが、古い index には新しい版が抜けうるので、オフラインなら `offline_miss` (キャッシュにある版を添える)、通信できなかったなら `network_error` (`retryable: true`) にした。統合テストで見つけた
+
 ### 6.3 M2b
 
 (まだ無い)

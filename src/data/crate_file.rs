@@ -37,6 +37,8 @@ const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 pub struct StaticCrates {
     client: reqwest::Client,
     base_url: Arc<str>,
+    /// Whether no request may be sent (`network.offline`, requirement R-CA-7).
+    offline: bool,
 }
 
 /// Why the `.crate` or its `Cargo.toml` could not be read.
@@ -78,6 +80,10 @@ pub enum CrateError {
     /// The cache could not be read or written.
     #[error("the cache could not be used")]
     Cache(#[source] io::Error),
+    /// No request may be sent (`network.offline`), and the cache does not have it (requirement
+    /// R-CA-7).
+    #[error("the server is offline (network.offline), and the cache does not have it")]
+    Offline,
 }
 
 impl CrateError {
@@ -111,6 +117,7 @@ impl StaticCrates {
         Ok(Self {
             client: http::client_builder(network).build()?,
             base_url: base_url.into(),
+            offline: network.offline,
         })
     }
 
@@ -152,6 +159,9 @@ impl StaticCrates {
     async fn fetch(&self, name: &CrateName, version: &Version) -> Result<Box<[u8]>, CrateError> {
         // The parts are validated, so they cannot change the shape of the URL. static.crates.io
         // takes the `+` of build metadata as itself.
+        if self.offline {
+            return Err(CrateError::Offline);
+        }
         let url = format!("{}/crates/{name}/{name}-{version}.crate", self.base_url);
         let mut response = http::send(self.client.get(&url))
             .await

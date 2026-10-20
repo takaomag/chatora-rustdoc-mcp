@@ -504,7 +504,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
 }
 
 /// The date of `days` since 1970-01-01, the inverse of [`days_from_civil`].
-fn civil_from_days(days: i64) -> Option<(i64, i64, i64)> {
+pub(super) fn civil_from_days(days: i64) -> Option<(i64, i64, i64)> {
     let days = days.checked_add(719_468)?;
     let era = days.checked_div_euclid(146_097)?;
     let day_of_era = days.checked_sub(era.checked_mul(146_097)?)?;

@@ -183,6 +183,37 @@ impl Cache {
             .join(target.map_or(DEFAULT_TARGET_DIR, TargetTriple::as_str))
     }
 
+    /// The versions of `name` whose rustdoc JSON from docs.rs is in the cache, for any target,
+    /// newest first: what an offline lookup can answer (§8 `offline_miss`).
+    #[must_use]
+    pub fn docs_rs_versions(&self, name: &CrateName) -> Vec<Version> {
+        let subdirectories = |dir: &Path| {
+            fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .collect::<Vec<_>>()
+        };
+        let has_json = |dir: &Path| {
+            subdirectories(dir).iter().any(|target| {
+                fs::read_dir(target.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|file| json_format(&file.file_name()).is_some())
+            })
+        };
+        let mut versions: Vec<Version> =
+            subdirectories(&self.root.join("docs.rs").join(name.cache_key()))
+                .iter()
+                .filter(|entry| has_json(&entry.path()))
+                .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+                .collect();
+        versions.sort_by(|a, b| b.cmp(a));
+        versions
+    }
+
     /// The cache directory, where nothing configures cargo or rustup: rustc runs there to tell the
     /// host target (requirement R-TG-1).
     #[must_use]
@@ -843,6 +874,32 @@ mod tests {
             None,
             dir.map(|dir| ("CHATORA_RUSTDOC_MCP_CACHE__DIR".into(), dir.to_owned())),
         )
+    }
+
+    #[test]
+    fn the_versions_with_json_in_the_cache_are_listed_newest_first() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let name: CrateName = "serde".parse().expect("a crate name");
+        let place = |version: &str, target: &str| {
+            let place = dir.path().join("docs.rs/serde").join(version).join(target);
+            fs::create_dir_all(&place).expect("made");
+            place
+        };
+        fs::write(place("1.0.9", "_default").join("61.json"), b"{}").expect("written");
+        fs::write(
+            place("1.0.10", "x86_64-pc-windows-msvc").join("57.json"),
+            b"{}",
+        )
+        .expect("written");
+        // A version with only the record of a miss has no documentation.
+        fs::write(place("1.0.11", "_default").join("miss.json"), b"{}").expect("written");
+        assert_eq!(cache.docs_rs_versions(&name), [
+            Version::new(1, 0, 10),
+            Version::new(1, 0, 9),
+        ]);
+        let other: CrateName = "tokio".parse().expect("a crate name");
+        assert_eq!(cache.docs_rs_versions(&other), Vec::<Version>::new());
     }
 
     #[test]

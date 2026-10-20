@@ -104,6 +104,8 @@ pub struct Dist {
     // `Arc` so that cloning the client does not copy the URL.
     base_url: Arc<str>,
     settings: DistSettings,
+    /// Whether no request may be sent (`network.offline`, requirement R-CA-7).
+    offline: bool,
 }
 
 /// What the settings say about the JSON of std from the distribution server: `std.fetch_from_dist`
@@ -192,6 +194,10 @@ pub enum DistError {
         /// Why the nightly here cannot be used.
         why: Box<str>,
     },
+    /// No request may be sent (`network.offline`), and the cache does not have it (requirement
+    /// R-CA-7).
+    #[error("the server is offline (network.offline), and the cache does not have it")]
+    Offline,
 }
 
 /// The JSON of std of one nightly, unpacked in the cache.
@@ -324,6 +330,7 @@ impl Dist {
             client: http::client_builder(network).build()?,
             base_url: base_url.into(),
             settings: DistSettings::default(),
+            offline: network.offline,
         })
     }
 
@@ -337,7 +344,15 @@ impl Dist {
                 .expect("the client builds"),
             base_url: base_url.into(),
             settings: DistSettings::default(),
+            offline: false,
         }
+    }
+
+    /// The client offline (`network.offline`).
+    #[cfg(test)]
+    pub(super) const fn offline(mut self) -> Self {
+        self.offline = true;
+        self
     }
 
     /// The client with `settings` instead.
@@ -349,6 +364,9 @@ impl Dist {
 
     /// Fetches the body at `url`, at most `limit` bytes.
     async fn get(&self, url: &str, limit: u64) -> Result<Vec<u8>, DistError> {
+        if self.offline {
+            return Err(DistError::Offline);
+        }
         let mut response = http::send(self.client.get(url))
             .await
             .map_err(network_error)?;
@@ -541,7 +559,8 @@ async fn summary(
             tracing::warn!(error = %error, "using the manifest of the nightly channel kept before");
             warnings.push(
                 format!(
-                    "the manifest of the nightly channel could not be fetched, so the one from {} is used",
+                    "the manifest of the nightly channel could not be fetched ({error}), so the one \
+                     from {} is used",
                     kept.date
                 )
                 .into(),
@@ -941,6 +960,19 @@ available = false
             std_docs(&cache, &dist, &linux(), None).await,
             Err(DistError::TooLarge { limit: 10 })
         ));
+    }
+
+    /// Offline, the server is not asked, and without the manifest in the cache there is nothing
+    /// to unpack (requirement R-CA-7).
+    #[tokio::test]
+    async fn offline_nothing_is_fetched() {
+        let archive = archive(&json_files());
+        let (cache, dist, requests, _dir) = setup(&archive, None);
+        assert!(matches!(
+            std_docs(&cache, &dist.offline(), &linux(), None).await,
+            Err(DistError::Offline)
+        ));
+        assert!(requests.try_recv().is_err(), "nothing was asked");
     }
 
     #[test]

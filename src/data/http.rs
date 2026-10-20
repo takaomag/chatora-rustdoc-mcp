@@ -33,6 +33,9 @@ pub struct Network {
     pub connect_timeout: Duration,
     /// The longest silence while a body is received.
     pub read_timeout: Duration,
+    /// No request is sent: only what the cache has is used (`network.offline`, requirement
+    /// R-CA-7).
+    pub offline: bool,
 }
 
 impl Default for Network {
@@ -40,6 +43,7 @@ impl Default for Network {
         Self {
             connect_timeout: CONNECT_TIMEOUT,
             read_timeout: READ_TIMEOUT,
+            offline: false,
         }
     }
 }
@@ -62,6 +66,11 @@ impl Network {
             connect_timeout: seconds("network.connect_timeout_secs")
                 .unwrap_or(default.connect_timeout),
             read_timeout: seconds("network.read_timeout_secs").unwrap_or(default.read_timeout),
+            offline: settings
+                .get("network.offline", |value| {
+                    value.boolean().ok_or("true or false")
+                })
+                .unwrap_or(default.offline),
         }
     }
 }
@@ -270,6 +279,7 @@ mod tests {
         assert_eq!(Network::from_settings(&settings), Network {
             connect_timeout: Duration::from_secs(3),
             read_timeout: READ_TIMEOUT,
+            offline: false,
         });
         assert_eq!(settings.problems().len(), 1, "0 is not valid");
     }

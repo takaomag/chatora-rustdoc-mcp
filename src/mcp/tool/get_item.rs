@@ -34,7 +34,7 @@ use crate::{
         dist::{DistError, StdCrate},
         docs_rs::FetchError,
         rustdoc_json::ParseError,
-        sparse_index::IndexError,
+        sparse_index::{IndexEntry, IndexError},
         std_json::{self, Chosen},
         target::{HostTarget, TargetTriple},
         version::{NoVersion, VersionSpec},
@@ -323,6 +323,9 @@ struct Request {
     in_build: InBuild,
     /// How many crates the path was followed through to get here (requirement R-PR-4).
     hops: usize,
+    /// When the crates.io index that decided the version was read, when it was older than its
+    /// TTL (requirements R-CA-3 and R-CA-7), in RFC 3339.
+    index_fetched_at: Option<Box<str>>,
 }
 
 /// The most crates that a path is followed into, through re-exports of their items, after the
@@ -448,6 +451,11 @@ pub(super) fn provenance_schema() -> Value {
             "project_from": {
                 "type": "string",
                 "enum": ["argument", "claude_project_dir", "cwd"],
+            },
+            "index_fetched_at": {
+                "type": "string",
+                "description": "When the crates.io index that decided the version was read (RFC \
+                                3339), when it was older than it is trusted for, as offline.",
             },
             "toolchain": { "type": "string" },
             "std_from": {
@@ -802,26 +810,16 @@ async fn resolve(
     #[cfg(not(feature = "local"))]
     let checked_later = false;
     if !checked_later && let Some(version) = cached_exact(state, &name, &spec, &target) {
-        let request = Request {
-            version,
-            path: with_lib_name(&name.cache_key(), &path),
-            name,
-            project_from: None,
-            resolved_from: ResolvedFrom::Explicit,
-            target,
-            shape,
-            checksum: None,
-            build: None,
-            in_build: InBuild::default(),
-            hops: 0,
-        };
-        return Ok((request, warnings));
+        return Ok((
+            cached_request(name, version, &path, target, shape),
+            warnings,
+        ));
     }
     let entry = state
         .index
         .entry(&name)
         .await
-        .map_err(|error| Box::new(index_error(&name, &error)))?;
+        .map_err(|error| Box::new(index_error(&state.cache, &name, &error)))?;
     warnings.extend(entry.stale.clone());
     // docs.rs has the project's package only if it is the one on crates.io (requirement R-VR-2).
     #[cfg(feature = "local")]
@@ -833,7 +831,7 @@ async fn resolve(
     }
     let resolved = spec
         .resolve(&entry.versions)
-        .map_err(|no_version| Box::new(version_not_found(&entry.name, &spec, &no_version)))?;
+        .map_err(|no_version| Box::new(version_not_found(state, &entry, &spec, &no_version)))?;
     warnings.extend(resolved.warnings.into_iter().map(Into::into));
     #[cfg(feature = "local")]
     let (resolved_from, project_from, in_build) = chosen_by(&spec, from_project);
@@ -850,6 +848,10 @@ async fn resolve(
         build: None,
         in_build,
         hops: 0,
+        index_fetched_at: entry
+            .stale
+            .as_ref()
+            .map(|_| data::rfc3339(entry.fetched_at).into()),
         project_from,
         path,
         resolved_from,
@@ -857,6 +859,31 @@ async fn resolve(
         shape,
     };
     Ok((request, warnings))
+}
+
+/// The request for `name` at the exact `version` whose JSON is cached, without the crates.io
+/// index.
+fn cached_request(
+    name: CrateName,
+    version: Version,
+    path: &str,
+    target: TargetTriple,
+    shape: Shape,
+) -> Request {
+    Request {
+        version,
+        path: with_lib_name(&name.cache_key(), path),
+        name,
+        project_from: None,
+        resolved_from: ResolvedFrom::Explicit,
+        target,
+        shape,
+        checksum: None,
+        build: None,
+        in_build: InBuild::default(),
+        hops: 0,
+        index_fetched_at: None,
+    }
 }
 
 /// The warning that `target` stands in for the host target, when no target was asked for and the
@@ -924,10 +951,36 @@ fn cached_exact(
 
 /// `version_not_found` (§8), with the versions to suggest.
 pub(super) fn version_not_found(
-    name: &str,
+    state: &ToolState,
+    entry: &IndexEntry,
     spec: &VersionSpec,
     no_version: &NoVersion,
 ) -> CallToolResult {
+    let name = &entry.name;
+    // An index file read long ago may lack the version, which may be newer (requirements R-CA-3
+    // and R-CA-7).
+    if let Some(stale) = &entry.stale {
+        let message = format!("{name} {spec} is not in the crates.io index as last read: {stale}");
+        return if state.index.is_offline() {
+            let suggestions = name.parse::<CrateName>().map_or_else(
+                |_| Vec::new(),
+                |name| offline_suggestions(&state.cache, &name),
+            );
+            error_result(&json!({
+                "code": "offline_miss",
+                "message": message,
+                "retryable": false,
+                "suggestions": suggestions,
+            }))
+        } else {
+            error_result(&json!({
+                "code": "network_error",
+                "message": message,
+                "retryable": true,
+                "suggestions": ["try again in a while"],
+            }))
+        };
+    }
     error_result(&json!({
         "code": "version_not_found",
         "message": format!("{name} has no version {spec} on crates.io"),
@@ -985,8 +1038,40 @@ pub(super) fn not_on_docs_rs(package: &ProjectPackage, check: DocsRsCheck) -> Co
     }
 }
 
+/// The most versions in the cache that `offline_miss` names.
+const MAX_CACHED_VERSIONS: usize = 5;
+
+/// What `offline_miss` suggests: the versions of `name` in the cache, newest first, and else to
+/// turn offline mode off (§8 and requirement R-CA-7).
+pub(super) fn offline_suggestions(cache: &Cache, name: &CrateName) -> Vec<String> {
+    let versions = cache.docs_rs_versions(name);
+    let mut suggestions = Vec::new();
+    if !versions.is_empty() {
+        let listed: Vec<String> = versions
+            .iter()
+            .take(MAX_CACHED_VERSIONS)
+            .map(|version| format!("{name}@{version}"))
+            .collect();
+        suggestions.push(format!(
+            "the cache has the documentation of {}{}: ask for one of these",
+            listed.join(", "),
+            if versions.len() > MAX_CACHED_VERSIONS {
+                " and older versions"
+            } else {
+                ""
+            }
+        ));
+    }
+    suggestions.push(
+        "the server is offline (network.offline): turn network.offline off to fetch what the \
+         cache lacks"
+            .to_owned(),
+    );
+    suggestions
+}
+
 /// The tool error for an index that could not be read (§8).
-pub(super) fn index_error(name: &CrateName, error: &IndexError) -> CallToolResult {
+pub(super) fn index_error(cache: &Cache, name: &CrateName, error: &IndexError) -> CallToolResult {
     let message = format!(
         "the versions of {name} could not be read: {}",
         ErrorChain(error)
@@ -1011,6 +1096,12 @@ pub(super) fn index_error(name: &CrateName, error: &IndexError) -> CallToolResul
             "message": message,
             "retryable": false,
             "suggestions": [],
+        })),
+        IndexError::Offline => error_result(&json!({
+            "code": "offline_miss",
+            "message": message,
+            "retryable": false,
+            "suggestions": offline_suggestions(cache, name),
         })),
         IndexError::Cache(_) => super::tool_error(
             "internal_error",
@@ -1145,7 +1236,7 @@ async fn load_and_look_up(
     .await
     {
         Ok(loaded) => loaded,
-        Err(error) => return Err(Box::new(load_error(&arguments, &error))),
+        Err(error) => return Err(Box::new(load_error(&state.cache, &arguments, &error))),
     };
     warnings.extend(loaded.warnings);
     let lookup = Lookup {
@@ -1373,49 +1464,55 @@ async fn destination_request(
     if let Some(request) = in_project_build(state, destination, origin).await {
         return Ok(request);
     }
-    let (name, version, resolved_from) = if let Some((name, version)) = &destination.release {
-        (name.clone(), version.clone(), ResolvedFrom::Reexport)
-    } else {
-        let name: CrateName = destination.lib_name.parse().map_err(|error| {
-            Box::new(super::tool_error(
-                "item_not_found",
-                &format!(
-                    "the crate that the path goes on in has a name that is not valid: {error}"
-                ),
-                false,
-                &[],
-            ))
-        })?;
-        let entry = state
-            .index
-            .entry(&name)
-            .await
-            .map_err(|error| Box::new(index_error(&name, &error)))?;
-        warnings.extend(entry.stale.clone());
-        let resolved = VersionSpec::Latest
-            .resolve(&entry.versions)
-            .map_err(|no_version| {
-                Box::new(version_not_found(
-                    &entry.name,
-                    &VersionSpec::Latest,
-                    &no_version,
+    let (name, version, resolved_from, index_fetched_at) =
+        if let Some((name, version)) = &destination.release {
+            (name.clone(), version.clone(), ResolvedFrom::Reexport, None)
+        } else {
+            let name: CrateName = destination.lib_name.parse().map_err(|error| {
+                Box::new(super::tool_error(
+                    "item_not_found",
+                    &format!(
+                        "the crate that the path goes on in has a name that is not valid: {error}"
+                    ),
+                    false,
+                    &[],
                 ))
             })?;
-        let version = resolved.version.version.clone();
-        warnings.push(
-            format!(
-                "the version of {} that {} {} was built with is not known, so the latest, \
+            let entry = state
+                .index
+                .entry(&name)
+                .await
+                .map_err(|error| Box::new(index_error(&state.cache, &name, &error)))?;
+            warnings.extend(entry.stale.clone());
+            let resolved = VersionSpec::Latest
+                .resolve(&entry.versions)
+                .map_err(|no_version| {
+                    Box::new(version_not_found(
+                        state,
+                        &entry,
+                        &VersionSpec::Latest,
+                        &no_version,
+                    ))
+                })?;
+            let version = resolved.version.version.clone();
+            warnings.push(
+                format!(
+                    "the version of {} that {} {} was built with is not known, so the latest, \
                  {version}, is shown",
-                entry.name, origin.name, origin.version
+                    entry.name, origin.name, origin.version
+                )
+                .into(),
+            );
+            (
+                entry.name.parse().unwrap_or(name),
+                version,
+                ResolvedFrom::Latest,
+                entry
+                    .stale
+                    .as_ref()
+                    .map(|_| data::rfc3339(entry.fetched_at).into()),
             )
-            .into(),
-        );
-        (
-            entry.name.parse().unwrap_or(name),
-            version,
-            ResolvedFrom::Latest,
-        )
-    };
+        };
     Ok(Request {
         name,
         version,
@@ -1428,6 +1525,7 @@ async fn destination_request(
         build: None,
         in_build: InBuild::default(),
         hops: origin.hops.saturating_add(1),
+        index_fetched_at,
     })
 }
 
@@ -1480,6 +1578,8 @@ async fn in_project_build(
             sets: None,
         },
         hops: origin.hops.saturating_add(1),
+        // The version is the project's, not the index's.
+        index_fetched_at: None,
     })
 }
 
@@ -1604,7 +1704,7 @@ async fn recover(
                     (again, returned)
                 },
                 Ok(None) => (looked_up, arguments),
-                Err(error) => return Err(Box::new(load_error(&arguments, &error))),
+                Err(error) => return Err(Box::new(load_error(&state.cache, &arguments, &error))),
             }
         },
         // Its header was read when it was fetched, yet it does not parse: docs.rs may have served
@@ -1642,7 +1742,7 @@ async fn recover(
                 }
                 (again, returned)
             },
-            Err(error) => return Err(Box::new(load_error(&arguments, &error))),
+            Err(error) => return Err(Box::new(load_error(&state.cache, &arguments, &error))),
         },
         Ok(_)
         | Err(Failure::Parse(_) | Failure::Archive(_) | Failure::Item(_) | Failure::Serialize(_)) => {
@@ -1707,6 +1807,7 @@ async fn execute_std(
         build: None,
         in_build: InBuild::default(),
         hops: 0,
+        index_fetched_at: None,
     };
     let cache = state.cache.clone();
     let task = crate::task::spawn_blocking(move || {
@@ -1850,6 +1951,8 @@ pub(super) fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
         DistError::Cache(_) => ("internal_error", None, false),
         // With the dist turned off, the nightly here is the only source (requirement R-STD-4).
         DistError::Disabled { .. } => ("toolchain_missing", None, false),
+        // The install command below goes with it too (requirement R-STD-4).
+        DistError::Offline => ("offline_miss", None, false),
     };
     let mut body = json!({
         "code": code,
@@ -2041,7 +2144,16 @@ fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Request) -> Result<Value, Fa
             .features(arguments.name.as_str(), &arguments.version),
         follow: arguments.hops < MAX_FOLLOWED,
     };
-    respond_in(&view, item_request, &arguments.shape.what)
+    let mut response = respond_in(&view, item_request, &arguments.shape.what)?;
+    if let (Some(fetched_at), Some(provenance)) = (
+        &arguments.index_fetched_at,
+        response
+            .get_mut("provenance")
+            .and_then(Value::as_object_mut),
+    ) {
+        provenance.insert("index_fetched_at".to_owned(), json!(fetched_at));
+    }
+    Ok(response)
 }
 
 /// Looks the item up in `view`, lists the module, or gives the overview of the crate, as `what`
@@ -2132,12 +2244,17 @@ fn release(arguments: &Request) -> String {
 }
 
 /// The tool error for JSON that could not be loaded (§8).
-fn load_error(arguments: &Request, error: &LoadError) -> CallToolResult {
-    load_error_of(&release(arguments), error)
+fn load_error(cache: &Cache, arguments: &Request, error: &LoadError) -> CallToolResult {
+    load_error_of(cache, &arguments.name, &release(arguments), error)
 }
 
 /// The tool error for the JSON of `release` (`name@version`) that could not be loaded (§8).
-pub(super) fn load_error_of(release: &str, error: &LoadError) -> CallToolResult {
+pub(super) fn load_error_of(
+    cache: &Cache,
+    name: &CrateName,
+    release: &str,
+    error: &LoadError,
+) -> CallToolResult {
     tracing::warn!(%release, error = %ErrorChain(error), "rustdoc JSON could not be loaded");
     let fetch = match error {
         LoadError::Fetch(fetch) => fetch,
@@ -2219,6 +2336,14 @@ pub(super) fn load_error_of(release: &str, error: &LoadError) -> CallToolResult 
             "the TLS certificate of docs.rs was rejected: if a proxy inspects TLS, add its CA \
              certificate to the system's trusted certificates",
         ]),
+        FetchError::Offline => {
+            return error_result(&json!({
+                "code": "offline_miss",
+                "message": format!("rustdoc JSON of {release} could not be loaded: {}", ErrorChain(fetch)),
+                "retryable": false,
+                "suggestions": offline_suggestions(cache, name),
+            }));
+        },
     };
     let mut body = json!({
         "code": code,
@@ -2496,6 +2621,7 @@ mod tests {
             build: None,
             in_build: InBuild::default(),
             hops: 0,
+            index_fetched_at: None,
         };
         let candidates = (0..25).map(|n| format!("item {n}").into()).collect();
         let result = item_error(&request, &GetItemError::Ambiguous { candidates });

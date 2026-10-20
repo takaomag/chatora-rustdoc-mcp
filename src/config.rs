@@ -31,6 +31,7 @@ const KEYS: &[&str] = &[
     "log.retention_days",
     "log.total_max_size",
     "network.connect_timeout_secs",
+    "network.offline",
     "network.read_timeout_secs",
     "std.fetch_from_dist",
 ];
