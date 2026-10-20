@@ -4,21 +4,12 @@
 //! Each process hashes with its own random seed, so a `HashMap` whose order reaches a response
 //! shows up here as a difference. The crates are those of `testdata/docs-rs-json.txt`, which must
 //! be in the cache that `CHATORA_RUSTDOC_MCP_CACHE__DIR` names, as in the `testdata` job of CI.
-//! Run it with `cargo test --release --test determinism -- --ignored`.
 
-#![cfg(test)]
-#![expect(
-    unused_crate_dependencies,
-    reason = "an integration test uses only some of the package's dependencies"
-)]
-
-use std::{
-    collections::BTreeMap,
-    io::{BufRead as _, BufReader, Write as _},
-    process::{Command, Stdio},
-};
+use std::{collections::BTreeMap, path::Path};
 
 use serde_json::{Value, json};
+
+use crate::client::Client;
 
 /// The queries that are compared: every tool, responses with maps (`auto_traits`, `counts`,
 /// `features`), lists that are cut to a page, std, and an error.
@@ -94,57 +85,20 @@ fn other_queries() -> Vec<(&'static str, Value)> {
 }
 
 /// Starts a server, asks it `queries` one at a time, and returns its responses by query, as the
-/// text the client reads. Errors lose their `request_id`, which differs on purpose (requirement
-/// R-ERR-2).
-fn answers(queries: &[(&'static str, Value)], logs: &std::path::Path) -> BTreeMap<String, String> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"))
-        .arg("serve")
-        // The project of the default project is this package, for `list_crates`.
-        .env("CLAUDE_PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
-        .env("CHATORA_RUSTDOC_MCP_LOG__DIR", logs)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("the server starts");
-    let mut stdin = child.stdin.take().expect("stdin is piped");
-    let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
-    let meta = json!({
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientCapabilities": {},
-    });
-    let mut answers = BTreeMap::new();
-    for (id, (name, arguments)) in (1_u64..).zip(queries) {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "tools/call",
-            "params": { "name": name, "arguments": arguments, "_meta": meta },
-        });
-        writeln!(stdin, "{request}").expect("the server reads stdin");
-        stdin.flush().expect("the server reads stdin");
-        let mut line = String::new();
-        stdout.read_line(&mut line).expect("a response");
-        let response: Value = serde_json::from_str(&line).expect("JSON");
-        assert_eq!(response["id"], id, "{response}");
-        let result = &response["result"];
-        let answer = if result["isError"] == true {
-            let mut error: Value = result["content"][0]["text"]
-                .as_str()
-                .and_then(|text| serde_json::from_str(text).ok())
-                .unwrap_or_else(|| panic!("an error with JSON in its text: {result}"));
-            error
-                .as_object_mut()
-                .map(|error| error.remove("request_id"));
-            json!({ "error": error })
-        } else {
-            result["structuredContent"].clone()
-        };
-        // As text: maps that differ only in order are equal as values.
-        answers.insert(format!("{name} {arguments}"), answer.to_string());
-    }
-    drop(stdin);
-    assert!(child.wait().expect("the server exits").success());
+/// text the client reads. Results are checked against their `outputSchema` on the way.
+fn answers(queries: &[(&'static str, Value)], logs: &Path) -> BTreeMap<String, String> {
+    // The project is this package, for `list_crates`.
+    let mut client = Client::start(Some(Path::new(env!("CARGO_MANIFEST_DIR"))), logs);
+    let answers = queries
+        .iter()
+        .map(|(name, arguments)| {
+            (
+                format!("{name} {arguments}"),
+                client.call(name, arguments).text(),
+            )
+        })
+        .collect();
+    client.finish();
     answers
 }
 

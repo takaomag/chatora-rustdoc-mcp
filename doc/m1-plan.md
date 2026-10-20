@@ -745,6 +745,19 @@ D4 を 2 つに分けた。D4a は `tools/list` と `server/discover` が返す�
 - 検査で見つかって直したこと: `get_item` の説明文に代わりのツールが無かった (`list_methods`・`list_impls`・`search_items` を足し、instructions と重なる「記憶で答えず使え」の文などを削って 2,041 文字)。`list_crates` の最初の文に Rust が無かった
 - stdio のテスト: `server/discover` に instructions があること。`tools/list` の `readOnlyHint` が構成に合うこと
 
+#### D4b (2026-10-20)
+
+動作の検査を足した (R-QA-5・R-OUT-1・R-MCP-3)。実データを使うものは `tests/real_data` (1 つのテストの crate) にまとめ、CI の `testdata` の job で `--ignored` で回す (D3 の決定性の検査もここに移した)。各表が揃っているかの検査はデータが要らないので、普段のテストで両方の構成で回る。
+
+- **応答の `outputSchema` での検証**: スキーマの部分集合 (`type`・`properties`・`required`・`items`・`additionalProperties`・`enum`・`minimum`・`maximum`・`anyOf`) の小さな検証器を書いた (`tests/common/schema.rs`。依存は増やさない)。スキーマに宣言の無いフィールドも誤りにする (応答とスキーマのずれを捕まえるため。標準より厳しい)。stdio のテストのすべての `tools/call` の結果と、実データのテストのすべての結果を検証する。今ある応答はすべて通った。宣言の無いフィールド・型の違い・必須の欠け・enum の外の値を誤りにすることを、それ自体のテストで確かめた
+- **引数ごとのテスト** (`arguments.rs`): ツールごとに、宣言したすべての引数について、基になる呼び出しと、その引数だけを変えた呼び出しの結果 (文字列) が違うことを確かめる。基の呼び出しは成功していること (別のエラーになっただけで通らないように)。`cursor` は基の結果の `next_cursor` を渡す。`version` は tokio の 1.53.3 と 1.45.1 (clap は中身がほかの crate の glob の re-export で、版を変えても比べる item が無かった)。`project` は既定のプロジェクトの中の別の workspace (`poc/m0a-a10`) を渡してエラーに変わること。`list_implementors` の `scope` は `crate` しか無いので、別の値が `invalid_argument` になること。表に無い引数があれば落ちる
+- **説明文の問い** (`questions.rs`): 説明文の `Answers questions such as` の後の問いを抜き出し、それぞれに、答える呼び出しと答えの確かめ方を持つ。表に無い問い・説明文に無い問いがあれば落ちる (23 問。プロジェクトについての 3 問は、ローカル機能の無い構成では回さない。その構成の説明文にも問いは残っている。ホスト版 (M6) で直す)
+  - 見つかったこと: `list_implementors` の「which types in tower implement `Service`?」は答えられなかった (`Service` は tower-service の trait で、M1 は trait の crate の中の実装だけを返すので `&mut S` と `Box<S>` しか出ない)。最初の確かめ方 (空でない) が緩くて通っていた。説明文の例を「which types in tokio implement `AsyncRead`?」に替え、`TcpStream` が出ることを確かめる
+  - `resolve_version` の `yanked` は、yanked のときだけ出る (`member`・`direct` と同じ)
+- **罠のテスト** (stdio、Unix とローカル機能のある構成だけ): 既定のプロジェクトと外の workspace の両方に、rustc の代わりに印を書くスクリプトを `build.rustc` に置き、外の workspace を `project` で渡した `list_crates`・`resolve_version`・`get_item`・`crate_overview`・`search_items` がどれもエラーになって印ができないこと、既定のプロジェクトの `list_crates` では印ができること (陽性の対照) を確かめる。`cargo metadata` と `cargo tree` が `build.rustc` を起動することは手で確かめた。範囲の外の依存の build.rs の罠 (R-QA-5 の次の項) は、ビルドを入れる M2 で
+- CI: `testdata` の job の手順を `--test real_data` に替えた (tokio 1.47.1 の JSON、serde 1.0.200 の index などをネットワークから取る)
+- 実行時間: release で 3.3 秒 (キャッシュが温まった後)
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

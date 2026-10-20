@@ -11,6 +11,9 @@
     reason = "an integration test uses only some of the package's dependencies"
 )]
 
+#[path = "common/schema.rs"]
+mod schema;
+
 use std::{
     collections::HashMap,
     io::{BufRead as _, BufReader, Write as _},
@@ -217,6 +220,9 @@ struct Server {
     lines: Receiver<Result<Value, String>>,
     /// Messages received while waiting for another one.
     pending: Vec<Value>,
+    /// The tools that the `tools/call` requests sent call, by request id, to check their results
+    /// against the tools' `outputSchema`.
+    calls: HashMap<u64, String>,
 }
 
 impl Server {
@@ -274,6 +280,7 @@ impl Server {
             stdin,
             lines,
             pending: Vec::new(),
+            calls: HashMap::new(),
         }
     }
 
@@ -302,6 +309,12 @@ impl Server {
 
     /// Writes one message as a line to the server's stdin.
     fn send(&mut self, message: &Value) {
+        if message["method"] == "tools/call"
+            && let (Some(id), Some(tool)) =
+                (message["id"].as_u64(), message["params"]["name"].as_str())
+        {
+            self.calls.insert(id, tool.to_owned());
+        }
         let stdin = self.stdin.as_mut().expect("stdin is open");
         writeln!(stdin, "{message}").expect("the server reads stdin");
         stdin.flush().expect("the server reads stdin");
@@ -338,9 +351,17 @@ impl Server {
 
     /// Waits for the response to the request `id`.
     fn response(&mut self, id: u64) -> Value {
-        self.wait_for(&format!("the response to request {id}"), |message| {
+        let response = self.wait_for(&format!("the response to request {id}"), |message| {
             message["id"] == id && message.get("method").is_none()
-        })
+        });
+        // Every result of a tool matches its `outputSchema` (requirement R-OUT-1).
+        if let (Some(tool), Some(structured)) = (
+            self.calls.get(&id),
+            response["result"].get("structuredContent"),
+        ) {
+            schema::check_output(tool, structured);
+        }
+        response
     }
 
     /// Waits for a notification with `method`.
@@ -762,6 +783,84 @@ fn demo_workspace() -> TempDir {
         .expect("cargo runs");
     assert!(status.success(), "cargo generate-lockfile");
     dir
+}
+
+/// Puts in `project` a `.cargo/config.toml` whose `build.rustc` is a script that writes `marker`
+/// before it runs rustc: a trap for a cargo started there.
+#[cfg(all(unix, feature = "local"))]
+fn set_trap(project: &Path, marker: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let script = project.join("trap-rustc");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nexec rustc \"$@\"\n",
+            marker.display()
+        ),
+    )
+    .expect("written");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("made runnable");
+    std::fs::create_dir_all(project.join(".cargo")).expect("made");
+    std::fs::write(
+        project.join(".cargo/config.toml"),
+        format!("[build]\nrustc = '{}'\n", script.display()),
+    )
+    .expect("written");
+}
+
+/// The lookup tools start no process for a project outside the default one, whose settings could
+/// run anything; in the default project, the same trap goes off (requirements R-MCP-3 and R-QA-5).
+#[cfg(all(unix, feature = "local"))]
+#[test]
+fn lookups_start_nothing_for_a_project_outside_the_default_one() {
+    let markers = TempDir::new().expect("a temporary directory");
+    let (inside_marker, outside_marker) = (
+        markers.path().join("inside"),
+        markers.path().join("outside"),
+    );
+    let project = demo_workspace();
+    let outside = demo_workspace();
+    set_trap(project.path(), &inside_marker);
+    set_trap(outside.path(), &outside_marker);
+    let mut server = Server::start_in(Some(project.path()));
+    let elsewhere = outside.path().to_str().expect("UTF-8");
+    let calls = [
+        ("list_crates", json!({ "project": elsewhere })),
+        (
+            "resolve_version",
+            json!({ "crate": "demo", "project": elsewhere }),
+        ),
+        (
+            "get_item",
+            json!({ "crate": "demo", "path": "hello", "project": elsewhere }),
+        ),
+        (
+            "crate_overview",
+            json!({ "crate": "demo", "project": elsewhere }),
+        ),
+        (
+            "search_items",
+            json!({ "query": "hello", "project": elsewhere }),
+        ),
+    ];
+    for (id, (tool, arguments)) in (1_u64..).zip(calls) {
+        server.send(&call_tool(id, tool, arguments));
+        let result = server.response(id)["result"].clone();
+        assert_eq!(result["isError"], true, "{tool}: {result}");
+    }
+    assert!(
+        !outside_marker.exists(),
+        "a process was started outside the default project"
+    );
+    // The control: the trap works.
+    server.send(&call_tool(9, "list_crates", json!({})));
+    assert_eq!(server.response(9)["result"]["isError"], false);
+    assert!(
+        inside_marker.exists(),
+        "the trap did not go off in the default project"
+    );
+    assert!(server.finish().success());
 }
 
 /// Without a version, the project decides it (requirements R-MCP-3 and R-VR-2). The project here
