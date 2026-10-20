@@ -322,7 +322,15 @@ Claude Code 2.1.304、Linux で測った。
 
 ### 6.3 M2b
 
-(まだ無い)
+**B1 (子の起動と後始末。2026-10-20、Linux で確かめ、macOS・Windows は CI)**:
+
+- 置き場所: `data::child`。cargo (`data::cargo::run`) と、toolchain の短いコマンド (`data::tool::output`。`rustc -vV`・`rustup run`) の子は、すべてここから起動する
+- 起動するスレッド: 子は、プロセスと同じだけ生きる専用のスレッド (`child-starter`) から起動する。呼び出し側の Tokio の runtime に入って (`Handle::enter`) `spawn` し、パイプはその runtime に登録する。`PR_SET_PDEATHSIG` は子を起動したスレッドの終了で発火し、Tokio の blocking のスレッドは使われないと終わるため (Q-29 の案のとおり)
+- グループ: Unix では新しいセッション (`setsid`。プロセスグループも新しくなり、制御端末が外れる。M1 から)、Linux ではさらに `PR_SET_PDEATHSIG` に SIGKILL を設定し、設定の後に `getppid` がサーバーでなければ起動を失敗にする (設定の前にサーバーが死んでいた場合)。Windows では Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) に入れる。Job Object は windows-sys で自前に作る (利用者が決めた。tokio が使う 0.61.2 と同じ版で、新しい crate は増えない。子を Job に入れる前のごく短い間に孫が起動されると、Job から漏れる隙間が残る)
+- 止め方: `Child` を落とすと (取り消し・30 分の上限・正常な終了の後のいずれも) グループごと止める。Unix ではプロセスグループに SIGKILL、Windows では `TerminateJobObject`。正常に終わった後も、残った孫を止める
+- サーバーの終了: stdin を包み、EOF か読み取りの失敗で `stop_all` を呼ぶ (rmcp は EOF の後に処理中の要求を最大 5 秒待つが、その間も子を動かさない)。SIGINT・SIGTERM (Windows は Ctrl+C) では、`stop_all` の後に rmcp の `cancellation_token` でサーバーを止める。`stop_all` の後は新しい子を起動しない (統合テストで見つけた: 止めた `cargo metadata` の代わりに Cargo.lock を直接読む経路が `cargo tree` を起動し、それが rmcp の 5 秒の待ちの間ハングして残った)
+- テスト: 単体テスト (孫を起動する子を落とすと孫も止まる。3 つの OS。テストが本当に検出することを、止める処理を外して落ちることで確かめた。Linux で子がセッションの長であること)。統合テスト (Unix): `build.rustc` に孫を起動してハングする rustc を置き、`list_crates` で cargo を起動してから、stdin を閉じると 2 秒以内に cargo・rustc・孫が止まり、別の cargo も起動されない。SIGTERM でも同じで、サーバーも終わる。Linux では、サーバーを SIGKILL しても cargo が止まる (`PR_SET_PDEATHSIG`。cargo が起動した rustc と孫は残る。C4 で起動時に片付ける)
+- Windows の Job Object と孫の扱いは、手元でコンパイルできない (依存の C のコードのため) ので、CI で確かめる
 
 ### 6.4 M2c
 

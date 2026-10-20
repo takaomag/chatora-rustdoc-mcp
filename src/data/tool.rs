@@ -67,20 +67,23 @@ pub(super) async fn output(
 ) -> Result<String, Cow<'static, str>> {
     std::fs::create_dir_all(dir)
         .map_err(|error| Cow::Owned(format!("the directory to run {program} in: {error}")))?;
-    let output = tokio::process::Command::new(program)
+    let mut command = tokio::process::Command::new(program);
+    command
         .args(args)
         .current_dir(dir)
         .env("RUSTUP_AUTO_INSTALL", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output();
+        .stderr(Stdio::piped());
+    // In a group of its own with what it starts (requirement R-WS-6).
+    super::child::prepare(&mut command);
+    let not_run = |error| Cow::Owned(format!("{program} could not be run: {error}"));
+    let child = super::child::spawn(command).await.map_err(not_run)?;
     let command = || format!("{program} {}", args.join(" "));
-    let output = tokio::time::timeout(TIMEOUT, output)
+    let output = tokio::time::timeout(TIMEOUT, child.output())
         .await
         .map_err(|_elapsed| Cow::Owned(format!("{} did not finish in 10 seconds", command())))?
-        .map_err(|error| Cow::Owned(format!("{program} could not be run: {error}")))?;
+        .map_err(not_run)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let first_line = stderr.lines().next().unwrap_or_default();

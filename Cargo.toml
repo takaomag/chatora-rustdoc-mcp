@@ -22,8 +22,10 @@ default = ["local"]
 # `--no-default-features` では、cargo を起動するコードも build.rs を実行するコードもバイナリに入らない。
 # 子プロセス (`rustc -vV`・cargo) を起動するので tokio の `process` を、`cargo metadata` の結果を
 # 共有するので tokio の `sync` を足す。cargo の出すパスと比べるので、Windows でも `\\?\` の付かない
-# 形に正規化する dunce を足す。
-local = ["tokio/process", "tokio/sync", "dep:dunce"]
+# 形に正規化する dunce を足す。子と孫をまとめて止める Windows の Job Object のために windows-sys を
+# 足す (Unix のプロセスグループは libc)。stdin の EOF と SIGINT・SIGTERM で子を止めるので、tokio の
+# `signal` を足す (要件 R-WS-6)。
+local = ["tokio/process", "tokio/signal", "tokio/sync", "dep:dunce", "dep:windows-sys"]
 
 [dependencies]
 const_format = "0.2.36"
@@ -65,7 +67,17 @@ zstd = { version = "0.14.3", default-features = false }
 
 [target."cfg(unix)".dependencies]
 # キャッシュのファイルを symlink をたどらずに開く `O_NOFOLLOW` と、FIFO で止まらない `O_NONBLOCK` (要件 R-CA-4)。
+# 子のセッション (`setsid`)、Linux の `PR_SET_PDEATHSIG`、プロセスグループごとの kill (要件 R-WS-6)。
 libc = "0.2.191"
+
+[target."cfg(windows)".dependencies]
+# 子と孫をまとめて止める Job Object (要件 R-WS-6)。tokio が使う版と同じにして、新しい crate を増やさない。
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+], optional = true }
 
 [profile.release]
 opt-level = 3

@@ -35,6 +35,8 @@ use thiserror as _;
 use toml as _;
 use tracing as _;
 use tracing_subscriber as _;
+#[cfg(all(windows, feature = "local"))]
+use windows_sys as _;
 use zstd as _;
 
 const BIN_NAME: &str = env!("CARGO_BIN_NAME");

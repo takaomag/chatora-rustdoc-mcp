@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 
+use super::child;
+
 /// Longest run of one cargo command in minutes (`build.timeout_secs`, requirement R-WS-6,
 /// default).
 const MAX_RUN_MINUTES: u64 = 30;
@@ -89,7 +91,6 @@ pub(super) fn project_command(root: &Path, offline: bool) -> tokio::process::Com
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
         // git translates its messages, which `classify` matches.
         .env("LC_ALL", "C")
         // Nothing may stop to ask for credentials (requirement R-WS-6). Stored credentials are
@@ -99,30 +100,10 @@ pub(super) fn project_command(root: &Path, offline: bool) -> tokio::process::Com
         .env("SSH_ASKPASS_REQUIRE", "never")
         .env_remove("SSH_ASKPASS")
         .env_remove("GIT_ASKPASS");
-    #[cfg(unix)]
-    start_session(&mut command);
+    // In a group of its own with what it starts, without a controlling terminal (requirement
+    // R-WS-6).
+    child::prepare(&mut command);
     command
-}
-
-/// Runs the child in a session of its own, without a controlling terminal, so that git and ssh
-/// cannot open `/dev/tty` to ask for a password or a host key (requirement R-WS-6).
-#[cfg(unix)]
-#[expect(
-    unsafe_code,
-    reason = "setsid has to be called in the child, between fork and exec"
-)]
-fn start_session(command: &mut tokio::process::Command) {
-    let setsid = || {
-        // SAFETY: setsid takes no arguments and only changes the calling process.
-        if unsafe { libc::setsid() } == -1 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    };
-    // SAFETY: the closure runs in the forked child. It calls only setsid, which is
-    // async-signal-safe, and reads errno; it neither allocates nor takes a lock.
-    unsafe { command.pre_exec(setsid) };
 }
 
 /// Runs `command` to the end, and stops it after [`MAX_RUN_TIME`].
@@ -130,8 +111,10 @@ fn start_session(command: &mut tokio::process::Command) {
 /// # Errors
 ///
 /// Returns an error when cargo cannot be started or runs too long.
-pub(super) async fn run(mut command: tokio::process::Command) -> Result<Output, RunError> {
-    tokio::time::timeout(MAX_RUN_TIME, command.output())
+pub(super) async fn run(command: tokio::process::Command) -> Result<Output, RunError> {
+    let child = child::spawn(command).await.map_err(RunError::NotStarted)?;
+    // Dropped on the timeout, or when the call is cancelled, which stops the whole group.
+    tokio::time::timeout(MAX_RUN_TIME, child.output())
         .await
         .map_err(|_elapsed| RunError::TimedOut)?
         .map_err(RunError::NotStarted)
@@ -270,21 +253,6 @@ mod tests {
             stderr: Vec::new(),
         };
         assert_eq!(classify(&output, false), Failure::Killed);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn the_child_leads_a_session_of_its_own() {
-        let mut command = tokio::process::Command::new("sh");
-        // The first and sixth fields of the stat are the pid and the session id.
-        command
-            .args(["-c", "cut -d ' ' -f 1,6 /proc/$$/stat"])
-            .stdout(Stdio::piped());
-        start_session(&mut command);
-        let output = command.output().await.expect("sh runs");
-        let stat = String::from_utf8(output.stdout).expect("text");
-        let (pid, session) = stat.trim().split_once(' ').expect("two fields");
-        assert_eq!(pid, session, "{stat}");
     }
 
     #[test]

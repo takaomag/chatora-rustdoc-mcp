@@ -269,13 +269,35 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
     tokio::spawn(async move {
         tools.host().await;
     });
-    match Box::pin(server.serve(stdio())).await {
-        Ok(running) => match running.waiting().await {
-            Ok(QuitReason::JoinError(error)) | Err(error) => {
-                Err(ServeError::Cancelled(crate::task::resume_if_panic(error)))
-            },
+    #[cfg(feature = "local")]
+    let transport = {
+        let (stdin, stdout) = stdio();
+        (StopChildrenAtEnd(stdin), stdout)
+    };
+    #[cfg(not(feature = "local"))]
+    let transport = stdio();
+    match Box::pin(server.serve(transport)).await {
+        Ok(running) => {
+            #[cfg(feature = "local")]
+            let on_signal = {
+                let token = running.cancellation_token();
+                tokio::spawn(async move {
+                    stop_signal().await;
+                    tracing::info!("stopping on a signal");
+                    crate::data::child::stop_all();
+                    token.cancel();
+                })
+            };
+            let waited = running.waiting().await;
+            #[cfg(feature = "local")]
+            on_signal.abort();
+            match waited {
+                Ok(QuitReason::JoinError(error)) | Err(error) => {
+                    Err(ServeError::Cancelled(crate::task::resume_if_panic(error)))
+                },
 
-            Ok(_) => Ok(()),
+                Ok(_) => Ok(()),
+            }
         },
 
         // The client closed stdin before the session started, for example after only
@@ -283,5 +305,58 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
         Err(ServerInitializeError::ConnectionClosed(_)) => Ok(()),
 
         Err(error) => Err(ServeError::Initialize(Box::new(error))),
+    }
+}
+
+/// The server's stdin, which stops every child and what it started when it ends or fails: the
+/// client has gone, and rmcp still waits up to 5 seconds for the calls in progress (requirement
+/// R-WS-6).
+#[cfg(feature = "local")]
+struct StopChildrenAtEnd<R>(R);
+
+#[cfg(feature = "local")]
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for StopChildrenAtEnd<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        let polled = std::pin::Pin::new(&mut self.0).poll_read(context, buffer);
+        let ended = match &polled {
+            std::task::Poll::Ready(Ok(())) => {
+                buffer.filled().len() == before && buffer.remaining() > 0
+            },
+            std::task::Poll::Ready(Err(_)) => true,
+            std::task::Poll::Pending => false,
+        };
+        if ended {
+            crate::data::child::stop_all();
+        }
+        polled
+    }
+}
+
+/// Waits for SIGINT or SIGTERM on Unix, and Ctrl+C on Windows: how Claude Code stops the server
+/// (requirement R-WS-6). Never ends if the signals cannot be watched.
+#[cfg(feature = "local")]
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut interrupt), Ok(mut terminate)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = interrupt.recv() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
     }
 }

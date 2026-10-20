@@ -1284,3 +1284,143 @@ fn the_tool_for_testing_is_only_for_the_tests() {
     assert_eq!(server.response(2)["error"]["code"], -32602);
     assert!(server.finish().success());
 }
+
+/// Puts in `project` a `.cargo/config.toml` whose `build.rustc` hangs: it starts a grandchild that
+/// runs for minutes, writes the process IDs of the grandchild, of its parent (cargo) and of
+/// itself to `dir`, and waits.
+#[cfg(all(unix, feature = "local"))]
+fn set_hanging_rustc(project: &Path, dir: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let script = project.join("hanging-rustc");
+    let dir = dir.display();
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nsleep 300 &\necho $! > '{dir}/grandchild'\necho $PPID > '{dir}/cargo'\n\
+             echo $$ > '{dir}/rustc'\nwait\n"
+        ),
+    )
+    .expect("written");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("made runnable");
+    std::fs::create_dir_all(project.join(".cargo")).expect("made");
+    std::fs::write(
+        project.join(".cargo/config.toml"),
+        format!("[build]\nrustc = '{}'\n", script.display()),
+    )
+    .expect("written");
+}
+
+/// Has the server run cargo on its default project, whose `build.rustc` is [`set_hanging_rustc`]
+/// writing to `dir`, and returns the process IDs of cargo, the hanging rustc and its grandchild.
+#[cfg(all(unix, feature = "local"))]
+fn hang(server: &mut Server, dir: &Path) -> [String; 3] {
+    server.send(&call_tool(1, "list_crates", json!({})));
+    assert!(
+        eventually(Duration::from_secs(30), || dir.join("rustc").exists()),
+        "the hanging rustc did not start"
+    );
+    ["cargo", "rustc", "grandchild"].map(|name| {
+        std::fs::read_to_string(dir.join(name))
+            .expect("written")
+            .trim()
+            .to_owned()
+    })
+}
+
+/// Whether the process `pid` runs.
+#[cfg(all(unix, feature = "local"))]
+fn alive(pid: &str) -> bool {
+    Command::new("sh")
+        .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+        .status()
+        .expect("sh runs")
+        .success()
+}
+
+/// Waits up to `limit` for `done`.
+#[cfg(all(unix, feature = "local"))]
+fn eventually(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        if done() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    done()
+}
+
+/// When the client closes stdin, the children of the server and what they started stop at once,
+/// not after the 5 seconds that rmcp waits for the calls in progress (requirement R-WS-6).
+#[cfg(all(unix, feature = "local"))]
+#[test]
+fn the_end_of_stdin_stops_the_children_and_what_they_started() {
+    let pids = TempDir::new().expect("a temporary directory");
+    let project = demo_workspace();
+    set_hanging_rustc(project.path(), pids.path());
+    let mut server = Server::start_in(Some(project.path()));
+    let running = hang(&mut server, pids.path());
+    assert!(running.iter().all(|pid| alive(pid)), "{running:?}");
+    drop(server.stdin.take());
+    assert!(
+        eventually(Duration::from_secs(2), || running
+            .iter()
+            .all(|pid| !alive(pid))),
+        "still running: {:?}",
+        running.iter().filter(|pid| alive(pid)).collect::<Vec<_>>()
+    );
+    // The call goes on without cargo's answer, but starts no other cargo, whose rustc would
+    // hang in its place.
+    assert!(server.finish().success());
+    let rustc = std::fs::read_to_string(pids.path().join("rustc")).expect("written");
+    assert_eq!(rustc.trim(), running[1], "another rustc was started");
+}
+
+/// On SIGTERM (or SIGINT), as Claude Code stops the server, the children and what they started
+/// stop, and the server ends (requirement R-WS-6).
+#[cfg(all(unix, feature = "local"))]
+#[test]
+fn a_signal_stops_the_children_and_the_server() {
+    let pids = TempDir::new().expect("a temporary directory");
+    let project = demo_workspace();
+    set_hanging_rustc(project.path(), pids.path());
+    let mut server = Server::start_in(Some(project.path()));
+    let running = hang(&mut server, pids.path());
+    let status = Command::new("kill")
+        .args(["-TERM", &server.child.id().to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(status.success());
+    assert!(
+        eventually(Duration::from_secs(2), || running
+            .iter()
+            .all(|pid| !alive(pid))),
+        "still running: {:?}",
+        running.iter().filter(|pid| alive(pid)).collect::<Vec<_>>()
+    );
+    assert!(server.finish().success());
+}
+
+/// On Linux, cargo dies with the server even when the server is killed outright, which nothing can
+/// catch (`PR_SET_PDEATHSIG`, requirement R-WS-6). What cargo started may stay; it is cleaned up
+/// at the next start (M2's C4).
+#[cfg(all(target_os = "linux", feature = "local"))]
+#[test]
+fn cargo_dies_with_a_killed_server() {
+    let pids = TempDir::new().expect("a temporary directory");
+    let project = demo_workspace();
+    set_hanging_rustc(project.path(), pids.path());
+    let mut server = Server::start_in(Some(project.path()));
+    let [cargo, rustc, grandchild] = hang(&mut server, pids.path());
+    server.child.kill().expect("killed");
+    server.child.wait().expect("waited");
+    assert!(
+        eventually(Duration::from_secs(2), || !alive(&cargo)),
+        "cargo {cargo} outlived the server"
+    );
+    // What cargo started is left; this test does not leave it.
+    for pid in [rustc, grandchild] {
+        drop(Command::new("kill").args(["-KILL", &pid]).status());
+    }
+}
