@@ -5,12 +5,14 @@
 
 use std::{
     cmp::Reverse,
+    collections::HashMap,
     ffi::{OsStr, OsString},
     fs::{self, File, Metadata},
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
     sync::{
         Arc,
+        Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
@@ -19,6 +21,7 @@ use std::{
 use etcetera::BaseStrategy as _;
 use semver::Version;
 use sha2::{Digest as _, Sha256};
+use tokio::sync::OwnedMutexGuard;
 
 use super::{
     crate_name::CrateName,
@@ -45,10 +48,37 @@ const STALE_TEMPORARY_AGE: Duration = Duration::from_hours(1);
 /// R-CA-4).
 static WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// The disk cache. Cloning it is cheap.
+/// The disk cache. Cloning it is cheap, and the clones share their locks.
 #[derive(Debug, Clone)]
 pub struct Cache {
     root: Arc<Path>,
+    locks: Arc<DirLocks>,
+}
+
+/// Locks on paths in the cache, within this process: tasks that fetch or make the same thing take
+/// turns, so that the second finds what the first made instead of fetching and parsing it again
+/// (requirements R-NW-2 and R-WS-6). Locks across processes come in M2 (R-CA-4).
+#[derive(Debug, Default)]
+struct DirLocks(parking_lot::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>);
+
+/// The lock on a path in the cache, held until it is dropped. See [`Cache::lock`].
+#[derive(Debug)]
+#[must_use = "the lock is released when the guard is dropped"]
+pub struct PathGuard(#[expect(dead_code, reason = "held for its drop")] OwnedMutexGuard<()>);
+
+impl DirLocks {
+    /// The lock of `path`, made when no task holds or waits for it.
+    fn of(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.0.lock();
+        if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+            return lock;
+        }
+        // Forget the locks that nobody holds any more, so that the map does not grow.
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(path.into(), Arc::downgrade(&lock));
+        lock
+    }
 }
 
 /// A rustdoc JSON read from the cache.
@@ -108,7 +138,22 @@ impl Cache {
     /// The cache at `root`.
     #[must_use]
     pub fn at(root: &Path) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            locks: Arc::default(),
+        }
+    }
+
+    /// Waits until no other task of this process holds `path`, and holds it: the directory of a
+    /// crate's JSON while it is fetched and archived, for example. The path is only a name, which
+    /// need not exist. A task must not take a path it holds already.
+    pub async fn lock(&self, path: &Path) -> PathGuard {
+        PathGuard(self.locks.of(path).lock_owned().await)
+    }
+
+    /// [`Self::lock`] for a blocking thread. It must not be called from async code.
+    pub fn lock_blocking(&self, path: &Path) -> PathGuard {
+        PathGuard(self.locks.of(path).blocking_lock_owned())
     }
 
     /// The directory of the rustdoc JSON fetched from docs.rs for `name` at `version`, built for
@@ -558,6 +603,28 @@ fn write_and_rename(temp: &Path, path: &Path, contents: &[u8]) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tasks_that_lock_the_same_path_take_turns() {
+        let cache = Cache::at(Path::new("/nonexistent"));
+        let path = Path::new("/nonexistent/docs.rs/tokio");
+        let held = cache.lock(path).await;
+        // Another path is not held.
+        drop(cache.lock(Path::new("/nonexistent/docs.rs/serde")).await);
+        let (other, path_owned) = (cache.clone(), path.to_path_buf());
+        let waiting = tokio::spawn(async move { drop(other.lock(&path_owned).await) });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "the lock was taken twice");
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the lock was let go")
+            .expect("no panic");
+        // The locks that nobody holds are forgotten when another is made.
+        assert_eq!(cache.locks.0.lock().len(), 2);
+        drop(cache.lock(Path::new("/nonexistent/docs.rs/rand")).await);
+        assert_eq!(cache.locks.0.lock().len(), 1);
+    }
 
     fn serde() -> (CrateName, Version) {
         (

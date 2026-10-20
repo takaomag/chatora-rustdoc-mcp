@@ -1080,17 +1080,36 @@ async fn look_up_release(
     {
         arguments.in_build.sets = feature_sets(state, &arguments, &mut warnings).await;
     }
-    let target = Some(&arguments.target);
-    let dir = state
-        .cache
-        .docs_rs_dir(&arguments.name, &arguments.version, target);
+    let looked_up = {
+        // Another call that loads the same crate goes first, and this one then finds its archive
+        // (requirements R-NW-2 and R-WS-6). The lock is let go before the path is followed into
+        // another crate.
+        let dir =
+            state
+                .cache
+                .docs_rs_dir(&arguments.name, &arguments.version, Some(&arguments.target));
+        let _held = state.cache.lock(&dir).await;
+        load_and_look_up(state, dir, arguments, &mut warnings).await
+    };
+    match looked_up {
+        Ok((looked_up, arguments)) => conclude(state, looked_up, arguments, warnings).await,
+        Err(result) => *result,
+    }
+}
+
+/// Looks the item up in the archive of the crate in `dir`, or else fetches the JSON of the crate,
+/// archives it there, and looks the item up in it.
+async fn load_and_look_up(
+    state: &Arc<ToolState>,
+    dir: PathBuf,
+    arguments: Request,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<(Result<Value, Failure>, Request), Box<CallToolResult>> {
     let arguments =
         match look_up_archived(state.cache.clone(), dir.clone(), Box::new(arguments)).await {
-            Some(Ok((looked_up, arguments))) => {
-                return conclude(state, looked_up, *arguments, warnings).await;
-            },
+            Some(Ok((looked_up, arguments))) => return Ok((looked_up, *arguments)),
             Some(Err(arguments)) => *arguments,
-            None => return shutting_down(),
+            None => return Err(Box::new(shutting_down())),
         };
     let loaded = match data::docs_rs_json(
         &state.cache,
@@ -1102,7 +1121,7 @@ async fn look_up_release(
     .await
     {
         Ok(loaded) => loaded,
-        Err(error) => return load_error(&arguments, &error),
+        Err(error) => return Err(Box::new(load_error(&arguments, &error))),
     };
     warnings.extend(loaded.warnings);
     let lookup = Lookup {
@@ -1111,12 +1130,9 @@ async fn look_up_release(
     };
     let Some((looked_up, arguments, json)) = lookup.on_blocking(loaded.json, arguments).await
     else {
-        return shutting_down();
+        return Err(Box::new(shutting_down()));
     };
-    match recover(state, &lookup, looked_up, arguments, &json, &mut warnings).await {
-        Ok((looked_up, arguments)) => conclude(state, looked_up, arguments, warnings).await,
-        Err(result) => *result,
-    }
+    recover(state, &lookup, looked_up, arguments, &json, warnings).await
 }
 
 /// The result of a lookup, or of the lookup in the crate that the path goes on in.

@@ -302,22 +302,26 @@ async fn load_all(
         .map(|(name, version)| {
             let (state, target) = (Arc::clone(state), target.clone());
             let (task_name, task_version) = (name.clone(), version.clone());
-            let handle = super::spawn(async move {
+            // Aborted if the call is cancelled while it waits (requirement R-WS-6).
+            let handle = super::AbortOnDrop::new(super::spawn(async move {
                 load_release(&state, &task_name, &task_version, &target).await
-            });
+            }));
             (name, version, handle)
         })
         .collect();
     let mut outcomes = Vec::new();
-    for (name, version, handle) in handles {
-        let outcome = match tokio::time::timeout_at(deadline, handle).await {
+    for (name, version, mut handle) in handles {
+        let outcome = match tokio::time::timeout_at(deadline, &mut handle).await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(error)) => {
                 tracing::error!(%error, "loading a crate to search did not finish");
                 Outcome::Failed(json!({ "code": "internal_error", "retryable": true }))
             },
             // The task goes on, and writes the cache for the next search.
-            Err(_) => Outcome::Fetching,
+            Err(_) => {
+                handle.detach();
+                Outcome::Fetching
+            },
         };
         outcomes.push((name, version, outcome));
     }
@@ -334,6 +338,9 @@ async fn load_release(
     target: &TargetTriple,
 ) -> Outcome {
     let dir = state.cache.docs_rs_dir(name, version, Some(target));
+    // A call that loads the same crate goes first, and this one then finds its archive
+    // (requirements R-NW-2 and R-WS-6).
+    let _held = state.cache.lock(&dir).await;
     let (cache, opened_dir) = (state.cache.clone(), dir.clone());
     let opened = crate::task::spawn_blocking(move || load::open_archived(&cache, &opened_dir))
         .await

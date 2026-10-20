@@ -227,8 +227,14 @@ impl Server {
     /// A running server whose default project is `project`, or which has none: it then runs in
     /// its cache directory, so that the project these tests run in is not read.
     fn start_in(project: Option<&Path>) -> Self {
+        Self::start_with(project, &[])
+    }
+
+    /// [`Self::start_in`], with more environment variables.
+    fn start_with(project: Option<&Path>, env: &[(&str, &str)]) -> Self {
         let cache = test_cache();
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"));
+        command.envs(env.iter().copied());
         match project {
             Some(project) => command.env("CLAUDE_PROJECT_DIR", project),
             None => command.env_remove("CLAUDE_PROJECT_DIR"),
@@ -852,6 +858,70 @@ fn progress_is_reported_and_a_cancelled_request_gets_no_response() {
         later.len() <= 1,
         "progress went on after cancellation: {later:?}"
     );
+    assert!(server.finish().success());
+}
+
+/// Over `limits.concurrent_calls`, a call gets `busy`, and a cancelled call gives its place back
+/// (requirements R-SEC-7 and R-WS-6). `sleep` is only in debug builds.
+#[cfg(debug_assertions)]
+#[test]
+fn a_call_over_the_limit_is_busy_until_a_cancelled_call_gives_its_place_back() {
+    let mut server = Server::start_with(None, &[(
+        "CHATORA_RUSTDOC_MCP_LIMITS__CONCURRENT_CALLS",
+        "1",
+    )]);
+    let mut sleep = call_tool(1, "sleep", json!({ "seconds": 30 }));
+    sleep["params"]["_meta"] = meta(json!({ "progressToken": "p1" }));
+    server.send(&sleep);
+    server.notification("notifications/progress");
+    let get_item = |id| {
+        call_tool(
+            id,
+            "get_item",
+            json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET }),
+        )
+    };
+    server.send(&get_item(2));
+    let busy = text_json(&server.response(2)["result"]);
+    assert_eq!(busy["code"], "busy", "{busy}");
+    assert_eq!(busy["retryable"], true);
+    assert_eq!(busy["retry_after_secs"], 1);
+    assert!(busy["request_id"].is_string(), "{busy}");
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": { "requestId": 1, "reason": "test" },
+    }));
+    // The place is given back as soon as the cancelled call has stopped.
+    let deadline = Instant::now()
+        .checked_add(TIMEOUT)
+        .expect("the deadline fits in an Instant");
+    let mut id = 3;
+    let result = loop {
+        server.send(&get_item(id));
+        let result = server.response(id)["result"].clone();
+        if result["isError"] != true || text_json(&result)["code"] != "busy" {
+            break result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the cancelled call kept its place"
+        );
+        thread::sleep(Duration::from_millis(20));
+        id += 1;
+    };
+    assert_eq!(result["isError"], false, "{result}");
+
+    let log = server.log();
+    let error_of = |tool: &str| {
+        log.iter()
+            .filter(|line| line["kind"] == "call" && line["tool"] == tool)
+            .filter_map(|line| line["error"].as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(error_of("sleep"), ["cancelled"], "{log:?}");
+    assert!(error_of("get_item").contains(&"busy"), "{log:?}");
     assert!(server.finish().success());
 }
 

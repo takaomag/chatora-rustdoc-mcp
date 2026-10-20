@@ -342,6 +342,9 @@ pub async fn std_docs(
         .join("std")
         .join(short_hash)
         .join(triple.as_str());
+    // Another call that wants the same nightly goes first, and this one then finds it unpacked
+    // instead of fetching the archive again (requirement R-NW-2).
+    let _held = cache.lock(&dir).await;
     if let Some(nightly) = read_complete(cache, &dir).await? {
         return Ok(StdDocs {
             dir,
@@ -416,6 +419,7 @@ async fn summary(
         || "nightly.json".to_owned(),
         |date| format!("nightly-{date}.json"),
     ));
+    let _held = cache.lock(&path).await;
     let kept = {
         let (cache, path) = (cache.clone(), path.clone());
         blocking(move || {

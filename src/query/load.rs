@@ -87,6 +87,7 @@ pub fn archive_json(cache: &Cache, dir: &Path, json: &[u8]) -> Result<Mapped<Ind
 }
 
 /// The archive of the JSON of the crate `stem` in the cache directory `dir`, made the first time.
+/// It must be called on a blocking thread, not in async code.
 ///
 /// It is keyed by `source`: the SHA-256 of the JSON, or another id of 64 hex digits that changes
 /// with it. Without it, the JSON that `json` reads is parsed, indexed and archived there (the std
@@ -104,6 +105,9 @@ pub fn archive_of(
 ) -> Result<Mapped<Indexed>, LoadError> {
     let short = source.get(..16).unwrap_or(source);
     let path = dir.join(format!("{stem}.{short}.v{ARCHIVE_SCHEMA}.rkyv"));
+    // Another thread that archives the same JSON goes first, and this one then opens its archive
+    // (requirement R-WS-6).
+    let _held = cache.lock_blocking(&path);
     // The format is not compared when an archive is opened.
     let opened = Mapped::open(cache, &path, &header(0, source.into()));
     match opened {

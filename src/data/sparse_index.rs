@@ -226,6 +226,9 @@ impl SparseIndex {
     async fn entry_at(&self, name: &str) -> Result<IndexEntry, IndexError> {
         let body_path = self.cache.sparse_index_path(&index_path(name));
         let record_path = with_suffix(&body_path, ".meta.json");
+        // Another call that wants the same file goes first, and this one then finds it fresh in
+        // the cache (requirement R-NW-2).
+        let _held = self.cache.lock(&body_path).await;
         let cached = read_cached(&self.cache, body_path.clone(), record_path.clone()).await?;
         let now = SystemTime::now();
         if let Some(cached) = &cached {

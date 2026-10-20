@@ -706,6 +706,20 @@ C2〜C8 で M1 のツール (`list_crates`・`resolve_version`・`crate_overview
 - テスト: stdio で、エラーの `request_id` がログの行と一致し、成功の応答に `request_id` が無いこと。Layer が呼び出しの中の warn に `request_id` を付け、info を書かないこと。ファイルの切り替えと削除 (保持期間・合計・使用中・マーカー)。`log.filter` の全体の差し戻し、容量の解析、要求の記録が query と資格情報を除くこと
 - まだ: 知らない `CHATORA_RUSTDOC_MCP_*` の環境変数をログで知らせること (R-DIST-3) は、設定ファイルを読む仕組みと一緒にする
 
+#### D2 (2026-10-20)
+
+同時実行の上限、キャンセル、同じものの取得と解析の合流を入れた (R-SEC-7・R-WS-6・R-NW-2)。
+
+- 上限: 同時に処理するツール呼び出しはプロセスごとに 16 まで (`limits.concurrent_calls`、環境変数 `CHATORA_RUSTDOC_MCP_LIMITS__CONCURRENT_CALLS`。誤った値は既定に戻してログに出す)。超えた呼び出しは待たせずに `busy` (`retryable: true`、`retry_after_secs: 1`) を返す。M1 にはビルドが無いので `status: building` の場合は無い。ローカルビルドの数の上限は M2
+- キャンセル: `notifications/cancelled` で `context.ct` が切れたら、呼び出しの future を落とし、ツールの task を abort する (それまでは rmcp が応答を捨てるだけで、task は最後まで走っていた)。取得中の要求も一緒に止まる。blocking のスレッドの解析は途中で止められず、終わればアーカイブを書く (次の呼び出しで使える)。キャンセルした呼び出しはログに `error: cancelled` で残る
+  - `search_items` の依存の横断: 待っている間にキャンセルされたら、各 crate の読み込みの task も abort する。待つ上限を過ぎて応答した後の task は切り離し、裏でキャッシュを満たし続ける (R-WS-6 の「切り離した状態」)
+- 合流: キャッシュのパスごとのプロセス内のロック (`Cache::lock`。tokio の `Mutex` を `Weak` で持ち、使われなくなったものは次に作るときに忘れる)。同じものを求める 2 つ目以降の呼び出しは、1 つ目が終わるのを待ってからキャッシュを見るので、取得も解析もしない。取る場所: crate の JSON の取得とアーカイブ (`get_item` 系と依存の横断)、std のアーカイブ (blocking のスレッドで)、nightly の manifest と `rust-docs-json` の展開、`.crate`、sparse index のファイル
+  - 1 つ目がキャンセルされると、2 つ目は自分で取り直す (取得を共有して、全員がキャンセルしたときだけ止める R-WS-6 の形にはしていない。M1 の取得は数秒で、取り直しの損は小さい。ビルドを共有する M2 で singleflight にする)
+  - ロックは同じ task で入れ子に取らない (取っている間に別の crate へパスを追う前に放す)。プロセスをまたぐロックは M2 で同じ場所に足す (R-CA-4)
+- 実データ: キャッシュに無い itoa 1.0.15 への 4 つの同時の呼び出し (`get_item` 2 つ・`search_items`・`list_module`) で、`.crate` と JSON の取得は 1 回ずつ、ほかの 3 つは `cache: hit` で 0.5 秒。docs.rs に JSON の無い itoa 1.0.10 では、1 つ目の 404 を否定キャッシュに残し、ほかは取得しなかった。web-sys の取得中 (1.5 秒) のキャンセルでは JSON はキャッシュに書かれず、4 秒 (取得の後の解析中) のキャンセルでは JSON だけが残った
+- 依存: tokio の `sync` 機能を明示した (それまでは他の依存が有効にしていた)
+- テスト: stdio で、上限 1 のとき 2 つ目が `busy` になり、1 つ目をキャンセルすると次の呼び出しが通り、ログに `cancelled` と `busy` が残ること (`sleep` を使うので debug ビルドだけ)。`run_tool` を落とすとツールの task が止まること。上限の出入り。同じパスのロックを順に取ること
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

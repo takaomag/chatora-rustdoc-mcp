@@ -130,6 +130,8 @@ impl StaticCrates {
         checksum: Option<&str>,
     ) -> Result<Option<Box<[u8]>>, CrateError> {
         let path = cache.crate_file_path(name, version);
+        // Another call that wants the same `.crate` goes first (requirement R-NW-2).
+        let _held = cache.lock(&path).await;
         match cache.read_verified(&path).map_err(CrateError::Cache)? {
             Verified::Found(contents) => return Ok(Some(contents)),
             Verified::Mismatch | Verified::None => {},

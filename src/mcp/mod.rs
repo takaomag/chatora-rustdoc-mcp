@@ -204,6 +204,7 @@ pub async fn serve() -> Result<(), ServeError> {
             ),
             #[cfg(feature = "local")]
             resolver: Resolver::new(false),
+            calls: tool::CallLimit::from_env(),
         }),
     };
     match Box::pin(server.serve(stdio())).await {

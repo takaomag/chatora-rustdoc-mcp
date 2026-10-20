@@ -33,7 +33,10 @@ use rmcp::{
     service::{RequestContext, RoleServer},
 };
 use serde_json::{Value, json};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+};
 use tracing::Instrument as _;
 
 use crate::data::{
@@ -69,7 +72,73 @@ pub(super) struct ToolState {
     /// Resolves the packages of projects with `cargo metadata` (requirement R-VR-2).
     #[cfg(feature = "local")]
     pub(super) resolver: Resolver,
+    /// The calls being handled, at most `limits.concurrent_calls` (requirement R-SEC-7).
+    pub(super) calls: CallLimit,
 }
+
+/// The most tool calls handled at once (requirement R-SEC-7). Over it, a call gets `busy`.
+#[derive(Debug)]
+pub(super) struct CallLimit {
+    permits: Arc<Semaphore>,
+    max: usize,
+}
+
+impl CallLimit {
+    /// `limits.concurrent_calls` unless set (requirement R-SEC-7, initial value).
+    const DEFAULT: usize = 16;
+    /// Environment variable of `limits.concurrent_calls` (requirement R-DIST-3).
+    const ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_LIMITS__CONCURRENT_CALLS";
+
+    /// The limit that [`Self::ENV_VAR`] sets, or the default. A value that is not a whole number
+    /// from 1 is logged and replaced by the default.
+    pub(super) fn from_env() -> Self {
+        let max = std::env::var_os(Self::ENV_VAR).map_or(Self::DEFAULT, |value| {
+            value
+                .to_str()
+                .and_then(|value| value.trim().parse().ok())
+                .filter(|max| *max > 0)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "{} is not valid ({}), so the default {} is used",
+                        Self::ENV_VAR,
+                        value.to_string_lossy(),
+                        Self::DEFAULT
+                    );
+                    Self::DEFAULT
+                })
+        });
+        Self::new(max)
+    }
+
+    fn new(max: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(max.min(Semaphore::MAX_PERMITS))),
+            max,
+        }
+    }
+
+    /// A place among the calls being handled, or `None` when there is none.
+    fn enter(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.permits).try_acquire_owned().ok()
+    }
+
+    /// The error of a call that found no place (requirements R-SEC-7 and R-ERR-2).
+    fn busy(&self) -> CallToolResult {
+        error_result(&json!({
+            "code": "busy",
+            "message": format!(
+                "the server is handling as many calls as it can at once ({})",
+                self.max
+            ),
+            "retryable": true,
+            "suggestions": ["call again in a moment, or make fewer calls at once"],
+            "retry_after_secs": BUSY_RETRY_AFTER_SECS,
+        }))
+    }
+}
+
+/// How long a `busy` call is told to wait: lookups take well under a second (requirement R-ERR-2).
+const BUSY_RETRY_AFTER_SECS: u64 = 1;
 
 /// An error and its sources, joined with `: `.
 pub(super) struct ErrorChain<'a>(&'a dyn std::error::Error);
@@ -117,11 +186,28 @@ pub(super) async fn call(
     state: &Arc<ToolState>,
 ) -> Result<CallToolResponse, ErrorData> {
     let call = call_log::Call::start(&request.name, request.arguments.as_ref());
+    let Some(entered) = state.calls.enter() else {
+        let mut busy = state.calls.busy();
+        call.finish(&mut busy);
+        return Ok(busy.into());
+    };
+    let cancelled = context.ct.clone();
     let span = call.span();
-    let called = call
+    let running = call
         .fetches()
-        .scope(dispatch(request, context, state).instrument(span))
-        .await;
+        .scope(dispatch(request, context, state).instrument(span));
+    // On `notifications/cancelled`, the call stops: its task is aborted, and with it what it was
+    // fetching, unless another call waits for the same (requirement R-WS-6). rmcp sends no
+    // response to a cancelled request.
+    let called = tokio::select! {
+        called = running => called,
+        () = cancelled.cancelled() => {
+            let mut result = tool_error("cancelled", "the call was cancelled", false, &[]);
+            call.finish(&mut result);
+            return Ok(result.into());
+        },
+    };
+    drop(entered);
     match called {
         Ok(mut result) => {
             call.finish(&mut result);
@@ -216,7 +302,8 @@ async fn run_tool<F>(future: F) -> CallToolResult
 where
     F: Future<Output = CallToolResult> + Send + 'static,
 {
-    match spawn(future).await {
+    // Dropping this future, as a cancelled call does, aborts the task.
+    match AbortOnDrop::new(spawn(future)).await {
         Ok(result) => result,
         Err(error) => {
             // The panic hook has already written the panic message to stderr.
@@ -242,6 +329,44 @@ where
     match Fetches::current() {
         Some(fetches) => tokio::spawn(fetches.scope(future).instrument(span)),
         None => tokio::spawn(future.instrument(span)),
+    }
+}
+
+/// A task that is aborted when this is dropped before it finishes. Tokio's `JoinHandle` lets the
+/// task go on.
+pub(super) struct AbortOnDrop<T>(Option<JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    pub(super) const fn new(handle: JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// Lets the task go on after this is dropped: it fills the cache for later calls.
+    #[cfg(feature = "local")]
+    pub(super) fn detach(mut self) {
+        drop(self.0.take());
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+impl<T> Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // Only `detach` takes the handle, and it consumes `self`.
+        self.0.as_mut().map_or(std::task::Poll::Pending, |handle| {
+            std::pin::Pin::new(handle).poll(context)
+        })
     }
 }
 
@@ -290,6 +415,8 @@ fn error_result(body: &Value) -> CallToolResult {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// Returns the JSON in `content[0].text` of a tool result.
@@ -307,6 +434,46 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         assert!(result.structured_content.is_none());
         assert_eq!(text_json(&result)["code"], "internal_error");
+    }
+
+    #[tokio::test]
+    async fn dropping_run_tool_aborts_the_task_of_the_tool() {
+        /// Says when it is dropped, as the task's future is when the task is aborted.
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    sender.send(()).unwrap_or_default();
+                }
+            }
+        }
+        let (sender, dropped) = tokio::sync::oneshot::channel();
+        let (started_sender, started) = tokio::sync::oneshot::channel::<()>();
+        let running = tokio::spawn(run_tool(async move {
+            let _dropped = Dropped(Some(sender));
+            started_sender.send(()).unwrap_or_default();
+            std::future::pending::<CallToolResult>().await
+        }));
+        started.await.expect("the tool started");
+        running.abort();
+        tokio::time::timeout(Duration::from_secs(10), dropped)
+            .await
+            .expect("the tool's task was aborted")
+            .expect("dropped once");
+    }
+
+    #[test]
+    fn calls_over_the_limit_are_busy_until_one_leaves() {
+        let limit = CallLimit::new(2);
+        let first = limit.enter().expect("a place");
+        let _second = limit.enter().expect("a place");
+        assert!(limit.enter().is_none());
+        let busy = text_json(&limit.busy());
+        assert_eq!(busy["code"], "busy");
+        assert_eq!(busy["retryable"], true);
+        assert_eq!(busy["retry_after_secs"], BUSY_RETRY_AFTER_SECS);
+        drop(first);
+        assert!(limit.enter().is_some());
     }
 
     #[tokio::test]
