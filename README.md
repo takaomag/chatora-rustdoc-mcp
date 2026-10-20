@@ -1,45 +1,58 @@
 # chatora-rustdoc-mcp
 
-> **Status: early development.** Nothing works yet. Everything below describes what is planned, and it will change.
+> **Status: early (0.1).** It looks up crates on docs.rs and the standard library. Building documentation locally (for your own workspace, and for crates docs.rs has none of) is not there yet. Names, arguments and responses may still change.
 
 An MCP server that looks up Rust API documentation from rustdoc JSON, so that coding agents such as Claude Code write Rust against real definitions instead of memory.
 
-## Planned features
+- Looks up the version your project resolves in `Cargo.lock`, without the agent naming a version, or any version you name.
+- Shows paths you can `use`, following re-exports, also into other crates (`reqwest::header::HeaderMap` is shown from `http`).
+- Tells which features an item needs, whether your project enables them, and whether docs.rs built the documentation with them.
+- Looks up the standard library of a nightly toolchain, with the release each item became stable in.
+- Lists the methods of a type (its own and its traits'), the traits a type implements (with the conditions of `Send` and `Sync`), and the implementors of a trait within its crate.
 
-- Looks up the versions your project actually resolves (from `Cargo.lock`), without the agent having to name a version.
-- Covers your dependencies, your own workspace (including private items), and the standard library in one server.
-- Shows paths you can actually `use`, resolving re-exports instead of exposing private definition paths.
-- Fetches rustdoc JSON for crates.io dependencies from docs.rs (building it locally when docs.rs has none), and builds it locally for your workspace and for path, git, and private-registry dependencies.
-- Comes with a small CLI to manage the cache (and possibly to install the skill).
-- Ships as a Claude Code plugin (MCP server and skill).
-- Supports Linux, macOS, and Windows.
+## Platforms: Linux for now
 
-## Installation (planned)
+It builds and runs on Linux, macOS and Windows, but since 2026-05-01 docs.rs builds most new releases for `x86_64-unknown-linux-gnu` only. The server looks up the documentation for the host's target, so on macOS and Windows it answers `docs_unavailable` (`no_target_json`) for most releases since then; asking with `target: "x86_64-unknown-linux-gnu"` gets the Linux documentation, which may lack items for your platform. Building documentation locally, which will cover other targets, comes in a later release.
 
-This project is not published on crates.io yet. Until it is, do not install a crate by this name. Once published, it will be installed with:
+## Installation
 
 ```sh
 cargo install --locked chatora-rustdoc-mcp
 ```
 
-Prebuilt binaries will also be published on GitHub Releases; whether to support `cargo binstall` or installer scripts is not decided yet. Claude Code v2.1.292 or later is required.
+It needs Rust 1.99 or later to build, and Claude Code v2.1.292 or later. Prebuilt binaries are planned.
 
-The server speaks only MCP 2026-07-28. When Claude Code first connects to a server, it asks whether the server supports that version; if the answer comes too late, Claude Code uses the older protocol with that server for seven days, and during that time it cannot connect to this server. How to reset this is not confirmed yet.
-
-## Usage (planned)
+Register it with Claude Code for all your projects:
 
 ```sh
-# MCP server over stdio
-chatora-rustdoc-mcp serve
-
-# CLI for humans (syntax not final)
-chatora-rustdoc-mcp cache ls
-chatora-rustdoc-mcp cache gc
-chatora-rustdoc-mcp cache clear serde@1.0.228
-chatora-rustdoc-mcp install-skill   # optional, may come later
+claude mcp add --scope user chatora-rustdoc-mcp -- chatora-rustdoc-mcp serve
 ```
 
-Subagents that list their `tools` get no MCP tools unless you add `mcp__chatora-rustdoc-mcp` (or, for a plugin install, the `mcp__plugin_<plugin>_<server>` name) to the list.
+The server reads the project Claude Code is opened in (`CLAUDE_PROJECT_DIR`, or its working directory) for the versions in `Cargo.lock`; tools also take a `project` argument inside it. For the standard library, it uses a nightly toolchain with the `rust-docs-json` component if one is installed and is not older than the project's toolchain, and otherwise downloads that component of the latest nightly from static.rust-lang.org (about 4 MB).
+
+The server speaks only MCP 2026-07-28. When Claude Code first connects to a server, it asks whether the server supports that version; if the answer comes too late, Claude Code uses the older protocol with that server for seven days, and during that time it cannot connect to this server.
+
+Subagents that list their `tools` get no MCP tools unless you add `mcp__chatora-rustdoc-mcp` to the list.
+
+## Tools
+
+| Tool | Answers |
+| --- | --- |
+| `list_crates` | What the project depends on, at which versions, and why a crate is in the graph |
+| `resolve_version` | The latest release, the version the project uses, whether one exists or is yanked, and whether docs.rs has its JSON |
+| `crate_overview` | What a crate is and how it is organized: its modules, items and features |
+| `search_items` | Items by name, alias, documentation or path, in one crate or across the project's direct dependencies |
+| `get_item` | One item: its signature, documentation, the features it needs, its stability, and where it is defined |
+| `list_module` | What a module has and re-exports, or a crate's whole public API |
+| `list_methods` | The methods that can be called on a type, and which need a `use` |
+| `list_impls` | The traits a type implements, and the conditions of its auto traits |
+| `list_implementors` | The types that implement a trait in its crate, and what an implementation must write |
+
+Every response says where its data came from (`provenance`): the crate, the version and how it was chosen, the target, and the features docs.rs built it with.
+
+## Cache
+
+rustdoc JSON and what the server makes of it are cached in `$XDG_CACHE_HOME/chatora-rustdoc-mcp/` (`~/.cache/chatora-rustdoc-mcp/` when unset) on Linux and macOS, and in `%LOCALAPPDATA%\chatora-rustdoc-mcp\cache\` on Windows; `CHATORA_RUSTDOC_MCP_CACHE__DIR` (an absolute path) moves it. The standard library takes a few hundred MB, and a large crate tens of MB. Nothing is removed from the cache yet; deleting the directory is safe while no server runs. A command to manage the cache is planned.
 
 ## Logs
 
@@ -62,45 +75,31 @@ The server also logs to stderr. These environment variables change the logs:
 | `CHATORA_RUSTDOC_MCP_LOG__TOTAL_MAX_SIZE` | `50MB` | The size of all files together |
 | `CHATORA_RUSTDOC_MCP_LOG__FILTER` | `info` | Which lines stderr gets, in [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax; if any part is not valid, the default is used. The log file is not filtered |
 
+## Settings
+
+Settings are environment variables for now; a settings file is planned. Besides those of the cache and the logs above:
+
+| Variable | Default | |
+| --- | --- | --- |
+| `CHATORA_RUSTDOC_MCP_LIMITS__CONCURRENT_CALLS` | `16` | How many tool calls are handled at once; more get `busy` |
+
+A setting with a value that is not valid is replaced by its default, which the log says.
+
 ## Security
 
-Local builds run `cargo`, and with it build scripts and procedural macros, outside Claude Code's sandbox. The server itself never asks for confirmation.
+The server needs no confirmation for anything it does, and builds nothing yet. For a lookup in the project Claude Code is opened in, it runs `cargo metadata`, `cargo tree` and `rustc -vV` there; for the standard library, `rustup run nightly rustc` in its cache directory. It does not run anything for a `project` outside the project Claude Code is opened in.
 
-- The lookup tools build only the project Claude Code is opened in, plus the dependencies that `cargo check --all-targets` builds for the project's target platforms (`build.target` in `.cargo/config.toml`, or the host if unset; if several are listed, lookups without a `target` argument use the first), the same set rust-analyzer builds. If that directory has no `Cargo.toml`, each workspace directly inside it (as of server startup) counts as a project; a repository cloned there later is not included, and neither is a workspace nested deeper (open Claude Code in it, or point `build_external_docs` at it). Given a different `target`, the lookup tools build nothing: they use docs.rs, or what `build_external_docs` built for that target.
-- A separate tool, `build_external_docs`, builds code from anywhere else the agent points it at: another project directory, a git repository, a crate that is not a dependency, or a version that is not in `Cargo.lock`, as well as the dependencies of this project that the lookup tools cannot build. It can also build any of these, as well as this project's own code and dependencies, for another target.
+- `[toolchain] path` in the project's `rust-toolchain.toml` can make these commands run any executable, and `build.rustc` and `build.rustc-wrapper` in its `.cargo/config.toml` can do the same for `cargo metadata` and `cargo tree`; `cargo metadata` also fetches the git dependencies in `Cargo.toml` from whatever hosts they name. rust-analyzer does the same when it opens the project. Do not open untrusted repositories in Claude Code with this server enabled.
+- The server connects to docs.rs, index.crates.io, static.crates.io and static.rust-lang.org over HTTPS, and to nothing else.
+- A repository you trust in Claude Code can also change this server's settings through the `env` block of its `.claude/settings.json`, just as its hooks can run commands.
+- Keep the cache and log directories out of places other users can write to, such as `/tmp`: another user could change the cached documentation, or, as cargo reads `.cargo/config.toml` from every parent directory, make the commands above run their programs. The server creates its directories with your default permissions, so if other users can read your home directory, they can also read the logs, which contain project paths.
 
-Lookups in a project run `cargo metadata`, `cargo tree`, and `rustc -vV` even when nothing is built. `[toolchain] path` in the project's `rust-toolchain.toml` can make all of them run any executable; `build.rustc` and `build.rustc-wrapper` in its `.cargo/config.toml` can do the same for `cargo metadata` and `cargo tree`; and `cargo metadata` fetches the git dependencies in `Cargo.toml` from whatever hosts they name.
+## Planned
 
-To allow the lookup tools but still be asked before code from elsewhere is built, use these Claude Code permission rules (for a plugin install, the tool names start with `mcp__plugin_<plugin>_<server>__`):
-
-```json
-{
-  "permissions": {
-    "allow": ["mcp__chatora-rustdoc-mcp__*"],
-    "ask": ["mcp__chatora-rustdoc-mcp__build_external_docs"]
-  }
-}
-```
-
-Without the `ask` rule, the wildcard also allows `build_external_docs` without a prompt. With it, what happens depends on where and how Claude Code runs (checked with Claude Code 2.1.301):
-
-| Where | Permission mode | `build_external_docs` |
-| --- | --- | --- |
-| Terminal | Manual, `acceptEdits`, auto, plan | Asks first |
-| Terminal | `bypassPermissions` | Runs without asking (contradicts the Claude Code docs, which say ask rules apply in every mode; see [anthropics/claude-code#95741](https://github.com/anthropics/claude-code/issues/95741)) |
-| VS Code | Manual | Asks first |
-| VS Code | auto | Runs without asking (also contradicts the docs, and the terminal asks in auto mode; see [anthropics/claude-code#83766](https://github.com/anthropics/claude-code/issues/83766)) |
-| Headless (`claude -p`) | Any, even with `--allowedTools`, `bypassPermissions`, `dontAsk`, or a `PreToolUse` hook that returns `allow` | Refused |
-
-If you want to be asked before code from elsewhere is built, do not use `bypassPermissions`, and in VS Code use Manual rather than auto. To use `build_external_docs` in headless mode, run with settings that have no `ask` rule for it and add it to `--allowedTools`.
-
-- Do not point `build_external_docs` at code you do not trust, and do not open untrusted repositories in Claude Code with this server enabled.
-- A repository you trust in Claude Code can also change this server's settings through the `env` block of its `.claude/settings.json` (for example the cargo path, or, if mirror settings are added, the mirror URLs, including where your GitHub token is sent), just as its hooks can run commands or read the token.
-- `git` URLs with `http://` or `git://` are accepted, with a warning in the result; downloads over them can be tampered with in transit.
-- Do not use this server in CI jobs that handle untrusted code, such as pull requests from forks: their build scripts would run with the job's secrets.
-- Builds never prompt you for git or SSH credentials themselves (terminal prompts and askpass dialogs are turned off), but prompts raised by your SSH agent or credential helper still appear: for example, 1Password's or Secretive's SSH agent asking you to approve a key, macOS asking for Keychain access, or gnome-keyring asking to unlock.
-- Keep the cache, state, and log directories out of places other users can write to, such as `/tmp`: cargo reads `.cargo/config.toml` from every parent directory, so a file another user puts in `/tmp/.cargo/` would apply to this server's builds, and another user could tamper with the build directories in the cache to run code as you. Like cargo, the server creates its cache, state, and log directories with your default permissions, so if other users can read your home directory, they can also read the cached documentation of your private code and the logs.
-- The source lookup tools read only package contents (sources and the files their builds read, `Cargo.toml`, the readme and examples a manifest names, and for registry and git dependencies the contents of the `.crate` or checkout; never dotfiles such as `.env`), but they still bypass Claude Code's `Read` deny rules for those files, and the `project` argument lets them read those files in any workspace. Local builds also put the contents of files that code pulls into its documentation with `include_str!` into lookup results, even files outside the project (for example `~/.ssh/id_rsa`).
+- Local builds of rustdoc JSON for your workspace (with private items), for path, git and private-registry dependencies, for crates docs.rs has no JSON of, and for other targets. Local builds will run build scripts and procedural macros outside Claude Code's sandbox; a separate tool, which you can make ask for permission, will build code from outside the project.
+- The implementors of a trait across your dependency graph, the methods of the type a type dereferences to, and the source of items.
+- Feature inspection, examples, changelogs, API diffs between versions, crate metadata, and advisories.
+- A CLI to manage the cache, a settings file, and a Claude Code plugin with a skill.
 
 ## Development
 

@@ -809,6 +809,14 @@ canary と live の docs.rs の smoke test を足した (R-QA-4)。`.github/work
 - 手元で両方通った (nightly 2026-10-19 の rustc、docs.rs は 2026-10-20 時点)。Issue の開閉は、GitHub で定期実行が回るまで確かめられない (手動の実行では開閉しない)
 - まだ: beta の toolchain に `RUSTC_BOOTSTRAP` を付けた合成の workspace のローカルビルド (R-QA-4 の 4 つ目) はローカルビルドを入れる M2 で。std のスナップショットの変化の検知は、今は代表の item が引けることと形式 58〜60 の写しの確認だけで、スナップショットの比較は入れていない (nightly ごとに文面が変わり、Issue が開きっぱなしになるため。R-QA-1 の予算 (E2) で大きさの変化は捕まえる)
 
+#### E4 (2026-10-20)
+
+README を M1 の実態に合わせ、crates.io への最初の公開を用意した (R-DIST-1)。公開は利用者が行う。
+
+- README (利用者向け、英語): 状態 (0.1。docs.rs と std の照会ができ、ローカルビルドはまだ)、できること、**Linux 向けであること** (docs.rs が 2026-05-01 から新しいリリースの多くを x86_64-unknown-linux-gnu だけで作るので、macOS と Windows ではホストの target の照会が `no_target_json` になる。`target` に Linux を渡せば引ける)、導入 (`cargo install --locked`、Rust 1.99 以上、Claude Code 2.1.292 以上、`claude mcp add --scope user chatora-rustdoc-mcp -- chatora-rustdoc-mcp serve`)、std の JSON の出どころ、ツール 9 本の表、キャッシュ (場所・大きさ・まだ消さないこと)、ログ (D1)、設定 (環境変数だけ)、セキュリティ (今動かすもの: 既定のプロジェクトでの `cargo metadata`・`cargo tree`・`rustc -vV`、std のための `rustup run nightly rustc`。それが動かしうるもの、接続する 4 つのホスト、信頼したリポジトリの `env`、ディレクトリの置き場所)、予定 (ローカルビルドと外のツール、M4 の機能、CLI・設定ファイル・プラグイン)。M2 のビルドの許可ルールの表は、ビルドを入れるときに戻す (要件 R-SEC-2 にある)
+- 公開の確認: `cargo publish --dry-run --locked` が通った (81 ファイル、1.1MiB、圧縮して 282KiB。`include` で `src`・`build.rs`・README・ライセンスだけ。説明文の Markdown は `src` の下)。テストのファイルが入らない旨の警告は、`include` で外しているため
+- 公開の手順 (利用者): CI が緑の main を push した後、`cargo login` (crates.io の API token)、`cargo publish --locked`。公開した版は消せない (yank はできる)。公開したら `cargo install --locked chatora-rustdoc-mcp` で入ることを確かめる
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。
