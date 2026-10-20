@@ -418,9 +418,9 @@ fn tools_list_is_cacheable_and_not_paginated() {
         .collect();
     // `sleep` is only in debug builds.
     let expected: &[&str] = if cfg!(debug_assertions) {
-        &["get_item", "sleep"]
+        &["get_item", "resolve_version", "sleep"]
     } else {
-        &["get_item"]
+        &["get_item", "resolve_version"]
     };
     assert_eq!(names, expected);
     let get_item = &result["tools"][0];
@@ -499,6 +499,25 @@ fn get_item_returns_structured_content_and_tool_errors() {
     );
     // Only an unknown tool is a JSON-RPC error.
     assert_eq!(server.response(4)["error"]["code"], -32602);
+    assert!(server.finish().success());
+}
+
+/// `resolve_version` answers without the network when there is nothing to resolve: std comes
+/// with the toolchain, and an argument that is not valid is a tool error (requirement R-ARG-1).
+#[test]
+fn resolve_version_needs_no_network_for_std_and_bad_arguments() {
+    let mut server = Server::start();
+    server.send(&call_tool(1, "resolve_version", json!({ "crate": "std" })));
+    server.send(&call_tool(
+        2,
+        "resolve_version",
+        json!({ "crate": "tokio@x.y" }),
+    ));
+    for id in [1, 2] {
+        let result = &server.response(id)["result"];
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(text_json(result)["code"], "invalid_argument", "{result}");
+    }
     assert!(server.finish().success());
 }
 

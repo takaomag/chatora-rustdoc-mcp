@@ -167,8 +167,28 @@ impl DocsRs {
         name: &CrateName,
         version: &Version,
     ) -> Result<bool, FetchError> {
-        let url = self.json_url(name, version, None);
-        let response = http::send(self.client.head(&url))
+        self.has_json_at(&self.json_url(name, version, None)).await
+    }
+
+    /// Whether docs.rs has rustdoc JSON of `name` at `version` built for `target`, asked with
+    /// `HEAD`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when docs.rs does not answer with 200 or 404.
+    pub async fn has_rustdoc_json_for(
+        &self,
+        name: &CrateName,
+        version: &Version,
+        target: &TargetTriple,
+    ) -> Result<bool, FetchError> {
+        self.has_json_at(&self.json_url(name, version, Some(target)))
+            .await
+    }
+
+    /// Whether docs.rs answers `HEAD` of `url` with 200 rather than 404.
+    async fn has_json_at(&self, url: &str) -> Result<bool, FetchError> {
+        let response = http::send(self.client.head(url))
             .await
             .map_err(network_error)?;
         match response.status() {

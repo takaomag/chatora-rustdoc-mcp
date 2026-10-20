@@ -5,6 +5,7 @@
 
 mod get_item;
 mod project;
+mod resolve_version;
 #[cfg(debug_assertions)]
 mod sleep;
 
@@ -74,6 +75,7 @@ impl std::fmt::Display for ErrorChain<'_> {
 pub(super) fn definitions() -> Vec<Tool> {
     vec![
         get_item::definition(),
+        resolve_version::definition(),
         // A tool for testing progress and cancellation, only in debug builds.
         #[cfg(debug_assertions)]
         sleep::definition(),
@@ -96,6 +98,15 @@ pub(super) async fn call(
             Ok(arguments) => Ok(run_tool(get_item::execute(arguments, Arc::clone(state)))
                 .await
                 .into()),
+            Err(error) => Ok(error.into_result().into()),
+        },
+        resolve_version::NAME => match resolve_version::parse_arguments(request.arguments.as_ref())
+        {
+            Ok(arguments) => Ok(
+                run_tool(resolve_version::execute(arguments, Arc::clone(state)))
+                    .await
+                    .into(),
+            ),
             Err(error) => Ok(error.into_result().into()),
         },
         #[cfg(debug_assertions)]

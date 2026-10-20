@@ -569,6 +569,18 @@ C1 の終わりの印は満たした:
 
 M1 の終わりに要件へ反映するもの (C1 の分): `detail` の各段の中身と `sections`・`attrs`・`truncated` (R-OUT-7・R-OUT-3)、応答の上限の初期値 32,000 文字と削る順、`candidates_total`、cfg の 4 系統の表記と `doc`・`docsrs` の畳み方 (R-FT-2)、`enabled_in_project` の評価の規則 (C1d-2 の決定)、provenance の `features`・`all_features`・`cfg` と欠けた feature の warnings (R-FT-1・§7.3)、`resolved_from: "reexport"`、他の crate へのパスを自動でたどること (R-PR-4)、型のパスの扱い (§7。M4 へ)、`stability` (Q17)、`.crate` の取得 (R-SC-2 の初期の上限)、R-NW-4 の見直し
 
+#### C2 (2026-10-20)
+
+`resolve_version` を足した (§6.3)。要件には表の 1 行と応答の骨格 (R-OUT-9) しか無いので、細部を次のように決めた (M1 の終わりに要件へ反映する)。
+
+- 引数: `get_item` から `path`・`detail` を除いたもの (`crate[@版]`・`version`・`project`・`target`)。解析は `get_item` と共有した (`parse_release`)
+- 版の決め方は `get_item` と同じ (明示 > プロジェクトの Cargo.lock > latest)。違いは 2 つ: プロジェクトの path・git・別レジストリのパッケージをエラー (`local_build_required`) にせず、取得元として答える。キャッシュの近道を使わず常に crates.io の index を読む (latest と yanked のため)。同名の複数版は `get_item` と同じく `ambiguous_version`
+- 応答: provenance は `source` (`crates.io`、プロジェクトだけのパッケージは `project`)・`crate`・`version`・`resolved_from`・`project_from`・`target`。`data` は `version`・`source` (プロジェクトがどこから取るか: `crates.io`・`path`・`git`・`registry`)・`yanked` (真のときだけ)・`rust_version` (index の MSRV)・`latest` (crates.io の最新の stable)・`docs_rs_json`
+- `docs_rs_json`: キャッシュにあれば `available`。無ければ docs.rs に `HEAD` で聞く (その target の JSON → 無ければ既定の target の JSON): `available`・`no_target_json`・`no_json`。プロジェクトの複製が crates.io のものでなければ `not_on_docs_rs` (理由を warnings に)。聞けなければ `unknown`
+- std の仲間は crates.io の版を持たないので `invalid_argument` にし、`get_item` を案内する
+- 実データ (§3 Q2): `axum@latest` は 0.8.9 (MSRV 1.80)、このリポジトリの `tokio` は Cargo.lock の 1.53.3 で latest は 1.54.0、この crate 自身は `path` で `not_on_docs_rs`、`serde@1.0.200` は `no_json` (2025-05-23 より前)、mac 向けの `tokio@1.53.3` は `no_target_json`、`windows-sys` は 2 版で `ambiguous_version`
+- テスト: 引数の解析、outputSchema が応答を覆うこと、説明文の長さ、stdio で std と誤った引数がネットワークなしにエラーになること、`tools/list` の一覧
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

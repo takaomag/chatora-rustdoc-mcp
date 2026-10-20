@@ -379,10 +379,11 @@ fn object(value: Value) -> JsonObject {
     }
 }
 
-/// Checks the arguments (requirement R-ARG-1).
-pub(super) fn parse_arguments(
+/// Checks the arguments that name a release: `crate`, `version`, `project` and `target`
+/// (requirement R-ARG-1). `resolve_version` takes these, too.
+pub(super) fn parse_release(
     arguments: Option<&JsonObject>,
-) -> Result<Arguments, InvalidArgument> {
+) -> Result<ReleaseArguments, InvalidArgument> {
     let argument = |name| arguments.and_then(|arguments| arguments.get(name));
     let string = |name: &'static str, example| match argument(name) {
         Some(Value::String(value)) => Ok(Some(value.trim())),
@@ -439,6 +440,45 @@ pub(super) fn parse_arguments(
             })
         })
         .transpose()?;
+    Ok(ReleaseArguments {
+        name,
+        version,
+        project,
+        target,
+    })
+}
+
+/// The arguments that name a release, checked.
+#[derive(Debug)]
+pub(super) struct ReleaseArguments {
+    pub(super) name: CrateName,
+    /// The version asked for, in `crate` or `version`. Without one, the project's is used.
+    pub(super) version: Option<VersionSpec>,
+    /// The project whose Cargo.lock decides the version, when it is not the default one.
+    pub(super) project: Option<PathBuf>,
+    /// The target asked for.
+    pub(super) target: Option<TargetTriple>,
+}
+
+/// Checks the arguments (requirement R-ARG-1).
+pub(super) fn parse_arguments(
+    arguments: Option<&JsonObject>,
+) -> Result<Arguments, InvalidArgument> {
+    let ReleaseArguments {
+        name,
+        version,
+        project,
+        target,
+    } = parse_release(arguments)?;
+    let argument = |name| arguments.and_then(|arguments| arguments.get(name));
+    let string = |name: &'static str, example| match argument(name) {
+        Some(Value::String(value)) => Ok(Some(value.trim())),
+        Some(_) => Err(InvalidArgument::new(
+            format!("`{name}` must be a string"),
+            example,
+        )),
+        None => Ok(None),
+    };
     let Some(path) = string("path", PATH_EXAMPLE)? else {
         return Err(InvalidArgument::new("`path` is required", PATH_EXAMPLE));
     };
@@ -648,7 +688,11 @@ fn cached_exact(
 }
 
 /// `version_not_found` (§8), with the versions to suggest.
-fn version_not_found(name: &str, spec: &VersionSpec, no_version: &NoVersion) -> CallToolResult {
+pub(super) fn version_not_found(
+    name: &str,
+    spec: &VersionSpec,
+    no_version: &NoVersion,
+) -> CallToolResult {
     error_result(&json!({
         "code": "version_not_found",
         "message": format!("{name} has no version {spec} on crates.io"),
@@ -666,24 +710,7 @@ fn version_not_found(name: &str, spec: &VersionSpec, no_version: &NoVersion) -> 
 /// on crates.io, and this server does not build documentation yet (decided in M1, until M2).
 #[cfg(feature = "local")]
 fn local_build_required(package: &ProjectPackage, check: DocsRsCheck) -> CallToolResult {
-    let why: Cow<'_, str> = match (check, &package.source) {
-        (DocsRsCheck::NotCratesIo, Source::Local) => {
-            "a workspace member or a path dependency".into()
-        },
-        (DocsRsCheck::NotCratesIo, Source::Git(source)) => format!("from git ({source})").into(),
-        (DocsRsCheck::NotCratesIo, Source::Registry(source)) => {
-            format!("from another registry ({source})").into()
-        },
-        (DocsRsCheck::ChecksumMismatch, _) => {
-            "a copy whose checksum in Cargo.lock differs from crates.io's (patched or vendored)"
-                .into()
-        },
-        (DocsRsCheck::NoChecksum, _) => "without a checksum in Cargo.lock".into(),
-        (DocsRsCheck::NotInIndex, _) => "a version that crates.io does not list".into(),
-        (DocsRsCheck::NotCratesIo, Source::CratesIo) | (DocsRsCheck::Allowed, _) => {
-            "not the release on crates.io".into()
-        },
-    };
+    let why = not_on_docs_rs(package, check);
     error_result(&json!({
         "code": "docs_unavailable",
         "message": format!(
@@ -700,8 +727,31 @@ fn local_build_required(package: &ProjectPackage, check: DocsRsCheck) -> CallToo
     }))
 }
 
+/// What the project's `package` is, that docs.rs does not have it (`check`).
+#[cfg(feature = "local")]
+pub(super) fn not_on_docs_rs(package: &ProjectPackage, check: DocsRsCheck) -> Cow<'_, str> {
+    match (check, &package.source) {
+        (DocsRsCheck::NotCratesIo, Source::Local) => {
+            "a workspace member or a path dependency".into()
+        },
+        (DocsRsCheck::NotCratesIo, Source::Git(source)) => format!("from git ({source})").into(),
+        (DocsRsCheck::NotCratesIo, Source::Registry(source)) => {
+            format!("from another registry ({source})").into()
+        },
+        (DocsRsCheck::ChecksumMismatch, _) => {
+            "a copy whose checksum in Cargo.lock differs from crates.io's (patched or vendored)"
+                .into()
+        },
+        (DocsRsCheck::NoChecksum, _) => "without a checksum in Cargo.lock".into(),
+        (DocsRsCheck::NotInIndex, _) => "a version that crates.io does not list".into(),
+        (DocsRsCheck::NotCratesIo, Source::CratesIo) | (DocsRsCheck::Allowed, _) => {
+            "not the release on crates.io".into()
+        },
+    }
+}
+
 /// The tool error for an index that could not be read (§8).
-fn index_error(name: &CrateName, error: &IndexError) -> CallToolResult {
+pub(super) fn index_error(name: &CrateName, error: &IndexError) -> CallToolResult {
     let message = format!(
         "the versions of {name} could not be read: {}",
         ErrorChain(error)
@@ -1264,7 +1314,7 @@ async fn recover(
 }
 
 /// The crate of std that `name` is, if it is one (requirement R-STD-1).
-fn std_crate(name: &CrateName) -> Option<StdCrate> {
+pub(super) fn std_crate(name: &CrateName) -> Option<StdCrate> {
     StdCrate::from_name(&name.as_str().to_ascii_lowercase().replace('-', "_"))
 }
 
