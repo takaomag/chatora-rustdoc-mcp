@@ -6,6 +6,7 @@ pub mod cache;
 pub mod cargo;
 #[cfg(feature = "local")]
 pub mod cargo_lock;
+pub mod crate_file;
 pub mod crate_name;
 pub mod dist;
 pub mod docs_rs;

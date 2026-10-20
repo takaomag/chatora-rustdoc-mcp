@@ -25,6 +25,7 @@ use crate::{
         LoadError,
         archive::Mapped,
         cache::Cache,
+        crate_file::{self, DocsRsBuild},
         crate_name::CrateName,
         dist::{DistError, StdCrate},
         docs_rs::FetchError,
@@ -106,6 +107,10 @@ struct Request {
     resolved_from: ResolvedFrom,
     target: TargetTriple,
     detail: Detail,
+    /// The sha256 of the `.crate` in the crates.io index, when the index was read.
+    checksum: Option<Box<str>>,
+    /// How docs.rs built it, once its `.crate` is read (requirement R-FT-1).
+    build: Option<Box<DocsRsBuild>>,
 }
 
 /// Definition of the tool for `tools/list`.
@@ -194,6 +199,9 @@ fn output_schema() -> JsonObject {
                     },
                     "target": { "type": "string" },
                     "format_version": { "type": "integer" },
+                    "features": strings,
+                    "all_features": { "type": "boolean" },
+                    "cfg": strings,
                 },
                 "required": ["source", "crate", "version", "target"],
             },
@@ -450,6 +458,8 @@ async fn resolve(
             resolved_from: ResolvedFrom::Explicit,
             target,
             detail,
+            checksum: None,
+            build: None,
         };
         return Ok((request, warnings));
     }
@@ -487,6 +497,8 @@ async fn resolve(
     let request = Request {
         name: published,
         version: resolved.version.version.clone(),
+        checksum: Some(resolved.version.checksum.clone()),
+        build: None,
         project_from,
         path,
         resolved_from,
@@ -667,19 +679,23 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
         .target
         .clone()
         .unwrap_or_else(|| state.host.triple.clone());
-    let (arguments, mut warnings) = match resolve(&state, arguments, target).await {
+    let (mut arguments, mut warnings) = match resolve(&state, arguments, target).await {
         Ok(resolved) => resolved,
         Err(error) => return *error,
     };
+    arguments.build = docs_rs_build(&state, &arguments, &mut warnings)
+        .await
+        .map(Box::new);
     let target = Some(&arguments.target);
     let dir = state
         .cache
         .docs_rs_dir(&arguments.name, &arguments.version, target);
-    let arguments = match look_up_archived(state.cache.clone(), dir.clone(), arguments).await {
-        Some(Ok((looked_up, arguments))) => return finish(looked_up, &arguments, &warnings),
-        Some(Err(arguments)) => arguments,
-        None => return shutting_down(),
-    };
+    let arguments =
+        match look_up_archived(state.cache.clone(), dir.clone(), Box::new(arguments)).await {
+            Some(Ok((looked_up, arguments))) => return finish(looked_up, &arguments, &warnings),
+            Some(Err(arguments)) => *arguments,
+            None => return shutting_down(),
+        };
     let loaded = match data::docs_rs_json(
         &state.cache,
         &state.docs_rs,
@@ -704,6 +720,68 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
     match recover(&state, &lookup, looked_up, arguments, &json, &mut warnings).await {
         Ok((looked_up, arguments)) => finish(looked_up, &arguments, &warnings),
         Err(result) => *result,
+    }
+}
+
+/// How docs.rs built the release of `request`, from the `Cargo.toml` in its `.crate`
+/// (requirement R-FT-1): cached, or fetched and checked against the checksum in the crates.io
+/// index, which is read for it if the version was decided without it. `None`, with a warning,
+/// when it cannot be read; the lookup goes on without it.
+async fn docs_rs_build(
+    state: &ToolState,
+    request: &Request,
+    warnings: &mut Vec<Box<str>>,
+) -> Option<DocsRsBuild> {
+    let (name, version) = (&request.name, &request.version);
+    let mut checksum = request.checksum.clone();
+    let mut contents = state
+        .static_crates
+        .crate_file(&state.cache, name, version, checksum.as_deref())
+        .await;
+    if matches!(contents, Ok(None)) {
+        checksum = match state.index.entry(name).await {
+            Ok(entry) => entry
+                .versions
+                .iter()
+                .find(|found| found.version == *version)
+                .map(|found| found.checksum.clone()),
+            Err(error) => {
+                tracing::debug!(error = %ErrorChain(&error), "the index was not read for the .crate");
+                None
+            },
+        };
+        contents = state
+            .static_crates
+            .crate_file(&state.cache, name, version, checksum.as_deref())
+            .await;
+    }
+    let read = contents.and_then(|contents| {
+        contents
+            .map(|contents| crate_file::docs_rs_build(&contents, name, version))
+            .transpose()
+    });
+    match read {
+        Ok(Some(build)) => Some(build),
+        Ok(None) => {
+            warnings.push(
+                format!(
+                    "the features that docs.rs built {name} {version} with are not known: its \
+                     checksum is not in the crates.io index"
+                )
+                .into(),
+            );
+            None
+        },
+        Err(error) => {
+            warnings.push(
+                format!(
+                    "the features that docs.rs built {name} {version} with are not known: {}",
+                    ErrorChain(&error)
+                )
+                .into(),
+            );
+            None
+        },
     }
 }
 
@@ -839,6 +917,8 @@ async fn execute_std(
         resolved_from: ResolvedFrom::Latest,
         target,
         detail: arguments.detail,
+        checksum: None,
+        build: None,
     };
     let cache = state.cache.clone();
     let task = tokio::task::spawn_blocking(move || {
@@ -997,8 +1077,8 @@ fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
 async fn look_up_archived(
     cache: Cache,
     dir: PathBuf,
-    arguments: Request,
-) -> Option<Result<(Result<Value, Failure>, Request), Request>> {
+    arguments: Box<Request>,
+) -> Option<Result<(Result<Value, Failure>, Box<Request>), Box<Request>>> {
     let task = tokio::task::spawn_blocking(move || match load::open_archived(&cache, &dir) {
         Ok(Some(mapped)) => Ok((look_up_in(&mapped, &arguments), arguments)),
         Ok(None) => Err(arguments),
@@ -1150,6 +1230,7 @@ fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Request) -> Result<Value, Fa
         origin: Origin::DocsRs {
             resolved_from: arguments.resolved_from,
             project_from: arguments.project_from,
+            build: arguments.build.as_deref(),
         },
         target: Some(arguments.target.as_str()),
         detail: arguments.detail,
@@ -1482,6 +1563,8 @@ mod tests {
             resolved_from: ResolvedFrom::Explicit,
             target: "x86_64-unknown-linux-gnu".parse().expect("a triple"),
             detail: Detail::Normal,
+            checksum: None,
+            build: None,
         };
         let candidates = (0..25).map(|n| format!("item {n}").into()).collect();
         let result = item_error(&request, &GetItemError::Ambiguous { candidates });
@@ -1512,6 +1595,7 @@ mod tests {
 
         let some = || Some(Box::<str>::from("x"));
         let many = || Box::from([Box::<str>::from("x")]);
+        let features: Box<[Box<str>]> = many();
         let response = ItemResponse {
             provenance: Provenance {
                 source: Source::DocsRs,
@@ -1526,6 +1610,9 @@ mod tests {
                 }),
                 target: "x",
                 format_version: 61,
+                features: Some(&features),
+                all_features: true,
+                cfg: &features,
             },
             warnings: Box::from(["x".into()]),
             data: ItemData {

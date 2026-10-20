@@ -11,6 +11,7 @@ use derive_more as _;
 use dunce as _;
 use elsa as _;
 use etcetera as _;
+use flate2 as _;
 #[cfg(test)]
 use insta as _;
 #[cfg(unix)]

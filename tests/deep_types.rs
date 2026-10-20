@@ -141,6 +141,7 @@ fn a_type_nested_up_to_the_limit_is_rendered_and_freed() {
                 origin: Origin::DocsRs {
                     resolved_from: ResolvedFrom::Explicit,
                     project_from: None,
+                    build: None,
                 },
                 detail: Detail::Normal,
                 target: None,

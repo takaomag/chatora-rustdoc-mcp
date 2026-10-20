@@ -30,6 +30,7 @@ use rmcp::{
 
 use crate::data::{
     cache::{Cache, CacheError},
+    crate_file::StaticCrates,
     dist::Dist,
     docs_rs::DocsRs,
     sparse_index::SparseIndex,
@@ -184,6 +185,7 @@ pub async fn serve() -> Result<(), ServeError> {
             docs_rs: DocsRs::new()?,
             dist: Dist::new()?,
             index: SparseIndex::new(cache.clone())?,
+            static_crates: StaticCrates::new()?,
             host,
             cache,
             // Decided once, so that a repository cloned inside later does not join it

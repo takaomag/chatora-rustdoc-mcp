@@ -137,6 +137,17 @@ impl Cache {
         &self.root
     }
 
+    /// Where the `.crate` of `name` at `version` from static.crates.io is kept, with its digest
+    /// next to it (requirement R-SC-2).
+    #[must_use]
+    pub fn crate_file_path(&self, name: &CrateName, version: &Version) -> PathBuf {
+        self.root
+            .join("static.crates.io")
+            .join(name.cache_key())
+            .join(version.to_string())
+            .join(format!("{name}-{version}.crate"))
+    }
+
     /// Where the crates.io sparse index file at `index_path` (`se/rd/serde`) is kept. The record
     /// of how it was fetched is next to it, with `.meta.json` added (no crate name has a `.`).
     #[must_use]

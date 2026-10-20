@@ -411,6 +411,7 @@ fn representative_items_are_returned_by_get_item() {
             origin: Origin::DocsRs {
                 resolved_from: ResolvedFrom::Explicit,
                 project_from: None,
+                build: None,
             },
             detail: Detail::Normal,
             target: None,

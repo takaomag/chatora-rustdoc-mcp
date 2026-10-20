@@ -31,6 +31,7 @@ derive_more = { version = "2.1.1", default-features = false, features = ["displa
 dunce = { version = "1.0.5", optional = true }
 elsa = "1.11.2"
 etcetera = "0.11.0"
+flate2 = "1.1.10"
 lzma-rust2 = { version = "0.23.0", default-features = false, features = [
   "std",
   "xz",

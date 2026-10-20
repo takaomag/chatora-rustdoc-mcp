@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 
 use crate::data::{
     cache::Cache,
+    crate_file::StaticCrates,
     dist::Dist,
     docs_rs::DocsRs,
     sparse_index::SparseIndex,
@@ -44,6 +45,8 @@ pub(super) struct ToolState {
     pub(super) dist: Dist,
     /// The crates.io sparse index, for the versions of crates.
     pub(super) index: SparseIndex,
+    /// static.crates.io, for the `.crate` of releases (requirement R-FT-1).
+    pub(super) static_crates: StaticCrates,
     /// The host target, the default target of the documentation (requirement R-TG-1).
     pub(super) host: HostTarget,
     /// The default project, decided at startup (requirement R-MCP-3).

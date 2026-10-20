@@ -517,6 +517,22 @@ C1d も 3 つに分けた: C1d-1 (cfg を読んで item の条件を出す)、C1
 - 扱っていないこと: `also_reexported_at` の各パスの条件 (正準パスと違うときだけ添える。R-FT-2)、`#[doc(auto_cfg(hide(...)))]`、crate の外への re-export (`reexport_of`) の条件
 - テスト: 3 系統の読み取り (位置の読み飛ばし、入れ子、読めないもの)、`doc`・`docsrs` の畳み方、feature の書き方と 3 値の評価、re-export・`impl`・enum からの継承、条件の無い item
 
+#### C1d-2 (2026-10-20)
+
+利用者が決めた (推奨案): `enabled_in_project` では、feature 以外の条件を docs.rs のビルドと同じく成り立つとみなす (照会に使う JSON は、評価する target と同じ target のものだけなので、`unix`・`not(loom)` などは docs.rs と同じ値になる)。docs.rs が `[package.metadata.docs.rs]` の `--cfg` で立てたもの (`tokio_unstable` など) が絡むときだけ `unknown` にして条件を添える。立てた cfg は `.crate` を読まないと分からないので、C1d-2 と C1d-3 の順を入れ替え、`.crate` を読む段を先にした。
+
+- Windows・macOS でも前提は崩れない: docs.rs の JSON を他の target で代用しない (R-TG-1) ので、使う JSON はいつも評価する target のもの。ただし次の 2 つは手当てか記録が要る
+  - JSON の target が評価する target と違うとき (今は warnings だけ): feature 以外の条件を `unknown` にする (C1d-3)
+  - プロジェクトの `.cargo/config.toml` の `build.target` をまだ読んでいない (R-TG-1 の残り)。たとえば Linux で wasm 向けにビルドするプロジェクトでも、ホストの target で評価する。feature の組 (`cargo tree --target`) も同じ target で取るので、内部の食い違いは無い
+- `.crate` (`data::crate_file`): static.crates.io の `crates/<name>/<name>-<version>.crate` から取る。ビルドメタデータの `+` はそのままでも `%2B` でも通り、無いものは 403 (2026-10-20 に確認)。sparse index の `cksum` と照合してから (R-SC-2)、キャッシュの `static.crates.io/<鍵>/<版>/` に横の digest と一緒に置く。展開はせず、`<name>-<version>/Cargo.toml` のエントリだけを読む (cargo は `Cargo.toml` を先頭近くに書く。tokio では 4 番目)。上限: `.crate` 128 MiB、`Cargo.toml` を探すまでに展開する量 256 MiB、`Cargo.toml` 4 MiB (初期値)。依存に flate2 1.1.10 を足した (miniz_oxide の経路だけ)
+  - 版を index なしで決めたとき (キャッシュにある完全一致の版) は、`.crate` がキャッシュに無ければ index を引いて `cksum` を得る。取れなければ warnings に書いて照会は続ける
+- `[package.metadata.docs.rs]` から求めるもの (R-FT-1): `all-features`・`features`・`no-default-features` による有効な feature、`rustdoc-args`・`rustc-args` の `--cfg` の名前 (`docsrs` と `feature` を除く)、有効にならなかった feature。最後のものは、`[features]` と、`dep:` で名指しされない optional の依存 (`[target.*]` の下と build-dependencies も) が作る feature のうち、有効な feature から推移的にたどれないもの (`dep/feat` は依存の feature を有効にし、`dep?/feat` はしない)。feature 名と cfg 名は文法に合うものだけを受ける (R-SEC-4)
+- provenance に `features` (有効にした feature。`all_features` のときは省く。tokio では 26 個になるため) と `all_features`、`cfg` (docs.rs が立てた cfg) を足した。有効にならなかった feature があれば、warnings に「docs.rs は [..] なしでビルドした。それらが要る item はこの文書に無い」と出す (§7.3 の例は有効な feature を挙げる形だったが、欠けたものを挙げるほうが答えに直結する)
+- 実データ: tokio 1.53.3 と reqwest 0.13.5 は `all_features`、`cfg` はそれぞれ `tokio_unstable`・`reqwest_unstable`。serde 1.0.228 は `alloc` が、hyper 1.12.0 は `capi`・`nightly` が欠けて warnings が出た (hyper の `cfg` は `hyper_unstable_ffi`・`hyper_unstable_tracing`)。初回は `.crate` の取得で約 0.3 秒、2 回目からは 0.01 秒
+- stdio の結合テスト: 合成の `.crate` をキャッシュに置く (crates.io に `demo` という crate が実在し、置かないと本物を取りに行った)
+- 直した不具合: stdio の `without_a_version_the_project_decides_it` は、ローカル機能なしの構成 (`--no-default-features`) では毎回落ちていた (プロジェクトを読まないので latest になり、crates.io の本物の `demo` 0.1.1 を引いて `no_json` になる)。C1b-2 で足したテストで、CI では C1b-2 から落ちるはずだった。C1c の報告で「たまに落ちる」としたのは誤りで、再現を試したのが既定の構成だけだったため。テストをローカル機能のときだけにした
+- テスト: feature の求め方 (`all-features`、名指し、`default`、`no-default-features`、`--cfg` の 2 つの書き方)、推移的にたどって欠けた feature を求めること、`Cargo.toml` の無い `.crate`、stdio での provenance
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

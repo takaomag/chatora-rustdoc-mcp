@@ -23,7 +23,7 @@ use super::{
     render::Renderer,
     view::CrateView,
 };
-use crate::data::crate_name::CrateName;
+use crate::data::{crate_file::DocsRsBuild, crate_name::CrateName};
 
 /// What to look up.
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +64,8 @@ pub enum Origin<'a> {
         resolved_from: ResolvedFrom,
         /// Where the project that decided the version came from, if one did.
         project_from: Option<&'static str>,
+        /// How docs.rs built it, if its `.crate` could be read (requirement R-FT-1).
+        build: Option<&'a DocsRsBuild>,
     },
     /// The std of a nightly toolchain (requirement R-STD-1).
     Std {
@@ -119,6 +121,16 @@ pub struct Provenance<'a> {
     pub target: &'a str,
     /// The rustdoc JSON format.
     pub format_version: u32,
+    /// The features docs.rs built the documentation with, when known and not all of them
+    /// (requirement R-FT-1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub features: Option<&'a [Box<str>]>,
+    /// docs.rs built it with every feature.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub all_features: bool,
+    /// The `--cfg` that docs.rs built it with, other than `docsrs` (`tokio_unstable`).
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub cfg: &'a [Box<str>],
 }
 
 /// Where std came from, and why.
@@ -457,6 +469,22 @@ impl<'a> Query<'a> {
     /// The provenance, read from the JSON and checked against the request (§7.3).
     fn provenance(&mut self) -> Provenance<'a> {
         let view = self.view;
+        let build = match self.request.origin {
+            Origin::DocsRs { build, .. } => build,
+            Origin::Std { .. } => None,
+        };
+        if let Some(build) = build
+            && !build.missing.is_empty()
+        {
+            // Items behind a feature that docs.rs did not enable are not in the JSON (R-FT-1).
+            self.warnings.push(Cow::Owned(format!(
+                "docs.rs built {} {} without the features [{}]; items that need them are not in \
+                 this documentation",
+                self.request.name,
+                self.request.version,
+                build.missing.join(", ")
+            )));
+        }
         let requested = self.request.version;
         let version = if let Origin::Std { .. } = self.request.origin {
             // std writes its version with the commit (`1.101.0-nightly\t(b6eeb93c9\t…)`); the
@@ -502,6 +530,7 @@ impl<'a> Query<'a> {
             Origin::DocsRs {
                 resolved_from,
                 project_from,
+                ..
             } => (
                 Source::DocsRs,
                 Some(resolved_from),
@@ -534,6 +563,12 @@ impl<'a> Query<'a> {
             std_from,
             target,
             format_version: view.format_version(),
+            // Every feature is in the list with `all_features`, which says it in fewer words.
+            features: build
+                .filter(|build| !build.all_features)
+                .map(|build| &*build.features),
+            all_features: build.is_some_and(|build| build.all_features),
+            cfg: build.map_or(&[], |build| &build.cfg),
         }
     }
 
@@ -1376,6 +1411,7 @@ mod tests {
             origin: Origin::DocsRs {
                 resolved_from: ResolvedFrom::Explicit,
                 project_from: None,
+                build: None,
             },
             detail: Detail::Normal,
             target: None,
@@ -1481,6 +1517,7 @@ mod tests {
             origin: Origin::DocsRs {
                 resolved_from: ResolvedFrom::Explicit,
                 project_from: None,
+                build: None,
             },
             detail: Detail::Normal,
             target: None,
@@ -1586,6 +1623,7 @@ mod tests {
             origin: Origin::DocsRs {
                 resolved_from: ResolvedFrom::Explicit,
                 project_from: None,
+                build: None,
             },
             detail,
             target: None,

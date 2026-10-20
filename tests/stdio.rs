@@ -21,7 +21,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chatora_rustdoc_mcp::data::{cache::Cache, crate_name::CrateName};
+use chatora_rustdoc_mcp::data::{
+    cache::{Cache, sha256_hex},
+    crate_name::CrateName,
+};
+use flate2::{Compression, write::GzEncoder};
 use rustdoc_types::{
     Abi,
     Crate,
@@ -172,7 +176,32 @@ fn test_cache() -> TempDir {
             &json,
         )
         .expect("the cache is writable");
+    // The `.crate`, so that what docs.rs built it with is read without static.crates.io (where
+    // a crate called `demo` is).
+    let path = cache.crate_file_path(&name, &Version::new(0, 1, 0));
+    let contents = demo_crate_file();
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+    std::fs::write(&path, &contents).expect("written");
+    std::fs::write(path.with_extension("crate.sha256"), sha256_hex(&contents)).expect("written");
     dir
+}
+
+/// The `.crate` of `demo` 0.1.0, whose features docs.rs enabled all.
+fn demo_crate_file() -> Vec<u8> {
+    let manifest = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n[features]\nextra = []\n\
+                    [package.metadata.docs.rs]\nall-features = true\n";
+    let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest.len().try_into().expect("small"));
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "demo-0.1.0/Cargo.toml", manifest.as_bytes())
+        .expect("appended");
+    builder
+        .into_inner()
+        .and_then(GzEncoder::finish)
+        .expect("finished")
 }
 
 /// A running server, talking JSON-RPC over its stdin and stdout.
@@ -440,6 +469,7 @@ fn get_item_returns_structured_content_and_tool_errors() {
                 "resolved_from": "explicit",
                 "target": "x86_64-unknown-linux-gnu",
                 "format_version": rustdoc_types::FORMAT_VERSION,
+                "all_features": true,
             },
             "data": {
                 "path": "demo::hello",
@@ -474,6 +504,7 @@ fn get_item_returns_structured_content_and_tool_errors() {
 
 /// A workspace with the package `demo` and its Cargo.lock, in a new temporary directory. crates.io
 /// has a crate named demo too, which must not be looked for in its place.
+#[cfg(feature = "local")]
 fn demo_workspace() -> TempDir {
     let dir = TempDir::new().expect("a temporary directory");
     std::fs::create_dir_all(dir.path().join("src")).expect("made");
@@ -498,7 +529,8 @@ fn demo_workspace() -> TempDir {
 
 /// Without a version, the project decides it (requirements R-MCP-3 and R-VR-2). The project here
 /// is the package itself, which docs.rs does not have, and one outside the default project is not
-/// read with cargo.
+/// read with cargo. Without local features, no project is read.
+#[cfg(feature = "local")]
 #[test]
 fn without_a_version_the_project_decides_it() {
     let project = demo_workspace();
