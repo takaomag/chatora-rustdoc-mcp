@@ -244,6 +244,8 @@ impl Server {
         let config = cache.path().join("config.toml");
         std::fs::write(&config, "").expect("written");
         command.env("CHATORA_RUSTDOC_MCP_CONFIG", config);
+        // The tool for testing (`sleep`) in a debug build.
+        command.env("CHATORA_RUSTDOC_TEST_TOOLS", "1");
         command.envs(env.iter().copied());
         match project {
             Some(project) => command.env("CLAUDE_PROJECT_DIR", project),
@@ -1261,5 +1263,24 @@ fn a_version_missing_from_an_old_index_that_cannot_be_refreshed_is_a_network_err
         found["provenance"]["index_fetched_at"], "2023-11-14T22:13:20Z",
         "{found}"
     );
+    assert!(server.finish().success());
+}
+
+/// A debug build lists the tool for testing only when the tests ask for it, so that one installed
+/// for use (`cargo install --debug`) does not show it.
+#[cfg(debug_assertions)]
+#[test]
+fn the_tool_for_testing_is_only_for_the_tests() {
+    let mut server = Server::start_with(None, &[("CHATORA_RUSTDOC_TEST_TOOLS", "")]);
+    server.send(&request(1, "tools/list", json!({})));
+    let names: Vec<Value> = server.response(1)["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| tool["name"].clone())
+        .collect();
+    assert!(!names.contains(&json!("sleep")), "{names:?}");
+    server.send(&call_tool(2, "sleep", json!({ "seconds": 1 })));
+    assert_eq!(server.response(2)["error"]["code"], -32602);
     assert!(server.finish().success());
 }

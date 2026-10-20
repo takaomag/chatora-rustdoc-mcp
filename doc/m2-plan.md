@@ -309,6 +309,11 @@ Claude Code 2.1.304、Linux で測った。
 - 古い index を使ったときの provenance (R-CA-7。M1 から抜けていた): `index_fetched_at` (UTC の RFC 3339、秒まで) を、TTL を過ぎた index で版を決めたときだけ出す。`get_item` と、その経路を使う一覧のツール (mcp の `look_up_in` で足す)、`resolve_version`。名前は要件に無かったので決めた。オフラインのときと、通信できずに古いものを使ったときの両方
 - 古い index に無い版を求められたとき: M1 は `version_not_found` (「crates.io に無い」) を返していたが、古い index には新しい版が抜けうるので、オフラインなら `offline_miss` (キャッシュにある版を添える)、通信できなかったなら `network_error` (`retryable: true`) にした。統合テストで見つけた
 
+**A4a (試験用のツールと公開の確認。2026-10-20)**: A4 を、ここで済むもの (A4a) と、実データのテストを 3 つの OS で回して結果を見てから扱いを決めるもの (A4b) に分けた
+
+- 試験用の `sleep` ツール: debug ビルドで、環境変数 `CHATORA_RUSTDOC_TEST_TOOLS=1` があるときだけ出す (release ビルドには今までどおり無い)。統合テストはサーバーを起動するときにこの変数を渡す。`cargo install --debug` で入れたバイナリは、変数が無ければ出さない。変数は設定ではないので、設定の接頭辞 (`CHATORA_RUSTDOC_MCP_`) の外の名前にした。変数を空にしたサーバーが `sleep` を出さず、呼ぶと `-32602` になることのテストを足した
+- CI に `package` の job を足し、`cargo publish --dry-run --locked` を回す (R-DIST-1)。公開される package のファイルは `src/`・ライセンス・README・build.rs・Cargo.toml・Cargo.lock (`cargo package --list` で確かめた)
+
 ### 6.3 M2b
 
 (まだ無い)

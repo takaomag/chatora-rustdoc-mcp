@@ -56,6 +56,16 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # crates.io に公開できる形か (要件 R-DIST-1。doc/m2-plan.md の A4)。`include` から漏れたファイルや、
+  # 公開の形でだけ壊れるビルドを、公開の前に知る。crates.io には上げない (公開は利用者が行う)。
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo publish --dry-run --locked
+
   # testdata/docs-rs-json.txt の docs.rs の JSON を取ってキャッシュし、実データのテスト (#[ignore]) を回す
   # (doc/m1-plan.md の P3)。一覧が変わらない限り、docs.rs から取り直さない。
   testdata:

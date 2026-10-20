@@ -162,9 +162,27 @@ impl std::fmt::Display for ErrorChain<'_> {
     }
 }
 
+/// The environment variable that adds the tool for testing (`sleep`) to a debug build. The
+/// integration tests set it to `1`; a debug build installed for use (`cargo install --debug`)
+/// does not list the tool. It is not a setting (requirement R-DIST-3), so it is not under the
+/// settings' prefix.
+#[cfg(debug_assertions)]
+const TEST_TOOLS_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_TOOLS";
+
+/// Whether the tool for testing is served: a debug build with [`TEST_TOOLS_ENV_VAR`] set to `1`.
+#[cfg(debug_assertions)]
+fn test_tools() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(TEST_TOOLS_ENV_VAR).is_some_and(|value| value == "1"))
+}
+
 /// Definitions of every tool, in the order `tools/list` returns them.
 pub(super) fn definitions() -> Vec<Tool> {
-    let tools = vec![
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(unused_mut, reason = "only a debug build adds the tool for testing")
+    )]
+    let mut tools = vec![
         crate_overview::definition(),
         get_item::definition(),
         // A project is needed, which only local features read (requirement R-ARCH-4).
@@ -176,10 +194,12 @@ pub(super) fn definitions() -> Vec<Tool> {
         list_module::definition(),
         resolve_version::definition(),
         search_items::definition(),
-        // A tool for testing progress and cancellation, only in debug builds.
-        #[cfg(debug_assertions)]
-        sleep::definition(),
     ];
+    // A tool for testing progress and cancellation.
+    #[cfg(debug_assertions)]
+    if test_tools() {
+        tools.push(sleep::definition());
+    }
     if cfg!(feature = "local") {
         tools
     } else {
@@ -321,12 +341,12 @@ async fn dispatch(
             Err(error) => Ok(error.into_result()),
         },
         #[cfg(debug_assertions)]
-        sleep::NAME => match sleep::parse_arguments(request.arguments.as_ref()) {
+        sleep::NAME if test_tools() => match sleep::parse_arguments(request.arguments.as_ref()) {
             Ok(seconds) => Ok(run_tool(sleep::execute(seconds, context)).await),
             Err(error) => Ok(error.into_result()),
         },
         name => {
-            // Only `sleep` uses the context, and release builds have no `sleep`.
+            // Only `sleep` uses the context, which only the tests have.
             drop(context);
             Err(ErrorData::invalid_params(
                 format!("unknown tool: {name}"),

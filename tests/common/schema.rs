@@ -21,6 +21,8 @@ pub(crate) fn tools() -> &'static BTreeMap<String, Value> {
         let mut child = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"))
             .arg("serve")
             .env("CHATORA_RUSTDOC_MCP_CONFIG", config)
+            // The tool for testing (`sleep`) in a debug build, whose schema is checked too.
+            .env("CHATORA_RUSTDOC_TEST_TOOLS", "1")
             .env("CHATORA_RUSTDOC_MCP_LOG__DIR", logs.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
