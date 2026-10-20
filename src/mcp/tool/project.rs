@@ -13,7 +13,7 @@ use super::{ErrorChain, ToolState, error_result};
 use crate::data::crate_name::CrateName;
 #[cfg(feature = "local")]
 use crate::data::{
-    cargo::Failure,
+    cargo::{Failure, GitFetchFailure},
     metadata::{CargoError, Resolution, ResolveError},
     packages::{Candidate, Lookup, PackageGraph, ProjectPackage},
     project::{self, DefaultProject, ProjectFrom, Workspace},
@@ -256,12 +256,24 @@ fn raw_warnings(because: &CargoError) -> Vec<Box<str>> {
         )
         .into(),
     ];
-    if failure == Failure::LockfileOutdated {
-        warnings.push(
+    match failure {
+        Failure::LockfileOutdated => warnings.push(
             "Cargo.lock does not match Cargo.toml, so the version may be out of date; run \
              `cargo fetch` to update Cargo.lock"
                 .into(),
-        );
+        ),
+        // §8 `fetch_failed` with `auth`. GitHub asks for credentials for a missing repository,
+        // too, and cargo uses git's credential helpers, which gh can be (`gh auth setup-git`).
+        Failure::GitFetch(GitFetchFailure::Auth) => warnings.push(
+            "a git dependency could not be fetched without credentials (or its URL is wrong); \
+             run `cargo fetch` in the project's terminal to pass them. With the GitHub CLI, \
+             `gh auth setup-git` lets git and cargo use its login"
+                .into(),
+        ),
+        Failure::GitFetch(GitFetchFailure::NoRepository | GitFetchFailure::NoRev)
+        | Failure::OfflineMiss
+        | Failure::Killed
+        | Failure::Other => {},
     }
     warnings
 }
@@ -365,5 +377,22 @@ mod tests {
         assert_eq!(code(&error)["reason"], "no_record");
 
         assert!(workspace(None, None).expect("no error").is_none());
+    }
+
+    #[test]
+    fn a_git_dependency_without_credentials_is_explained() {
+        let failed = |failure| CargoError::Failed {
+            command: "metadata",
+            failure,
+            stderr: "".into(),
+        };
+        let auth = raw_warnings(&failed(Failure::GitFetch(GitFetchFailure::Auth)));
+        assert_eq!(auth.len(), 2, "{auth:?}");
+        assert!(auth[0].contains("fetch_failed"), "{auth:?}");
+        assert!(auth[1].contains("gh auth setup-git"), "{auth:?}");
+        assert_eq!(
+            raw_warnings(&failed(Failure::GitFetch(GitFetchFailure::NoRev))).len(),
+            1
+        );
     }
 }

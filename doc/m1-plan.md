@@ -574,9 +574,11 @@ M1 の終わりに要件へ反映するもの (C1 の分): `detail` の各段の
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。
 
 - v0.15 の「`GITHUB_TOKEN` は読まない」の理由 (他のツール向けの token を使わない) は、守りとして弱かった。同じ要件が書くとおり、信頼したリポジトリは hook で環境変数も読める。守るべきは送り先なので、token は公式の `api.github.com` にだけ送り、ミラー (R-CA-8) には送らない
-- `gh auth token` は実行しない。今の gh は既定で token を OS のキーリングに置き、取り出すときにキーリングの許可のダイアログが出うるため (M0 で git の CLI が出した askpass のダイアログと同じ問題)
-- token が無くても匿名で使う。rate limit に当たったときだけ、token の渡し方 (`export GH_TOKEN=$(gh auth token)` か設定) を案内する
+- token が無くても匿名で使う。キーリングを読むのは rate limit に当たったときだけにする (利用者が決めた。2026-10-20。最初は「`gh auth token` は実行しない」としたが改めた): 今の gh は既定で token を OS のキーリングに置き (このホストでも `hosts.yml` に token は無かった)、取り出すときにキーリングの許可のダイアログが出うる (M0 で git の CLI が出した askpass のダイアログと同じ問題)。読む場面を稀な rate limit のときに限れば、gh の利用者は設定なしで token が効き、ダイアログが出うるのもその場面だけになる
+  - rate limit に当たったら、`gh auth token` (gh があれば)、次に `git credential fill` で `https://github.com` の資格情報 (gh の `setup-git` のほか、libsecret・Git Credential Manager・macOS のキーチェーンに保存した token も拾える) の順で取り、取れたらその要求をやり直す。子は git の依存の取得と同じく端末と askpass の問い合わせを止め、時間の上限を付ける。取れた token はプロセスのメモリにだけ持ち、ディスクには書かない。`git credential approve`・`reject` は呼ばず、git の保存内容を変えない
+  - どちらでも取れなければ、token の渡し方 (`export GH_TOKEN=$(gh auth token)` か設定) を案内する
 - git の依存の取得 (子の cargo) は別の話で、サーバーは token を扱わない。利用者の資格情報が使われ、認証で失敗したら利用者の端末で通すよう案内する (R-WS-6・R-WS-7。変更なし)
+- GitHub CLI (gh) は必須にしない (利用者が決めた。推奨案。2026-10-20): GitHub API は匿名でも読める公開リポジトリにだけ使い、token は rate limit を緩めるためだけなので、その小さな機能のために導入の条件を gh にしない。`gh api` を毎回子で呼ぶとキーリングの許可のダイアログが出うるうえ、ETag・rate limit の待ち・ミラー (R-CA-8)・オフラインの扱いが gh の出力の解析になる。git の依存は子の cargo が取得し、cargo は libgit2 の経路でも git の CLI の経路でも git の `credential.helper` を使うので、利用者が `gh auth setup-git` を実行していれば gh の認証情報がそのまま効く。そこで、`cargo metadata` が git の認証の失敗で落ちたときの warnings (今は Cargo.lock を直接読む経路だけ) に `cargo fetch` と `gh auth setup-git` の案内を足した。§8 の `fetch_failed` の `auth` の案内と README にも M1 の終わりに足す。GitHub 以外 (GitLab・Bitbucket・自前のサーバー) は cargo と git の設定に任せる (変更なし)
 
 ## 7. M1 の終わり方
 
