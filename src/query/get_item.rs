@@ -405,6 +405,13 @@ pub enum GetItemError {
         /// What the item is.
         kind: &'static str,
     },
+    /// The path names an item that is not a trait, whose implementors to list (requirement
+    /// R-TI-3).
+    #[error("the path names a {kind}, not a trait")]
+    NotATrait {
+        /// What the item is.
+        kind: &'static str,
+    },
     /// The path names an item that is not a type, whose impls to list (requirement R-TI-2).
     #[error("the path names a {kind}, not a type")]
     NotAType {
@@ -1071,6 +1078,11 @@ impl<'a> Query<'a> {
             header.push_str(predicate);
         }
         header.into()
+    }
+
+    /// The type `ty` as Rust writes it.
+    pub(super) fn type_text(&mut self, ty: &rustdoc_types::Type) -> Box<str> {
+        self.renderer.render_type(ty).into()
     }
 
     /// The where predicates of `item`, as Rust writes them.

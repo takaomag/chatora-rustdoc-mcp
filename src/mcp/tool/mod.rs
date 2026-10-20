@@ -5,6 +5,7 @@
 
 mod crate_overview;
 mod get_item;
+mod list_implementors;
 mod list_impls;
 mod list_methods;
 mod list_module;
@@ -82,6 +83,7 @@ pub(super) fn definitions() -> Vec<Tool> {
     vec![
         crate_overview::definition(),
         get_item::definition(),
+        list_implementors::definition(),
         list_impls::definition(),
         list_methods::definition(),
         list_module::definition(),
@@ -118,6 +120,17 @@ pub(super) async fn call(
                     .into(),
             ),
             Err(error) => Ok(error.into_result().into()),
+        },
+        list_implementors::NAME => {
+            match list_implementors::parse_arguments(request.arguments.as_ref()) {
+                Ok(arguments) => Ok(run_tool(list_implementors::execute(
+                    arguments,
+                    Arc::clone(state),
+                ))
+                .await
+                .into()),
+                Err(error) => Ok(error.into_result().into()),
+            }
         },
         list_impls::NAME => match list_impls::parse_arguments(request.arguments.as_ref()) {
             Ok(arguments) => Ok(run_tool(list_impls::execute(arguments, Arc::clone(state)))

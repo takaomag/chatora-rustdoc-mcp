@@ -421,6 +421,7 @@ fn tools_list_is_cacheable_and_not_paginated() {
         &[
             "crate_overview",
             "get_item",
+            "list_implementors",
             "list_impls",
             "list_methods",
             "list_module",
@@ -432,6 +433,7 @@ fn tools_list_is_cacheable_and_not_paginated() {
         &[
             "crate_overview",
             "get_item",
+            "list_implementors",
             "list_impls",
             "list_methods",
             "list_module",

@@ -51,6 +51,7 @@ use crate::{
             ResolvedFrom,
             get_item,
         },
+        implementors::{ImplementorOptions, list_implementors},
         impls::{ImplOptions, list_impls},
         list_module::{ListOptions, list_module},
         load,
@@ -135,6 +136,8 @@ pub(super) enum What {
     Impls(Box<Paging>),
     /// The methods that can be called on the type (`list_methods`).
     Methods(Box<MethodFilter>),
+    /// The types that implement the trait (`list_implementors`).
+    Implementors(Box<Paging>),
 }
 
 /// Which methods `list_methods` lists (requirement R-LS-3), and the page.
@@ -235,6 +238,16 @@ impl Arguments {
                 what: What::Search(Box::new(searching)),
             },
         }
+    }
+
+    /// The arguments of `list_implementors`: those that name a release, the trait's path, and
+    /// the page.
+    pub(super) fn for_implementors(release: ReleaseArguments, path: &str, paging: Paging) -> Self {
+        let mut arguments = Self::for_impls(release, path, paging);
+        if let What::Impls(paging) = arguments.shape.what {
+            arguments.shape.what = What::Implementors(paging);
+        }
+        arguments
     }
 
     /// The arguments of `list_impls`: those that name a release, the type's path, and the page.
@@ -1954,6 +1967,16 @@ fn respond_in(
             .map_err(Failure::Item)?;
             return serde_json::to_value(&response).map_err(Failure::Serialize);
         },
+        What::Implementors(paging) => {
+            let response = list_implementors(view, request, ImplementorOptions {
+                limit: paging.limit,
+                offset: paging.offset,
+                cursor_request: &paging.request_digest,
+                cursor_data: paging.cursor_data.as_deref(),
+            })
+            .map_err(Failure::Item)?;
+            return serde_json::to_value(&response).map_err(Failure::Serialize);
+        },
         What::List(listing) => listing,
     };
     let kinds: Vec<&str> = listing.kinds.to_vec();
@@ -2161,6 +2184,12 @@ fn item_error(arguments: &Request, error: &GetItemError) -> CallToolResult {
         GetItemError::NotAModule { kind } => error_result(&json!({
             "code": "invalid_argument",
             "message": format!("{release} has a {kind}, not a module, at {}", arguments.path),
+            "retryable": false,
+            "suggestions": [format!("call get_item with the path {}", arguments.path)],
+        })),
+        GetItemError::NotATrait { kind } => error_result(&json!({
+            "code": "invalid_argument",
+            "message": format!("{release} has a {kind}, not a trait, at {}", arguments.path),
             "retryable": false,
             "suggestions": [format!("call get_item with the path {}", arguments.path)],
         })),

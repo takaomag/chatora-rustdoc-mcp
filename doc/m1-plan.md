@@ -661,6 +661,16 @@ C3 を 2 つに分けた: C3a (`list_module` と一覧の共通の仕組み)、C
 - 実データ: `tokio::sync::Mutex` は固有メソッド 10 個 (`lock` など)、`Debug`・`Default`・`From` 由来、tracing の `Instrument`・`WithSubscriber` が blanket。`std::time::Duration` の `name: checked` → `checked_add`・`checked_sub`・`checked_mul`・`checked_div`。`tokio::fs::File` の blanket を展開すると `AsyncReadExt::read` などがシグネチャ付きで 65 個
 - テスト: 固有メソッド、`from`・`name` の絞り込み、引数
 
+#### C7 (2026-10-20)
+
+`list_implementors` を足した (R-TI-3 の `scope: crate`・R-TI-5 の trait の分。§3 Q9 のうち crate の中)。`scope: dependency_graph` は計画どおり M4 で、渡すと理由付きの `invalid_argument` にし、型ごとに `list_impls` で確かめるよう案内する。
+
+- 実装者: trait の `implementations` の impl ごとに、型 (`render_type` で描く。`&T`・`[u8]`・`Box<S>` なども)・分類 (`list_impls` と同じ構造の判定)・見出し。同じ crate の型で公開パスを持たないもの (core の `FlattenCompat`・`CaseMappingIter` など) への impl は出さない (R-SH-5)。並びは型・見出しの順。ページングは `list_module` と同じカーソル
+- trait の情報 (R-TI-5): `signature`、`items` (メソッド・関連型・関連定数ごとに `provided`。既定の本体・型・値があるか)、`dyn_compatible`、`auto`、`unsafe`、`has_negative_impls`、`sealed`。`sealed` は、supertrait に同じ crate の公開パスの無い trait があるときだけ、その名前を根拠に出す。見つからなくても「封印されていない」とは言わない (ほかの封印の仕方は拾えない。検出の方法を増やすかは R-TI-5 の「M1 で決める」で、今は supertrait だけにした)
+- trait でない item を指したら `invalid_argument` (`NotATrait`)。他の crate から re-export された trait はたどる (`tower::Service` → `tower_service::Service`、`std::iter::Iterator` → `core::iter::Iterator`)
+- 実データ: `tower::Service` は items がすべて required で dyn compatible、crate の中の実装者は `&'a mut S` と `Box<S>` の 2 つ (tower-service の中だけなので。Q9 の「自分の依存の中で」は M4)。`std::iter::Iterator` は `next` と `Item` が required、ほかは provided で、negative impl (`!Iterator for [T]`) があり、公開の実装者が 115。`std::marker::Send` は `unsafe auto trait` で、`!Send for *const T` などの negative impl を含む 544
+- テスト: required / provided、非公開の supertrait による `sealed`、実装者と見出し、`scope` の引数
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。
