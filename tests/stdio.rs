@@ -1316,8 +1316,12 @@ fn set_hanging_rustc(project: &Path, dir: &Path) {
 #[cfg(all(unix, feature = "local"))]
 fn hang(server: &mut Server, dir: &Path) -> [String; 3] {
     server.send(&call_tool(1, "list_crates", json!({})));
+    // The file is there before its contents, which the script writes last.
     assert!(
-        eventually(Duration::from_secs(30), || dir.join("rustc").exists()),
+        eventually(Duration::from_secs(30), || std::fs::read_to_string(
+            dir.join("rustc")
+        )
+        .is_ok_and(|pid| pid.ends_with('\n'))),
         "the hanging rustc did not start"
     );
     ["cargo", "rustc", "grandchild"].map(|name| {
@@ -1328,14 +1332,17 @@ fn hang(server: &mut Server, dir: &Path) -> [String; 3] {
     })
 }
 
-/// Whether the process `pid` runs.
+/// Whether the process `pid` runs. A zombie, which has stopped and waits for its parent to take
+/// its status, does not: the server takes that of a stopped cargo when it gets to it.
 #[cfg(all(unix, feature = "local"))]
 fn alive(pid: &str) -> bool {
-    Command::new("sh")
-        .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
-        .status()
-        .expect("sh runs")
-        .success()
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .expect("ps runs");
+    let state = String::from_utf8_lossy(&output.stdout);
+    let state = state.trim();
+    !state.is_empty() && !state.starts_with('Z')
 }
 
 /// Waits up to `limit` for `done`.
