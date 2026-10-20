@@ -81,6 +81,9 @@ jobs:
       # 確認用の 3 日分) と、手元の nightly の rust-docs-json から読むもの。
       - run: rustup toolchain install nightly --profile minimal --component rust-docs-json
       - run: cargo test --locked --release --test std_dist -- --ignored
+      # 決定性: 同じ問い合わせを別々のプロセスで、間に別の問い合わせを挟んで実行し、応答の文字列が
+      # 一致することを確かめる (要件 R-ARCH-5)。上の testdata の JSON と std を使う。
+      - run: cargo test --locked --release --test determinism -- --ignored
 
   # toml の整形 (.taplo.toml) と Markdown の lint (.markdownlint.jsonc)。
   config-lint:

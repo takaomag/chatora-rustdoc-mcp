@@ -720,6 +720,15 @@ C2〜C8 で M1 のツール (`list_crates`・`resolve_version`・`crate_overview
 - 依存: tokio の `sync` 機能を明示した (それまでは他の依存が有効にしていた)
 - テスト: stdio で、上限 1 のとき 2 つ目が `busy` になり、1 つ目をキャンセルすると次の呼び出しが通り、ログに `cancelled` と `busy` が残ること (`sleep` を使うので debug ビルドだけ)。`run_tool` を落とすとツールの task が止まること。上限の出入り。同じパスのロックを順に取ること
 
+#### D3 (2026-10-20)
+
+決定性の検査を足した (R-ARCH-5・R-OUT-4)。`tests/determinism.rs` (`#[ignore]`) は、testdata の JSON (tokio・axum・serde・clap) と std で、同じ問い合わせを 3 つのプロセスで実行する。1 回目は足りないもの (index・`.crate`・std) を取ってアーカイブを作るためで、比べるのは 2 回目と、順を逆にして間に別の問い合わせを挟んだ 3 回目。CI の `testdata` の job で、std の確認の後に回す。
+
+- 問い合わせ: 全ツール (`list_crates` はローカル機能のある構成だけ)。map を含む応答 (`list_impls` の `auto_traits`、`crate_overview` の `counts`・`features`)、ページで切られる一覧、std、エラー (`item_not_found`) を入れた。エラーは `request_id` を除いて比べる
+- **比べ方の落とし穴**: `preserve_order` の下の `serde_json::Value` の等価は map の順を見ない (中の `IndexMap` の `PartialEq` が順によらない)。値で比べた最初の版は、`counts` を `HashMap` にしても通ってしまった。応答を文字列にして比べるように直し、`HashMap` にすると落ちることを確かめた。ほかのテストの `Value` の比較も順を見ていないので、順を確かめたいときは文字列で比べる
+- 監査: 応答に `HashMap` を直列化している所は無かった。`HashMap` を回す所 (`iter_over_hash_type` の `expect`) は、数えるだけか、後で並べ替えている。アーカイブの `public_items` (順は不定) の使い手 2 つも、数えるか所属を調べるだけ
+- 実行時間: release で 2.4 秒 (キャッシュが温まった後)。手元で通った
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。
