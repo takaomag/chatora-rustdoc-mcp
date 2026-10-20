@@ -145,6 +145,7 @@ fn a_type_nested_up_to_the_limit_is_rendered_and_freed() {
                 },
                 detail: Detail::Normal,
                 project_features: None,
+                follow: false,
                 target: None,
             })
             .expect("deep::f is found");

@@ -415,6 +415,7 @@ fn representative_items_are_returned_by_get_item() {
             },
             detail: Detail::Normal,
             project_features: None,
+            follow: false,
             target: None,
         })
         .unwrap_or_else(|error| panic!("{path}: {error}"));

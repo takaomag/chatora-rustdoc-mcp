@@ -183,6 +183,8 @@ pub struct DocsRsBuild {
     /// The names of the `--cfg` that `rustdoc-args` and `rustc-args` pass (`tokio_unstable`), but
     /// `docsrs`, which docs.rs always sets, and `feature`.
     pub cfg: Box<[Box<str>]>,
+    /// The name of the package as published, from `[package]`.
+    pub package_name: Option<Box<str>>,
     /// The features of the crate that were not enabled, even through others: those of
     /// `[features]` and those that optional dependencies make. Items that need them are not in
     /// the documentation.
@@ -296,6 +298,11 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
         }
     }
     DocsRsBuild {
+        package_name: table
+            .get("package")
+            .and_then(|package| package.get("name"))
+            .and_then(toml::Value::as_str)
+            .map(Into::into),
         all_features,
         features: features.into_iter().map(Into::into).collect(),
         cfg: cfg.into_iter().map(Into::into).collect(),
@@ -447,6 +454,7 @@ rustc-args = ["--cfg=tokio_taskdump", "--cfg", "feature=\"x\""]
         );
         assert!(build.all_features);
         assert!(build.missing.is_empty(), "{build:?}");
+        assert_eq!(build.package_name.as_deref(), Some("demo"));
         assert_eq!(&*build.features, [
             Box::from("default"),
             "net".into(),

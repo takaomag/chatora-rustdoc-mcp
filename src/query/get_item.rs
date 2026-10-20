@@ -13,7 +13,18 @@ use std::{
     path::{Component, Path},
 };
 
-use rustdoc_types::{Attribute, Id, Item, ItemEnum, ItemKind, MacroKind, Struct, StructKind};
+use rustdoc_types::{
+    Attribute,
+    Id,
+    Item,
+    ItemEnum,
+    ItemKind,
+    MacroKind,
+    Stability,
+    StabilityLevel,
+    Struct,
+    StructKind,
+};
 use semver::Version;
 use serde::Serialize;
 
@@ -42,6 +53,10 @@ pub struct ItemRequest<'a> {
     /// The features that the project builds the crate with, when the project decided the
     /// version, for `enabled_in_project` (requirement R-FT-2).
     pub project_features: Option<ProjectFeatures<'a>>,
+    /// Whether a path that goes on in another crate is returned as
+    /// [`GetItemError::Elsewhere`], to be followed there (requirement R-PR-4), rather than as the
+    /// re-export with a hint.
+    pub follow: bool,
     /// The target asked for, to warn when the data is for another.
     pub target: Option<&'a str>,
 }
@@ -110,6 +125,8 @@ pub enum Origin<'a> {
         std_from: &'static str,
         /// Why that one was used.
         why: &'a str,
+        /// The release of the project's toolchain, to tell what it does not have yet.
+        project_release: Option<&'a Version>,
     },
 }
 
@@ -204,6 +221,9 @@ pub enum ResolvedFrom {
     /// The version in the project's Cargo.lock, read directly because `cargo metadata` failed
     /// (requirement R-VR-2).
     CargoLockRaw,
+    /// The version that the crate which re-exports the item was built with on docs.rs, from its
+    /// `html_root_url` (requirement R-PR-4).
+    Reexport,
 }
 
 /// One item, as of `detail=normal` (requirement R-OUT-7), with the signature before the prose
@@ -274,6 +294,10 @@ pub struct ItemData<'a> {
     /// `#[non_exhaustive]` (requirement R-SH-6).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub non_exhaustive: bool,
+    /// Since which release of Rust the item is stable, or the feature it needs, as std marks
+    /// it (§3 Q17).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stability: Option<StabilityNote<'a>>,
     /// The attributes, with `detail=full` (requirement R-OUT-7).
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub attrs: Box<[Box<str>]>,
@@ -289,6 +313,23 @@ pub struct ItemData<'a> {
     /// Something was cut to keep the response within its budget (requirement R-OUT-3).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+}
+
+/// The stability of an item of std, and of its use in `const`.
+#[derive(Debug, Default, Serialize)]
+pub struct StabilityNote<'a> {
+    /// The release it is stable since.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_since: Option<&'a str>,
+    /// The feature that it needs, being unstable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unstable_feature: Option<&'a str>,
+    /// The release it is stable in `const` since.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub const_stable_since: Option<&'a str>,
+    /// The feature that its use in `const` needs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub const_unstable_feature: Option<&'a str>,
 }
 
 /// A section of the documentation.
@@ -351,6 +392,28 @@ pub enum GetItemError {
         /// What each item is: its canonical path, or its name and `impl`.
         candidates: Box<[Box<str>]>,
     },
+    /// The path goes on in another crate, through a re-export of its item (requirement R-PR-4).
+    #[error("the path goes on in {}", .0.path)]
+    Elsewhere(Box<Destination>),
+}
+
+/// Where a path goes on in another crate (requirement R-PR-4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Destination {
+    /// The path asked for, up to the re-export (`reqwest::header`).
+    pub reexport: Box<str>,
+    /// What it re-exports, by its path in the other crate (`http::header`).
+    pub reexported: Box<str>,
+    /// The path to look up in the other crate, which starts with its name as code writes it
+    /// (`http::header::HeaderMap`).
+    pub path: Box<str>,
+    /// The crate as code writes it (`http`).
+    pub lib_name: Box<str>,
+    /// The crate as crates.io names it and the version that the JSON was built with, from its
+    /// `html_root_url` on docs.rs.
+    pub release: Option<(CrateName, Version)>,
+    /// The crate is one of std, documented with the toolchain.
+    pub is_std: bool,
 }
 
 /// Looks up the item at `request.path` in the crate of `view`.
@@ -372,10 +435,22 @@ pub fn get_item<'a>(
         hints: Vec::new(),
     };
     let provenance = query.provenance();
-    let data = match index.resolve(view, request.path) {
+    let with_root = with_root_name(view, request.name, request.path);
+    let path = with_root.as_deref().unwrap_or(request.path);
+    let resolution = index.resolve(view, path);
+    if request.follow
+        && matches!(
+            resolution,
+            Resolution::ExternalReexport(_) | Resolution::NotFound
+        )
+        && let Some(destination) = query.destination(path)
+    {
+        return Err(GetItemError::Elsewhere(Box::new(destination)));
+    }
+    let data = match resolution {
         Resolution::Item(id) => {
             let data = query.item_data(id, None);
-            if let Some(reexport) = index.hidden_reexport(request.path) {
+            if let Some(reexport) = index.hidden_reexport(path) {
                 query.hint_hidden_reexport(&reexport);
             }
             data
@@ -415,6 +490,27 @@ pub fn get_item<'a>(
     };
     fit(&mut response, MAX_RESPONSE_CHARS);
     Ok(response)
+}
+
+/// `path` with its head written as the crate's lib name, the name of its root module, when it is
+/// written as the package `name` and the two differ (`md-5::Md5` is `md5::Md5`). When the lib name
+/// follows the package name (`md_5::md5::Md5`, as a path given without the crate name gets it),
+/// the package name is dropped. `None` when nothing changes.
+fn with_root_name(view: &CrateView<'_>, name: &CrateName, path: &str) -> Option<String> {
+    let root = view.item(view.root())?.name.as_deref()?;
+    let (head, rest) = path
+        .split_once("::")
+        .map_or((path, None), |(head, rest)| (head, Some(rest)));
+    let package = name.as_str().replace('-', "_");
+    if head == root || !head.replace('-', "_").eq_ignore_ascii_case(&package) {
+        return None;
+    }
+    let rest = rest.and_then(|rest| match rest.split_once("::") {
+        Some((next, after)) if next == root => Some(after),
+        None if rest == root => None,
+        Some(_) | None => Some(rest),
+    });
+    Some(rest.map_or_else(|| root.to_owned(), |rest| format!("{root}::{rest}")))
 }
 
 /// The most characters of a response, as JSON (requirement R-OUT-3: about 8,000 tokens until the
@@ -584,6 +680,7 @@ impl<'a> Query<'a> {
                 toolchain,
                 std_from,
                 why,
+                ..
             } => (
                 Source::Std,
                 None,
@@ -649,6 +746,7 @@ impl<'a> Query<'a> {
             .iter()
             .any(|attr| matches!(attr, Attribute::MustUse { .. }));
         data.non_exhaustive = item.attrs.contains(&Attribute::NonExhaustive);
+        data.stability = self.stability(item, &data.path);
         data.source_location = self.source_location(item);
         if let Some(parent) = parent {
             data.impl_header = self.impl_header(parent, id);
@@ -707,6 +805,47 @@ impl<'a> Query<'a> {
             reexport_of,
             ..ItemData::default()
         }
+    }
+
+    /// The stability of `item`, at `path`, with a warning if the project's toolchain does not
+    /// have it as stable (§3 Q17).
+    fn stability(&mut self, item: &'a Item, path: &str) -> Option<StabilityNote<'a>> {
+        let mut note = StabilityNote::default();
+        let level = |stability: Option<&'a Stability>| match stability {
+            Some(Stability {
+                level: StabilityLevel::Stable { since },
+                ..
+            }) => (since.as_deref(), None),
+            Some(Stability {
+                feature,
+                level: StabilityLevel::Unstable,
+            }) => (None, Some(feature.as_str())),
+            None => (None, None),
+        };
+        (note.stable_since, note.unstable_feature) = level(item.stability.as_deref());
+        (note.const_stable_since, note.const_unstable_feature) =
+            level(item.const_stability.as_deref());
+        let project_release = match self.request.origin {
+            Origin::Std {
+                project_release, ..
+            } => project_release,
+            Origin::DocsRs { .. } => None,
+        };
+        if let Some(feature) = note.unstable_feature {
+            self.warnings.push(Cow::Owned(format!(
+                "{path} is unstable: it needs a nightly toolchain and #![feature({feature})]"
+            )));
+        } else if let (Some(since), Some(project)) = (note.stable_since, project_release)
+            && Version::parse(since).is_ok_and(|since| {
+                (since.major, since.minor, since.patch)
+                    > (project.major, project.minor, project.patch)
+            })
+        {
+            self.warnings.push(Cow::Owned(format!(
+                "{path} is stable since Rust {since}, after the project's toolchain {project}"
+            )));
+        }
+        (note.stable_since.is_some() || note.unstable_feature.is_some()).then_some(note)
     }
 
     /// Fills in the conditions that the item `id` needs (requirement R-FT-2): its own, those of
@@ -1007,6 +1146,45 @@ impl<'a> Query<'a> {
         Some(ReexportOf {
             name,
             path: definition.joined(),
+        })
+    }
+
+    /// Where the path asked for goes on in another crate: the longest prefix of it that
+    /// re-exports another crate's item. `None` when there is none, or the crate is a private
+    /// dependency of std (sysroot's `hashbrown`), which is not the crate of crates.io
+    /// (requirement R-PR-4).
+    fn destination(&self, path: &str) -> Option<Destination> {
+        let crossing = self.index.crossing(path)?;
+        let summary = self.view.summary(crossing.reexport.target)?;
+        let external = self.view.external_crate(summary.crate_id)?;
+        let release = external.html_root_url.as_deref().and_then(docs_rs_release);
+        let is_std = external
+            .html_root_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("https://doc.rust-lang.org/"))
+            || matches!(
+                external.name.as_str(),
+                "std" | "core" | "alloc" | "proc_macro" | "test"
+            );
+        // Formats 54 to 56 have no path, so a private dependency of std cannot be told there.
+        let in_sysroot = external
+            .path
+            .components()
+            .any(|component| component.as_os_str() == "rustlib");
+        if in_sysroot && !is_std {
+            return None;
+        }
+        Some(Destination {
+            reexport: crossing.reexport.path.joined(),
+            reexported: crossing
+                .reexport
+                .definition
+                .as_ref()
+                .map_or_else(|| external.name.as_str().into(), PublicPath::joined),
+            path: crossing.continued,
+            lib_name: external.name.as_str().into(),
+            release,
+            is_std,
         })
     }
 
@@ -1520,6 +1698,7 @@ mod tests {
             },
             detail: Detail::Normal,
             project_features: None,
+            follow: false,
             target: None,
         }))
     }
@@ -1627,6 +1806,7 @@ mod tests {
             },
             detail: Detail::Normal,
             project_features: None,
+            follow: false,
             target: None,
         })
         .expect("found");
@@ -1734,6 +1914,7 @@ mod tests {
             },
             detail,
             project_features: None,
+            follow: false,
             target: None,
         })
         .expect("found");
@@ -1965,6 +2146,7 @@ mod tests {
                 normal: normal.as_ref(),
                 with_dev: with_dev.as_ref(),
             }),
+            follow: false,
             target,
         })
         .expect("found");
@@ -2035,5 +2217,171 @@ mod tests {
             ),
             (json!("unknown"), json!(null))
         );
+    }
+
+    /// The error of `get_item` with `follow` for `path` in [`parsed`], after `change`, or `None`
+    /// when it finds the item.
+    fn followed(path: &str, change: impl FnOnce(&mut Crate)) -> Option<GetItemError> {
+        let mut krate = parsed().krate;
+        change(&mut krate);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::new(1, 2, 3);
+        get_item(&view, ItemRequest {
+            name: &name,
+            version: &version,
+            path,
+            origin: Origin::DocsRs {
+                resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
+                build: None,
+            },
+            detail: Detail::Brief,
+            project_features: None,
+            follow: true,
+            target: None,
+        })
+        .err()
+    }
+
+    #[test]
+    fn a_path_into_another_crate_goes_on_there() {
+        let destination = |path| match followed(path, |_| {}) {
+            Some(GetItemError::Elsewhere(destination)) => *destination,
+            other => panic!("{path}: {other:?}"),
+        };
+        let other = || Some(("other".parse().expect("a name"), Version::new(0, 5, 1)));
+        assert_eq!(destination("my_crate::Thing"), Destination {
+            reexport: "my_crate::Thing".into(),
+            reexported: "other::inner::Thing".into(),
+            path: "other::inner::Thing".into(),
+            lib_name: "other".into(),
+            release: other(),
+            is_std: false,
+        });
+        // A path under the re-export goes on under its target.
+        assert_eq!(
+            destination("my_crate::Thing::method").path,
+            "other::inner::Thing::method".into()
+        );
+        // The items of this crate are found here.
+        assert!(followed("my_crate::Mutex", |_| {}).is_none());
+        assert!(matches!(
+            followed("my_crate::Nothing", |_| {}),
+            Some(GetItemError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn a_private_dependency_of_std_is_not_followed() {
+        // The sysroot's copy is not the crate of crates.io with that name.
+        let in_sysroot = |krate: &mut Crate| {
+            if let Some(other) = krate.external_crates.get_mut(&1) {
+                other.path = PathBuf::from(
+                    "/toolchain/lib/rustlib/x86_64-unknown-linux-gnu/lib/libother-0123.rlib",
+                );
+            }
+        };
+        assert!(followed("my_crate::Thing", in_sysroot).is_none());
+        // A crate of std goes on with the toolchain.
+        let std = |krate: &mut Crate| {
+            if let Some(other) = krate.external_crates.get_mut(&1) {
+                other.html_root_url = Some("https://doc.rust-lang.org/nightly/".to_owned());
+            }
+        };
+        assert!(matches!(
+            followed("my_crate::Thing", std),
+            Some(GetItemError::Elsewhere(destination)) if destination.is_std && destination.release.is_none()
+        ));
+    }
+
+    #[test]
+    fn std_tells_since_when_an_item_is_stable() {
+        let mut krate = parsed().krate;
+        let stable = |since: &str| {
+            Some(Box::new(Stability {
+                feature: "f".to_owned(),
+                level: StabilityLevel::Stable {
+                    since: Some(since.to_owned()),
+                },
+            }))
+        };
+        if let Some(mutex) = krate.index.get_mut(&Id(3)) {
+            mutex.stability = stable("1.100.0");
+        }
+        if let Some(lock) = krate.index.get_mut(&Id(6)) {
+            lock.stability = Some(Box::new(Stability {
+                feature: "mutex_lock".to_owned(),
+                level: StabilityLevel::Unstable,
+            }));
+            lock.const_stability = stable("1.90.0");
+        }
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::new(1, 2, 3);
+        let project = Version::new(1, 99, 1);
+        let look_up = |path| {
+            let response = get_item(&view, ItemRequest {
+                name: &name,
+                version: &version,
+                path,
+                origin: Origin::Std {
+                    toolchain: "rustc 1.101.0-nightly",
+                    std_from: "dist",
+                    why: "x",
+                    project_release: Some(&project),
+                },
+                detail: Detail::Normal,
+                project_features: None,
+                follow: false,
+                target: None,
+            })
+            .expect("found");
+            let response = serde_json::to_value(response).expect("serializes");
+            (
+                response["data"]["stability"].clone(),
+                response["warnings"].clone(),
+            )
+        };
+        assert_eq!(
+            look_up("my_crate::Mutex"),
+            (
+                json!({ "stable_since": "1.100.0" }),
+                json!([
+                    "my_crate::Mutex is stable since Rust 1.100.0, after the project's toolchain 1.99.1"
+                ])
+            )
+        );
+        assert_eq!(
+            look_up("my_crate::Mutex::lock"),
+            (
+                json!({ "unstable_feature": "mutex_lock", "const_stable_since": "1.90.0" }),
+                json!([
+                    "my_crate::Mutex::lock is unstable: it needs a nightly toolchain and #![feature(mutex_lock)]"
+                ])
+            )
+        );
+    }
+
+    #[test]
+    fn a_path_may_start_with_the_package_name_of_a_lib_named_otherwise() {
+        let mut krate = parsed().krate;
+        if let Some(root) = krate.index.get_mut(&Id(0)) {
+            root.name = Some("mine".to_owned());
+        }
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let with_root = |path| with_root_name(&view, &name, path);
+        assert_eq!(with_root("my-crate::Mutex").as_deref(), Some("mine::Mutex"));
+        assert_eq!(
+            with_root("my_crate::mine::Mutex").as_deref(),
+            Some("mine::Mutex")
+        );
+        assert_eq!(with_root("my_crate").as_deref(), Some("mine"));
+        assert_eq!(with_root("mine::Mutex"), None);
+        assert_eq!(with_root("other::Mutex"), None);
     }
 }

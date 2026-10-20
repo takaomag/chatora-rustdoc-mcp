@@ -20,7 +20,7 @@ use super::{
 #[cfg(feature = "local")]
 use crate::data::{
     features::FeatureSets,
-    packages::{DocsRsCheck, ProjectPackage, Source},
+    packages::{DocsRsCheck, Lookup as PackageLookup, PackageGraph, ProjectPackage, Source},
     project::Workspace,
 };
 use crate::{
@@ -42,6 +42,7 @@ use crate::{
     query::{
         across::{self, Indexed},
         get_item::{
+            Destination,
             Detail,
             GetItemError,
             ItemRequest,
@@ -125,7 +126,13 @@ struct Request {
     build: Option<Box<DocsRsBuild>>,
     /// The project's build of it, when the project decided the version.
     in_build: InBuild,
+    /// How many crates the path was followed through to get here (requirement R-PR-4).
+    hops: usize,
 }
+
+/// The most crates that a path is followed into, through re-exports of their items, after the
+/// one asked for (requirement R-PR-4).
+const MAX_FOLLOWED: usize = 3;
 
 /// The project's build of the crate, for `enabled_in_project` (requirement R-FT-2). Empty when
 /// the project did not decide the version, and without local features.
@@ -230,7 +237,14 @@ fn output_schema() -> JsonObject {
                     "version": { "type": "string" },
                     "resolved_from": {
                         "type": "string",
-                        "enum": ["explicit", "explicit_req", "latest", "cargo_lock", "cargo_lock_raw"],
+                        "enum": [
+                            "explicit",
+                            "explicit_req",
+                            "latest",
+                            "cargo_lock",
+                            "cargo_lock_raw",
+                            "reexport",
+                        ],
                     },
                     "project_from": {
                         "type": "string",
@@ -317,6 +331,17 @@ fn data_schema() -> Value {
             },
             "must_use": { "type": "boolean" },
             "non_exhaustive": { "type": "boolean" },
+            "stability": {
+                "type": "object",
+                "description": "For std: since which Rust release it is stable, or the feature it \
+                                needs; the same for its use in const.",
+                "properties": {
+                    "stable_since": { "type": "string" },
+                    "unstable_feature": { "type": "string" },
+                    "const_stable_since": { "type": "string" },
+                    "const_unstable_feature": { "type": "string" },
+                },
+            },
             "also_reexported_at": strings,
             "reexport_of": {
                 "type": "object",
@@ -514,6 +539,7 @@ async fn resolve(
             checksum: None,
             build: None,
             in_build: InBuild::default(),
+            hops: 0,
         };
         return Ok((request, warnings));
     }
@@ -548,6 +574,7 @@ async fn resolve(
         checksum: Some(resolved.version.checksum.clone()),
         build: None,
         in_build,
+        hops: 0,
         project_from,
         path,
         resolved_from,
@@ -721,8 +748,8 @@ fn with_crate_name(name: &CrateName, path: &str) -> Box<str> {
 }
 
 /// `path` with the crate name at its head written as code writes it: `name` with `_` for `-`
-/// (`Serde-JSON::Value` asked of `serde_json` is `serde_json::Value`). The lib name can differ from
-/// that; C1e reads it from the JSON.
+/// (`Serde-JSON::Value` asked of `serde_json` is `serde_json::Value`). A lib name that differs
+/// more (`md5` of `md-5`) is put in its place by the lookup, from the JSON.
 fn with_lib_name(name: &str, path: &str) -> Box<str> {
     let lib = name.replace('-', "_");
     let rest = match path.split_once("::") {
@@ -757,22 +784,40 @@ fn same_crate_name(a: &str, b: &str) -> bool {
 /// it first, on a blocking thread, since parsing a large crate takes a large part of a second.
 pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
     if let Some(krate) = std_crate(&arguments.name) {
-        return execute_std(arguments, krate, state).await;
+        return execute_std(arguments, krate, state, Vec::new()).await;
     }
     let target = arguments
         .target
         .clone()
         .unwrap_or_else(|| state.host.triple.clone());
-    let (mut arguments, mut warnings) = match resolve(&state, arguments, target).await {
+    let (arguments, warnings) = match resolve(&state, arguments, target).await {
         Ok(resolved) => resolved,
         Err(error) => return *error,
     };
-    arguments.build = docs_rs_build(&state, &arguments, &mut warnings)
+    look_up_release(&state, arguments, warnings).await
+}
+
+/// Looks the item up in the release that `arguments` names, from its archive or its JSON on
+/// docs.rs, and follows the path into the crate it goes on in, if any (requirement R-PR-4).
+async fn look_up_release(
+    state: &Arc<ToolState>,
+    mut arguments: Request,
+    mut warnings: Vec<Box<str>>,
+) -> CallToolResult {
+    arguments.build = docs_rs_build(state, &arguments, &mut warnings)
         .await
         .map(Box::new);
+    // The name as published, when the version was decided without the crates.io index.
+    if let Some(published) = arguments
+        .build
+        .as_ref()
+        .and_then(|build| build.package_name.as_deref()?.parse::<CrateName>().ok())
+    {
+        arguments.name = published;
+    }
     #[cfg(feature = "local")]
     {
-        arguments.in_build.sets = feature_sets(&state, &arguments, &mut warnings).await;
+        arguments.in_build.sets = feature_sets(state, &arguments, &mut warnings).await;
     }
     let target = Some(&arguments.target);
     let dir = state
@@ -780,7 +825,9 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
         .docs_rs_dir(&arguments.name, &arguments.version, target);
     let arguments =
         match look_up_archived(state.cache.clone(), dir.clone(), Box::new(arguments)).await {
-            Some(Ok((looked_up, arguments))) => return finish(looked_up, &arguments, &warnings),
+            Some(Ok((looked_up, arguments))) => {
+                return conclude(state, looked_up, *arguments, warnings).await;
+            },
             Some(Err(arguments)) => *arguments,
             None => return shutting_down(),
         };
@@ -805,10 +852,247 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
     else {
         return shutting_down();
     };
-    match recover(&state, &lookup, looked_up, arguments, &json, &mut warnings).await {
-        Ok((looked_up, arguments)) => finish(looked_up, &arguments, &warnings),
+    match recover(state, &lookup, looked_up, arguments, &json, &mut warnings).await {
+        Ok((looked_up, arguments)) => conclude(state, looked_up, arguments, warnings).await,
         Err(result) => *result,
     }
+}
+
+/// The result of a lookup, or of the lookup in the crate that the path goes on in.
+async fn conclude(
+    state: &Arc<ToolState>,
+    looked_up: Result<Value, Failure>,
+    arguments: Request,
+    warnings: Vec<Box<str>>,
+) -> CallToolResult {
+    match looked_up {
+        Err(Failure::Item(GetItemError::Elsewhere(destination))) => {
+            follow(state, *destination, arguments, warnings).await
+        },
+        looked_up => finish(looked_up, &arguments, &warnings),
+    }
+}
+
+/// Looks the path up in the crate that it goes on in, through a re-export of that crate's item
+/// (requirement R-PR-4): a crate of std, or a release on docs.rs. If that fails, the re-export
+/// itself is returned from `origin`, with why.
+async fn follow(
+    state: &Arc<ToolState>,
+    destination: Destination,
+    mut origin: Request,
+    warnings: Vec<Box<str>>,
+) -> CallToolResult {
+    let mut followed = warnings.clone();
+    let std = destination
+        .lib_name
+        .parse::<CrateName>()
+        .ok()
+        .and_then(|name| Some((std_crate(&name)?, name)));
+    let result = match std {
+        Some((krate, name)) if destination.is_std => {
+            followed.push(shown_from(&destination, &origin, krate.as_str()));
+            let arguments = Arguments {
+                name,
+                version: None,
+                project: None,
+                path: destination.path.clone(),
+                target: Some(origin.target.clone()),
+                detail: origin.detail,
+            };
+            Box::pin(execute_std(arguments, krate, Arc::clone(state), followed)).await
+        },
+        Some(_) | None => {
+            match destination_request(state, &destination, &origin, &mut followed).await {
+                Ok(request) => {
+                    followed.push(shown_from(
+                        &destination,
+                        &origin,
+                        &format!("{} {}", request.name, request.version),
+                    ));
+                    Box::pin(look_up_release(state, request, followed)).await
+                },
+                Err(result) => *result,
+            }
+        },
+    };
+    if result.is_error != Some(true) {
+        return result;
+    }
+    let mut warnings = warnings;
+    warnings.push(
+        format!(
+            "{} goes on as {}, which could not be looked up: {}",
+            origin.path,
+            destination.path,
+            error_summary(&result)
+        )
+        .into(),
+    );
+    origin.hops = MAX_FOLLOWED;
+    let fallback = Box::pin(look_up_release(state, origin, warnings)).await;
+    // Without the re-export to show, the error of the crate the path goes on in tells more.
+    if fallback.is_error == Some(true) {
+        result
+    } else {
+        fallback
+    }
+}
+
+/// The warning that the path asked for in `origin` is shown from `krate`.
+fn shown_from(destination: &Destination, origin: &Request, krate: &str) -> Box<str> {
+    let (asked, there) = (&origin.path, &destination.path);
+    if asked == &destination.reexport {
+        format!("{asked} is a re-export of {there} ({krate}), shown from there").into()
+    } else {
+        format!(
+            "{} is a re-export of {} ({krate}), so {asked} is shown as {there} from there",
+            destination.reexport, destination.reexported
+        )
+        .into()
+    }
+}
+
+/// The code and the message of the tool error `result`.
+fn error_summary(result: &CallToolResult) -> String {
+    let body: Option<Value> = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .and_then(|text| serde_json::from_str(&text.text).ok());
+    body.map_or_else(
+        || "an error".to_owned(),
+        |body| {
+            format!(
+                "{}: {}",
+                body.get("code").and_then(Value::as_str).unwrap_or("error"),
+                body.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            )
+        },
+    )
+}
+
+/// The request for the crate that the path goes on in (requirement R-PR-4). Its version is the
+/// one in the project's build when the project decided the version of `origin`, or else the one
+/// that `origin` was built with on docs.rs, or else the latest, with a warning.
+async fn destination_request(
+    state: &ToolState,
+    destination: &Destination,
+    origin: &Request,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<Request, Box<CallToolResult>> {
+    #[cfg(feature = "local")]
+    if let Some(request) = in_project_build(state, destination, origin).await {
+        return Ok(request);
+    }
+    let (name, version, resolved_from) = if let Some((name, version)) = &destination.release {
+        (name.clone(), version.clone(), ResolvedFrom::Reexport)
+    } else {
+        let name: CrateName = destination.lib_name.parse().map_err(|error| {
+            Box::new(super::tool_error(
+                "item_not_found",
+                &format!(
+                    "the crate that the path goes on in has a name that is not valid: {error}"
+                ),
+                false,
+                &[],
+            ))
+        })?;
+        let entry = state
+            .index
+            .entry(&name)
+            .await
+            .map_err(|error| Box::new(index_error(&name, &error)))?;
+        let resolved = VersionSpec::Latest
+            .resolve(&entry.versions)
+            .map_err(|no_version| {
+                Box::new(version_not_found(
+                    &entry.name,
+                    &VersionSpec::Latest,
+                    &no_version,
+                ))
+            })?;
+        let version = resolved.version.version.clone();
+        warnings.push(
+            format!(
+                "the version of {} that {} {} was built with is not known, so the latest, \
+                 {version}, is shown",
+                entry.name, origin.name, origin.version
+            )
+            .into(),
+        );
+        (
+            entry.name.parse().unwrap_or(name),
+            version,
+            ResolvedFrom::Latest,
+        )
+    };
+    Ok(Request {
+        name,
+        version,
+        project_from: None,
+        path: destination.path.clone(),
+        resolved_from,
+        target: origin.target.clone(),
+        detail: origin.detail,
+        checksum: None,
+        build: None,
+        in_build: InBuild::default(),
+        hops: origin.hops.saturating_add(1),
+    })
+}
+
+/// The request for the crate that the path goes on in, at its version in the project's build,
+/// when the project decided the version of `origin` and has the crate from crates.io. Of several
+/// versions, the one that `origin` was built with on docs.rs.
+#[cfg(feature = "local")]
+async fn in_project_build(
+    state: &ToolState,
+    destination: &Destination,
+    origin: &Request,
+) -> Option<Request> {
+    let workspace = origin.in_build.workspace.as_ref()?;
+    let resolution = state.resolver.resolve(workspace).await.ok()?;
+    let graph = PackageGraph::new(&resolution);
+    let built_with = destination.release.as_ref().map(|(_, version)| version);
+    let name = destination
+        .release
+        .as_ref()
+        .map_or(&*destination.lib_name, |(name, _)| name.as_str());
+    let package = match graph.look_up(name) {
+        PackageLookup::Found {
+            package,
+            other_versions,
+        } => other_versions
+            .into_iter()
+            .find(|other| Some(&other.version) == built_with)
+            .unwrap_or(package),
+        PackageLookup::AmbiguousVersion(candidates) => candidates
+            .into_iter()
+            .map(|candidate| candidate.package)
+            .find(|package| Some(&package.version) == built_with)?,
+        PackageLookup::AmbiguousPackage(_) | PackageLookup::NotFound => return None,
+    };
+    if package.source != Source::CratesIo {
+        return None;
+    }
+    Some(Request {
+        name: package.name.parse().ok()?,
+        version: package.version.clone(),
+        project_from: origin.project_from,
+        path: destination.path.clone(),
+        resolved_from: origin.resolved_from,
+        target: origin.target.clone(),
+        detail: origin.detail,
+        checksum: package.checksum.clone(),
+        build: None,
+        in_build: InBuild {
+            workspace: Some(workspace.clone()),
+            sets: None,
+        },
+        hops: origin.hops.saturating_add(1),
+    })
 }
 
 /// The features of the packages in the build of the workspace that decided the version of
@@ -991,12 +1275,12 @@ async fn execute_std(
     arguments: Arguments,
     krate: StdCrate,
     state: Arc<ToolState>,
+    mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
     let target = arguments
         .target
         .clone()
         .unwrap_or_else(|| state.host.triple.clone());
-    let mut warnings: Vec<Box<str>> = Vec::new();
     if arguments.version.is_some() {
         warnings.push(
             "std has no versions on crates.io, so the version is ignored; std is that of a nightly \
@@ -1033,10 +1317,11 @@ async fn execute_std(
         checksum: None,
         build: None,
         in_build: InBuild::default(),
+        hops: 0,
     };
     let cache = state.cache.clone();
     let task = tokio::task::spawn_blocking(move || {
-        let looked_up = look_up_std(&cache, &chosen, &request);
+        let looked_up = look_up_std(&cache, &chosen, &request, at_least.as_ref());
         (looked_up, request)
     });
     match task.await {
@@ -1084,6 +1369,7 @@ fn look_up_std(
     cache: &Cache,
     chosen: &Chosen,
     request: &Request,
+    project_release: Option<&Version>,
 ) -> (Result<Value, Failure>, Vec<Box<str>>) {
     let mut loaded: HashMap<StdCrate, Arc<Mapped<Indexed>>> = HashMap::new();
     let mut failed = None;
@@ -1144,10 +1430,12 @@ fn look_up_std(
             toolchain: &toolchain,
             std_from: chosen.json.source(),
             why: &chosen.why,
+            project_release,
         },
         target: Some(request.target.as_str()),
         detail: request.detail,
         project_features: None,
+        follow: false,
     })
     .map_err(Failure::Item)
     .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize));
@@ -1304,7 +1592,14 @@ fn add_warnings(response: &mut Value, warnings: &[Box<str>]) {
     let Some(fields) = response.as_object_mut() else {
         return;
     };
-    let mut all: Vec<Value> = warnings.iter().map(|warning| json!(warning)).collect();
+    let mut all: Vec<Value> = Vec::with_capacity(warnings.len());
+    // The same warning comes twice when a path is looked up again after it could not be followed.
+    for warning in warnings {
+        let warning = json!(warning);
+        if !all.contains(&warning) {
+            all.push(warning);
+        }
+    }
     if let Some(Value::Array(more)) = fields.get_mut("warnings") {
         all.append(more);
         fields.insert("warnings".to_owned(), Value::Array(all));
@@ -1352,6 +1647,7 @@ fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Request) -> Result<Value, Fa
         project_features: arguments
             .in_build
             .features(arguments.name.as_str(), &arguments.version),
+        follow: arguments.hops < MAX_FOLLOWED,
     })
     .map_err(Failure::Item)
     .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize))
@@ -1531,6 +1827,16 @@ fn item_error(arguments: &Request, error: &GetItemError) -> CallToolResult {
                  (tokio::sync::Mutex::lock)",
             ],
         })),
+        // Followed before the error is made; reached only if following is turned off.
+        GetItemError::Elsewhere(destination) => error_result(&json!({
+            "code": "item_not_found",
+            "message": format!(
+                "{release} has no item at {}; it goes on as {} in another crate",
+                arguments.path, destination.path
+            ),
+            "retryable": false,
+            "suggestions": [format!("call get_item with the path {}", destination.path)],
+        })),
         GetItemError::Ambiguous { candidates } => error_result(&json!({
             "code": "ambiguous_path",
             "message": format!("{release} has more than one item at {}", arguments.path),
@@ -1684,6 +1990,7 @@ mod tests {
             checksum: None,
             build: None,
             in_build: InBuild::default(),
+            hops: 0,
         };
         let candidates = (0..25).map(|n| format!("item {n}").into()).collect();
         let result = item_error(&request, &GetItemError::Ambiguous { candidates });
@@ -1708,6 +2015,7 @@ mod tests {
             Section,
             Source,
             SourceLocation,
+            StabilityNote,
             StdFrom,
         };
 
@@ -1757,6 +2065,12 @@ mod tests {
                 }),
                 must_use: true,
                 non_exhaustive: true,
+                stability: Some(StabilityNote {
+                    stable_since: some_str(),
+                    unstable_feature: some_str(),
+                    const_stable_since: some_str(),
+                    const_unstable_feature: some_str(),
+                }),
                 also_reexported_at: many(),
                 reexport_of: Some(ReexportOf {
                     name: "x".into(),

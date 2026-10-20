@@ -544,6 +544,31 @@ C1d も 3 つに分けた: C1d-1 (cfg を読んで item の条件を出す)、C1
 - 扱っていないこと: 版を明示して、それがプロジェクトの版と同じときの評価 (今はプロジェクトが版を決めたときだけ)。feature とそれ以外が混ざった項 (`any(feature = "a", unix)`) の、feature 以外の部分の評価 (不明として扱う)。プロジェクトの `build.target` (C1d-2 の記録のとおり)。一覧系のツールの各項目への注記 (C2 以降)
 - テスト: feature で決まること、docs.rs が立てた cfg で不明になること、欠けた feature が不明より勝つこと、dev だけの item と crate、他の target の JSON で不明になること
 
+#### C1e (2026-10-20)
+
+利用者が決めた 2 件 (どちらも推奨案): 他の crate への re-export は行き先の中身まで自動でたどって返す (R-PR-4 の「M1 で決める」)。シグネチャの中の他の crate の型は、M1 では rustdoc が渡すソースの書き方のまま描き、他の crate の索引で正準パスにするのは M4 (依存グラフ全体の作業) に回す (§7 の型のパスの「M1 から」を M1 の終わりに改める)。
+
+- 他の crate へ続くパス (R-PR-4): パスが見つからないか他の crate の item の re-export に当たったら、その先頭のうち最も長い re-export (公開パス索引の `crossing`) の行き先を求め、その crate で引き直す (`GetItemError::Elsewhere`)。たどるのは最大 3 crate 先まで
+  - 行き先の版: 起点の版をプロジェクトが決めたときはプロジェクトの Cargo.lock の版 (同じ crate の版が複数なら、起点が docs.rs でビルドされたときの版と同じもの)。次に起点の JSON の `html_root_url` (docs.rs の URL に crates.io の名前と版が入っている。`resolved_from: "reexport"` を足した)。どちらでも決まらなければ latest にして warnings に書く。rustdoc は re-export の連鎖を最終の定義の id に解決しているので、起点と参照元のどちらの `html_root_url` を先に見るかという問いは実際には起きない
+  - 行き先が std の仲間 (`html_root_url` が doc.rust-lang.org) なら std の経路で引く (`tokio::io::Error` → `core::io::Error`)。std の私的な依存 (`ExternalCrate::path` が sysroot の `rustlib` の下にあるもの) はたどらない (crates.io の同名の crate と取り違えないため。形式 54〜56 は `path` が無いので見分けられない)
+  - たどれなかったら、起点を「たどらない」で引き直して M0 と同じく `reexport_of` と hint を返し、理由を warnings に書く。それもエラーなら、行き先の crate のエラー (`http@1.5.0 has no item at http::header::NoSuchThing`) を返す
+  - warnings に「`reqwest::header` は `http::header` (http 1.5.0) の re-export なので、`reqwest::header::HeaderMap` を `http::header::HeaderMap` としてそこから示した」の形で書く
+- 実データ: `reqwest::header::HeaderMap` (http 1.5.0)、`reqwest::Url` (url 2.5.8)、`compio::io::AsyncWriteAt` (compio-io 0.10.1。§3 Q20)、`axum::http::StatusCode` (http 1.3.1)、`tokio::io::Error` (core)。このリポジトリのプロジェクトで版を省くと、http もプロジェクトの Cargo.lock の 1.5.0 (`cargo_lock`) で、`enabled_in_project` も付く。初回は行き先の JSON の取得で 0.4〜0.7 秒
+- std の安定性 (§3 Q17): 形式 61 の `Item::stability`・`const_stability` から `stability` (`stable_since`・`unstable_feature`・`const_stable_since`・`const_unstable_feature`) を出す。unstable なら必要な `#![feature(...)]` を、stable になった版がプロジェクトの toolchain より新しければその旨を warnings に書く (`std::never` は 1.100.0 で、プロジェクトの 1.99.1 より新しい)。docs.rs の普通の crate には入っていない
+- 綴りと lib 名: 版を index なしで決めたとき (キャッシュにある完全一致の版) は、provenance の `crate` が頼まれた綴りのままだった。`.crate` の `Cargo.toml` の `package.name` を正とした (`Serde_Json@1.0.154` は `serde_json`)。パッケージ名と lib 名が違う crate (`md-5` の lib は `md5`) では、パスの先頭のパッケージ名を JSON のルートの名前 (lib 名) に置き換える (`md-5::Md5` も `md5::Md5` も引ける)
+- テスト: 他の crate へ続くパス (re-export そのものと、その下のパス)、std の私的な依存をたどらないこと、std の仲間への行き先、std の安定性と warnings、lib 名への置き換え、`package.name` の読み取り
+
+#### C1 の終わり (2026-10-20)
+
+C1 の終わりの印は満たした:
+
+- §3 Q5 (`tokio::sync::Mutex::lock` のシグネチャ・ドキュメント・panic 条件): `detail=full` でシグネチャ、`sync` の条件、本文、節 (Cancel safety・Examples。panic の節は無い) が返る
+- §3 Q17 (この std API は自分の toolchain や MSRV で使えるか): `stability` と warnings で答えられる (MSRV を踏まえた表示は M4)
+- §3 Q20 (`compio::io::AsyncWriteAt` はどこで定義されているか): compio-io 0.10.1 の `compio_io::AsyncWriteAt` として返り、warnings に re-export の経路が出る
+- `reqwest::header::HeaderMap` を引ける (http の `http::HeaderMap`)
+
+M1 の終わりに要件へ反映するもの (C1 の分): `detail` の各段の中身と `sections`・`attrs`・`truncated` (R-OUT-7・R-OUT-3)、応答の上限の初期値 32,000 文字と削る順、`candidates_total`、cfg の 4 系統の表記と `doc`・`docsrs` の畳み方 (R-FT-2)、`enabled_in_project` の評価の規則 (C1d-2 の決定)、provenance の `features`・`all_features`・`cfg` と欠けた feature の warnings (R-FT-1・§7.3)、`resolved_from: "reexport"`、他の crate へのパスを自動でたどること (R-PR-4)、型のパスの扱い (§7。M4 へ)、`stability` (Q17)、`.crate` の取得 (R-SC-2 の初期の上限)、R-NW-4 の見直し
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。
