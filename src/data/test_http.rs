@@ -29,7 +29,7 @@ pub(super) fn serve_once(head: &str, body: &[u8]) -> (String, mpsc::Receiver<Str
         }
         let mut stream = reader.into_inner();
         stream
-            .write_all(head.as_bytes())
+            .write_all(closing(&head).as_bytes())
             .expect("the response is writable");
         stream.write_all(&body).expect("the response is writable");
         sender.send(request_head).expect("the test waits");
@@ -71,7 +71,7 @@ pub(super) fn serve_sequence_with(
             }
             let mut stream = reader.into_inner();
             stream
-                .write_all(head.as_bytes())
+                .write_all(closing(&head).as_bytes())
                 .expect("the response is writable");
             stream.write_all(&body).expect("the response is writable");
             if sender.send(request_head).is_err() {
@@ -80,4 +80,13 @@ pub(super) fn serve_sequence_with(
         }
     });
     (base_url, requests)
+}
+
+/// `head` with `Connection: close` after its status line. The server answers one request on each
+/// connection and then closes it. Without the header, the client may send its next request on the
+/// same connection, and closing a connection with that request unread resets it, so that the
+/// client fails with `ECONNRESET` now and then.
+fn closing(head: &str) -> String {
+    let (status, fields) = head.split_once("\r\n").expect("a status line");
+    format!("{status}\r\nConnection: close\r\n{fields}")
 }
