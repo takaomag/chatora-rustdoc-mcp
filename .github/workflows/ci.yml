@@ -68,8 +68,13 @@ jobs:
 
   # testdata/docs-rs-json.txt の docs.rs の JSON を取ってキャッシュし、実データのテスト (#[ignore]) を回す
   # (doc/m1-plan.md の P3)。一覧が変わらない限り、docs.rs から取り直さない。
+  # 3 つの OS で回す (doc/m2-plan.md の A4b)。照会の多くは target を省くので、ホストの target の文書を引く。
   testdata:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     env:
       CHATORA_RUSTDOC_MCP_CACHE__DIR: ${{ github.workspace }}/../rustdoc-json-cache
     steps:
@@ -81,8 +86,9 @@ jobs:
           path: ${{ env.CHATORA_RUSTDOC_MCP_CACHE__DIR }}
           # v2: キャッシュの配置 (docs.rs/<名前>/<版>/<target>/<形式>.json と digest。M1 の B6)。
           # 配置を変えたら上げる。
-          key: docs-rs-json-v2-${{ hashFiles('testdata/docs-rs-json.txt') }}
+          key: docs-rs-json-v2-${{ runner.os }}-${{ hashFiles('testdata/docs-rs-json.txt') }}
       - name: Fetch the test data
+        shell: bash
         run: >-
           awk -F'\t' '!/^#/ && NF >= 2 { print $1 "@" $2 }' testdata/docs-rs-json.txt
           | xargs cargo run --locked --release --example fetch_docs_rs --
