@@ -3,6 +3,7 @@
 //! Each tool is a module with `NAME`, `definition()`, `parse_arguments()` when its arguments need
 //! checking, and `execute()`.
 
+mod crate_overview;
 mod get_item;
 mod list_module;
 mod project;
@@ -75,6 +76,7 @@ impl std::fmt::Display for ErrorChain<'_> {
 /// Definitions of every tool, in the order `tools/list` returns them.
 pub(super) fn definitions() -> Vec<Tool> {
     vec![
+        crate_overview::definition(),
         get_item::definition(),
         list_module::definition(),
         resolve_version::definition(),
@@ -100,6 +102,14 @@ pub(super) async fn call(
             Ok(arguments) => Ok(run_tool(get_item::execute(arguments, Arc::clone(state)))
                 .await
                 .into()),
+            Err(error) => Ok(error.into_result().into()),
+        },
+        crate_overview::NAME => match crate_overview::parse_arguments(request.arguments.as_ref()) {
+            Ok(arguments) => Ok(
+                run_tool(crate_overview::execute(arguments, Arc::clone(state)))
+                    .await
+                    .into(),
+            ),
             Err(error) => Ok(error.into_result().into()),
         },
         list_module::NAME => match list_module::parse_arguments(request.arguments.as_ref()) {

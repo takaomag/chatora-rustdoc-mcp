@@ -189,6 +189,11 @@ pub struct DocsRsBuild {
     /// `[features]` and those that optional dependencies make. Items that need them are not in
     /// the documentation.
     pub missing: Box<[Box<str>]>,
+    /// Every feature of the crate: those of `[features]` and those that optional dependencies
+    /// make, sorted.
+    pub declared: Box<[Box<str>]>,
+    /// The features that `default` enables, through others too, sorted.
+    pub default: Box<[Box<str>]>,
 }
 
 /// How docs.rs built `name` at `version`, from the `Cargo.toml` in its `.crate` `contents`.
@@ -272,6 +277,15 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
         features
     };
     let enabled = closure(&features, features_table);
+    let default: Box<[Box<str>]> = if declared.contains("default") {
+        closure(&BTreeSet::from(["default"]), features_table)
+            .into_iter()
+            .filter(|&feature| feature != "default")
+            .map(Into::into)
+            .collect()
+    } else {
+        Box::default()
+    };
     let missing = declared
         .iter()
         .filter(|feature| !enabled.contains(feature.as_str()))
@@ -307,6 +321,11 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
         features: features.into_iter().map(Into::into).collect(),
         cfg: cfg.into_iter().map(Into::into).collect(),
         missing,
+        declared: declared
+            .iter()
+            .map(|feature| feature.as_str().into())
+            .collect(),
+        default,
     }
 }
 
@@ -510,6 +529,7 @@ libc = { version = "0.2", optional = true }
 features = ["full"]
 "#,
         );
+        assert_eq!(&*build.default, [Box::from("rt")]);
         // `full` enables `rt` and `net`, and `net` the optional `bytes`; `serde?/derive` does not
         // enable `serde`, and `mio` has no feature of its own as `dep:mio` names it.
         assert_eq!(&*build.missing, [

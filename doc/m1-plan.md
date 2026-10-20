@@ -487,7 +487,7 @@ C1b も 3 つに分けた: C1b-1 (版・target・provenance)、C1b-2 (プロジ�
   - `brief`: パス・種類・親・シグネチャの 1 行目 (`macro_rules!` の規則は省く) と `reexport_of` だけ
   - `normal`: 今までの内容に、ドキュメントの見出しごとの節 (`sections`) の見出しと行数を足した。`docs` は最初の見出しより前の第 1 段落
   - `full`: 最初の見出しより前の全文を `docs` に、各節の本文を `sections[].text` に、属性を `attrs` に出す
-- ドキュメントの整形 (`query::docs`): コードブロックの外の ATX 見出し (`#`〜`######`) で節に分ける。Rust のコードブロック (info string が無いか、doctest の属性だけ) から隠し行 (`#` だけの行と `# ` で始まる行) を除き、行頭の `##` を `#` にする (R-OUT-6)。`text` などほかの言語のブロックは触らない
+- ドキュメントの整形 (`query::docs`): コードブロックの外の ATX 見出し (`#`〜`######`) で節に分ける。Rust のコードブロック (info string が無いか、doctest の属性だけ) から隠し行 (`#` だけの行と、`#` の後に空白が続く行) を除き、行頭の `##` を `#` にする (R-OUT-6)。`text` などほかの言語のブロックは触らない
 - `attrs`: rustdoc-types の `Attribute` を Rust の書き方に戻す (`#[repr(C, align(8))]` など)。`Other` はそのまま出すが、cfg の痕跡 (`#[<cfg`・`#[attr = Cfg…`・`#[doc(cfg`) は C1d の feature の注記に任せて除き、`#[doc = "…"]` と rustc 内部の属性 (`#[attr = Rustc…`。std の `RustcDiagnosticItem` など) も除く
 - 応答の上限 (R-OUT-3): 応答の JSON を 32,000 文字 (トークンの見積もりを測るまでの仮の値。約 8,000 トークン) に収める。超えたら次の順に削り、`truncated: true` を付ける
   1. 節の本文を後ろから
@@ -595,6 +595,18 @@ C3 を 2 つに分けた: C3a (`list_module` と一覧の共通の仕組み)、C
 - std の re-export の `reexport_of` で「版が分からない」と warnings に出ていたのをやめた (std の仲間は toolchain の版なので、crate 名だけにする)。「他の crate の item がこのデータに無い」の warnings にパスを入れた
 - 実データ (§3 Q6): `axum::routing` は 31 件 (`Router` は `canonical: axum::Router`)、`reqwest::header` は http 1.5.0 の `http::header` を 104 件、tokio のモジュールにはそれぞれ必要な feature (`fs`・`rt`・`sync` など)、`std::collections` は alloc・core の re-export に `reexport_of`。カーソルで次のページが取れる
 - テスト: 子の並びと re-export、`recursive` と kind の絞り込み、ページとカーソル (データの食い違い、終わりの先)、モジュールでない item、引数の誤り、要求のダイジェストがキーの順によらないこと、stdio で合成の crate を一覧すること
+
+#### C3b (2026-10-20)
+
+`crate_overview` を足した (§6.3。§3 Q3)。要件は「ルートのドキュメントの要約、主要なモジュールと item、feature の概要」の 1 行なので、中身を次のように決めた (M1 の終わりに要件へ反映する)。
+
+- 引数: `get_item` の版を名指すものと `detail` (`brief`・`normal` (既定)・`full`)。照会の流れの `Shape` を「item・一覧・全体像」の 3 種にし、版の決定・キャッシュ・std の経路を共有した
+- `data`: `path` (crate のルート)、`docs` (ルートのドキュメントの第 1 段落。見出しから始まるもの (serde・std) は最初の節の第 1 段落)、`sections` (`normal` で見出しと行数、`full` で本文も)、`counts` (公開パスを持つ item の種類ごとの数)、`modules` (ルートのモジュール。それぞれドキュメントの最初の 1 文と cfg の注記。他の crate から re-export したモジュールもここ)、`items` (ルートのほかの item を最大 50 件、`brief` で。`items_total` を添え、超えたら `list_module` を hints で案内)、`features` (`.crate` を読めたとき: `all`・`default` が有効にするもの・docs.rs で欠けたもの `not_in_docs`・プロジェクトが版を決めたときは `enabled_in_project`)
+- 予算を超えたら、節の本文 → ルートの item → モジュールの 1 文 → ルートの本文の順に削り、`truncated` を付ける
+- `.crate` の読み取りに、宣言された feature の一覧と、`default` が推移的に有効にする feature を足した
+- std の中から参照される crate (`std_detect` など) は、std の JSON では `html_root_url` が `docs.rs/<name>/latest/`、パスが toolchain のビルドの場所なので、std を引いているときは版の warnings を出さないようにした
+- 実データ: tokio (このリポジトリの Cargo.lock の 1.53.3) は struct 162・function 73・module 37 など、モジュール 11 個にそれぞれ必要な feature、feature 26 個でプロジェクトで有効な 16 個。axum は `default` が有効にする 11 個。serde は `not_in_docs: [alloc]`。std はモジュール 60 余り・ルートの item 75 件で、残りを `list_module` に案内
+- テスト: 数・モジュール・item の並び、最初の 1 文の切り方、引数、説明文の長さ
 
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 

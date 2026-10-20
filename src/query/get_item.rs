@@ -624,6 +624,11 @@ impl<'a> Query<'a> {
         }
     }
 
+    /// Adds a hint of what to call next.
+    pub(super) fn hint(&mut self, hint: String) {
+        self.hints.push(hint.into());
+    }
+
     /// The kind of the item `id` of another crate, from its summary.
     pub(super) fn external_kind(&self, id: Id) -> &'static str {
         self.view
@@ -1171,10 +1176,17 @@ impl<'a> Query<'a> {
             )));
             return None;
         };
-        let of_std = external
-            .html_root_url
-            .as_deref()
-            .is_some_and(|url| url.starts_with("https://doc.rust-lang.org/"));
+        // A crate of std, or of the sysroot that std depends on, which in std's own data have
+        // paths of the build of the toolchain.
+        let of_std = matches!(self.request.origin, Origin::Std { .. })
+            || external
+                .html_root_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://doc.rust-lang.org/"))
+            || external
+                .path
+                .components()
+                .any(|component| component.as_os_str() == "rustlib");
         let name: Box<str> = if let Some((name, version)) =
             external.html_root_url.as_deref().and_then(docs_rs_release)
         {

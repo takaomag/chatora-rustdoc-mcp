@@ -259,6 +259,11 @@ impl ArchivedPathIndex {
             .unwrap_or_default()
     }
 
+    /// Every item that has a public path, in no particular order.
+    pub fn public_items(&self) -> impl Iterator<Item = Id> + '_ {
+        self.paths_of.keys().map(view::native)
+    }
+
     /// The items at the public path `path`, or the re-export of another crate's item there.
     #[must_use]
     pub fn at_public_path(&self, path: &str) -> Option<Resolution> {

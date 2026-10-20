@@ -53,6 +53,7 @@ use crate::{
         },
         list_module::{ListOptions, list_module},
         load,
+        overview::crate_overview,
         view::CrateView,
     },
 };
@@ -113,8 +114,18 @@ pub(super) struct Arguments {
 #[derive(Debug, Clone)]
 pub(super) struct Shape {
     pub(super) detail: Detail,
-    /// For `list_module`, how to list the module.
-    pub(super) listing: Option<Box<Listing>>,
+    pub(super) what: What,
+}
+
+/// What a lookup returns.
+#[derive(Debug, Clone)]
+pub(super) enum What {
+    /// The item (`get_item`).
+    Item,
+    /// The items of the module (`list_module`).
+    List(Box<Listing>),
+    /// The overview of the crate (`crate_overview`).
+    Overview,
 }
 
 /// How `list_module` lists a module (requirements R-LS-1, R-LS-2 and R-OUT-3).
@@ -158,7 +169,22 @@ impl Arguments {
             target: release.target,
             shape: Shape {
                 detail,
-                listing: Some(Box::new(listing)),
+                what: What::List(Box::new(listing)),
+            },
+        }
+    }
+
+    /// The arguments of `crate_overview`: those that name a release, and how much to show.
+    pub(super) fn for_overview(release: ReleaseArguments, detail: Detail) -> Self {
+        Self {
+            path: release.name.as_str().replace('-', "_").into(),
+            name: release.name,
+            version: release.version,
+            project: release.project,
+            target: release.target,
+            shape: Shape {
+                detail,
+                what: What::Overview,
             },
         }
     }
@@ -579,7 +605,7 @@ pub(super) fn parse_arguments(
         target,
         shape: Shape {
             detail,
-            listing: None,
+            what: What::Item,
         },
     })
 }
@@ -1560,7 +1586,7 @@ fn look_up_std(
         project_features: None,
         follow: false,
     };
-    let looked_up = respond_in(&view, item_request, request.shape.listing.as_deref());
+    let looked_up = respond_in(&view, item_request, &request.shape.what);
     (looked_up, followed.through)
 }
 
@@ -1771,19 +1797,27 @@ fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Request) -> Result<Value, Fa
             .features(arguments.name.as_str(), &arguments.version),
         follow: arguments.hops < MAX_FOLLOWED,
     };
-    respond_in(&view, item_request, arguments.shape.listing.as_deref())
+    respond_in(&view, item_request, &arguments.shape.what)
 }
 
-/// Looks the item up in `view`, or with `listing` lists the module, and serializes the response
+/// Looks the item up in `view`, lists the module, or gives the overview of the crate, as `what`
+/// says, and serializes the response
 /// while the items it borrows from are still there.
 fn respond_in(
     view: &CrateView<'_>,
     request: ItemRequest<'_>,
-    listing: Option<&Listing>,
+    what: &What,
 ) -> Result<Value, Failure> {
-    let Some(listing) = listing else {
-        let response = get_item(view, request).map_err(Failure::Item)?;
-        return serde_json::to_value(&response).map_err(Failure::Serialize);
+    let listing = match what {
+        What::Item => {
+            let response = get_item(view, request).map_err(Failure::Item)?;
+            return serde_json::to_value(&response).map_err(Failure::Serialize);
+        },
+        What::Overview => {
+            let response = crate_overview(view, request).map_err(Failure::Item)?;
+            return serde_json::to_value(&response).map_err(Failure::Serialize);
+        },
+        What::List(listing) => listing,
     };
     let kinds: Vec<&str> = listing.kinds.to_vec();
     let response = list_module(view, request, ListOptions {
@@ -2146,7 +2180,7 @@ mod tests {
             target: "x86_64-unknown-linux-gnu".parse().expect("a triple"),
             shape: Shape {
                 detail: Detail::Normal,
-                listing: None,
+                what: What::Item,
             },
             checksum: None,
             build: None,

@@ -418,12 +418,26 @@ fn tools_list_is_cacheable_and_not_paginated() {
         .collect();
     // `sleep` is only in debug builds.
     let expected: &[&str] = if cfg!(debug_assertions) {
-        &["get_item", "list_module", "resolve_version", "sleep"]
+        &[
+            "crate_overview",
+            "get_item",
+            "list_module",
+            "resolve_version",
+            "sleep",
+        ]
     } else {
-        &["get_item", "list_module", "resolve_version"]
+        &[
+            "crate_overview",
+            "get_item",
+            "list_module",
+            "resolve_version",
+        ]
     };
     assert_eq!(names, expected);
-    let get_item = &result["tools"][0];
+    let get_item = result["tools"]
+        .as_array()
+        .and_then(|tools| tools.iter().find(|tool| tool["name"] == "get_item"))
+        .expect("get_item is listed");
     assert_eq!(get_item["annotations"]["readOnlyHint"], false);
     assert_eq!(get_item["annotations"]["openWorldHint"], true);
     assert_eq!(
