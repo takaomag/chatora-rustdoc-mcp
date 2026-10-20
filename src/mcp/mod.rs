@@ -34,7 +34,6 @@ use crate::data::{
     dist::Dist,
     docs_rs::DocsRs,
     sparse_index::SparseIndex,
-    target,
 };
 #[cfg(feature = "local")]
 use crate::data::{metadata::Resolver, project::DefaultProject};
@@ -230,15 +229,14 @@ pub async fn serve() -> Result<(), ServeError> {
         "pid": std::process::id(),
     }));
     let cache = Cache::open_default()?;
-    // The cache is where nothing configures rustc (requirement R-TG-1).
-    let host = target::host_target(cache.dir()).await;
     let server = Server {
         tools: Arc::new(tool::ToolState {
             docs_rs: DocsRs::new()?,
             dist: Dist::new()?,
             index: SparseIndex::new(cache.clone())?,
             static_crates: StaticCrates::new()?,
-            host,
+            // Found in the background below: rustc may be slow to start (requirement R-MCP-11).
+            host: tokio::sync::OnceCell::new(),
             cache,
             // Decided once, so that a repository cloned inside later does not join it
             // (requirement R-MCP-3).
@@ -252,6 +250,12 @@ pub async fn serve() -> Result<(), ServeError> {
             calls: tool::CallLimit::from_env(),
         }),
     };
+    // The host target is found while the session starts, not before it: rustc may be slow to
+    // start the first time (requirement R-MCP-11). The first tool call waits for it.
+    let tools = Arc::clone(&server.tools);
+    tokio::spawn(async move {
+        tools.host().await;
+    });
     match Box::pin(server.serve(stdio())).await {
         Ok(running) => match running.waiting().await {
             Ok(QuitReason::JoinError(error)) | Err(error) => {

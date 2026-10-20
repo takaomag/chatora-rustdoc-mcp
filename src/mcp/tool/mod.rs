@@ -37,7 +37,7 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OnceCell, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
 };
 use tracing::Instrument as _;
@@ -49,7 +49,7 @@ use crate::data::{
     docs_rs::DocsRs,
     fetches::Fetches,
     sparse_index::SparseIndex,
-    target::HostTarget,
+    target::{self, HostTarget},
 };
 #[cfg(feature = "local")]
 use crate::data::{metadata::Resolver, project::DefaultProject};
@@ -67,8 +67,10 @@ pub(super) struct ToolState {
     pub(super) index: SparseIndex,
     /// static.crates.io, for the `.crate` of releases (requirement R-FT-1).
     pub(super) static_crates: StaticCrates,
-    /// The host target, the default target of the documentation (requirement R-TG-1).
-    pub(super) host: HostTarget,
+    /// The host target, the default target of the documentation (requirement R-TG-1). It is
+    /// found in the background from startup, as it runs rustc, so that the server answers at once
+    /// (requirement R-MCP-11); see [`Self::host`].
+    pub(super) host: OnceCell<HostTarget>,
     /// The default project, decided at startup (requirement R-MCP-3).
     #[cfg(feature = "local")]
     pub(super) project: Option<DefaultProject>,
@@ -77,6 +79,16 @@ pub(super) struct ToolState {
     pub(super) resolver: Resolver,
     /// The calls being handled, at most `limits.concurrent_calls` (requirement R-SEC-7).
     pub(super) calls: CallLimit,
+}
+
+impl ToolState {
+    /// The host target, from `rustc -vV` in the cache directory, found once. The first call waits
+    /// for it, which `serve` starts at startup.
+    pub(super) async fn host(&self) -> &HostTarget {
+        self.host
+            .get_or_init(|| target::host_target(self.cache.dir()))
+            .await
+    }
 }
 
 /// The most tool calls handled at once (requirement R-SEC-7). Over it, a call gets `busy`.
@@ -186,7 +198,8 @@ pub(super) fn definitions() -> Vec<Tool> {
 fn without_project(mut tool: Tool) -> Tool {
     let mut schema = (*tool.input_schema).clone();
     if let Some(Value::Object(properties)) = schema.get_mut("properties") {
-        properties.remove("project");
+        // `remove` would swap the last argument into its place.
+        properties.shift_remove("project");
     }
     tool.input_schema = Arc::new(schema);
     tool
@@ -504,6 +517,22 @@ mod tests {
         assert_eq!(busy["retry_after_secs"], BUSY_RETRY_AFTER_SECS);
         drop(first);
         assert!(limit.enter().is_some());
+    }
+
+    #[test]
+    fn without_project_keeps_the_order_of_the_other_arguments() {
+        let names = |tool: &Tool| -> Vec<String> {
+            tool.input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|properties| properties.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        // `project` is in the middle of its arguments.
+        let tool = list_module::definition();
+        let mut expected = names(&tool);
+        expected.retain(|name| name != "project");
+        assert_eq!(names(&without_project(tool)), expected);
     }
 
     #[tokio::test]

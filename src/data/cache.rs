@@ -110,10 +110,6 @@ pub(super) enum Verified {
 /// Why the cache directory could not be decided.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
-    /// The environment variable holds a relative path. The server's working directory depends on
-    /// how it was started, so a relative path would point somewhere unpredictable.
-    #[error("{DIR_ENV_VAR} must be an absolute path, but it is {0:?}")]
-    RelativeDir(Box<Path>),
     /// The home directory, under which the default cache directory is, could not be found.
     #[error("the home directory could not be found to place the cache")]
     NoHome(#[source] etcetera::HomeDirError),
@@ -122,12 +118,14 @@ pub enum CacheError {
 impl Cache {
     /// The cache at the directory that [`DIR_ENV_VAR`] sets, or at the OS default:
     /// `$XDG_CACHE_HOME/chatora-rustdoc-mcp` (`~/.cache/…` when unset) on Linux and macOS, and
-    /// `%LOCALAPPDATA%\chatora-rustdoc-mcp\cache` on Windows (requirement R-CA-1).
+    /// `%LOCALAPPDATA%\chatora-rustdoc-mcp\cache` on Windows (requirement R-CA-1). A relative path
+    /// in the variable is logged and replaced by the default, as other settings that are not
+    /// valid are: the server's working directory depends on how it was started, so it would
+    /// point somewhere unpredictable.
     ///
     /// # Errors
     ///
-    /// Returns an error when the environment variable holds a relative path, or when the home
-    /// directory cannot be found.
+    /// Returns an error when the home directory, under which the default is, cannot be found.
     pub fn open_default() -> Result<Self, CacheError> {
         let root = root_dir(std::env::var_os(DIR_ENV_VAR), || {
             etcetera::choose_base_strategy().map(|strategy| strategy.cache_dir())
@@ -488,11 +486,13 @@ fn root_dir(
 ) -> Result<PathBuf, CacheError> {
     if let Some(value) = env_value.filter(|value| !value.is_empty()) {
         let dir = PathBuf::from(value);
-        return if dir.is_absolute() {
-            Ok(dir)
-        } else {
-            Err(CacheError::RelativeDir(dir.into_boxed_path()))
-        };
+        if dir.is_absolute() {
+            return Ok(dir);
+        }
+        tracing::warn!(
+            "{DIR_ENV_VAR} must be an absolute path, but it is {}, so the default is used",
+            dir.display()
+        );
     }
     let dir = os_cache_dir().map_err(CacheError::NoHome)?.join(APP_DIR);
     // On Windows, the state directory is under %LOCALAPPDATA%\chatora-rustdoc-mcp too
@@ -836,10 +836,10 @@ mod tests {
             root_dir(Some(absolute.clone().into()), no_home).expect("absolute"),
             absolute
         );
-        assert!(matches!(
-            root_dir(Some("relative/cache".into()), no_home),
-            Err(CacheError::RelativeDir(_))
-        ));
+        // A relative path is replaced by the default.
+        let os = std::env::temp_dir().join("os-cache");
+        let relative = root_dir(Some("relative/cache".into()), || Ok(os.clone())).expect("default");
+        assert!(relative.starts_with(&os), "{}", relative.display());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use super::across::{ARCHIVE_SCHEMA, Indexed};
 use crate::data::{
@@ -61,6 +61,41 @@ fn give_back_memory() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 const fn give_back_memory() {}
 
+/// The most crates parsed and archived at once in the process. Parsing takes about 5 to 7 times
+/// the size of the JSON in memory (core: about 500 MB), and a search across many dependencies
+/// would otherwise parse them all at once (decided before the first release, 2026-10-20).
+const MAX_PARSES: usize = 2;
+
+/// The crates being parsed, at most [`MAX_PARSES`].
+static PARSING: Mutex<usize> = Mutex::new(0);
+
+/// Signalled when a crate has been parsed.
+static PARSED: Condvar = Condvar::new();
+
+/// A place among the crates being parsed, given back when it is dropped.
+struct Parsing;
+
+impl Parsing {
+    /// Waits for a place. It blocks, so it is taken on a blocking thread.
+    fn enter() -> Self {
+        let mut parsing = PARSING.lock();
+        while *parsing >= MAX_PARSES {
+            PARSED.wait(&mut parsing);
+        }
+        *parsing = parsing.saturating_add(1);
+        Self
+    }
+}
+
+impl Drop for Parsing {
+    fn drop(&mut self) {
+        let mut parsing = PARSING.lock();
+        *parsing = parsing.saturating_sub(1);
+        drop(parsing);
+        PARSED.notify_one();
+    }
+}
+
 /// The archive at `path` that this process has opened, if it still exists.
 fn opened(path: &Path) -> Option<Arc<Mapped<Indexed>>> {
     let mapped = OPEN.lock().by_path.get(path).map(Arc::clone)?;
@@ -93,7 +128,7 @@ fn keep(path: &Path, mapped: Mapped<Indexed>) -> Arc<Mapped<Indexed>> {
 /// process has mapped is never replaced (which Windows does not allow, requirement R-CA-4).
 fn archive_path(dir: &Path, format: u32, sha256: &str) -> PathBuf {
     let short = sha256.get(..16).unwrap_or(sha256);
-    dir.join(format!("{format}.{short}.v{ARCHIVE_SCHEMA}.rkyv"))
+    dir.join(format!("{format}.{short}.{}.rkyv", archive_version()))
 }
 
 /// The header of the archive of the JSON in `format` with `sha256`.
@@ -101,8 +136,17 @@ const fn header(format: u32, sha256: Box<str>) -> Header {
     Header {
         schema: ARCHIVE_SCHEMA,
         format_version: format,
+        types_version: rustdoc_types::FORMAT_VERSION,
         source_sha256: sha256,
     }
+}
+
+/// The part of an archive's name that changes with what it holds: the schema of [`Indexed`] and
+/// the version of rustdoc-types, as in `v5t61`. An archive made by another version of the server
+/// is left alone (the GC removes it), not replaced in place, which Windows does not allow while
+/// another process maps it.
+fn archive_version() -> String {
+    format!("v{ARCHIVE_SCHEMA}t{}", rustdoc_types::FORMAT_VERSION)
 }
 
 /// The archive of the rustdoc JSON in the cache directory `dir`, if it is there and checks out.
@@ -134,6 +178,7 @@ pub fn archive_json(
     dir: &Path,
     json: &[u8],
 ) -> Result<Arc<Mapped<Indexed>>, LoadError> {
+    let parsing = Parsing::enter();
     let parsed = rustdoc_json::parse(json)?;
     let format = parsed.krate.format_version;
     let sha256: Box<str> = cache::sha256_hex(json).into();
@@ -146,6 +191,7 @@ pub fn archive_json(
         Ok(Some(mapped)) => {
             drop(indexed);
             give_back_memory();
+            drop(parsing);
             return Ok(keep(&path, mapped));
         },
         Ok(None) => {
@@ -178,7 +224,7 @@ pub fn archive_of(
     json: impl FnOnce() -> io::Result<Box<[u8]>>,
 ) -> Result<Arc<Mapped<Indexed>>, LoadError> {
     let short = source.get(..16).unwrap_or(source);
-    let path = dir.join(format!("{stem}.{short}.v{ARCHIVE_SCHEMA}.rkyv"));
+    let path = dir.join(format!("{stem}.{short}.{}.rkyv", archive_version()));
     if let Some(mapped) = opened(&path) {
         return Ok(mapped);
     }
@@ -193,6 +239,7 @@ pub fn archive_of(
             tracing::warn!(path = %path.display(), %error, "an archive could not be read");
         },
     }
+    let parsing = Parsing::enter();
     let json = json().map_err(LoadError::Read)?;
     let parsed = rustdoc_json::parse(&json)?;
     drop(json);
@@ -204,6 +251,7 @@ pub fn archive_of(
         Ok(Some(mapped)) => {
             drop(indexed);
             give_back_memory();
+            drop(parsing);
             return Ok(keep(&path, mapped));
         },
         Ok(None) => {
@@ -221,6 +269,30 @@ pub fn archive_of(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn at_most_two_crates_are_parsed_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (now, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let (now, most) = (Arc::clone(&now), Arc::clone(&most));
+                std::thread::spawn(move || {
+                    let place = Parsing::enter();
+                    let inside = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(inside, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    drop(place);
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("no panic");
+        }
+        let most = most.load(Ordering::SeqCst);
+        assert!((1..=MAX_PARSES).contains(&most), "{most}");
+    }
     use crate::query::view::CrateView;
 
     const JSON: &[u8] = br#"{"root":0,"crate_version":"1.0.0","includes_private":false,"index":{"0":{"id":0,"crate_id":0,"name":"c","span":null,"visibility":"public","docs":null,"links":{},"attrs":[],"deprecation":null,"inner":{"module":{"is_crate":true,"items":[],"is_stripped":false}}}},"paths":{},"external_crates":{},"target":{"triple":"x86_64-unknown-linux-gnu","target_features":[]},"format_version":61}"#;

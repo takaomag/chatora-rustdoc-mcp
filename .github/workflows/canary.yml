@@ -1,6 +1,8 @@
 # 要件 R-QA-4 の canary と、live の docs.rs の smoke test (doc/m1-plan.md の E3)。
 # このリポジトリの外で変わるもの (最新の nightly の rustdoc の JSON、docs.rs の配り方、std) を毎日確かめる。
 # 失敗したら Issue (label: canary) を開き、通ったら閉じる (失敗を放置しない)。
+# GitHub は、公開リポジトリで 60 日間活動が無いと定期実行を止める。止まったら Actions の画面か
+# `gh workflow enable canary.yml` で戻す (doc/m1-plan.md の「公開前の見直し」)。
 # action はコミットの SHA で固定し、コメントに版を書く (ci.yml と同じ)。
 
 name: Canary

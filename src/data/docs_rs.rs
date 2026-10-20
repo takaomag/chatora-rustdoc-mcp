@@ -7,6 +7,7 @@ use std::{io::Read as _, sync::Arc};
 
 use reqwest::StatusCode;
 use semver::Version;
+use tokio::sync::Semaphore;
 
 use super::{
     crate_name::CrateName,
@@ -33,7 +34,14 @@ pub struct DocsRs {
     client: reqwest::Client,
     // `Arc` so that cloning the client does not copy the URL (`reqwest::Client` is an `Arc` too).
     base_url: Arc<str>,
+    /// Places for the fetches of rustdoc JSON at once, at most [`MAX_FETCHES`].
+    fetches: Arc<Semaphore>,
 }
+
+/// The most rustdoc JSON fetched from docs.rs at once, by all the calls of the process: a search
+/// across many dependencies would otherwise fetch them all at once, and a body may be hundreds of
+/// MB (decided before the first release, 2026-10-20).
+const MAX_FETCHES: usize = 4;
 
 /// Why rustdoc JSON could not be fetched.
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +107,7 @@ impl DocsRs {
         Ok(Self {
             client: http::client_builder().build()?,
             base_url: base_url.into(),
+            fetches: Arc::new(Semaphore::new(MAX_FETCHES)),
         })
     }
 
@@ -112,6 +121,7 @@ impl DocsRs {
                 .build()
                 .expect("the client builds"),
             base_url: base_url.into(),
+            fetches: Arc::new(Semaphore::new(MAX_FETCHES)),
         }
     }
 
@@ -135,6 +145,10 @@ impl DocsRs {
         if let Some(format) = format {
             url = format!("{url}/{format}");
         }
+        // The semaphore is never closed.
+        let place = self.fetches.acquire().await.map_err(|_closed| {
+            FetchError::Corrupt(std::io::Error::other("the fetches were shut down"))
+        })?;
         let mut response = http::send(self.client.get(&url))
             .await
             .map_err(network_error)?;
@@ -152,6 +166,7 @@ impl DocsRs {
                     BodyError::Network(error) => FetchError::Network(error),
                     BodyError::TooLarge { limit } => FetchError::TooLarge { limit },
                 })?;
+        drop(place);
         decompress(body, MAX_BYTES).map(Vec::into_boxed_slice)
     }
 

@@ -4,7 +4,8 @@
 //! An archive is derived from a source, such as a rustdoc JSON, and is safe to lose: when its
 //! header does not match or its bytes do not check out, it is made again. The header says what it
 //! holds and what it was made from: a magic number, the version of its schema, the series of rkyv
-//! that wrote it, the format version of the source, and the SHA-256 of the source. The bytes after
+//! that wrote it, the format version of the source, the version of the types it was read into,
+//! and the SHA-256 of the source. The bytes after
 //! it are checked once, when the archive is opened (bytecheck), and then read without copying.
 
 use std::{fs::File, io, marker::PhantomData, path::Path};
@@ -35,7 +36,8 @@ const MAGIC: [u8; 8] = *b"CHRDMCPA";
 const HEADER_LEN: usize = 128;
 
 /// Where the format version is in the header, after the magic number, the schema, the rkyv series,
-/// the layout and the SHA-256.
+/// the layout and the SHA-256. Everything else in the header is compared, including the version
+/// of the types after it.
 const FORMAT_AT: usize = 84;
 
 /// The layout options of rkyv that the archives use: little endian, 32-bit relative pointers
@@ -53,6 +55,11 @@ pub struct Header {
     /// The format version of the source. It is recorded but not compared when an archive is
     /// opened, as the SHA-256 of the source decides it.
     pub format_version: u32,
+    /// The version of the types that the source was read into and that are archived, such as
+    /// `rustdoc_types::FORMAT_VERSION` for rustdoc JSON of any format. When a newer version of
+    /// the types is built in, the archives of the older ones are made again: their bytes may
+    /// still check out as the new types and be read wrong.
+    pub types_version: u32,
     /// The SHA-256 of the source, in lowercase hex.
     pub source_sha256: Box<str>,
 }
@@ -74,6 +81,7 @@ impl Header {
             &LAYOUT.to_le_bytes(),
             digest,
             &self.format_version.to_le_bytes(),
+            &self.types_version.to_le_bytes(),
         ];
         let mut at: usize = 0;
         for field in fields {
@@ -227,6 +235,7 @@ mod tests {
         Header {
             schema: 1,
             format_version,
+            types_version: 61,
             source_sha256: "ab".repeat(32).into(),
         }
     }
@@ -267,6 +276,9 @@ mod tests {
         let mut other = header(61);
         other.source_sha256 = "cd".repeat(32).into();
         assert!(!open(&other), "another source");
+        let mut newer_types = header(61);
+        newer_types.types_version = 62;
+        assert!(!open(&newer_types), "another version of the types");
         // The archive is cut short.
         let contents = std::fs::read(&path).expect("read");
         std::fs::write(

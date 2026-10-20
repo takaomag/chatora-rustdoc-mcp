@@ -37,6 +37,9 @@ const FIRST_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// that a request does not wait for most of a tool call's time (requirement R-ARCH-6).
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(5);
 
+/// The most redirects that one request follows (reqwest's default).
+const MAX_REDIRECTS: usize = 10;
+
 /// Why a body could not be read.
 #[derive(Debug)]
 pub(super) enum BodyError {
@@ -55,6 +58,32 @@ pub(super) fn client_builder() -> reqwest::ClientBuilder {
         .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::custom(redirect))
+}
+
+/// Follows a redirect only to the same host and port with the same scheme as the request, so
+/// that the server talks only to the sources it names (README) and never goes from https to
+/// http. Other redirects are errors.
+fn redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect::Action {
+    let Some(first) = attempt.previous().first() else {
+        return attempt.stop();
+    };
+    let next = attempt.url();
+    let same_place = next.scheme() == first.scheme()
+        && next.host_str() == first.host_str()
+        && next.port_or_known_default() == first.port_or_known_default();
+    if !same_place {
+        let error = format!(
+            "a redirect from {} to another host: {}",
+            first.origin().ascii_serialization(),
+            next.origin().ascii_serialization()
+        );
+        return attempt.error(error);
+    }
+    if attempt.previous().len() > MAX_REDIRECTS {
+        return attempt.error("too many redirects");
+    }
+    attempt.follow()
 }
 
 /// Sends `request`, and sends it again after a transient failure: a 429 or 5xx status, a failed
@@ -182,7 +211,47 @@ pub(super) fn exceeds(len: usize, limit: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::test_http::serve_sequence_with, *};
+
+    #[tokio::test]
+    async fn redirects_are_followed_only_within_the_host() {
+        let (base_url, _requests) = serve_sequence_with(|base_url| {
+            vec![
+                (
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {base_url}/next\r\nContent-Length: \
+                         0\r\n\r\n"
+                    ),
+                    Vec::new(),
+                ),
+                (
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n".to_owned(),
+                    b"ok".to_vec(),
+                ),
+            ]
+        });
+        let client = client_builder().build().expect("a client");
+        let response = send(client.get(format!("{base_url}/first")))
+            .await
+            .expect("followed");
+        assert_eq!(response.url().path(), "/next");
+
+        // 127.0.0.1 and localhost are different hosts.
+        let (base_url, _requests) = serve_sequence_with(|base_url| {
+            let port = base_url.rsplit(':').next().unwrap_or_default();
+            vec![(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/elsewhere\r\n\
+                     Content-Length: 0\r\n\r\n"
+                ),
+                Vec::new(),
+            )]
+        });
+        let error = send(client.get(format!("{base_url}/first")))
+            .await
+            .expect_err("not followed");
+        assert!(error.is_redirect(), "{error}");
+    }
 
     #[test]
     fn a_rejected_certificate_is_found_among_the_causes() {

@@ -234,10 +234,18 @@ fn file_name(stem: &str, part: u32) -> String {
     }
 }
 
-/// The stem (`<8 digits>-<digits>`) of `name` when it is that of a log file that this server
-/// writes, `<stem>.jsonl` or `<stem>.<part>.jsonl`, or of a lock file, `<stem>.lock`, with whether
-/// it is a lock file.
-fn stem_of(name: &str) -> Option<(&str, bool)> {
+/// What a file in the log directory is, by its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A log, `<stem>.jsonl` (part 1) or `<stem>.<part>.jsonl`.
+    Log(u32),
+    /// The lock file of a stem, `<stem>.lock`.
+    Lock,
+}
+
+/// The stem (`<8 digits>-<digits>`) of `name` and what the file is, when it is a log or a lock
+/// file that this server writes.
+fn stem_of(name: &str) -> Option<(&str, Kind)> {
     let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
     let (stem, rest) = name.split_once('.')?;
     let (date, pid) = stem.split_once('-')?;
@@ -245,13 +253,108 @@ fn stem_of(name: &str) -> Option<(&str, bool)> {
         return None;
     }
     if rest == LOCK_EXTENSION {
-        return Some((stem, true));
+        return Some((stem, Kind::Lock));
     }
     let part = rest.strip_suffix(EXTENSION)?;
-    (part.is_empty() || part.strip_suffix('.').is_some_and(digits)).then_some((stem, false))
+    if part.is_empty() {
+        return Some((stem, Kind::Log(1)));
+    }
+    let part = part.strip_suffix('.').filter(|part| digits(part))?;
+    Some((stem, Kind::Log(part.parse().ok()?)))
 }
 
-/// See [`LogFile::collect_garbage`].
+/// A log file found by [`collect_garbage`].
+struct Found {
+    modified: SystemTime,
+    len: u64,
+    path: PathBuf,
+    stem: String,
+    part: u32,
+}
+
+/// The logs and lock files in a log directory, and the last error in looking at one.
+struct Scanned {
+    logs: Vec<Found>,
+    locks: Vec<(String, PathBuf)>,
+    failed: Option<io::Error>,
+}
+
+/// Finds the logs and lock files in `dir`. A file that cannot be looked at is left out.
+fn scan(dir: &Path) -> io::Result<Scanned> {
+    let mut failed = None;
+    let mut logs = Vec::new();
+    let mut locks = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let found = entry.and_then(|entry| {
+            let name = entry.file_name();
+            let Some((stem, kind)) = name.to_str().and_then(stem_of) else {
+                return Ok(None);
+            };
+            // `DirEntry::metadata` does not follow symbolic links, which are left alone.
+            let metadata = entry.metadata()?;
+            if !metadata.is_file() {
+                return Ok(None);
+            }
+            Ok(Some(match kind {
+                Kind::Lock => (stem.to_owned(), entry.path(), None),
+                Kind::Log(part) => (
+                    stem.to_owned(),
+                    entry.path(),
+                    Some((metadata.modified()?, metadata.len(), part)),
+                ),
+            }))
+        });
+        match found {
+            Ok(Some((stem, path, None))) => locks.push((stem, path)),
+            Ok(Some((stem, path, Some((modified, len, part))))) => logs.push(Found {
+                modified,
+                len,
+                path,
+                stem,
+                part,
+            }),
+            Ok(None) => {},
+            // Another server may have removed it in between.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Err(error) => failed = Some(error),
+        }
+    }
+    Ok(Scanned {
+        logs,
+        locks,
+        failed,
+    })
+}
+
+/// The part that a running process writes, by stem, or 0 for a stem whose process has ended. A
+/// stem whose lock cannot be tried is taken as running, with the error in `failed`.
+fn being_written(
+    dir: &Path,
+    logs: &[Found],
+    failed: &mut Option<io::Error>,
+) -> HashMap<String, u32> {
+    let mut last_parts: HashMap<String, u32> = HashMap::new();
+    for log in logs {
+        let last = last_parts.entry(log.stem.clone()).or_default();
+        *last = (*last).max(log.part);
+    }
+    last_parts
+        .into_iter()
+        .map(|(stem, last)| {
+            let running = match is_held(&dir.join(format!("{stem}.{LOCK_EXTENSION}"))) {
+                Ok(running) => running,
+                Err(error) => {
+                    *failed = Some(error);
+                    true
+                },
+            };
+            (stem, if running { last } else { 0 })
+        })
+        .collect()
+}
+
+/// See [`LogFile::collect_garbage`]. Each file that cannot be looked at or removed is left, and
+/// the last such error is returned after the rest are done.
 fn collect_garbage(dir: &Path, limits: Limits, now: SystemTime) -> io::Result<()> {
     // The marker must be a file of its own, not a link to one elsewhere.
     match fs::symlink_metadata(dir.join(MARKER)) {
@@ -260,63 +363,57 @@ fn collect_garbage(dir: &Path, limits: Limits, now: SystemTime) -> io::Result<()
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     }
-    let mut logs = Vec::new();
-    let mut locks = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some((stem, is_lock)) = name.to_str().and_then(stem_of) else {
-            continue;
-        };
-        // `DirEntry::metadata` does not follow symbolic links, which are left alone.
-        let metadata = entry.metadata()?;
-        if !metadata.is_file() {
-            continue;
-        }
-        if is_lock {
-            locks.push((stem.to_owned(), entry.path()));
-        } else {
-            logs.push((
-                metadata.modified()?,
-                metadata.len(),
-                entry.path(),
-                stem.to_owned(),
-            ));
-        }
-    }
-    // Whether the process of each stem still runs, asked once for each.
-    let mut held: HashMap<String, bool> = HashMap::new();
-    let mut is_running = |stem: &str| -> io::Result<bool> {
-        if let Some(&running) = held.get(stem) {
-            return Ok(running);
-        }
-        let running = is_held(&dir.join(format!("{stem}.{LOCK_EXTENSION}")))?;
-        held.insert(stem.to_owned(), running);
-        Ok(running)
-    };
-    // The oldest first, then by name so that the order does not depend on the directory.
-    logs.sort();
+    let Scanned {
+        mut logs,
+        locks,
+        mut failed,
+    } = scan(dir)?;
+    // The file a running process writes is the last part of its stem; the parts before it are
+    // done and may go.
+    let being_written = being_written(dir, &logs, &mut failed);
+    let kept = |log: &Found| being_written.get(&log.stem) == Some(&log.part);
+    // Only the files that may go count toward the limit, so that a running server's file does not
+    // push out the logs of sessions that have ended.
     let mut total = logs
         .iter()
-        .fold(0_u64, |total, (_, len, ..)| total.saturating_add(*len));
-    let mut kept: Vec<String> = Vec::new();
-    for (modified, len, path, stem) in logs {
+        .filter(|log| !kept(log))
+        .fold(0_u64, |total, log| total.saturating_add(log.len));
+    // The oldest first, then by name so that the order does not depend on the directory.
+    logs.sort_by(|a, b| (a.modified, &a.path).cmp(&(b.modified, &b.path)));
+    let mut stems_left: Vec<String> = Vec::new();
+    for log in &logs {
         let expired = now
-            .duration_since(modified)
+            .duration_since(log.modified)
             .is_ok_and(|age| age > limits.retention);
-        if (expired || total > limits.total_max_size) && !is_running(&stem)? && remove(&path)? {
-            total = total.saturating_sub(len);
-        } else {
-            kept.push(stem);
+        let goes = !kept(log) && (expired || total > limits.total_max_size);
+        if goes {
+            match remove(&log.path) {
+                Ok(_) => {
+                    total = total.saturating_sub(log.len);
+                    continue;
+                },
+                Err(error) => failed = Some(error),
+            }
         }
+        stems_left.push(log.stem.clone());
     }
     // The lock files of processes that have ended and whose logs are all gone.
     for (stem, path) in locks {
-        if !kept.contains(&stem) && !is_running(&stem)? {
-            remove(&path)?;
+        let running = being_written.get(&stem).is_some_and(|&last| last > 0);
+        if stems_left.contains(&stem) || running {
+            continue;
+        }
+        match is_held(&path) {
+            Ok(false) => {
+                if let Err(error) = remove(&path) {
+                    failed = Some(error);
+                }
+            },
+            Ok(true) => {},
+            Err(error) => failed = Some(error),
         }
     }
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 
 /// Removes the file at `path`. `Ok(true)` when it was removed, or was already gone.
@@ -372,18 +469,48 @@ mod tests {
     fn only_the_names_of_logs_and_locks_have_stems() {
         assert_eq!(
             stem_of("20261020-1234.jsonl"),
-            Some(("20261020-1234", false))
+            Some(("20261020-1234", Kind::Log(1)))
         );
         assert_eq!(
             stem_of("20261020-1234.2.jsonl"),
-            Some(("20261020-1234", false))
+            Some(("20261020-1234", Kind::Log(2)))
         );
-        assert_eq!(stem_of("20261020-1234.lock"), Some(("20261020-1234", true)));
+        assert_eq!(
+            stem_of("20261020-1234.lock"),
+            Some(("20261020-1234", Kind::Lock))
+        );
         assert_eq!(stem_of("2026102-1234.jsonl"), None);
         assert_eq!(stem_of("20261020-.jsonl"), None);
         assert_eq!(stem_of("20261020-1234.x.jsonl"), None);
         assert_eq!(stem_of("20261020-1234.json"), None);
         assert_eq!(stem_of("notes.jsonl"), None);
+    }
+
+    #[test]
+    fn only_the_file_a_running_process_writes_is_kept() {
+        let temp = tempfile::tempdir().expect("a temporary directory");
+        let dir = temp.path();
+        let log = LogFile::open(dir, LIMITS).expect("opened");
+        let line = "x".repeat(60);
+        // Three files of this process: the first two are done.
+        for _ in 0..3 {
+            log.write_line(&line);
+        }
+        let writing = log.path();
+        let done: Vec<String> = names(dir)
+            .into_iter()
+            .filter(|name| matches!(stem_of(name), Some((_, Kind::Log(_)))))
+            .filter(|name| {
+                Some(name.as_str()) != writing.file_name().and_then(|name| name.to_str())
+            })
+            .collect();
+        assert_eq!(done.len(), 2, "{done:?}");
+        // Past the retention, the parts that are done go and the one being written stays.
+        collect_garbage(dir, LIMITS, SystemTime::now() + LIMITS.retention * 2).expect("no error");
+        assert!(writing.exists());
+        for name in done {
+            assert!(!dir.join(&name).exists(), "{name}");
+        }
     }
 
     #[test]
@@ -462,7 +589,8 @@ mod tests {
         // Process 1 has ended and left its lock; process 2 still runs.
         fs::write(dir.join("20200101-1.lock"), "").expect("written");
         let running = lock(&dir.join("20200102-2.lock")).expect("locked");
-        // 1600 bytes are over the limit of 1000: 1 is past the retention, 2 runs, 3 goes.
+        // 1 is past the retention, and 2 runs: the 1200 bytes of 1, 3 and 4 are over the limit of
+        // 1000 until 1 goes.
         collect_garbage(dir, LIMITS, SystemTime::now()).expect("no error");
         let own_name = |extension: &str| {
             own.with_extension(extension)
@@ -475,6 +603,7 @@ mod tests {
             MARKER.to_owned(),
             "20200102-2.jsonl".to_owned(),
             "20200102-2.lock".to_owned(),
+            "20200103-3.jsonl".to_owned(),
             "20200104-4.jsonl".to_owned(),
             own_name(EXTENSION),
             own_name(LOCK_EXTENSION),

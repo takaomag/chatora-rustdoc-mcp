@@ -192,7 +192,7 @@ pub(super) fn parse_arguments(
                 )
             })?,
     };
-    let request_digest = list_module::request_digest(arguments);
+    let request_digest = list_module::request_digest(NAME, arguments);
     let (offset, cursor_data) = match argument("cursor") {
         None => (0, None),
         Some(Value::String(cursor)) => list_module::parse_cursor(cursor, &request_digest)?,

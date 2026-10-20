@@ -36,7 +36,7 @@ use crate::{
         rustdoc_json::ParseError,
         sparse_index::IndexError,
         std_json::{self, Chosen},
-        target::TargetTriple,
+        target::{HostTarget, TargetTriple},
         version::{NoVersion, VersionSpec},
     },
     query::{
@@ -723,7 +723,7 @@ async fn resolve(
     arguments: Arguments,
     target: TargetTriple,
 ) -> Result<(Request, Vec<Box<str>>), Box<CallToolResult>> {
-    let mut warnings: Vec<Box<str>> = stand_in_warning(state, &arguments, &target)
+    let mut warnings: Vec<Box<str>> = stand_in_warning(state.host().await, &arguments, &target)
         .into_iter()
         .collect();
     let Arguments {
@@ -830,11 +830,11 @@ async fn resolve(
 /// The warning that `target` stands in for the host target, when no target was asked for and the
 /// host target is not known.
 fn stand_in_warning(
-    state: &ToolState,
+    host: &HostTarget,
     arguments: &Arguments,
     target: &TargetTriple,
 ) -> Option<Box<str>> {
-    let why = state.host.stand_in_because.as_ref()?;
+    let why = host.stand_in_because.as_ref()?;
     arguments.target.is_none().then(|| {
         format!("the target {target} is used, as the host target is not known: {why}").into()
     })
@@ -1039,10 +1039,10 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
     if let Some(krate) = std_crate(&arguments.name) {
         return execute_std(arguments, krate, state, Vec::new()).await;
     }
-    let target = arguments
-        .target
-        .clone()
-        .unwrap_or_else(|| state.host.triple.clone());
+    let target = match &arguments.target {
+        Some(target) => target.clone(),
+        None => state.host().await.triple.clone(),
+    };
     let (arguments, warnings) = match resolve(&state, arguments, target).await {
         Ok(resolved) => resolved,
         Err(error) => return *error,
@@ -1546,10 +1546,11 @@ async fn execute_std(
     state: Arc<ToolState>,
     mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
+    let host = state.host().await;
     let target = arguments
         .target
         .clone()
-        .unwrap_or_else(|| state.host.triple.clone());
+        .unwrap_or_else(|| host.triple.clone());
     if arguments.version.is_some() {
         warnings.push(
             "std has no versions on crates.io, so the version is ignored; std is that of a nightly \
@@ -1563,7 +1564,7 @@ async fn execute_std(
         &state.dist,
         state.cache.dir(),
         &target,
-        &state.host.triple,
+        &host.triple,
         at_least.as_ref(),
     )
     .await
@@ -2052,7 +2053,8 @@ pub(super) fn load_error_of(release: &str, error: &LoadError) -> CallToolResult 
             }));
         },
         LoadError::Unparsable { retry_after } => {
-            return remembered_error(release, error, "unparsable", false, *retry_after, &[
+            // It may become readable: docs.rs builds a release again, or a newer server reads it.
+            return remembered_error(release, error, "unparsable", true, *retry_after, &[
                 "docs.rs served JSON that this server cannot parse; it is fetched again after \
                  retry_after_secs, or read by a newer version of the server",
             ]);

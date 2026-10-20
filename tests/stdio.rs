@@ -435,6 +435,29 @@ fn discover_describes_the_server() {
     assert!(server.finish().success());
 }
 
+/// The server answers at once, even when rustc, which it runs to find the host target, is slow
+/// to start (requirement R-MCP-11).
+#[cfg(unix)]
+#[test]
+fn discover_does_not_wait_for_a_slow_rustc() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = TempDir::new().expect("a temporary directory");
+    let rustc = bin.path().join("rustc");
+    std::fs::write(&rustc, "#!/bin/sh\nsleep 5\nexit 1\n").expect("written");
+    std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).expect("runnable");
+    let path = std::env::join_paths(std::iter::once(bin.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("a PATH");
+    let mut server = Server::start_with(None, &[("PATH", path.to_str().expect("UTF-8"))]);
+    let started = Instant::now();
+    server.send(&request(1, "server/discover", json!({})));
+    assert!(server.response(1)["result"]["supportedVersions"].is_array());
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(2), "discover took {took:?}");
+    assert!(server.finish().success());
+}
+
 #[test]
 fn initialize_is_rejected_with_a_message_for_old_clients() {
     let mut server = Server::start();

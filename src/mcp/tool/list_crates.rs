@@ -217,7 +217,7 @@ pub(super) fn parse_arguments(
                 )
             })?,
     };
-    let request_digest = list_module::request_digest(arguments);
+    let request_digest = list_module::request_digest(NAME, arguments);
     let (offset, cursor_data) = match argument("cursor") {
         None => (0, None),
         Some(Value::String(cursor)) => list_module::parse_cursor(cursor, &request_digest)?,
@@ -255,10 +255,10 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
             },
             Err(error) => return *error,
         };
-    let target = arguments
-        .target
-        .clone()
-        .unwrap_or_else(|| state.host.triple.clone());
+    let target = match &arguments.target {
+        Some(target) => target.clone(),
+        None => state.host().await.triple.clone(),
+    };
     let resolution = match state.resolver.resolve(&workspace).await {
         Ok(resolution) => resolution,
         Err(error) => return super::project::resolve_error(&workspace, &error),

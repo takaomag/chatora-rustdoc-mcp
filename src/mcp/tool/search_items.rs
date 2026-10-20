@@ -294,7 +294,7 @@ fn parse_searching(arguments: Option<&JsonObject>) -> Result<Searching, InvalidA
                 })?,
         ),
     };
-    let request_digest = list_module::request_digest(arguments);
+    let request_digest = list_module::request_digest(NAME, arguments);
     let (offset, cursor_data) = match argument("cursor") {
         None => (0, None),
         Some(Value::String(cursor)) => list_module::parse_cursor(cursor, &request_digest)?,
@@ -365,7 +365,10 @@ pub(super) async fn execute(arguments: SearchArguments, state: Arc<ToolState>) -
             detail,
             searching,
         } => {
-            let target = target.unwrap_or_else(|| state.host.triple.clone());
+            let target = match target {
+                Some(target) => target,
+                None => state.host().await.triple.clone(),
+            };
             search_across::std(state, target, detail, searching).await
         },
         SearchArguments::Dependencies {
@@ -374,7 +377,10 @@ pub(super) async fn execute(arguments: SearchArguments, state: Arc<ToolState>) -
             detail,
             searching,
         } => {
-            let target = target.unwrap_or_else(|| state.host.triple.clone());
+            let target = match target {
+                Some(target) => target,
+                None => state.host().await.triple.clone(),
+            };
             dependencies(state, project, target, detail, searching).await
         },
     }

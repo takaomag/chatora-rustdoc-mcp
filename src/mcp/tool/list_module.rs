@@ -223,7 +223,7 @@ pub(super) fn parse_arguments(
             ]));
         },
     };
-    let request_digest = request_digest(arguments);
+    let request_digest = request_digest(NAME, arguments);
     let (offset, cursor_data) = match argument("cursor") {
         None => (0, None),
         Some(Value::String(cursor)) => parse_cursor(cursor, &request_digest)?,
@@ -270,17 +270,20 @@ pub(super) fn parse_kinds(kind: Option<&Value>) -> Result<Box<[&'static str]>, I
         .collect()
 }
 
-/// The digest of the arguments but `cursor` and `limit`, which a cursor is bound to, so that it
-/// is not used for another list (requirement R-OUT-3). The order of the arguments does not
-/// matter.
-pub(super) fn request_digest(arguments: Option<&JsonObject>) -> String {
+/// The digest of the tool and its arguments but `cursor` and `limit`, which a cursor is bound
+/// to, so that it is not used for another list (requirement R-OUT-3): not even for another
+/// tool's list with the same arguments. The order of the arguments does not matter.
+pub(super) fn request_digest(tool: &str, arguments: Option<&JsonObject>) -> String {
     let kept: BTreeMap<&str, &Value> = arguments
         .into_iter()
         .flatten()
         .filter(|(name, _)| !matches!(name.as_str(), "cursor" | "limit"))
         .map(|(name, value)| (name.as_str(), value))
         .collect();
-    let canonical = serde_json::to_string(&kept).unwrap_or_default();
+    let canonical = format!(
+        "{tool}\n{}",
+        serde_json::to_string(&kept).unwrap_or_default()
+    );
     let digest = sha256_hex(canonical.as_bytes());
     digest.get(..16).unwrap_or(&digest).to_owned()
 }
@@ -353,7 +356,7 @@ mod tests {
             let Value::Object(object) = value else {
                 panic!("an object");
             };
-            request_digest(Some(&object))
+            request_digest(NAME, Some(&object))
         };
         let first = digest(json!({ "crate": "axum", "path": "routing", "limit": 10 }));
         assert_eq!(
@@ -368,6 +371,12 @@ mod tests {
         );
         let other = digest(json!({ "crate": "axum" }));
         drop(parse_cursor(&cursor, &other).expect_err("rejected"));
+        // Nor is it for another tool with the same arguments.
+        let Value::Object(same) = json!({ "crate": "axum", "path": "routing" }) else {
+            panic!("an object");
+        };
+        let another_tool = request_digest("list_impls", Some(&same));
+        drop(parse_cursor(&cursor, &another_tool).expect_err("rejected"));
         drop(parse_cursor("c1.x.y", &first).expect_err("rejected"));
         drop(parse_cursor(&format!("c2.{first}.abcd.50"), &first).expect_err("rejected"));
     }

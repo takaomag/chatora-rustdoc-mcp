@@ -197,7 +197,7 @@ pub(super) async fn std(
         &state.dist,
         state.cache.dir(),
         &target,
-        &state.host.triple,
+        &state.host().await.triple,
         at_least.as_ref(),
     )
     .await

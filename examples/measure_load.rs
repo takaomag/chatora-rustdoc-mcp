@@ -135,6 +135,7 @@ fn measure_archive(path: &str) -> Result<String, String> {
     let header = Header {
         schema: across::ARCHIVE_SCHEMA,
         format_version: parsed.krate.format_version,
+        types_version: rustdoc_types::FORMAT_VERSION,
         source_sha256: cache::sha256_hex(&json).into(),
     };
     drop(json);

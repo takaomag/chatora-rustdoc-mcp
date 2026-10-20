@@ -50,7 +50,7 @@ const PACKAGE: &str = "rust-docs-json-preview";
 
 /// The name of the file, written last, that marks an unpacked archive as complete (requirement
 /// R-CA-4).
-const COMPLETE_FILE: &str = "complete.json";
+pub(super) const COMPLETE_FILE: &str = "complete.json";
 
 /// The crates whose JSON the archive has (requirement R-STD-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

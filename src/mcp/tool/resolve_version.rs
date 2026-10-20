@@ -158,13 +158,14 @@ pub(super) async fn execute(arguments: ReleaseArguments, state: Arc<ToolState>) 
             &["call get_item for its items, which come from a nightly toolchain's documentation"],
         );
     }
+    let host = state.host().await;
     let target = arguments
         .target
         .clone()
-        .unwrap_or_else(|| state.host.triple.clone());
+        .unwrap_or_else(|| host.triple.clone());
     let mut warnings: Vec<Box<str>> = Vec::new();
     if arguments.target.is_none()
-        && let Some(why) = &state.host.stand_in_because
+        && let Some(why) = &host.stand_in_because
     {
         warnings.push(
             format!("the target {target} is used, as the host target is not known: {why}").into(),

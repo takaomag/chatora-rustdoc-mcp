@@ -26,7 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BINARY = ROOT / "target" / "release" / "chatora-rustdoc-mcp"
 META = {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}
-SCHEMA = 4  # ARCHIVE_SCHEMA in src/query/across.rs
+# ARCHIVE_SCHEMA in src/query/across.rs and rustdoc_types::FORMAT_VERSION: the archives are `*.v5t61.rkyv`.
+SCHEMA = "v5t*"
 
 # Crates whose archives are made again: (release, an item to ask for). Sizes of their JSON vary.
 NORMALIZED = [
@@ -137,16 +138,16 @@ def cache_key(name: str) -> str:
 def remove_archives(cache: Path, std_dir: Path | None) -> None:
     for release, _ in NORMALIZED:
         name, version = release.split("@")
-        for archive in (cache / "docs.rs" / cache_key(name) / version).glob(f"*/*.v{SCHEMA}.rkyv"):
+        for archive in (cache / "docs.rs" / cache_key(name) / version).glob(f"*/*.{SCHEMA}.rkyv"):
             archive.unlink()
     if std_dir:
-        for archive in std_dir.glob(f"*.v{SCHEMA}.rkyv"):
+        for archive in std_dir.glob(f"*.{SCHEMA}.rkyv"):
             archive.unlink()
 
 
 def std_dir_used(cache: Path) -> Path | None:
     """The directory of the std that the server uses: the one with the newest archive."""
-    archives = sorted(cache.glob(f"std/*/*/std.*.v{SCHEMA}.rkyv"), key=lambda path: path.stat().st_mtime)
+    archives = sorted(cache.glob(f"std/*/*/std.*.{SCHEMA}.rkyv"), key=lambda path: path.stat().st_mtime)
     return archives[-1].parent if archives else None
 
 

@@ -135,10 +135,45 @@ fn the_instructions_are_within_the_length() {
     assert!(len <= MAX_DESCRIPTION_CHARS, "{len} characters");
 }
 
-/// The tools that the requirements plan (§6.3), whether this build has them or not.
+/// The tools that the requirements plan (§6.3 of doc/requirements.md), whether this build has
+/// them or not. They are written here, not read from the requirements, which the published crate
+/// does not have; [`the_planned_tools_are_those_of_the_requirements`] keeps the two the same.
+const PLANNED_TOOLS: &[&str] = &[
+    "list_crates",
+    "resolve_version",
+    "crate_overview",
+    "search_items",
+    "get_item",
+    "list_module",
+    "list_methods",
+    "list_impls",
+    "list_implementors",
+    "get_source",
+    "search_source",
+    "inspect_features",
+    "find_examples",
+    "readme",
+    "changelog",
+    "api_diff",
+    "crate_metadata",
+    "search_crates",
+    "audit_dependencies",
+    "rust_release",
+    "build_external_docs",
+];
+
 fn planned_tools() -> BTreeSet<String> {
+    PLANNED_TOOLS.iter().map(|&name| name.to_owned()).collect()
+}
+
+/// [`PLANNED_TOOLS`] is the table of §6.3, when the requirements are there: in the repository,
+/// not in the published crate.
+#[test]
+fn the_planned_tools_are_those_of_the_requirements() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/doc/requirements.md");
-    let requirements = std::fs::read_to_string(path).expect("the requirements are readable");
+    let Ok(requirements) = std::fs::read_to_string(path) else {
+        return;
+    };
     let table = requirements
         .split("### 6.3 ")
         .nth(1)
@@ -149,8 +184,7 @@ fn planned_tools() -> BTreeSet<String> {
         .filter_map(|line| line.strip_prefix("| `")?.split('`').next())
         .map(str::to_owned)
         .collect();
-    assert!(planned.contains("get_item"), "{planned:?}");
-    planned
+    assert_eq!(planned, planned_tools());
 }
 
 /// A tool that a description or the instructions name must be one of this build: not one planned

@@ -825,6 +825,40 @@ README を M1 の実態に合わせ、crates.io への最初の公開を用意�
 - 同じ日に同じ PID のプロセスが残したロックのファイルは、取り直して使う (ログの番号は続きから)
 - テスト: 終わったプロセスのロックのファイルが消えること、動いているプロセス (テストの中でロックを取る) のログが保持期間を過ぎても残ること
 
+#### 公開前の見直し (2026-10-20)
+
+最初の公開の前に、M1 全体を点検した (自己点検と、前提知識の無いレビュアー)。利用者が 1 件ずつ決めた (いずれも推奨案。9 だけ別案)。
+
+1. std のキャッシュが nightly ごとに約 175MB 増え、消えない (毎日使えば 1 か月で約 5GB。E2 の時点で 5 つ・877MB): 新しい nightly の std を展開したら、7 日使われていない古い nightly の std を消す (R-CA-5 の GC のうち std の分を先に入れる)
+2. アーカイブの鍵に rustdoc-types の版が入っていない (ヘッダの `format_version` は元の JSON の形式で、開くときに比べてもいない。rustdoc-types を上げた版で古いアーカイブを新しい型として読みうる): ヘッダとファイル名に `rustdoc_types::FORMAT_VERSION` を入れ、開くときに比べる
+3. std は常に最新の nightly を使うので、nightly の形式が上がった日に公開済みの版の std の照会が壊れる: 最新の nightly が読めなければ、日付付きの manifest をさかのぼって (30 日まで) 読める nightly を探し、warnings で知らせ、見つけた日付を覚える
+4. stdio を読み始める前に `rustc -vV` (上限 10 秒) を走らせていた (R-MCP-11): ホストの target を並列の task で求め、stdio にはすぐ応え、ツールの呼び出しだけが結果を待つ
+5. 依存の横断検索が、取得と解析を上限なしに並列で起動する: プロセス全体で、JSON の解析 (アーカイブの作成) は同時に 2 つ、docs.rs からの取得は同時に 4 つまで
+6. ログの削除: 動いているプロセスでも書いている 1 ファイルだけを守る (切り替えた古い分は消せる)、合計には消せるものだけを数える、個々の失敗では止まらない
+7. README の約束に合わせる: `CHATORA_RUSTDOC_MCP_CACHE__DIR` が相対パスなら既定の場所を使って知らせる (それまでは起動しなかった)。HTTP のリダイレクトは同じホストの https だけに従う
+8. カーソルの要求のダイジェストにツール名を入れる (同じ引数のほかのツールのカーソルを受け付けていた)
+9. ツール名の検査の単体テストが `doc/requirements.md` (公開物に入らない) を読む: 予定のツール名をソースの定数に持つ (利用者が選んだ。推奨案は「ファイルが無ければ飛ばす」)
+10. GitHub は、公開リポジトリで 60 日活動が無いと定期実行を止める: 記録だけ残す (止まったら Actions の画面か `gh workflow enable canary.yml` で戻す)
+11. README の Security の節: キャッシュの親のディレクトリで効くのは `rust-toolchain.toml` (`rustc`・`rustup` が走る。起動時にも) と直す。プロジェクトの `rust-toolchain.toml` が入っていない toolchain を指すと、`cargo metadata` のために rustup が導入しうること (R-WS-7 で許している) を書き足す
+12. 細かな点: ローカル機能の無い構成で `project` を外すと引数の順が崩れる (`Map::remove` が入れ替える) のを直す。`unparsable` を `retryable: true` にする (`retry_after_secs` を付けているので。新しい版のサーバーや docs.rs の再ビルドで読めるようになりうる)。README に std の大きさと古いものを消すことを書く
+
+直した結果 (2026-10-20。両方の構成の clippy・テスト、`cargo doc` が通った):
+
+- 1: std を選ぶたびに、その nightly のディレクトリ (`std/<commit>/<target>/`、手元の nightly のアーカイブは `std/local/<commit>/<target>/`) の `used` の時刻を更新し (同じディレクトリはプロセスごとに 1 時間に 1 回)、裏のスレッドで、7 日使われていないディレクトリを消す。消すのは、展開の完了の印 (`complete.json`) かアーカイブのあるディレクトリだけで、symlink はたどらない。消せないもの (Windows でほかのプロセスが mmap している) は残して続ける。実際の配布サーバーから取って `used` ができることを確かめた
+- 2: アーカイブのヘッダに `types_version` (rustdoc-types の `FORMAT_VERSION`) を足して開くときに比べ、名前を `<形式>.<SHA-256 の先頭 16>.v5t61.rkyv` にした (`ARCHIVE_SCHEMA` は 5。今あるアーカイブは一度作り直しになる)。名前に入れるのは、版の違うサーバーが同じ名前のファイルを置き換えにいかないようにするため (Windows はほかのプロセスが mmap しているファイルを置き換えられない)
+- 3: dist の最新の nightly の `std.json` の末尾から形式を読み、対応範囲 (`SUPPORTED`) の外なら、覚えた日付 (`std/readable-<target>`) と、1〜30 日前の日付付きの manifest を順に試し、読める nightly を使って warnings で知らせ、日付を覚える。手元の nightly も、形式が範囲の外なら使わない。日付の計算は依存を増やさず書いた (Howard Hinnant の方法)
+- 4: `ToolState::host` を `OnceCell` にし、起動時に裏の task で求め始め、ツールの呼び出しだけが待つ。`rustc` を 5 秒かかるスクリプトにした PATH でも、`server/discover` が 0.1 秒以内に返るテストを足した (Unix だけ)
+- 5: docs.rs からの JSON の取得をプロセス全体で同時に 4 つまで (`DocsRs` の semaphore。本体を受け取り終えたら放す)、JSON の解析とアーカイブの作成を同時に 2 つまで (`query::load` の `Parsing`。blocking のスレッドで待つ)
+- 6: 動いているプロセスで守るのは、その stem の番号の最も大きいファイル (いま書いているもの) だけにした。合計には消せるファイルだけを数える。個々の失敗では止まらず、最後の失敗を stderr に出す
+- 7: (a) `CHATORA_RUSTDOC_MCP_CACHE__DIR` が相対パスなら、ログに出して既定の場所を使う (`CacheError::RelativeDir` を消した)。(b) reqwest のリダイレクトの方針を、同じスキーム・ホスト・ポートだけに従う (10 回まで) ものにした。別のホストへのリダイレクトはエラー。canary の live の docs.rs のテストが、この方針で通ることを確かめた
+- 8: 要求のダイジェストにツール名を入れた。同じ引数のほかのツールのカーソルは拒まれる
+- 9: 予定のツール名を `checks.rs` の定数にし、`doc/requirements.md` があるときだけ §6.3 の表と一致することを確かめる
+- 10: `canary.yml` の冒頭に、止まったときの戻し方を書いた
+- 11・12 (c): README の Cache と Security の節を直した (std の大きさと消し方、起動時の `rustc -vV`、rustup による導入、リダイレクトとプロキシ、キャッシュの親の `rust-toolchain.toml`)
+- 12 (a)(b): `project` を外すのに `shift_remove` を使う (引数の多い `list_module` で順が崩れないことを確かめるテストを足し、`remove` に戻すと落ちることを確かめた)。否定キャッシュに覚えた `unparsable` を `retryable: true` にした (`retry_after_secs` の無い `unparsable` は `false` のまま)
+
+レビュアーのほかの指摘は M2 以降に回す: プロセスをまたぐロック (Windows で 2 つのセッションが同じアーカイブを同時に書くと、相手が mmap しているファイルを置き換えにいく)、取り消しや時間切れで孫のプロセス (git など) が残ること、`cargo metadata` の失敗を覚えず同時の呼び出しを束ねないこと、`.crate` の取得が crates.io のダウンロード数に数えられうること、`project_from` の値 `CLAUDE_PROJECT_DIR` などの名前、`--debug` でインストールすると `sleep` ツールが出ること、`real_data` などの実データのテストと罠のテストが Linux でしか回らないこと、`cargo publish --dry-run` が CI に無いこと。
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

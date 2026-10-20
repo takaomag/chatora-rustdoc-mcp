@@ -52,7 +52,9 @@ Every response says where its data came from (`provenance`): the crate, the vers
 
 ## Cache
 
-rustdoc JSON and what the server makes of it are cached in `$XDG_CACHE_HOME/chatora-rustdoc-mcp/` (`~/.cache/chatora-rustdoc-mcp/` when unset) on Linux and macOS, and in `%LOCALAPPDATA%\chatora-rustdoc-mcp\cache\` on Windows; `CHATORA_RUSTDOC_MCP_CACHE__DIR` (an absolute path) moves it. The standard library takes a few hundred MB, and a large crate tens of MB. Nothing is removed from the cache yet; deleting the directory is safe while no server runs. A command to manage the cache is planned.
+rustdoc JSON and what the server makes of it are cached in `$XDG_CACHE_HOME/chatora-rustdoc-mcp/` (`~/.cache/chatora-rustdoc-mcp/` when unset) on Linux and macOS, and in `%LOCALAPPDATA%\chatora-rustdoc-mcp\cache\` on Windows; `CHATORA_RUSTDOC_MCP_CACHE__DIR` (an absolute path; a relative one is replaced by the default, which the log says) moves it.
+
+The standard library takes about 175 MB for each nightly. The server uses the latest nightly (or, when it writes a rustdoc JSON format that this version of the server does not read, the newest one of the last 30 days that it reads), so a new one comes each day it is used; the standard library of a nightly unused for 7 days is removed. A large crate takes tens of MB, and nothing else is removed from the cache yet; deleting the directory is safe while no server runs. A command to manage the cache is planned.
 
 ## Logs
 
@@ -87,12 +89,12 @@ A setting with a value that is not valid is replaced by its default, which the l
 
 ## Security
 
-The server needs no confirmation for anything it does, and builds nothing yet. For a lookup in the project Claude Code is opened in, it runs `cargo metadata`, `cargo tree` and `rustc -vV` there; for the standard library, `rustup run nightly rustc` in its cache directory. It does not run anything for a `project` outside the project Claude Code is opened in.
+The server needs no confirmation for anything it does, and builds nothing yet. When it starts, it runs `rustc -vV` in its cache directory to know the host's target. For a lookup in the project Claude Code is opened in, it runs `cargo metadata`, `cargo tree` and `rustc -vV` there; for the standard library, `rustup run nightly rustc` in its cache directory. It does not run anything for a `project` outside the project Claude Code is opened in.
 
-- `[toolchain] path` in the project's `rust-toolchain.toml` can make these commands run any executable, and `build.rustc` and `build.rustc-wrapper` in its `.cargo/config.toml` can do the same for `cargo metadata` and `cargo tree`; `cargo metadata` also fetches the git dependencies in `Cargo.toml` from whatever hosts they name. rust-analyzer does the same when it opens the project. Do not open untrusted repositories in Claude Code with this server enabled.
-- The server connects to docs.rs, index.crates.io, static.crates.io and static.rust-lang.org over HTTPS, and to nothing else.
+- `[toolchain] path` in the project's `rust-toolchain.toml` can make these commands run any executable, and `build.rustc` and `build.rustc-wrapper` in its `.cargo/config.toml` can do the same for `cargo metadata` and `cargo tree`; `cargo metadata` also fetches the git dependencies in `Cargo.toml` from whatever hosts they name, and when `rust-toolchain.toml` names a toolchain that is not installed, rustup may install it (hundreds of MB) to run them, as it would for your own `cargo`. rust-analyzer does the same when it opens the project. Do not open untrusted repositories in Claude Code with this server enabled.
+- The server connects to docs.rs, index.crates.io, static.crates.io and static.rust-lang.org over HTTPS, and to nothing else: it follows a redirect only within the same host. It uses a proxy that the usual environment variables (`HTTPS_PROXY`) name.
 - A repository you trust in Claude Code can also change this server's settings through the `env` block of its `.claude/settings.json`, just as its hooks can run commands.
-- Keep the cache and log directories out of places other users can write to, such as `/tmp`: another user could change the cached documentation, or, as cargo reads `.cargo/config.toml` from every parent directory, make the commands above run their programs. The server creates its directories with your default permissions, so if other users can read your home directory, they can also read the logs, which contain project paths.
+- Keep the cache and log directories out of places other users can write to, such as `/tmp`: another user could change the cached documentation, or, as rustup reads `rust-toolchain.toml` from the directory a command runs in and every parent of it, make `rustc` and `rustup` in the cache directory run their programs. The server creates its directories with your default permissions, so if other users can read your home directory, they can also read the logs, which contain project paths.
 
 ## Planned
 
