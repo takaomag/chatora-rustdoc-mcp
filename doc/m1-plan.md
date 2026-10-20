@@ -729,6 +729,22 @@ C2〜C8 で M1 のツール (`list_crates`・`resolve_version`・`crate_overview
 - 監査: 応答に `HashMap` を直列化している所は無かった。`HashMap` を回す所 (`iter_over_hash_type` の `expect`) は、数えるだけか、後で並べ替えている。アーカイブの `public_items` (順は不定) の使い手 2 つも、数えるか所属を調べるだけ
 - 実行時間: release で 2.4 秒 (キャッシュが温まった後)。手元で通った
 
+#### D4a (2026-10-20)
+
+D4 を 2 つに分けた。D4a は `tools/list` と `server/discover` が返すものの検査、D4b は動作の検査 (応答を `outputSchema` で検証する、引数ごとに値を変えると結果が変わるテスト、説明文の問いとテストの対応、既定のプロジェクトの外で子プロセスを起動しない罠のテスト)。
+
+- instructions を足した (R-MCP-6・R-MCP-14。利用者が決めた (推奨案): D4a で入れる)。中身は、呼び出しの順 (探す: `list_crates`・`crate_overview`・`list_module`・`search_items` → `get_item` → `list_methods`・`list_impls`・`list_implementors`。前もって呼ぶものは無い)、版の規則 (Cargo.lock → latest、`provenance`、`resolve_version` は先に要らない)、target と std の nightly (`stability` を見る)、この workspace 自身のコードは rust-analyzer。ローカル機能の無い構成では `list_crates` を出さず、版は latest になるので Cargo.lock の版を渡すよう書く。1,139 文字。E1 の eval で効き目を見る
+- annotations: R-MCP-4 どおり、ローカル機能のある構成では `readOnlyHint: false`、無い構成では `true` にした (それまではどちらも `false` で、理由も「キャッシュに書く」と要件と違っていた)。全ツールで 1 つの関数から付ける
+- ローカル機能の無い構成では、引数 `project` を宣言しない (何もしない引数を宣言しない。R-QA-5)。渡されたら、これまでどおり無視して warnings で知らせる
+- 検査 (`src/mcp/tool/checks.rs`。両方の構成の単体テストで回る):
+  - 名前: snake_case で 2 語以上、プラグインの接頭辞込みで 128 文字以内。`title` があり、`annotations.title` が無い
+  - 説明文: 2,048 文字以内、最初の文に Rust、答える問い (`Answers questions such as`)、戻り値 (`Returns`)、ほかのツールの名前。instructions も 2,048 文字以内
+  - 説明文と instructions に出てくるツール名: 要件の §6.3 の表にあるツールのうち、この構成に無いもの (後の段のツールと、構成で外したもの) を名指ししていないこと。`get_source` を instructions に足すと落ちることを確かめた
+  - スキーマ: ルートが object で combinator が無い、キーワードは `type`・`properties`・`required`・`items`・`additionalProperties`・`enum`・`minimum`・`maximum`・`description`・`anyOf`・`$defs`・`$ref` だけ、`null` の型が無い、`$ref` はスキーマの中だけ、入力の整数には `minimum`、引数の名前は 1〜64 文字の `[A-Za-z0-9_.-]`
+  - annotations: 上のとおり。`destructiveHint: false`・`idempotentHint: true`・`openWorldHint: true`
+- 検査で見つかって直したこと: `get_item` の説明文に代わりのツールが無かった (`list_methods`・`list_impls`・`search_items` を足し、instructions と重なる「記憶で答えず使え」の文などを削って 2,041 文字)。`list_crates` の最初の文に Rust が無かった
+- stdio のテスト: `server/discover` に instructions があること。`tools/list` の `readOnlyHint` が構成に合うこと
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

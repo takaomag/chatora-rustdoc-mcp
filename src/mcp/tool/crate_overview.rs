@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use rmcp::model::{CallToolResult, JsonObject, Tool, ToolAnnotations};
+use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde_json::{Value, json};
 
 use super::{
@@ -53,14 +53,7 @@ pub(super) fn definition() -> Tool {
     Tool::new(NAME, DESCRIPTION, input_schema)
         .with_title("Overview of a Rust crate")
         .with_raw_output_schema(Arc::new(output_schema()))
-        // It reads docs.rs and writes the cache, as get_item does (requirement R-MCP-4).
-        .with_annotations(
-            ToolAnnotations::new()
-                .read_only(false)
-                .destructive(false)
-                .idempotent(true)
-                .open_world(true),
-        )
+        .with_annotations(super::annotations())
 }
 
 /// The schema of the structured content: `OverviewResponse` in `query::overview`

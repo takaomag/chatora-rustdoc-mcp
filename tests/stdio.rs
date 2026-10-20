@@ -408,6 +408,9 @@ fn discover_describes_the_server() {
         result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
         "chatora-rustdoc-mcp"
     );
+    // The order of calls and the rules for versions (requirement R-MCP-6).
+    let instructions = result["instructions"].as_str().expect("instructions");
+    assert!(instructions.contains("`get_item`"), "{instructions}");
     assert!(server.finish().success());
 }
 
@@ -470,7 +473,11 @@ fn tools_list_is_cacheable_and_not_paginated() {
         .as_array()
         .and_then(|tools| tools.iter().find(|tool| tool["name"] == "get_item"))
         .expect("get_item is listed");
-    assert_eq!(get_item["annotations"]["readOnlyHint"], false);
+    // Only a build that reads projects may run cargo (requirement R-MCP-4).
+    assert_eq!(
+        get_item["annotations"]["readOnlyHint"],
+        !cfg!(feature = "local")
+    );
     assert_eq!(get_item["annotations"]["openWorldHint"], true);
     assert_eq!(
         get_item["outputSchema"]["required"],

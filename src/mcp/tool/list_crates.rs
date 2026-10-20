@@ -3,7 +3,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use rmcp::model::{CallToolResult, JsonObject, Tool, ToolAnnotations};
+use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde_json::{Map, Value, json};
 
 use super::{
@@ -87,14 +87,7 @@ pub(super) fn definition() -> Tool {
     Tool::new(NAME, DESCRIPTION, input_schema)
         .with_title("List the project's crates")
         .with_raw_output_schema(Arc::new(output_schema()))
-        // It runs cargo on the project (requirement R-MCP-4).
-        .with_annotations(
-            ToolAnnotations::new()
-                .read_only(false)
-                .destructive(false)
-                .idempotent(true)
-                .open_world(true),
-        )
+        .with_annotations(super::annotations())
 }
 
 /// The schema of the structured content (requirement R-OUT-1).

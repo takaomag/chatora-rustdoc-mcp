@@ -4,6 +4,8 @@
 //! checking, and `execute()`.
 
 mod call_log;
+#[cfg(test)]
+mod checks;
 mod crate_overview;
 mod get_item;
 #[cfg(feature = "local")]
@@ -29,6 +31,7 @@ use rmcp::{
         ContentBlock,
         ErrorData,
         Tool,
+        ToolAnnotations,
     },
     service::{RequestContext, RoleServer},
 };
@@ -155,7 +158,7 @@ impl std::fmt::Display for ErrorChain<'_> {
 
 /// Definitions of every tool, in the order `tools/list` returns them.
 pub(super) fn definitions() -> Vec<Tool> {
-    vec![
+    let tools = vec![
         crate_overview::definition(),
         get_item::definition(),
         // A project is needed, which only local features read (requirement R-ARCH-4).
@@ -170,7 +173,34 @@ pub(super) fn definitions() -> Vec<Tool> {
         // A tool for testing progress and cancellation, only in debug builds.
         #[cfg(debug_assertions)]
         sleep::definition(),
-    ]
+    ];
+    if cfg!(feature = "local") {
+        tools
+    } else {
+        tools.into_iter().map(without_project).collect()
+    }
+}
+
+/// `tool` without the `project` argument, which does nothing without local features: no argument
+/// is declared that is not used (requirements R-ARCH-3 and R-QA-5).
+fn without_project(mut tool: Tool) -> Tool {
+    let mut schema = (*tool.input_schema).clone();
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        properties.remove("project");
+    }
+    tool.input_schema = Arc::new(schema);
+    tool
+}
+
+/// The annotations of every tool (requirement R-MCP-4). With local features, each may run cargo
+/// or rustc on the project (`cargo metadata`, `rustc -vV`, and builds from M2), whose settings
+/// can run any program, so none is read-only. Without them, none runs anything.
+fn annotations() -> ToolAnnotations {
+    ToolAnnotations::new()
+        .read_only(!cfg!(feature = "local"))
+        .destructive(false)
+        .idempotent(true)
+        .open_world(true)
 }
 
 /// Runs the tool that `request` names, and logs the call with a new `request_id`, which an error

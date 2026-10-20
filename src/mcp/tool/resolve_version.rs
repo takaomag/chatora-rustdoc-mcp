@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use rmcp::model::{CallToolResult, JsonObject, Tool, ToolAnnotations};
+use rmcp::model::{CallToolResult, JsonObject, Tool};
 use semver::Version;
 use serde_json::{Value, json};
 
@@ -64,15 +64,7 @@ pub(super) fn definition() -> Tool {
     Tool::new(NAME, DESCRIPTION, input_schema)
         .with_title("Resolve a crate version")
         .with_raw_output_schema(Arc::new(output_schema()))
-        // It reads the crates.io index and docs.rs, and runs cargo on the project (requirement
-        // R-MCP-4).
-        .with_annotations(
-            ToolAnnotations::new()
-                .read_only(false)
-                .destructive(false)
-                .idempotent(true)
-                .open_world(true),
-        )
+        .with_annotations(super::annotations())
 }
 
 /// The schema of the structured content (requirement R-OUT-1). Every property but the required
