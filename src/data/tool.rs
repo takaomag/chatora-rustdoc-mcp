@@ -1,10 +1,56 @@
 //! Running a short command of the toolchain, as `rustc -vV`, in a directory without project
 //! settings.
 
-use std::{borrow::Cow, path::Path, process::Stdio, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
+
+use parking_lot::Mutex;
 
 /// Longest wait for a command that takes milliseconds when it works.
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`output_kept`] keeps what a command printed. Toolchains are seldom installed or
+/// switched while a session runs, and running rustc through rustup takes about 25 milliseconds,
+/// twice for each lookup in std, against a target of 50 for a whole lookup (§9.1, decided in M1).
+const KEPT_FOR: Duration = Duration::from_secs(60);
+
+/// What commands printed, or why they failed, by directory, program and arguments, and when.
+type Kept = HashMap<(PathBuf, String, Vec<String>), (Instant, Result<String, Cow<'static, str>>)>;
+
+static KEPT: LazyLock<Mutex<Kept>> = LazyLock::new(Mutex::default);
+
+/// [`output`], kept for [`KEPT_FOR`]: for the commands that only tell about a toolchain.
+///
+/// # Errors
+///
+/// As [`output`].
+pub(super) async fn output_kept(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+) -> Result<String, Cow<'static, str>> {
+    let key = (
+        dir.to_path_buf(),
+        program.to_owned(),
+        args.iter().map(|&arg| arg.to_owned()).collect::<Vec<_>>(),
+    );
+    if let Some((at, kept)) = KEPT.lock().get(&key)
+        && at.elapsed() < KEPT_FOR
+    {
+        return kept.clone();
+    }
+    let printed = output(dir, program, args).await;
+    let mut kept = KEPT.lock();
+    kept.retain(|_, (at, _)| at.elapsed() < KEPT_FOR);
+    kept.insert(key, (Instant::now(), printed.clone()));
+    printed
+}
 
 /// Runs `program` with `args` in `dir` and returns what it printed. rustup may not install a
 /// toolchain on the way (requirement R-WS-7), and the server's stdin and stdout are never shared

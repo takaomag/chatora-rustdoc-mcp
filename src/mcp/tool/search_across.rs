@@ -235,7 +235,7 @@ pub(super) async fn std(
         .filter_map(|(krate, archived)| {
             let name: CrateName = krate.as_str().parse().ok()?;
             let outcome = match archived {
-                Ok(mapped) => Outcome::Loaded(Arc::new(mapped)),
+                Ok(mapped) => Outcome::Loaded(mapped),
                 Err(error) => {
                     tracing::warn!(krate = krate.as_str(), error = %ErrorChain(&error), "the JSON of std could not be loaded");
                     Outcome::Failed(json!({
@@ -348,7 +348,7 @@ async fn load_release(
         .and_then(Result::ok)
         .flatten();
     if let Some(mapped) = opened {
-        return Outcome::Loaded(Arc::new(mapped));
+        return Outcome::Loaded(mapped);
     }
     let loaded =
         match crate::data::docs_rs_json(&state.cache, &state.docs_rs, name, version, Some(target))
@@ -364,7 +364,7 @@ async fn load_release(
     let archived =
         crate::task::spawn_blocking(move || load::archive_json(&cache, &dir, &loaded.json)).await;
     match archived {
-        Ok(Ok(mapped)) => Outcome::Loaded(Arc::new(mapped)),
+        Ok(Ok(mapped)) => Outcome::Loaded(mapped),
         Ok(Err(error)) => {
             tracing::warn!(%name, %version, error = %ErrorChain(&error), "a crate to search could not be archived");
             Outcome::Failed(json!({

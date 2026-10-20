@@ -1658,7 +1658,6 @@ fn look_up_std(
             });
         match archived {
             Ok(mapped) => {
-                let mapped = Arc::new(mapped);
                 loaded.insert(krate, Arc::clone(&mapped));
                 Some(mapped)
             },

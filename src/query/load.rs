@@ -2,9 +2,13 @@
 //! the JSON parsed, indexed and archived (requirements R-PF-1, R-PF-2 and R-CA-4).
 
 use std::{
+    collections::{HashMap, VecDeque},
     io,
     path::{Path, PathBuf},
+    sync::{Arc, LazyLock},
 };
+
+use parking_lot::Mutex;
 
 use super::across::{ARCHIVE_SCHEMA, Indexed};
 use crate::data::{
@@ -25,6 +29,63 @@ pub enum LoadError {
     /// The JSON could not be read.
     #[error("the rustdoc JSON could not be read")]
     Read(#[source] io::Error),
+}
+
+/// The most archives kept open in the process. Each is a mapping of its file, which the kernel can
+/// page out (requirement R-MEM-1), so the limit only bounds the mappings.
+const MAX_OPEN: usize = 32;
+
+/// Archives that this process has opened and checked, by path, the latest last (requirements
+/// R-PF-1 and §9.1). Checking the bytes of a large archive takes tens of milliseconds (core), so it
+/// is done once. An archive's name has the SHA-256 of its JSON, so the file at a path does not
+/// change.
+static OPEN: LazyLock<Mutex<Opened>> = LazyLock::new(Mutex::default);
+
+#[derive(Default)]
+struct Opened {
+    by_path: HashMap<PathBuf, Arc<Mapped<Indexed>>>,
+    order: VecDeque<PathBuf>,
+}
+
+/// Gives the memory that parsing a crate freed back to the system. glibc's allocator keeps most of
+/// it otherwise: about 220 MB after core (requirement R-MEM-1, Q-27, measured in M1).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[expect(unsafe_code, reason = "malloc_trim is a C function")]
+fn give_back_memory() {
+    // SAFETY: malloc_trim only releases free memory of the allocator; it has no preconditions.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+const fn give_back_memory() {}
+
+/// The archive at `path` that this process has opened, if it still exists.
+fn opened(path: &Path) -> Option<Arc<Mapped<Indexed>>> {
+    let mapped = OPEN.lock().by_path.get(path).map(Arc::clone)?;
+    // A cache cleared since is not used, so that the archive is made again where it was.
+    path.is_file().then_some(mapped)
+}
+
+/// Keeps `mapped`, opened at `path`, and lets go of the oldest beyond [`MAX_OPEN`].
+fn keep(path: &Path, mapped: Mapped<Indexed>) -> Arc<Mapped<Indexed>> {
+    let mapped = Arc::new(mapped);
+    let mut open = OPEN.lock();
+    if open
+        .by_path
+        .insert(path.to_path_buf(), Arc::clone(&mapped))
+        .is_none()
+    {
+        open.order.push_back(path.to_path_buf());
+    }
+    while open.order.len() > MAX_OPEN {
+        if let Some(oldest) = open.order.pop_front() {
+            open.by_path.remove(&oldest);
+        }
+    }
+    drop(open);
+    mapped
 }
 
 /// Where the archive of the JSON in `format` with `sha256` is kept, in its directory `dir`. The
@@ -50,12 +111,15 @@ const fn header(format: u32, sha256: Box<str>) -> Header {
 /// # Errors
 ///
 /// Returns an error when the cache cannot be read.
-pub fn open_archived(cache: &Cache, dir: &Path) -> io::Result<Option<Mapped<Indexed>>> {
+pub fn open_archived(cache: &Cache, dir: &Path) -> io::Result<Option<Arc<Mapped<Indexed>>>> {
     let Some((format, sha256)) = cache.docs_rs_source(dir)? else {
         return Ok(None);
     };
     let path = archive_path(dir, format, &sha256);
-    Mapped::open(cache, &path, &header(format, sha256))
+    if let Some(mapped) = opened(&path) {
+        return Ok(Some(mapped));
+    }
+    Ok(Mapped::open(cache, &path, &header(format, sha256))?.map(|mapped| keep(&path, mapped)))
 }
 
 /// Parses `json`, indexes it, and archives it in the cache directory `dir`, then opens the
@@ -65,7 +129,11 @@ pub fn open_archived(cache: &Cache, dir: &Path) -> io::Result<Option<Mapped<Inde
 /// # Errors
 ///
 /// Returns an error when the JSON cannot be parsed, or the crate cannot be archived at all.
-pub fn archive_json(cache: &Cache, dir: &Path, json: &[u8]) -> Result<Mapped<Indexed>, LoadError> {
+pub fn archive_json(
+    cache: &Cache,
+    dir: &Path,
+    json: &[u8],
+) -> Result<Arc<Mapped<Indexed>>, LoadError> {
     let parsed = rustdoc_json::parse(json)?;
     let format = parsed.krate.format_version;
     let sha256: Box<str> = cache::sha256_hex(json).into();
@@ -75,7 +143,11 @@ pub fn archive_json(cache: &Cache, dir: &Path, json: &[u8]) -> Result<Mapped<Ind
     match archive::write(cache, &path, &header, &indexed)
         .and_then(|()| Mapped::open(cache, &path, &header))
     {
-        Ok(Some(mapped)) => return Ok(mapped),
+        Ok(Some(mapped)) => {
+            drop(indexed);
+            give_back_memory();
+            return Ok(keep(&path, mapped));
+        },
         Ok(None) => {
             tracing::warn!(path = %path.display(), "an archive just written does not check out");
         },
@@ -83,7 +155,9 @@ pub fn archive_json(cache: &Cache, dir: &Path, json: &[u8]) -> Result<Mapped<Ind
             tracing::warn!(path = %path.display(), %error, "the archive could not be written");
         },
     }
-    Mapped::in_memory(&indexed).map_err(LoadError::Archive)
+    Mapped::in_memory(&indexed)
+        .map(Arc::new)
+        .map_err(LoadError::Archive)
 }
 
 /// The archive of the JSON of the crate `stem` in the cache directory `dir`, made the first time.
@@ -102,16 +176,18 @@ pub fn archive_of(
     stem: &str,
     source: &str,
     json: impl FnOnce() -> io::Result<Box<[u8]>>,
-) -> Result<Mapped<Indexed>, LoadError> {
+) -> Result<Arc<Mapped<Indexed>>, LoadError> {
     let short = source.get(..16).unwrap_or(source);
     let path = dir.join(format!("{stem}.{short}.v{ARCHIVE_SCHEMA}.rkyv"));
+    if let Some(mapped) = opened(&path) {
+        return Ok(mapped);
+    }
     // Another thread that archives the same JSON goes first, and this one then opens its archive
     // (requirement R-WS-6).
     let _held = cache.lock_blocking(&path);
     // The format is not compared when an archive is opened.
-    let opened = Mapped::open(cache, &path, &header(0, source.into()));
-    match opened {
-        Ok(Some(mapped)) => return Ok(mapped),
+    match Mapped::open(cache, &path, &header(0, source.into())) {
+        Ok(Some(mapped)) => return Ok(keep(&path, mapped)),
         Ok(None) => {},
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "an archive could not be read");
@@ -125,7 +201,11 @@ pub fn archive_of(
     match archive::write(cache, &path, &header, &indexed)
         .and_then(|()| Mapped::open(cache, &path, &header))
     {
-        Ok(Some(mapped)) => return Ok(mapped),
+        Ok(Some(mapped)) => {
+            drop(indexed);
+            give_back_memory();
+            return Ok(keep(&path, mapped));
+        },
         Ok(None) => {
             tracing::warn!(path = %path.display(), "an archive just written does not check out");
         },
@@ -133,7 +213,9 @@ pub fn archive_of(
             tracing::warn!(path = %path.display(), %error, "the archive could not be written");
         },
     }
-    Mapped::in_memory(&indexed).map_err(LoadError::Archive)
+    Mapped::in_memory(&indexed)
+        .map(Arc::new)
+        .map_err(LoadError::Archive)
 }
 
 #[cfg(test)]

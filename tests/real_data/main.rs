@@ -11,6 +11,7 @@
 )]
 
 mod arguments;
+mod budgets;
 mod client;
 mod determinism;
 mod questions;

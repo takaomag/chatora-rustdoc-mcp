@@ -774,6 +774,31 @@ D4 を 2 つに分けた。D4a は `tools/list` と `server/discover` が返す�
   - 直した後の同じ問い: 呼び出し 2 回・エラー 0、入力トークン 98,527 → 38,956、0.19 → 0.23 ドル (答えが長くなった分。出力トークンは 2,057 → 1,506)
 - まだ: ツールの分け方を変えるほどの問題は見つからなかった。`detail` の既定、`alwaysLoad` の有無などの比較 (R-QA-6) と換算係数の校正は M5。tool search が有効な場合の固定費は測っていない
 
+#### E2 (2026-10-20)
+
+性能とメモリを測った (§9.1・R-MEM-1・R-QA-1・Q-27)。測る道具は `eval/bench.py` (Linux。release ビルドで、testdata のキャッシュを使う。M4・M5 でも回す)。このホスト: 12 コア、16GB、gnu 版、ローカルの SSD。
+
+- **最初の測定で見つかって直したこと**:
+  - std の照会が毎回 50〜100ms かかっていた。ローカルの nightly を確かめる `rustup run nightly rustc` を毎回 2 回 (各約 25ms) 起動していたのと、core のアーカイブを開くたびに rkyv の検証 (約 40〜90ms) をしていたため
+    - アーカイブは、開いて検証したものをプロセスの中で 32 個まで持つ (`query::load`。名前に JSON の SHA-256 が入るので、同じパスの中身は変わらない。mmap なので R-MEM-1 では数えない。キャッシュが消されていたら使わない)
+    - toolchain のコマンド (`rustup run nightly rustc -vV`・`--print sysroot`、プロジェクトの `rustc -vV`) の出力を 60 秒持つ (`data::tool::output_kept`)。セッションの途中で toolchain を入れたら、最大 60 秒遅れて気付く
+  - core を解析した後に、匿名メモリが 220MB 残っていた (解放しても glibc の malloc が OS に返さない)。アーカイブを作り終えたら `malloc_trim(0)` を呼ぶ (Linux の glibc だけ。`query::load`)。core の後は 33MB、rmcp の後は 43 → 14MB。解析中の山 (core で約 510MB) は変わらない
+- **結果** (直した後):
+
+  | 測ったもの | 値 |
+  | --- | --- |
+  | キャッシュ済みの照会 (同じプロセス、20 周、8 item と 4 型) | `get_item` p50 1.4ms・p95 4.4ms・最大 6.3ms、`list_methods` p50 3.4ms・p95 4.9ms |
+  | 新しいプロセスでの最初の照会 (アーカイブはある) | 多くは 6〜12ms。core は 88ms (検証)。serde_json は 46ms (index の再検証の通信) |
+  | 正規化 (JSON はある。解析・索引・アーカイブ) | serde_json (1.4MB) 66ms、axum (5.1MB) 118ms、tokio (6.5MB) 181ms、syn (9.6MB) 183ms、rmcp (14.9MB) 258ms、core (96MB) 1.5s、alloc と std (26MB) 0.5s |
+  | 匿名メモリ | 照会だけなら 8MB。解析中の山は JSON の約 5〜7 倍 (rmcp 103MB、core 509MB)、解析の後は 33MB 以下 |
+
+  - 今の nightly の core の JSON は 96MB (要件の「約 61MB」は以前の nightly)
+- **§9.1 の M1 の目標の案** (M1 の終わりに要件へ反映する): キャッシュ済みの `get_item`・`list_methods` は p50 < 10ms・p95 < 50ms (要件の目安 50ms / 200ms より厳しくできる)。新しいプロセスで core を初めて開くのは < 150ms (目安の 50ms は、開くたびの検証をやめないと届かない。検証を省くかは Q-23 のまま)。中規模の crate (JSON 5〜15MB) の正規化は < 500ms。core の正規化は < 3s。解析中のメモリの山は JSON の 6 倍程度で、R-MEM-1 の既定の 1GB には core (96MB) で収まる。約 1GB の JSON (windows-rs) は、R-NW-3 のメモリの上限 (512MiB) で `too_large` になる見込みで、M1 では試していない (Q-22)
+- **Q-27** (アロケータ): gnu 版は `malloc_trim` で返せば足り、M1 では替えない。musl 版は M5 で測る
+- **R-QA-1 の予算**: 代表の item の `get_item` (`detail=normal`) の大きさを測り、約 1.5 倍を予算にして、実データのテスト (`tests/real_data/budgets.rs`。CI の `testdata` の job) で超えたら落とす: tokio の `Mutex` 1,000 バイト (いま 695)、`Mutex::lock` 1,300 (872)、`Vec` 1,700 (1,162)、`HashMap` 1,700 (1,173)、core の `Option` 1,500 (982)、axum の `Router` 900 (576)、serde の `Serialize` 1,300 (878)、serde_json の `Value` 1,400 (933)
+  - ferritin のホスト版との比較: ferritin の `get` は、ドキュメント全文・メソッドの一覧・実装の一覧を 1 回で返し、tokio の `Mutex` で約 5,000 文字、`std::vec::Vec` で約 21,000 文字、axum の `Router` で約 7,000 文字、serde の `Serialize` で約 2,000 文字 (2026-10-20)。こちらは `get_item` が 0.6〜1.2KB で、メソッドは `list_methods` (`Mutex` で 3.7KB、`Vec` で 10.8KB)、実装は `list_impls` に分かれる。必要な分だけ引けば、こちらが小さい
+- ビルドの待ちと docs.rs からの取得の時間 (取得込みの p50 < 3s) は測っていない (回線と docs.rs で決まるため。R-WS-6 のビルドは M2)
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

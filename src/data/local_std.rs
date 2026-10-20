@@ -76,7 +76,7 @@ pub async fn local_std(
     let rustc = async |args: &'static [&'static str]| {
         let mut all = vec!["run", TOOLCHAIN, "rustc"];
         all.extend_from_slice(args);
-        tool::output(neutral_dir, "rustup", &all)
+        tool::output_kept(neutral_dir, "rustup", &all)
             .await
             .map_err(NotUsed::NoNightly)
     };
@@ -107,7 +107,7 @@ pub async fn local_std(
 /// `rust-toolchain.toml` applies (requirement R-STD-1), or `None` if it cannot be run there without
 /// installing anything.
 pub async fn rustc_release(dir: &Path) -> Option<Version> {
-    let version = tool::output(dir, "rustc", &["-vV"])
+    let version = tool::output_kept(dir, "rustc", &["-vV"])
         .await
         .inspect_err(|why| tracing::debug!(%why, "the project's rustc could not be run"))
         .ok()?;
