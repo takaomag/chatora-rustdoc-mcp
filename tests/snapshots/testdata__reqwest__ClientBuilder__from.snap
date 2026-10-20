@@ -17,6 +17,10 @@ expression: response
     "parent": "reqwest::ClientBuilder",
     "impl": "impl<T> From<T> for reqwest::ClientBuilder",
     "signature": "fn from(t: T) -> T",
+    "other_cfg": [
+      "not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))"
+    ],
+    "cfg_source": "inherited",
     "docs": "Returns the argument unchanged."
   }
 }

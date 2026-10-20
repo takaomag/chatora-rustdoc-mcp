@@ -219,6 +219,15 @@ fn data_schema() -> Value {
             "where": strings,
             "fields": strings,
             "variants": strings,
+            "required_features": {
+                "type": "string",
+                "description": "The features the item needs (any(rt, rt-multi-thread)).",
+            },
+            "other_cfg": strings,
+            "cfg_source": {
+                "type": "string",
+                "enum": ["doc_cfg", "cfg_trace", "inherited", "unknown"],
+            },
             "docs": {
                 "type": "string",
                 "description": "The first paragraph of the documentation, or with \
@@ -1528,6 +1537,9 @@ mod tests {
                 where_predicates: many(),
                 fields: many(),
                 variants: many(),
+                required_features: some(),
+                other_cfg: many(),
+                cfg_source: Some("doc_cfg"),
                 docs: Some("x".into()),
                 docs_truncated: true,
                 deprecated: Some(Deprecated {

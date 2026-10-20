@@ -17,6 +17,7 @@ use semver::Version;
 use serde::Serialize;
 
 use super::{
+    cfg::{Cfg, CfgAttribute, CfgSource},
     docs,
     path_index::{self, ArchivedPathIndex, ExternalReexport, PublicPath, Resolution},
     render::Renderer,
@@ -189,6 +190,17 @@ pub struct ItemData<'a> {
     /// The variants of an enum, one each.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub variants: Box<[Box<str>]>,
+    /// The features the item needs, by name, with `any`, `all` and `not` as in `cfg`
+    /// (`any(rt, rt-multi-thread)`. Requirement R-FT-2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_features: Option<Box<str>>,
+    /// The other conditions it needs, as `cfg` writes them (`tokio_unstable`, `unix`).
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub other_cfg: Box<[Box<str>]>,
+    /// Where the conditions were read: `doc_cfg`, `cfg_trace`, `inherited` (only from the
+    /// modules, re-exports, type or `impl` it is in), or `unknown` (some could not be read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfg_source: Option<&'static str>,
     /// The first paragraph of the documentation, as written.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docs: Option<Cow<'a, str>>,
@@ -543,6 +555,7 @@ impl<'a> Query<'a> {
         } else {
             data.path = self.path_of(id);
         }
+        self.cfg_note(id, parent, &mut data);
         if detail == Detail::Brief {
             // One line: a `macro_rules!` macro shows its rules on the lines after it.
             data.signature = Some(signature.lines().next().unwrap_or_default().into());
@@ -617,6 +630,79 @@ impl<'a> Query<'a> {
             reexport_of,
             ..ItemData::default()
         }
+    }
+
+    /// Fills in the conditions that the item `id` needs (requirement R-FT-2): its own, those of
+    /// the `impl`, trait or type it belongs to, and those of the modules and re-exports on the
+    /// canonical path to it. rustdoc gives a child item none of its parent's.
+    fn cfg_note(&self, id: Id, parent: Option<Id>, data: &mut ItemData<'a>) {
+        let mut carriers = parent.map_or_else(
+            || self.index.canonical_via(id),
+            |parent| {
+                let mut carriers = self.index.canonical_via(parent);
+                carriers.push(parent);
+                carriers.extend(
+                    path_index::own_impls(self.view, parent)
+                        .find(|(_, contents)| contents.items.contains(&id))
+                        .map(|(impl_item, _)| impl_item.id),
+                );
+                carriers
+            },
+        );
+        carriers.push(id);
+        let mut conjuncts: Vec<Cfg> = Vec::new();
+        let mut own = None;
+        let mut unreadable = false;
+        for &carrier in &carriers {
+            let Some(item) = self.view.item(carrier) else {
+                continue;
+            };
+            let (mut doc_cfg, mut traces) = (Vec::new(), Vec::new());
+            for attribute in &item.attrs {
+                let Attribute::Other(text) = attribute else {
+                    continue;
+                };
+                match Cfg::of_attribute(text) {
+                    Some(CfgAttribute::Cfg(CfgSource::DocCfg, cfg)) => doc_cfg.push(cfg),
+                    Some(CfgAttribute::Cfg(CfgSource::CfgTrace, cfg)) => traces.push(cfg),
+                    Some(CfgAttribute::Unreadable) => unreadable = true,
+                    None => {},
+                }
+            }
+            // What the crate writes for its documentation comes first (requirement R-FT-2).
+            let (source, cfgs) = if doc_cfg.is_empty() {
+                (CfgSource::CfgTrace, traces)
+            } else {
+                (CfgSource::DocCfg, doc_cfg)
+            };
+            if cfgs.is_empty() {
+                continue;
+            }
+            if carrier == id {
+                own = Some(source);
+            }
+            for conjunct in Cfg::all(cfgs).for_build().conjuncts() {
+                if !conjuncts.contains(&conjunct) {
+                    conjuncts.push(conjunct);
+                }
+            }
+        }
+        let (features, other): (Vec<_>, Vec<_>) =
+            conjuncts.into_iter().partition(Cfg::is_features_only);
+        let inherited = !(features.is_empty() && other.is_empty());
+        data.cfg_source = if unreadable {
+            Some("unknown")
+        } else {
+            match own {
+                Some(CfgSource::DocCfg) => Some("doc_cfg"),
+                Some(CfgSource::CfgTrace) => Some("cfg_trace"),
+                None => inherited.then_some("inherited"),
+            }
+        };
+        if !features.is_empty() {
+            data.required_features = Some(Cfg::all(features).features_text().into());
+        }
+        data.other_cfg = other.iter().map(|cfg| cfg.to_string().into()).collect();
     }
 
     /// The canonical path of `id`, or its definition path with a warning if it has no public
@@ -1522,7 +1608,11 @@ mod tests {
                     packed: None,
                     int: None,
                 }),
-                Attribute::Other("#[attr = CfgTrace([NameValue { name: feature }])]".to_owned()),
+                Attribute::Other(
+                    "#[attr = CfgTrace([NameValue { name: \"feature\", value: Some(\"sync\"), \
+                     span: src/lib.rs:1:1: 1:2 (#0) }])]"
+                        .to_owned(),
+                ),
                 Attribute::Other("#[doc(alias = \"lock\")]".to_owned()),
                 Attribute::Other("#[attr = RustcDiagnosticItem(\"Mutex\")]".to_owned()),
             ]);
@@ -1538,6 +1628,8 @@ mod tests {
                 "path": "my_crate::Mutex",
                 "kind": "struct",
                 "signature": "pub struct Mutex",
+                "required_features": "sync",
+                "cfg_source": "cfg_trace",
             })
         );
     }
@@ -1624,5 +1716,63 @@ mod tests {
             serde_json::to_value(&response).expect("serializes")
         });
         assert!(cut["data"].get("truncated").is_none(), "{cut}");
+    }
+
+    /// The conditions of the re-export of `Mutex`, of the `impl` of `lock`, and of the enum.
+    fn with_cfgs(krate: &mut Crate) {
+        let mut add = |id: u32, text: &str| {
+            if let Some(item) = krate.index.get_mut(&Id(id)) {
+                item.attrs.push(Attribute::Other(text.to_owned()));
+            }
+        };
+        add(7, r#"#[doc(cfg(feature = "sync"))]"#);
+        add(
+            5,
+            r#"#[attr = CfgTrace([NameValue { name: "tokio_unstable", value: None, span: src/lib.rs:1:1: 1:2 (#0) }])]"#,
+        );
+        add(8, r#"#[<cfg>(any(feature = "a", feature = "b"))]"#);
+        add(8, "#[<cfg>(any(all(doc, docsrs), unix))]");
+    }
+
+    #[test]
+    fn conditions_are_inherited_from_reexports_impls_and_parents() {
+        let note = |path: &str| {
+            let data = at_detail(path, Detail::Brief, with_cfgs)["data"].clone();
+            (
+                data["required_features"].clone(),
+                data["other_cfg"].clone(),
+                data["cfg_source"].clone(),
+            )
+        };
+        assert_eq!(
+            note("my_crate::Mutex"),
+            (json!("sync"), json!(null), json!("inherited"))
+        );
+        assert_eq!(
+            note("my_crate::Mutex::lock"),
+            (json!("sync"), json!(["tokio_unstable"]), json!("inherited"))
+        );
+        // The trace is read when there is no `doc(cfg)`, and `doc` and `docsrs` are false in a
+        // build.
+        assert_eq!(
+            note("my_crate::E"),
+            (json!("any(a, b)"), json!(["unix"]), json!("cfg_trace"))
+        );
+        assert_eq!(
+            note("my_crate::E::A"),
+            (json!("any(a, b)"), json!(["unix"]), json!("inherited"))
+        );
+        // The definition path does not go through the re-export, but the canonical path does.
+        assert_eq!(
+            note("my_crate::sync::mutex::Mutex"),
+            (json!("sync"), json!(null), json!("inherited"))
+        );
+    }
+
+    #[test]
+    fn an_item_without_conditions_has_no_note() {
+        let data = at_detail("my_crate::Mutex", Detail::Normal, |_| {})["data"].clone();
+        assert!(data.get("cfg_source").is_none(), "{data}");
+        assert!(data.get("required_features").is_none(), "{data}");
     }
 }

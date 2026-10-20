@@ -20,6 +20,8 @@ expression: response
       "Self: Unpin",
       "B: BufMut + ?Sized"
     ],
+    "required_features": "io-util",
+    "cfg_source": "inherited",
     "docs": "Pulls some bytes from this source into the specified buffer,\nadvancing the buffer's internal cursor.",
     "docs_truncated": true,
     "sections": [

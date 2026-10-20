@@ -17,6 +17,8 @@ expression: response
     "parent": "tokio::sync::Mutex",
     "impl": "impl<T: ?Sized> tokio::sync::Mutex<T>",
     "signature": "pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, T>",
+    "required_features": "sync",
+    "cfg_source": "inherited",
     "docs": "Locks this mutex, causing the current task to yield until the lock has\nbeen acquired.  When the lock has been acquired, function returns a\n[`MutexGuard`].",
     "docs_truncated": true,
     "sections": [

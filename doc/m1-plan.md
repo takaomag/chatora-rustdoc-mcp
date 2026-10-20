@@ -500,6 +500,23 @@ C1b も 3 つに分けた: C1b-1 (版・target・provenance)、C1b-2 (プロジ�
 - テスト: 節への分割と隠し行、detail の 3 段階、属性の書き方と除くもの、上限への切り詰め (節の本文・docs・フィールドの順) と上限内なら削らないこと、`detail` の解析、候補の上限
 - 扱っていないこと: 文字数とトークン数の対応の測定 (R-OUT-3 の見積もり)。MCP の応答は `structuredContent` と `content` の text に同じ JSON を二重に載せるので、送る量は上限のおよそ 2 倍になる
 
+#### C1d-1 (2026-10-20)
+
+C1d も 3 つに分けた: C1d-1 (cfg を読んで item の条件を出す)、C1d-2 (プロジェクトの feature の組で `enabled_in_project`・`enabled_in_dev_only` を出す)、C1d-3 (R-FT-1。`.crate` の `[package.metadata.docs.rs]` から docs.rs のビルドの feature を求める)。
+
+- cfg の読み取り (`query::cfg`): 実データ (testdata の 20 crate、形式 46・48・57・61) で見つかった表記は 4 系統
+  - `#[doc(cfg(...))]` (全形式で同じ) と、形式 46・48 の痕跡 `#[<cfg>(...)]` は Rust の構文。属性の並び (`name`、`name = "値"`、`name(...)`) として読み、`all`・`any`・`not`・`true`・`false` を式にする
+  - 形式 57・61 の痕跡 `#[attr = CfgTrace([...])]` は rustc の Debug 表記。`NameValue { name, value, span }`・`All([...], span)`・`Any`・`Not`・`Bool` を読み、位置 (`span: src/macros/cfg.rs:480:19: 480:33 (#4230)`) は閉じ括弧まで読み飛ばす。並びの各項は「かつ」
+  - `CfgAttrTrace` と `<cfg_attr>` は、ほかの属性に掛かる条件で item の条件ではないので読まない
+  - 読めない cfg の属性は `cfg_source: unknown` にする。testdata の 20 crate では cfg の属性 12,977 件がすべて読めた (testdata の結合テストで確かめる)
+- item の条件 = パス上の条件の「かつ」(R-FT-2): 正準パスがたどるモジュールと `use` (公開パス索引に記録するようにした。アーカイブのスキーマを 2 に上げた)、関連 item なら親の型・trait・enum とその正準パスと `impl`、最後に item 自身。各 item では `doc(cfg)` があればそれを、無ければ痕跡を使う。同じ条件は 1 度だけ
+  - 通常のビルドでは `doc` と `docsrs` は偽なので畳む (`any(all(doc, docsrs), windows)` → `windows`)。畳むと偽になるもの (`#[cfg(docsrs)]` の item) は、文書にだけある item だと分かるように元のまま出す
+- 出力: 一番外の「かつ」の各項を、feature だけのもの (`required_features`。名前だけで `any(rt, rt-multi-thread)` のように書き、複数なら `all(...)`) と、それ以外 (`other_cfg`。`cfg` の書き方で 1 項ずつ。feature とそれ以外が混ざった項もこちら) に分ける。`cfg_source` は item 自身の情報源 (`doc_cfg`・`cfg_trace`)、自身に無く親や経路から来たなら `inherited`、読めないものがあれば `unknown`。条件が無ければどれも出さない。`detail=brief` でも出す (R-OUT-7)
+- 実データ: `tokio::spawn` は `rt` (doc_cfg)、`tokio::sync::Mutex::lock` は `sync` (モジュールから)、`tokio::runtime::Builder::new_multi_thread` は `all(rt, rt-multi-thread)`、`std::os::unix::fs::PermissionsExt` は `unix`、`reqwest::blocking::Client` は `blocking` と wasm 以外。testdata のスナップショット 8 件に注記が増えた
+- 痕跡から継ぐ条件には、crate の内部の cfg も入る: `tokio::net::UnixStream` の `not(loom)` (`net` モジュールに `doc(cfg)` が無く、痕跡を使うため)、std の `not(no_global_oom_handling)`。出すのは正しいが、C1d-2 で `enabled_in_project` を求めるとき、feature 以外の cfg をどう評価するかを決める必要がある
+- 扱っていないこと: `also_reexported_at` の各パスの条件 (正準パスと違うときだけ添える。R-FT-2)、`#[doc(auto_cfg(hide(...)))]`、crate の外への re-export (`reexport_of`) の条件
+- テスト: 3 系統の読み取り (位置の読み飛ばし、入れ子、読めないもの)、`doc`・`docsrs` の畳み方、feature の書き方と 3 値の評価、re-export・`impl`・enum からの継承、条件の無い item
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

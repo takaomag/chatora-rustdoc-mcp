@@ -98,6 +98,9 @@ pub struct ExternalGlob {
 pub struct PathIndex {
     /// The public paths of each item, the canonical one first.
     paths_of: HashMap<Id, Box<[PublicPath]>>,
+    /// The modules and `use` items that the canonical path of each item goes through, whose
+    /// `cfg` the item has, too (requirement R-FT-2). The root module is left out.
+    canonical_via: HashMap<Id, Box<[Id]>>,
     /// The items at each public path, by the path joined with `::`.
     by_public_path: HashMap<Box<str>, Box<[Id]>>,
     /// The items of this crate at each definition path.
@@ -157,15 +160,20 @@ impl PathIndex {
             visits: HashMap::new(),
             incomplete: false,
         };
-        walker.record(krate.root, vec![crate_name]);
-        walker.visit_module(krate.root, &[crate_name], 0);
+        walker.record(krate.root, vec![crate_name], &[]);
+        walker.visit_module(krate.root, &Place::root(crate_name), 0);
 
+        let mut canonical_via = HashMap::new();
         let paths_of: HashMap<Id, Box<[PublicPath]>> = walker
             .paths
             .into_iter()
             .map(|(id, paths)| {
                 let name = krate.index.get(&id).and_then(|item| item.name.as_deref());
-                (id, canonical_first(paths, name))
+                let (paths, via) = canonical_first(paths, name);
+                if !via.is_empty() {
+                    canonical_via.insert(id, via);
+                }
+                (id, paths)
             })
             .collect();
         let by_public_path = group(
@@ -204,6 +212,7 @@ impl PathIndex {
             .collect();
         Self {
             paths_of,
+            canonical_via,
             by_public_path,
             by_definition_path,
             external_reexports,
@@ -230,6 +239,15 @@ impl ArchivedPathIndex {
             .iter()
             .map(PublicPath::from_archived)
             .collect()
+    }
+
+    /// The modules and `use` items that the canonical path of `id` goes through, from the root
+    /// down, without the root module and `id` itself.
+    #[must_use]
+    pub fn canonical_via(&self, id: Id) -> Vec<Id> {
+        self.canonical_via
+            .get(&view::archived_id(id))
+            .map_or_else(Vec::new, |via| via.iter().map(view::native).collect())
     }
 
     fn archived_paths(&self, id: Id) -> &[ArchivedPublicPath] {
@@ -367,7 +385,8 @@ impl PublicPath {
 /// Walks the modules and re-exports of a crate, with paths that borrow names from it.
 struct Walker<'a> {
     krate: &'a Crate,
-    paths: HashMap<Id, Vec<Vec<&'a str>>>,
+    /// The paths of each item, with the modules and `use` items that each goes through.
+    paths: HashMap<Id, Vec<Place<'a>>>,
     external_reexports: Vec<(Vec<&'a str>, Id)>,
     external_globs: Vec<(Vec<&'a str>, &'a str)>,
     /// The modules being walked, to stop at a cycle.
@@ -378,12 +397,39 @@ struct Walker<'a> {
     incomplete: bool,
 }
 
-impl<'a> Walker<'a> {
-    fn record(&mut self, id: Id, path: Vec<&'a str>) {
-        self.paths.entry(id).or_default().push(path);
+/// Where the walk is: the path so far, and the modules and `use` items it went through.
+#[derive(Clone)]
+struct Place<'a> {
+    path: Vec<&'a str>,
+    via: Vec<Id>,
+}
+
+impl<'a> Place<'a> {
+    fn root(crate_name: &'a str) -> Self {
+        Self {
+            path: vec![crate_name],
+            via: Vec::new(),
+        }
     }
 
-    fn visit_module(&mut self, module: Id, prefix: &[&'a str], depth: usize) {
+    /// The place one step further, at `name` (if any) through `through`.
+    fn then(&self, name: Option<&'a str>, through: &[Id]) -> Self {
+        let mut next = self.clone();
+        next.path.extend(name);
+        next.via.extend_from_slice(through);
+        next
+    }
+}
+
+impl<'a> Walker<'a> {
+    fn record(&mut self, id: Id, path: Vec<&'a str>, via: &[Id]) {
+        self.paths.entry(id).or_default().push(Place {
+            path,
+            via: via.to_vec(),
+        });
+    }
+
+    fn visit_module(&mut self, module: Id, place: &Place<'a>, depth: usize) {
         if depth > MAX_DEPTH || self.on_stack.contains(&module) {
             return;
         }
@@ -400,13 +446,13 @@ impl<'a> Walker<'a> {
         }) = self.krate.index.get(&module)
         {
             for &member in &contents.items {
-                self.visit_member(member, prefix, depth);
+                self.visit_member(member, place, depth);
             }
         }
         self.on_stack.remove(&module);
     }
 
-    fn visit_member(&mut self, id: Id, prefix: &[&'a str], depth: usize) {
+    fn visit_member(&mut self, id: Id, place: &Place<'a>, depth: usize) {
         let Some(item) = self.krate.index.get(&id) else {
             return;
         };
@@ -416,16 +462,17 @@ impl<'a> Walker<'a> {
             return;
         }
         match &item.inner {
-            ItemEnum::Use(reexport) => self.visit_use(reexport, prefix, depth),
+            ItemEnum::Use(reexport) => self.visit_use(id, reexport, place, depth),
             // A stripped module is not public API. Items re-exported from it are reached through
             // their `use`.
             ItemEnum::Module(contents) if contents.is_stripped => {},
             ItemEnum::Module(_) => {
-                let Some(path) = item.name.as_deref().map(|name| extended(prefix, name)) else {
+                let Some(name) = item.name.as_deref() else {
                     return;
                 };
-                self.visit_module(id, &path, depth.saturating_add(1));
-                self.record(id, path);
+                let inside = place.then(Some(name), &[id]);
+                self.visit_module(id, &inside, depth.saturating_add(1));
+                self.record(id, extended(&place.path, name), &place.via);
             },
             ItemEnum::ExternCrate { .. }
             | ItemEnum::Union(_)
@@ -442,7 +489,7 @@ impl<'a> Walker<'a> {
             | ItemEnum::ProcMacro(_)
             | ItemEnum::Primitive(_) => {
                 if let Some(name) = item.name.as_deref() {
-                    self.record(id, extended(prefix, name));
+                    self.record(id, extended(&place.path, name), &place.via);
                 }
             },
             // These belong to another item and are found through it (`find_member`).
@@ -454,7 +501,7 @@ impl<'a> Walker<'a> {
         }
     }
 
-    fn visit_use(&mut self, reexport: &'a Use, prefix: &[&'a str], depth: usize) {
+    fn visit_use(&mut self, use_id: Id, reexport: &'a Use, place: &Place<'a>, depth: usize) {
         // A re-export of a primitive type has no id (R-PR-3 step 1, in M1).
         let Some(target) = reexport.id else {
             return;
@@ -467,19 +514,21 @@ impl<'a> Walker<'a> {
             // The item is in another crate.
             if reexport.is_glob {
                 self.external_globs
-                    .push((prefix.to_vec(), &reexport.source));
+                    .push((place.path.clone(), &reexport.source));
             } else {
                 self.external_reexports
-                    .push((extended(prefix, &reexport.name), target));
+                    .push((extended(&place.path, &reexport.name), target));
             }
             return;
         };
         if reexport.is_glob {
             match &item.inner {
                 ItemEnum::Module(_) => {
-                    self.visit_module(target, prefix, depth.saturating_add(1));
+                    let inside = place.then(None, &[use_id, target]);
+                    self.visit_module(target, &inside, depth.saturating_add(1));
                 },
                 ItemEnum::Enum(contents) => {
+                    let via = place.then(None, &[use_id, target]).via;
                     for &variant in &contents.variants {
                         if let Some(name) = self
                             .krate
@@ -487,7 +536,7 @@ impl<'a> Walker<'a> {
                             .get(&variant)
                             .and_then(|variant| variant.name.as_deref())
                         {
-                            self.record(variant, extended(prefix, name));
+                            self.record(variant, extended(&place.path, name), &via);
                         }
                     }
                 },
@@ -514,11 +563,12 @@ impl<'a> Walker<'a> {
             }
             return;
         }
-        let path = extended(prefix, &reexport.name);
+        let through = place.then(Some(&reexport.name), &[use_id]);
         if matches!(item.inner, ItemEnum::Module(_)) {
-            self.visit_module(target, &path, depth.saturating_add(1));
+            let inside = through.then(None, &[target]);
+            self.visit_module(target, &inside, depth.saturating_add(1));
         }
-        self.record(target, path);
+        self.record(target, through.path, &through.via);
     }
 }
 
@@ -531,17 +581,29 @@ fn extended<'a>(prefix: &[&'a str], name: &'a str) -> Vec<&'a str> {
 }
 
 /// The paths of an item without duplicates, the canonical one first (requirement R-PR-2): paths
-/// that do not rename the item, then shorter paths, then in lexicographic order.
-fn canonical_first(paths: Vec<Vec<&str>>, name: Option<&str>) -> Box<[PublicPath]> {
+/// that do not rename the item, then shorter paths, then in lexicographic order. Also returns
+/// what the canonical path goes through, the first way that it was reached.
+fn canonical_first(paths: Vec<Place<'_>>, name: Option<&str>) -> (Box<[PublicPath]>, Box<[Id]>) {
     let renames = |path: &[&str]| path.last().copied() != name;
     let mut paths = paths;
+    // Stable, so that equal paths stay in the order they were reached.
     paths.sort_by(|a, b| {
-        (renames(a), a.len())
-            .cmp(&(renames(b), b.len()))
-            .then_with(|| a.cmp(b))
+        (renames(&a.path), a.path.len())
+            .cmp(&(renames(&b.path), b.path.len()))
+            .then_with(|| a.path.cmp(&b.path))
     });
-    paths.dedup();
-    paths.iter().map(|path| PublicPath::new(path)).collect()
+    paths.dedup_by(|a, b| a.path == b.path);
+    let via = paths
+        .first()
+        .map(|place| place.via.clone().into_boxed_slice())
+        .unwrap_or_default();
+    (
+        paths
+            .iter()
+            .map(|place| PublicPath::new(&place.path))
+            .collect(),
+        via,
+    )
 }
 
 /// Groups ids by key, with the ids of each key in a fixed order (requirement R-OUT-4).

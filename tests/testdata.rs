@@ -23,6 +23,7 @@ use chatora_rustdoc_mcp::{
     },
     query::{
         across::Indexed,
+        cfg::{Cfg, CfgAttribute},
         get_item::{Detail, ItemRequest, Origin, ResolvedFrom, get_item},
         path_index::Resolution,
         view::CrateView,
@@ -170,6 +171,26 @@ fn every_supported_format_is_parsed_into_the_latest_types() {
                 "{what}: attributes with a variant left as strings"
             );
         }
+        // Every condition of compilation is read (requirement R-FT-2).
+        let mut read = 0_usize;
+        let mut unreadable = Vec::new();
+        for attr in krate.index.values().flat_map(|item| &item.attrs) {
+            let rustdoc_types::Attribute::Other(text) = attr else {
+                continue;
+            };
+            match Cfg::of_attribute(text) {
+                Some(CfgAttribute::Cfg(..)) => read = read.saturating_add(1),
+                Some(CfgAttribute::Unreadable) => unreadable.push(text.as_str()),
+                None => {},
+            }
+        }
+        assert!(
+            unreadable.is_empty(),
+            "{what}: {} conditions could not be read, as {:?}",
+            unreadable.len(),
+            unreadable.first()
+        );
+        eprintln!("{what}: {read} conditions of compilation read");
         // Formats before 57 have no path for external crates; it reads as an empty path.
         let empty_paths = krate
             .external_crates

@@ -15,6 +15,8 @@ expression: response
     "path": "tokio::select",
     "kind": "macro",
     "signature": "macro_rules! select {\n    {\n        $(\n            biased;\n        )?\n        $(\n            $bind:pat = $fut:expr $(, if $cond:expr)? => $handler:expr,\n        )*\n        $(\n            else => $els:expr $(,)?\n        )?\n    } => { ... };\n}",
+    "required_features": "macros",
+    "cfg_source": "doc_cfg",
     "docs": "Waits on multiple concurrent branches, returning when the **first** branch\ncompletes, cancelling the remaining branches.",
     "docs_truncated": true,
     "sections": [

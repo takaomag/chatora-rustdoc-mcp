@@ -17,6 +17,8 @@ expression: response
     "parent": "tokio::time::error::Elapsed",
     "impl": "impl<T> From<T> for tokio::time::error::Elapsed",
     "signature": "fn from(t: T) -> T",
+    "required_features": "time",
+    "cfg_source": "inherited",
     "docs": "Returns the argument unchanged."
   }
 }

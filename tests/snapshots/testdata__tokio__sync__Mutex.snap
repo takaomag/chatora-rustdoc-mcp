@@ -18,6 +18,8 @@ expression: response
     "fields": [
       "/* private fields */"
     ],
+    "required_features": "sync",
+    "cfg_source": "inherited",
     "docs": "An asynchronous `Mutex`-like type.",
     "docs_truncated": true,
     "sections": [

@@ -19,6 +19,8 @@ expression: response
       "CurrentThread",
       "MultiThread"
     ],
+    "required_features": "rt",
+    "cfg_source": "inherited",
     "docs": "The flavor of a `Runtime`.",
     "docs_truncated": true,
     "non_exhaustive": true,

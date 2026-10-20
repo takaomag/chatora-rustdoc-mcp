@@ -17,7 +17,7 @@ const MAX_CRATES: usize = 4;
 
 /// The version of the schema of [`Indexed`] in an archive (requirement R-CA-2). Change it with the
 /// types that it holds, other than those of rustdoc-types, whose format version is in the header.
-pub const ARCHIVE_SCHEMA: u32 = 1;
+pub const ARCHIVE_SCHEMA: u32 = 2;
 
 /// A parsed crate with its path index, which is archived as one (requirements R-PF-1 and R-PF-2).
 #[derive(Debug, rkyv::Archive, rkyv::Serialize)]
