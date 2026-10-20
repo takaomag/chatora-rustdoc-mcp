@@ -107,6 +107,9 @@ pub struct PathIndex {
     by_definition_path: HashMap<Box<str>, Box<[Id]>>,
     /// Re-exports from other crates, by their public path.
     external_reexports: HashMap<Box<str>, ExternalReexport>,
+    /// The public paths one segment below each public path, in order (requirement R-LS-1):
+    /// those of items and of re-exports from other crates.
+    children: HashMap<Box<str>, Box<[Box<str>]>>,
     /// Glob re-exports from other crates.
     external_globs: Box<[ExternalGlob]>,
     /// Some paths were not followed because a module was reached too many times.
@@ -188,7 +191,7 @@ impl PathIndex {
                 .filter(|(_, summary)| summary.crate_id == 0)
                 .map(|(&id, summary)| (summary.path.join("::").into_boxed_str(), id)),
         );
-        let external_reexports = walker
+        let external_reexports: HashMap<Box<str>, ExternalReexport> = walker
             .external_reexports
             .into_iter()
             .map(|(path, target)| {
@@ -210,9 +213,11 @@ impl PathIndex {
                 source: source.into(),
             })
             .collect();
+        let children = children_of(by_public_path.keys().chain(external_reexports.keys()));
         Self {
             paths_of,
             canonical_via,
+            children,
             by_public_path,
             by_definition_path,
             external_reexports,
@@ -239,6 +244,25 @@ impl ArchivedPathIndex {
             .iter()
             .map(PublicPath::from_archived)
             .collect()
+    }
+
+    /// The public paths one segment below `path` (a module, an enum or a crate root), sorted:
+    /// those of items and of re-exports from other crates (requirement R-LS-1).
+    #[must_use]
+    pub fn children(&self, path: &str) -> Vec<Box<str>> {
+        let Some(key) = normalize(path) else {
+            return Vec::new();
+        };
+        self.children
+            .get(key.as_ref())
+            .map(|children| children.iter().map(|child| Box::from(&**child)).collect())
+            .unwrap_or_default()
+    }
+
+    /// The items at the public path `path`, or the re-export of another crate's item there.
+    #[must_use]
+    pub fn at_public_path(&self, path: &str) -> Option<Resolution> {
+        self.lookup_public(path)
     }
 
     /// The modules and `use` items that the canonical path of `id` goes through, from the root
@@ -604,6 +628,29 @@ fn canonical_first(paths: Vec<Place<'_>>, name: Option<&str>) -> (Box<[PublicPat
             .collect(),
         via,
     )
+}
+
+/// The public paths one segment below each of `paths`, sorted, by the path above them.
+fn children_of<'p>(
+    paths: impl Iterator<Item = &'p Box<str>>,
+) -> HashMap<Box<str>, Box<[Box<str>]>> {
+    let mut children: HashMap<Box<str>, Vec<Box<str>>> = HashMap::new();
+    for path in paths {
+        if let Some((parent, _)) = path.rsplit_once("::") {
+            children
+                .entry(parent.into())
+                .or_default()
+                .push(path.clone());
+        }
+    }
+    children
+        .into_iter()
+        .map(|(parent, mut paths)| {
+            paths.sort_unstable();
+            paths.dedup();
+            (parent, paths.into_boxed_slice())
+        })
+        .collect()
 }
 
 /// Groups ids by key, with the ids of each key in a fixed order (requirement R-OUT-4).

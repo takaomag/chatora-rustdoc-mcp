@@ -51,6 +51,12 @@ impl<'a> CrateView<'a> {
         native(&self.archived.parsed.krate.root)
     }
 
+    /// What the data was made from (the SHA-256 of the JSON), or empty when not known.
+    #[must_use]
+    pub fn source_digest(&self) -> &'a str {
+        &self.archived.source
+    }
+
     /// The version of the crate, if the JSON has one.
     #[must_use]
     pub fn crate_version(&self) -> Option<&'a str> {
@@ -160,6 +166,7 @@ pub(super) mod tests {
                 krate,
                 newer_than_supported: false,
             },
+            source: "ab".repeat(32).into(),
         };
         rkyv::to_bytes::<rancor::Error>(&indexed).expect("archived")
     }

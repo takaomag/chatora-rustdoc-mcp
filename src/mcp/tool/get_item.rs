@@ -51,6 +51,7 @@ use crate::{
             ResolvedFrom,
             get_item,
         },
+        list_module::{ListOptions, list_module},
         load,
         view::CrateView,
     },
@@ -103,8 +104,64 @@ pub(super) struct Arguments {
     path: Box<str>,
     /// The target asked for.
     target: Option<TargetTriple>,
-    /// How much to show.
-    detail: Detail,
+    /// How much to show, and for `list_module`, of what.
+    shape: Shape,
+}
+
+/// What a lookup returns of the item at the path: the item (`get_item`), or the items of the
+/// module (`list_module`), and how much of each.
+#[derive(Debug, Clone)]
+pub(super) struct Shape {
+    pub(super) detail: Detail,
+    /// For `list_module`, how to list the module.
+    pub(super) listing: Option<Box<Listing>>,
+}
+
+/// How `list_module` lists a module (requirements R-LS-1, R-LS-2 and R-OUT-3).
+#[derive(Debug, Clone)]
+pub(super) struct Listing {
+    pub(super) recursive: bool,
+    pub(super) depth: usize,
+    pub(super) kinds: Box<[&'static str]>,
+    pub(super) limit: usize,
+    pub(super) offset: usize,
+    /// The digest of the arguments but `cursor` and `limit`, which cursors carry.
+    pub(super) request_digest: Box<str>,
+    /// The digest of the data that the cursor was made for, when there is a cursor.
+    pub(super) cursor_data: Option<Box<str>>,
+}
+
+impl Arguments {
+    /// The path, for the tests of the tools that make arguments.
+    #[cfg(test)]
+    pub(super) fn path_for_test(&self) -> Box<str> {
+        self.path.clone()
+    }
+
+    /// The arguments of `list_module`: those that name a release, the module's path (the
+    /// crate root if `None`), and how to list it.
+    pub(super) fn for_listing(
+        release: ReleaseArguments,
+        path: Option<&str>,
+        detail: Detail,
+        listing: Listing,
+    ) -> Self {
+        let path = path.map_or_else(
+            || release.name.as_str().replace('-', "_").into(),
+            |path| with_crate_name(&release.name, path.trim_start_matches("::")),
+        );
+        Self {
+            name: release.name,
+            version: release.version,
+            project: release.project,
+            path,
+            target: release.target,
+            shape: Shape {
+                detail,
+                listing: Some(Box::new(listing)),
+            },
+        }
+    }
 }
 
 /// What is looked up, once the version and the target are decided.
@@ -119,7 +176,7 @@ struct Request {
     path: Box<str>,
     resolved_from: ResolvedFrom,
     target: TargetTriple,
-    detail: Detail,
+    shape: Shape,
     /// The sha256 of the `.crate` in the crates.io index, when the index was read.
     checksum: Option<Box<str>>,
     /// How docs.rs built it, once its `.crate` is read (requirement R-FT-1).
@@ -229,44 +286,7 @@ fn output_schema() -> JsonObject {
     object(json!({
         "type": "object",
         "properties": {
-            "provenance": {
-                "type": "object",
-                "properties": {
-                    "source": { "type": "string", "enum": ["docs.rs", "std"] },
-                    "crate": { "type": "string" },
-                    "version": { "type": "string" },
-                    "resolved_from": {
-                        "type": "string",
-                        "enum": [
-                            "explicit",
-                            "explicit_req",
-                            "latest",
-                            "cargo_lock",
-                            "cargo_lock_raw",
-                            "reexport",
-                        ],
-                    },
-                    "project_from": {
-                        "type": "string",
-                        "enum": ["argument", "CLAUDE_PROJECT_DIR", "cwd"],
-                    },
-                    "toolchain": { "type": "string" },
-                    "std_from": {
-                        "type": "object",
-                        "properties": {
-                            "source": { "type": "string", "enum": ["dist", "local"] },
-                            "reason": { "type": "string" },
-                        },
-                        "required": ["source", "reason"],
-                    },
-                    "target": { "type": "string" },
-                    "format_version": { "type": "integer" },
-                    "features": strings,
-                    "all_features": { "type": "boolean" },
-                    "cfg": strings,
-                },
-                "required": ["source", "crate", "version", "target"],
-            },
+            "provenance": provenance_schema(),
             "warnings": strings,
             "data": data_schema(),
             "hints": strings,
@@ -275,13 +295,63 @@ fn output_schema() -> JsonObject {
     }))
 }
 
-/// The schema of `data`: `ItemData` in `query::get_item`.
-fn data_schema() -> Value {
+/// The schema of `provenance`: `Provenance` in `query::get_item`.
+pub(super) fn provenance_schema() -> Value {
     let strings = json!({ "type": "array", "items": { "type": "string" } });
     json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string", "description": "The canonical path." },
+            "source": { "type": "string", "enum": ["docs.rs", "std"] },
+            "crate": { "type": "string" },
+            "version": { "type": "string" },
+            "resolved_from": {
+                "type": "string",
+                "enum": [
+                    "explicit",
+                    "explicit_req",
+                    "latest",
+                    "cargo_lock",
+                    "cargo_lock_raw",
+                    "reexport",
+                ],
+            },
+            "project_from": {
+                "type": "string",
+                "enum": ["argument", "CLAUDE_PROJECT_DIR", "cwd"],
+            },
+            "toolchain": { "type": "string" },
+            "std_from": {
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "enum": ["dist", "local"] },
+                    "reason": { "type": "string" },
+                },
+                "required": ["source", "reason"],
+            },
+            "target": { "type": "string" },
+            "format_version": { "type": "integer" },
+            "features": strings,
+            "all_features": { "type": "boolean" },
+            "cfg": strings,
+        },
+        "required": ["source", "crate", "version", "target"],
+    })
+}
+
+/// The schema of `data`: `ItemData` in `query::get_item`.
+pub(super) fn data_schema() -> Value {
+    let strings = json!({ "type": "array", "items": { "type": "string" } });
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "The canonical path, or in a list the path it is listed at.",
+            },
+            "canonical": {
+                "type": "string",
+                "description": "In a list, the canonical path of an item listed at another.",
+            },
             "kind": { "type": "string" },
             "parent": { "type": "string" },
             "impl": { "type": "string" },
@@ -507,7 +577,10 @@ pub(super) fn parse_arguments(
         project,
         path,
         target,
-        detail,
+        shape: Shape {
+            detail,
+            listing: None,
+        },
     })
 }
 
@@ -528,7 +601,7 @@ async fn resolve(
         version,
         project,
         path,
-        detail,
+        shape,
         ..
     } = arguments;
     // Without a version, the project decides it (requirement R-VR-2), or else it is the latest.
@@ -575,7 +648,7 @@ async fn resolve(
             project_from: None,
             resolved_from: ResolvedFrom::Explicit,
             target,
-            detail,
+            shape,
             checksum: None,
             build: None,
             in_build: InBuild::default(),
@@ -619,7 +692,7 @@ async fn resolve(
         path,
         resolved_from,
         target,
-        detail,
+        shape,
     };
     Ok((request, warnings))
 }
@@ -947,7 +1020,7 @@ async fn follow(
                 project: None,
                 path: destination.path.clone(),
                 target: Some(origin.target.clone()),
-                detail: origin.detail,
+                shape: origin.shape.clone(),
             };
             Box::pin(execute_std(arguments, krate, Arc::clone(state), followed)).await
         },
@@ -1085,7 +1158,7 @@ async fn destination_request(
         path: destination.path.clone(),
         resolved_from,
         target: origin.target.clone(),
-        detail: origin.detail,
+        shape: origin.shape.clone(),
         checksum: None,
         build: None,
         in_build: InBuild::default(),
@@ -1134,7 +1207,7 @@ async fn in_project_build(
         path: destination.path.clone(),
         resolved_from: origin.resolved_from,
         target: origin.target.clone(),
-        detail: origin.detail,
+        shape: origin.shape.clone(),
         checksum: package.checksum.clone(),
         build: None,
         in_build: InBuild {
@@ -1363,7 +1436,7 @@ async fn execute_std(
         path: with_lib_name(krate.as_str(), &arguments.path),
         resolved_from: ResolvedFrom::Latest,
         target,
-        detail: arguments.detail,
+        shape: arguments.shape,
         checksum: None,
         build: None,
         in_build: InBuild::default(),
@@ -1472,7 +1545,7 @@ fn look_up_std(
         .and_then(|version| Version::parse(version).ok())
         .unwrap_or_else(|| request.version.clone());
     let toolchain = chosen.json.toolchain();
-    let looked_up = get_item(&view, ItemRequest {
+    let item_request = ItemRequest {
         name: &name,
         version: &version,
         path: &followed.path,
@@ -1483,12 +1556,11 @@ fn look_up_std(
             project_release,
         },
         target: Some(request.target.as_str()),
-        detail: request.detail,
+        detail: request.shape.detail,
         project_features: None,
         follow: false,
-    })
-    .map_err(Failure::Item)
-    .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize));
+    };
+    let looked_up = respond_in(&view, item_request, request.shape.listing.as_deref());
     (looked_up, followed.through)
 }
 
@@ -1683,7 +1755,7 @@ enum Failure {
 /// borrows from are still there.
 fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Request) -> Result<Value, Failure> {
     let view = CrateView::new(mapped.get());
-    get_item(&view, ItemRequest {
+    let item_request = ItemRequest {
         name: &arguments.name,
         version: &arguments.version,
         path: &arguments.path,
@@ -1693,14 +1765,38 @@ fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Request) -> Result<Value, Fa
             build: arguments.build.as_deref(),
         },
         target: Some(arguments.target.as_str()),
-        detail: arguments.detail,
+        detail: arguments.shape.detail,
         project_features: arguments
             .in_build
             .features(arguments.name.as_str(), &arguments.version),
         follow: arguments.hops < MAX_FOLLOWED,
+    };
+    respond_in(&view, item_request, arguments.shape.listing.as_deref())
+}
+
+/// Looks the item up in `view`, or with `listing` lists the module, and serializes the response
+/// while the items it borrows from are still there.
+fn respond_in(
+    view: &CrateView<'_>,
+    request: ItemRequest<'_>,
+    listing: Option<&Listing>,
+) -> Result<Value, Failure> {
+    let Some(listing) = listing else {
+        let response = get_item(view, request).map_err(Failure::Item)?;
+        return serde_json::to_value(&response).map_err(Failure::Serialize);
+    };
+    let kinds: Vec<&str> = listing.kinds.to_vec();
+    let response = list_module(view, request, ListOptions {
+        recursive: listing.recursive,
+        depth: listing.depth,
+        kinds: &kinds,
+        limit: listing.limit,
+        offset: listing.offset,
+        cursor_request: &listing.request_digest,
+        cursor_data: listing.cursor_data.as_deref(),
     })
-    .map_err(Failure::Item)
-    .and_then(|response| serde_json::to_value(&response).map_err(Failure::Serialize))
+    .map_err(Failure::Item)?;
+    serde_json::to_value(&response).map_err(Failure::Serialize)
 }
 
 /// `name@version` of the request.
@@ -1887,6 +1983,18 @@ fn item_error(arguments: &Request, error: &GetItemError) -> CallToolResult {
             "retryable": false,
             "suggestions": [format!("call get_item with the path {}", destination.path)],
         })),
+        GetItemError::NotAModule { kind } => error_result(&json!({
+            "code": "invalid_argument",
+            "message": format!("{release} has a {kind}, not a module, at {}", arguments.path),
+            "retryable": false,
+            "suggestions": [format!("call get_item with the path {}", arguments.path)],
+        })),
+        GetItemError::BadCursor(why) => error_result(&json!({
+            "code": "invalid_argument",
+            "message": format!("the cursor does not fit: {why}"),
+            "retryable": false,
+            "suggestions": ["call list_module again without cursor"],
+        })),
         GetItemError::Ambiguous { candidates } => error_result(&json!({
             "code": "ambiguous_path",
             "message": format!("{release} has more than one item at {}", arguments.path),
@@ -2012,7 +2120,7 @@ mod tests {
 
     #[test]
     fn detail_is_normal_unless_asked() {
-        let detail = |value: Value| arguments(value).map(|arguments| arguments.detail);
+        let detail = |value: Value| arguments(value).map(|arguments| arguments.shape.detail);
         assert_eq!(
             detail(json!({ "crate": "tokio", "path": "spawn" })).ok(),
             Some(Detail::Normal)
@@ -2036,7 +2144,10 @@ mod tests {
             path: "tokio::x".into(),
             resolved_from: ResolvedFrom::Explicit,
             target: "x86_64-unknown-linux-gnu".parse().expect("a triple"),
-            detail: Detail::Normal,
+            shape: Shape {
+                detail: Detail::Normal,
+                listing: None,
+            },
             checksum: None,
             build: None,
             in_build: InBuild::default(),
@@ -2095,6 +2206,7 @@ mod tests {
             warnings: Box::from(["x".into()]),
             data: ItemData {
                 path: "x".into(),
+                canonical: some(),
                 kind: "struct",
                 parent: some(),
                 impl_header: some(),

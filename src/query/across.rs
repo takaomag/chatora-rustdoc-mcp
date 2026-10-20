@@ -17,7 +17,7 @@ const MAX_CRATES: usize = 4;
 
 /// The version of the schema of [`Indexed`] in an archive (requirement R-CA-2). Change it with the
 /// types that it holds, other than those of rustdoc-types, whose format version is in the header.
-pub const ARCHIVE_SCHEMA: u32 = 2;
+pub const ARCHIVE_SCHEMA: u32 = 3;
 
 /// A parsed crate with its path index, which is archived as one (requirements R-PF-1 and R-PF-2).
 #[derive(Debug, rkyv::Archive, rkyv::Serialize)]
@@ -26,6 +26,9 @@ pub struct Indexed {
     pub parsed: ParsedCrate,
     /// Its public paths.
     pub index: PathIndex,
+    /// What the data was made from: the SHA-256 of the JSON, or another key of 64 hex digits
+    /// that changes with it. Empty when not known. Cursors are bound to it (requirement R-OUT-3).
+    pub source: Box<str>,
 }
 
 impl Indexed {
@@ -33,7 +36,18 @@ impl Indexed {
     #[must_use]
     pub fn new(parsed: ParsedCrate) -> Self {
         let index = PathIndex::build(&parsed.krate);
-        Self { parsed, index }
+        Self {
+            parsed,
+            index,
+            source: Box::default(),
+        }
+    }
+
+    /// The same, made from the data that `source` identifies.
+    #[must_use]
+    pub fn with_source(mut self, source: &str) -> Self {
+        self.source = source.into();
+        self
     }
 }
 

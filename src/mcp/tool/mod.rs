@@ -4,6 +4,7 @@
 //! checking, and `execute()`.
 
 mod get_item;
+mod list_module;
 mod project;
 mod resolve_version;
 #[cfg(debug_assertions)]
@@ -75,6 +76,7 @@ impl std::fmt::Display for ErrorChain<'_> {
 pub(super) fn definitions() -> Vec<Tool> {
     vec![
         get_item::definition(),
+        list_module::definition(),
         resolve_version::definition(),
         // A tool for testing progress and cancellation, only in debug builds.
         #[cfg(debug_assertions)]
@@ -96,6 +98,12 @@ pub(super) async fn call(
     match request.name.as_ref() {
         get_item::NAME => match get_item::parse_arguments(request.arguments.as_ref()) {
             Ok(arguments) => Ok(run_tool(get_item::execute(arguments, Arc::clone(state)))
+                .await
+                .into()),
+            Err(error) => Ok(error.into_result().into()),
+        },
+        list_module::NAME => match list_module::parse_arguments(request.arguments.as_ref()) {
+            Ok(arguments) => Ok(run_tool(list_module::execute(arguments, Arc::clone(state)))
                 .await
                 .into()),
             Err(error) => Ok(error.into_result().into()),

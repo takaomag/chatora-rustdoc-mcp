@@ -581,6 +581,21 @@ M1 の終わりに要件へ反映するもの (C1 の分): `detail` の各段の
 - 実データ (§3 Q2): `axum@latest` は 0.8.9 (MSRV 1.80)、このリポジトリの `tokio` は Cargo.lock の 1.53.3 で latest は 1.54.0、この crate 自身は `path` で `not_on_docs_rs`、`serde@1.0.200` は `no_json` (2025-05-23 より前)、mac 向けの `tokio@1.53.3` は `no_target_json`、`windows-sys` は 2 版で `ambiguous_version`
 - テスト: 引数の解析、outputSchema が応答を覆うこと、説明文の長さ、stdio で std と誤った引数がネットワークなしにエラーになること、`tools/list` の一覧
 
+#### C3a (2026-10-20)
+
+C3 を 2 つに分けた: C3a (`list_module` と一覧の共通の仕組み)、C3b (`crate_overview`)。利用者が決めた (推奨案): カーソルはオフセットにし、束縛を付ける (R-OUT-3 の「M1 で決める」)。
+
+- カーソル: `c1.<要求のダイジェスト>.<データのダイジェスト>.<位置>`。要求のダイジェストは `cursor` と `limit` を除いた引数 (キーの順によらない) の SHA-256 の先頭 16 文字で、他の crate へたどった後も同じカーソルが通る。データのダイジェストは元の JSON の SHA-256 (std は鍵) の先頭 16 文字で、アーカイブに持たせた (`Indexed::source`)。食い違い・形の誤り・終わりを越えた位置は、理由付きの `invalid_argument` で最初から取り直させる。並びは決定的でデータは版ごとに固定なので、オフセットで飛びや重複は起きない。サーバーは状態を持たない
+- `list_module` (R-LS-1・R-LS-2): 引数は `get_item` の版を名指すもの (`crate`・`version`・`project`・`target`) と `path` (省けば crate のルート)・`recursive`・`depth` (既定 3、最大 8)・`kind` (1 つか配列。`get_item` の kind の語)・`detail`・`limit` (既定 50、最大 200)・`cursor`
+  - 子の列挙: 公開パス索引に「公開パス → 1 段下の公開パス (整列済み)」の表を足した (アーカイブのスキーマを 3 に上げた)。他の crate からの re-export も子として並べ、`reexport_of` を付ける。一覧のパスと正準パスが違う item (re-export) には `canonical` を付ける。並びはパスの辞書順で、`recursive` ではモジュールの直後にその中身が来る。同じモジュールは 1 度だけ (re-export の循環に備えて)。kind の絞り込みは切る前に行い、`total` は絞り込んだ後の件数 (R-OUT-4)
+  - 各項目は `get_item` の `ItemData` を使い回す。`brief` は 1 行のシグネチャと cfg の注記 (R-FT-2) と `enabled_in_project`。`normal` は where 句・ドキュメントの第 1 段落・deprecated なども (fields・variants・節・定義位置は除く)。`full` は各 item を `get_item` の既定の段で。モジュール自身のドキュメントの第 1 段落は `normal` 以上で返す
+  - `detail` の既定は `brief` にした (R-OUT-7 の既定は `normal` だが、一覧は件数が多く、R-LS-1 の骨格も `brief` との組み合わせを想定している。M1 の終わりに要件へ反映する)
+  - 予算 (32,000 文字) を超えるページは、件数を減らして収め、続きをカーソルで示す (tokio の全体を `recursive` で引くと、`brief` で 150 件・約 25,000 文字、`normal` で 112 件・約 30,000 文字のページになった)
+  - モジュールでない item を指したら `invalid_argument` (kind を添えて `get_item` を案内)。他の crate のモジュール (`reqwest::header`) は `get_item` と同じ仕組みでたどって一覧する (照会の流れに「何を返すか」(`Shape`) を持たせ、`get_item` と `list_module` で共有した)。std も同じ
+- std の re-export の `reexport_of` で「版が分からない」と warnings に出ていたのをやめた (std の仲間は toolchain の版なので、crate 名だけにする)。「他の crate の item がこのデータに無い」の warnings にパスを入れた
+- 実データ (§3 Q6): `axum::routing` は 31 件 (`Router` は `canonical: axum::Router`)、`reqwest::header` は http 1.5.0 の `http::header` を 104 件、tokio のモジュールにはそれぞれ必要な feature (`fs`・`rt`・`sync` など)、`std::collections` は alloc・core の re-export に `reexport_of`。カーソルで次のページが取れる
+- テスト: 子の並びと re-export、`recursive` と kind の絞り込み、ページとカーソル (データの食い違い、終わりの先)、モジュールでない item、引数の誤り、要求のダイジェストがキーの順によらないこと、stdio で合成の crate を一覧すること
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

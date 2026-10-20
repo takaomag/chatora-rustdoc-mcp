@@ -69,7 +69,7 @@ pub fn archive_json(cache: &Cache, dir: &Path, json: &[u8]) -> Result<Mapped<Ind
     let parsed = rustdoc_json::parse(json)?;
     let format = parsed.krate.format_version;
     let sha256: Box<str> = cache::sha256_hex(json).into();
-    let indexed = Indexed::new(parsed);
+    let indexed = Indexed::new(parsed).with_source(&sha256);
     let path = archive_path(dir, format, &sha256);
     let header = header(format, sha256);
     match archive::write(cache, &path, &header, &indexed)
@@ -117,7 +117,7 @@ pub fn archive_of(
     let parsed = rustdoc_json::parse(&json)?;
     drop(json);
     let header = header(parsed.krate.format_version, source.into());
-    let indexed = Indexed::new(parsed);
+    let indexed = Indexed::new(parsed).with_source(source);
     match archive::write(cache, &path, &header, &indexed)
         .and_then(|()| Mapped::open(cache, &path, &header))
     {

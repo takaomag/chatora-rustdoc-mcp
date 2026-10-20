@@ -418,9 +418,9 @@ fn tools_list_is_cacheable_and_not_paginated() {
         .collect();
     // `sleep` is only in debug builds.
     let expected: &[&str] = if cfg!(debug_assertions) {
-        &["get_item", "resolve_version", "sleep"]
+        &["get_item", "list_module", "resolve_version", "sleep"]
     } else {
-        &["get_item", "resolve_version"]
+        &["get_item", "list_module", "resolve_version"]
     };
     assert_eq!(names, expected);
     let get_item = &result["tools"][0];
@@ -499,6 +499,39 @@ fn get_item_returns_structured_content_and_tool_errors() {
     );
     // Only an unknown tool is a JSON-RPC error.
     assert_eq!(server.response(4)["error"]["code"], -32602);
+    assert!(server.finish().success());
+}
+
+/// `list_module` lists a module of a cached crate a page at a time (requirements R-LS-1 and
+/// R-OUT-3).
+#[test]
+fn list_module_lists_a_cached_crate() {
+    let mut server = Server::start();
+    server.send(&call_tool(
+        1,
+        "list_module",
+        json!({ "crate": "demo@0.1.0", "target": TARGET }),
+    ));
+    server.send(&call_tool(
+        2,
+        "list_module",
+        json!({ "crate": "demo@0.1.0", "target": TARGET, "cursor": "c1.x.y.0" }),
+    ));
+    let response = server.response(1);
+    let result = &response["result"];
+    assert_eq!(result["isError"], false, "{result}");
+    let content = &result["structuredContent"];
+    assert_eq!(content["data"]["path"], "demo");
+    assert_eq!(
+        content["data"]["items"],
+        json!([{ "path": "demo::hello", "kind": "function", "signature": "pub fn hello() -> u8" }])
+    );
+    assert_eq!(
+        content["page"],
+        json!({ "shown": 1, "total": 1, "has_more": false })
+    );
+    let error = text_json(&server.response(2)["result"]);
+    assert_eq!(error["code"], "invalid_argument", "{error}");
     assert!(server.finish().success());
 }
 

@@ -4,6 +4,7 @@ pub mod across;
 pub mod cfg;
 pub mod docs;
 pub mod get_item;
+pub mod list_module;
 pub mod load;
 pub mod path_index;
 pub mod render;

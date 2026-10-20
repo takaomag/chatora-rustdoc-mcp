@@ -234,8 +234,12 @@ pub enum ResolvedFrom {
     reason = "each is a flag of the JSON that is left out when false"
 )]
 pub struct ItemData<'a> {
-    /// The canonical path; for a member, that of its parent and its name.
+    /// The canonical path; for a member, that of its parent and its name. In a list, the path
+    /// it is listed at.
     pub path: Box<str>,
+    /// In a list, the canonical path, when the item is listed at another (a re-export).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical: Option<Box<str>>,
     /// What the item is, in the words of rustdoc's `ItemKind`, except that a function in an
     /// `impl` or a trait is a `method`.
     pub kind: &'static str,
@@ -395,6 +399,15 @@ pub enum GetItemError {
     /// The path goes on in another crate, through a re-export of its item (requirement R-PR-4).
     #[error("the path goes on in {}", .0.path)]
     Elsewhere(Box<Destination>),
+    /// The path names an item that is not a module, to list (requirement R-LS-1).
+    #[error("the path names a {kind}, not a module")]
+    NotAModule {
+        /// What the item is.
+        kind: &'static str,
+    },
+    /// The cursor is not for this data or goes past its end (requirement R-OUT-3).
+    #[error("{0}")]
+    BadCursor(&'static str),
 }
 
 /// Where a path goes on in another crate (requirement R-PR-4).
@@ -426,14 +439,7 @@ pub fn get_item<'a>(
     request: ItemRequest<'a>,
 ) -> Result<ItemResponse<'a>, GetItemError> {
     let index = view.index();
-    let mut query = Query {
-        request,
-        view,
-        index,
-        renderer: Renderer::new(view),
-        warnings: Vec::new(),
-        hints: Vec::new(),
-    };
+    let mut query = Query::new(view, request);
     let provenance = query.provenance();
     let with_root = with_root_name(view, request.name, request.path);
     let path = with_root.as_deref().unwrap_or(request.path);
@@ -475,18 +481,12 @@ pub fn get_item<'a>(
     let Some(data) = data else {
         return Err(GetItemError::NotFound);
     };
-    let Query {
-        renderer,
-        mut warnings,
-        hints,
-        ..
-    } = query;
-    warnings.extend(renderer.into_warnings());
+    let Notes { warnings, hints } = query.finish();
     let mut response = ItemResponse {
         provenance,
-        warnings: warnings.into(),
+        warnings,
         data,
-        hints: hints.into(),
+        hints,
     };
     fit(&mut response, MAX_RESPONSE_CHARS);
     Ok(response)
@@ -496,7 +496,7 @@ pub fn get_item<'a>(
 /// written as the package `name` and the two differ (`md-5::Md5` is `md5::Md5`). When the lib name
 /// follows the package name (`md_5::md5::Md5`, as a path given without the crate name gets it),
 /// the package name is dropped. `None` when nothing changes.
-fn with_root_name(view: &CrateView<'_>, name: &CrateName, path: &str) -> Option<String> {
+pub(super) fn with_root_name(view: &CrateView<'_>, name: &CrateName, path: &str) -> Option<String> {
     let root = view.item(view.root())?.name.as_deref()?;
     let (head, rest) = path
         .split_once("::")
@@ -594,7 +594,15 @@ const fn list_mut<'b>(data: &'b mut ItemData<'_>, fields: bool) -> &'b mut Box<[
 const MIN_DOCS_CHARS: usize = 200;
 
 /// One lookup, with what it has found to warn about so far.
-struct Query<'a> {
+/// What a query says besides its data.
+pub(super) struct Notes {
+    /// What the caller should know about the data.
+    pub(super) warnings: Box<[Cow<'static, str>]>,
+    /// What to call next.
+    pub(super) hints: Box<[Box<str>]>,
+}
+
+pub(super) struct Query<'a> {
     request: ItemRequest<'a>,
     view: &'a CrateView<'a>,
     index: &'a ArchivedPathIndex,
@@ -604,8 +612,37 @@ struct Query<'a> {
 }
 
 impl<'a> Query<'a> {
+    /// A query of `view` for `request`.
+    pub(super) const fn new(view: &'a CrateView<'a>, request: ItemRequest<'a>) -> Self {
+        Self {
+            request,
+            view,
+            index: view.index(),
+            renderer: Renderer::new(view),
+            warnings: Vec::new(),
+            hints: Vec::new(),
+        }
+    }
+
+    /// The kind of the item `id` of another crate, from its summary.
+    pub(super) fn external_kind(&self, id: Id) -> &'static str {
+        self.view
+            .summary(id)
+            .map_or("unknown", |summary| summary_kind(summary.kind))
+    }
+
+    /// The warnings and the hints of the query, the renderer's warnings last.
+    pub(super) fn finish(self) -> Notes {
+        let mut warnings = self.warnings;
+        warnings.extend(self.renderer.into_warnings());
+        Notes {
+            warnings: warnings.into(),
+            hints: self.hints.into(),
+        }
+    }
+
     /// The provenance, read from the JSON and checked against the request (§7.3).
-    fn provenance(&mut self) -> Provenance<'a> {
+    pub(super) fn provenance(&mut self) -> Provenance<'a> {
         let view = self.view;
         let build = match self.request.origin {
             Origin::DocsRs { build, .. } => build,
@@ -713,7 +750,7 @@ impl<'a> Query<'a> {
 
     /// The item `id`, which belongs to `parent` if it is a member. `None` if it is not in the
     /// crate, which a resolved path should not be.
-    fn item_data(&mut self, id: Id, parent: Option<Id>) -> Option<ItemData<'a>> {
+    pub(super) fn item_data(&mut self, id: Id, parent: Option<Id>) -> Option<ItemData<'a>> {
         let item = self.view.item(id)?;
         let name = item.name.as_deref().unwrap_or("_");
         let detail = self.request.detail;
@@ -986,7 +1023,7 @@ impl<'a> Query<'a> {
 
     /// The canonical path of `id`, or its definition path with a warning if it has no public
     /// path.
-    fn path_of(&mut self, id: Id) -> Box<str> {
+    pub(super) fn path_of(&mut self, id: Id) -> Box<str> {
         if let Some(path) = self.index.canonical_path(id) {
             return path.joined();
         }
@@ -1123,19 +1160,28 @@ impl<'a> Query<'a> {
 
     /// The crate and definition path of the item that `reexport` re-exports, to look it up
     /// there. `None`, with a warning, when the data does not describe it.
-    fn reexport_target(&mut self, reexport: &ExternalReexport) -> Option<ReexportOf> {
+    pub(super) fn reexport_target(&mut self, reexport: &ExternalReexport) -> Option<ReexportOf> {
         let summary = self.view.summary(reexport.target);
         let external = summary.and_then(|summary| self.view.external_crate(summary.crate_id));
         let (Some(definition), Some(external)) = (&reexport.definition, external) else {
-            self.warnings.push(Cow::Borrowed(
-                "the re-exported item is not described in this crate's data",
-            ));
+            self.warnings.push(Cow::Owned(format!(
+                "the item that {} re-exports from another crate is not described in this \
+                 crate's data",
+                reexport.path
+            )));
             return None;
         };
+        let of_std = external
+            .html_root_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("https://doc.rust-lang.org/"));
         let name: Box<str> = if let Some((name, version)) =
             external.html_root_url.as_deref().and_then(docs_rs_release)
         {
             format!("{name}@{version}").into()
+        } else if of_std {
+            // A crate of std has the version of the toolchain, as `get_item` shows it.
+            external.name.as_str().into()
         } else {
             self.warnings.push(Cow::Owned(format!(
                 "the version of {} that is re-exported is unknown",
@@ -1153,7 +1199,7 @@ impl<'a> Query<'a> {
     /// re-exports another crate's item. `None` when there is none, or the crate is a private
     /// dependency of std (sysroot's `hashbrown`), which is not the crate of crates.io
     /// (requirement R-PR-4).
-    fn destination(&self, path: &str) -> Option<Destination> {
+    pub(super) fn destination(&self, path: &str) -> Option<Destination> {
         let crossing = self.index.crossing(path)?;
         let summary = self.view.summary(crossing.reexport.target)?;
         let external = self.view.external_crate(summary.crate_id)?;
@@ -1304,7 +1350,7 @@ fn boxed(values: Vec<String>) -> Box<[Box<str>]> {
 
 /// The kind of `item`, as rustdoc's `ItemKind` names it, except that a function that belongs to
 /// a type or trait is a `method`.
-const fn kind_of(item: &Item, is_member: bool) -> &'static str {
+pub(super) const fn kind_of(item: &Item, is_member: bool) -> &'static str {
     match &item.inner {
         ItemEnum::Function(_) if is_member => "method",
         ItemEnum::Function(_) => "function",
@@ -1336,7 +1382,7 @@ const fn kind_of(item: &Item, is_member: bool) -> &'static str {
 }
 
 /// The kind of an item of another crate, from its summary in `paths`.
-const fn summary_kind(kind: ItemKind) -> &'static str {
+pub(super) const fn summary_kind(kind: ItemKind) -> &'static str {
     match kind {
         ItemKind::Module => "module",
         ItemKind::ExternCrate => "extern_crate",
@@ -1388,7 +1434,7 @@ fn slash_separated(path: &Path) -> String {
 
 /// The first paragraph of `docs`, and whether anything follows it. A blank line inside a code
 /// block does not end the paragraph.
-fn first_paragraph(docs: &str) -> (&str, bool) {
+pub(super) fn first_paragraph(docs: &str) -> (&str, bool) {
     let docs = docs.trim_start_matches(['\n', '\r']);
     let mut in_code = false;
     let mut end = docs.len();
@@ -1408,7 +1454,7 @@ fn first_paragraph(docs: &str) -> (&str, bool) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::{collections::HashMap, path::PathBuf};
 
     use rustdoc_types::{
@@ -1580,7 +1626,7 @@ mod tests {
     /// #[non_exhaustive] pub enum E { A, B }
     /// pub use other::Thing;
     /// ```
-    fn parsed() -> ParsedCrate {
+    pub(in crate::query) fn parsed() -> ParsedCrate {
         let variant = |id, name| {
             item(
                 id,
