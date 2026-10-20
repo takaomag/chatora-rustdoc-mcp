@@ -18,9 +18,11 @@ use crate::data::{
     archive::{self, Header, Mapped},
     cache::{self, Cache, PathGuard},
     crate_name::CrateName,
+    dist::{Dist, DistError, StdCrate},
     docs_rs::DocsRs,
     flight::{Doing, Flights, Joined, Stage},
     rustdoc_json::{self, ParseError},
+    std_json::{self, Chosen},
     target::TargetTriple,
 };
 
@@ -104,6 +106,89 @@ pub async fn docs_rs_archive(
                 .map_err(Arc::new)
         })
         .await
+}
+
+/// The JSON of std that was chosen for the calls that wanted it at once, or why there is none.
+pub type SharedStd = Result<Arc<Chosen>, Arc<DistError>>;
+
+/// What std's JSON is chosen by, besides the cache and the distribution server.
+#[derive(Debug, Clone)]
+pub struct StdWanted {
+    /// The target asked for.
+    pub target: TargetTriple,
+    /// The host's target, which stands in when the nightly has none for `target`.
+    pub host: TargetTriple,
+    /// The release of the project's toolchain, which the nightly may not be older than.
+    pub at_least: Option<Version>,
+    /// Where rustup runs, out of any project.
+    pub neutral_dir: PathBuf,
+}
+
+/// The JSON of std that [`std_json::choose`] chooses for `wanted`, made ready by work that the
+/// calls for it share (requirements R-STD-6, R-NW-2 and R-WS-6).
+///
+/// The work fetches and unpacks the JSON when it comes from the distribution server, and makes the
+/// archives of std, alloc and core.
+///
+/// A call waits for the work until `until`. The work then goes on, so that a later call finds it
+/// done, and [`Joined::Going`] says what it is doing (requirements R-ARCH-6 and R-OUT-9). An
+/// archive that cannot be made is left to the lookup, which tells why.
+pub async fn std_json(
+    flights: &Flights<SharedStd>,
+    cache: &Cache,
+    dist: &Dist,
+    wanted: StdWanted,
+    until: Instant,
+) -> Joined<SharedStd> {
+    let key = format!(
+        "std:{}:{}",
+        wanted.target,
+        wanted
+            .at_least
+            .as_ref()
+            .map_or_else(String::new, ToString::to_string)
+    );
+    let what = format!("std for {}", wanted.target);
+    let (cache, dist) = (cache.clone(), dist.clone());
+    flights
+        .join(&key, &what, until, async move |stage| {
+            let chosen = std_json::choose(
+                &cache,
+                &dist,
+                &wanted.neutral_dir,
+                &wanted.target,
+                &wanted.host,
+                wanted.at_least.as_ref(),
+            )
+            .await
+            .map_err(Arc::new)?;
+            stage.set(Doing::Indexing);
+            let chosen = Arc::new(chosen);
+            let archiving = Arc::clone(&chosen);
+            // Ended by the end of the server only; the lookup then makes what is missing.
+            drop(crate::task::spawn_blocking(move || archive_std(&cache, &archiving)).await);
+            Ok(chosen)
+        })
+        .await
+}
+
+/// Makes the archives of std, alloc and core from `chosen`, which a path of std mostly goes
+/// through (requirement R-PR-2). A failure is logged; the lookup that needs the crate tells it.
+fn archive_std(cache: &Cache, chosen: &Chosen) {
+    for krate in [StdCrate::Std, StdCrate::Alloc, StdCrate::Core] {
+        let archived = chosen
+            .json
+            .archive_key(cache, krate)
+            .map_err(LoadError::Read)
+            .and_then(|(dir, key)| {
+                archive_of(cache, &dir, krate.as_str(), &key, || {
+                    chosen.json.read(cache, krate)
+                })
+            });
+        if let Err(error) = archived {
+            tracing::warn!(krate = krate.as_str(), %error, "the JSON of std could not be archived");
+        }
+    }
 }
 
 /// A release on docs.rs, whose archive is made in its directory of the cache.
@@ -714,5 +799,61 @@ mod tests {
         );
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         assert!(cache.try_lock(&place).is_some(), "let go when it ended");
+    }
+
+    /// std's JSON is chosen, fetched from the distribution server and archived by work that goes
+    /// on past the deadline of the call that started it, for a later call (requirements R-STD-6,
+    /// R-ARCH-6 and R-WS-6).
+    #[tokio::test]
+    async fn std_is_made_ready_by_work_that_goes_on_past_the_deadline() {
+        use crate::data::{
+            dist::tests::{HASH, archive, linux, setup_after},
+            std_json::StdJson,
+        };
+        let json = |krate: &str| format!("rust-docs-json-preview/share/doc/rust/json/{krate}.json");
+        let (std, core) = (json("std"), json("core"));
+        let archive = archive(&[
+            ("git-commit-hash", HASH.as_bytes()),
+            (&std, JSON),
+            (&core, JSON),
+        ]);
+        let (cache, dist, requests, dir) =
+            setup_after(&archive, None, std::time::Duration::from_millis(300));
+        let flights = Flights::default();
+        let wanted = StdWanted {
+            target: linux(),
+            host: linux(),
+            // No nightly here is as new, so the distribution server gives it.
+            at_least: Some(Version::new(999, 0, 0)),
+            neutral_dir: dir.path().to_owned(),
+        };
+        let soon = Instant::now()
+            .checked_add(std::time::Duration::from_millis(100))
+            .expect("in range");
+        let first = std_json(&flights, &cache, &dist, wanted.clone(), soon).await;
+        assert!(matches!(first, Joined::Going(Doing::Fetching)), "{first:?}");
+        let Joined::Done(Ok(chosen)) = std_json(&flights, &cache, &dist, wanted, later()).await
+        else {
+            panic!("made ready");
+        };
+        assert!(matches!(chosen.json, StdJson::Dist(_)), "{chosen:?}");
+        // Archived by the work: opened without its JSON.
+        let (place, key) = chosen
+            .json
+            .archive_key(&cache, StdCrate::Std)
+            .expect("its key");
+        tokio::task::spawn_blocking(move || {
+            archive_of(&cache, &place, "std", &key, || {
+                panic!("std was not archived by the work")
+            })
+        })
+        .await
+        .expect("no panic")
+        .expect("archived");
+        assert_eq!(
+            requests.try_iter().count(),
+            2,
+            "the manifest and the archive"
+        );
     }
 }

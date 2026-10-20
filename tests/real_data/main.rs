@@ -38,7 +38,8 @@ fn the_check_of_results_finds_what_does_not_match() {
     wrong_type["data"]["path"] = json!(1);
     let mut missing = valid.clone();
     if let Some(provenance) = missing["provenance"].as_object_mut() {
-        provenance.remove("version");
+        // Required even while the version is not known (requirement R-OUT-9).
+        provenance.remove("target");
     }
     let mut not_in_enum = valid;
     not_in_enum["provenance"]["source"] = json!("elsewhere");

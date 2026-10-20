@@ -429,7 +429,7 @@ pub async fn std_docs(
         .join(triple.as_str());
     // Another call that wants the same nightly goes first, and this one then finds it unpacked
     // instead of fetching the archive again (requirement R-NW-2).
-    let _held = cache.lock(&dir).await;
+    let held = cache.lock(&dir).await;
     if let Some(nightly) = read_complete(cache, &dir).await? {
         return Ok(StdDocs {
             dir,
@@ -450,9 +450,16 @@ pub async fn std_docs(
         let (cache, dir) = (cache.clone(), dir.clone());
         let (date, version) = (summary.date.clone(), summary.version.clone());
         let max = dist.settings.extract_max_size;
-        blocking(move || Ok(unpack(&cache, &body, &dir, date, version, triple, max)))
-            .await
-            .map_err(DistError::Cache)?
+        // The lock goes with the unpacking, which goes on to its end even when the task that
+        // waits for it is aborted, so that another call does not unpack it again meanwhile
+        // (requirement R-WS-6).
+        blocking(move || {
+            let unpacked = unpack(&cache, &body, &dir, date, version, triple, max);
+            drop(held);
+            Ok(unpacked)
+        })
+        .await
+        .map_err(DistError::Cache)?
     };
     Ok(StdDocs {
         dir,
@@ -745,16 +752,16 @@ fn archive_file(path: &Path) -> Option<ArchiveFile> {
 
 /// Tests, and an archive and a server for the tests of the modules next to this one.
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use std::sync::mpsc;
 
     use super::*;
     use crate::data::test_http;
 
-    const HASH: &str = "b6eeb93c9a1b2c3d4e5f60718293a4b5c6d7e8f9";
+    pub(crate) const HASH: &str = "b6eeb93c9a1b2c3d4e5f60718293a4b5c6d7e8f9";
 
     /// An xz archive with `files`, under a top directory, as the distribution server makes it.
-    pub(in crate::data) fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut tar = tar::Builder::new(Vec::new());
         for (path, contents) in files {
             let mut header = tar::Header::new_gnu();
@@ -786,7 +793,7 @@ pub(super) mod tests {
         xz.finish().expect("finished")
     }
 
-    pub(in crate::data) fn json_files() -> Vec<(&'static str, &'static [u8])> {
+    pub(crate) fn json_files() -> Vec<(&'static str, &'static [u8])> {
         vec![
             ("git-commit-hash", HASH.as_bytes()),
             (
@@ -853,15 +860,27 @@ available = false
         archive: &[u8],
         sha256: Option<&str>,
     ) -> (Cache, Dist, mpsc::Receiver<String>, tempfile::TempDir) {
+        setup_after(archive, sha256, Duration::ZERO)
+    }
+
+    /// [`setup`] whose server answers each request after `delay`.
+    pub(crate) fn setup_after(
+        archive: &[u8],
+        sha256: Option<&str>,
+        delay: Duration,
+    ) -> (Cache, Dist, mpsc::Receiver<String>, tempfile::TempDir) {
         // The URL is known only once the server runs, so the manifest names a path that the
         // server answers whatever is asked.
-        let (base_url, requests) = test_http::serve_sequence_with(|base_url| {
-            let url = format!(
-                "{base_url}/dist/2026-10-19/rust-docs-json-nightly-x86_64-unknown-linux-gnu.tar.xz"
-            );
-            let sha256 = sha256.map_or_else(|| cache::sha256_hex(archive), str::to_owned);
-            vec![ok(&manifest(&url, &sha256)), ok(archive)]
-        });
+        let (base_url, requests) = test_http::serve_sequence_after(
+            |base_url| {
+                let url = format!(
+                    "{base_url}/dist/2026-10-19/rust-docs-json-nightly-x86_64-unknown-linux-gnu.tar.xz"
+                );
+                let sha256 = sha256.map_or_else(|| cache::sha256_hex(archive), str::to_owned);
+                vec![ok(&manifest(&url, &sha256)), ok(archive)]
+            },
+            delay,
+        );
         let dir = tempfile::tempdir().expect("a temporary directory");
         (
             Cache::at(dir.path()),
@@ -871,7 +890,7 @@ available = false
         )
     }
 
-    pub(in crate::data) fn linux() -> TargetTriple {
+    pub(crate) fn linux() -> TargetTriple {
         "x86_64-unknown-linux-gnu".parse().expect("a triple")
     }
 

@@ -18,7 +18,7 @@ use tokio::time::Instant;
 use super::{
     ErrorChain,
     ToolState,
-    get_item::{self, Searching},
+    get_item::{self, Searching, StdUnready},
 };
 use crate::{
     data::{
@@ -26,7 +26,7 @@ use crate::{
         crate_name::CrateName,
         dist::StdCrate,
         flight::Doing,
-        std_json::{self, Chosen},
+        std_json::Chosen,
         target::TargetTriple,
     },
     query::{
@@ -196,19 +196,18 @@ pub(super) async fn std(
     searching: Searching,
     mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
+    let until = state.until();
     let at_least = get_item::project_toolchain(&state).await;
-    let chosen = match std_json::choose(
-        &state.cache,
-        &state.dist,
-        state.cache.dir(),
-        &target,
-        &state.host().await.triple,
-        at_least.as_ref(),
-    )
-    .await
-    {
+    let host = &state.host().await.triple;
+    let chosen = match get_item::shared_std(&state, &target, host, at_least.as_ref(), until).await {
         Ok(chosen) => chosen,
-        Err(error) => return get_item::dist_error(StdCrate::Std, &error),
+        Err(StdUnready::Failed(error)) => {
+            return get_item::dist_error(StdCrate::Std, &error);
+        },
+        Err(StdUnready::Stopped) => return get_item::stopped(),
+        Err(StdUnready::Going(doing)) => {
+            return get_item::std_building("std", &target, doing, &warnings);
+        },
     };
     warnings.extend(chosen.warnings.iter().cloned());
     let version = chosen
@@ -216,7 +215,7 @@ pub(super) async fn std(
         .release()
         .unwrap_or_else(|| Version::new(0, 0, 0));
     let cache = state.cache.clone();
-    let chosen = Arc::new(chosen);
+    // Archived by the shared work already, unless it failed there.
     let loading = Arc::clone(&chosen);
     let task = crate::task::spawn_blocking(move || {
         [StdCrate::Std, StdCrate::Alloc, StdCrate::Core].map(|krate| {

@@ -37,7 +37,7 @@ use crate::{
         flight::{Doing, Joined},
         rustdoc_json::ParseError,
         sparse_index::{IndexEntry, IndexError},
-        std_json::{self, Chosen},
+        std_json::Chosen,
         target::TargetTriple,
         version::{NoVersion, VersionSpec},
     },
@@ -476,7 +476,9 @@ pub(super) fn provenance_schema() -> Value {
             "all_features": { "type": "boolean" },
             "cfg": strings,
         },
-        "required": ["source", "crate", "version", "target"],
+        // Before the version is known, a response while it is fetched has no `version`, and may
+        // have no `source` (requirement R-OUT-9).
+        "required": ["crate", "target"],
     })
 }
 
@@ -1322,6 +1324,39 @@ async fn load_and_look_up(
     }
 }
 
+/// Why std's JSON is not there to look in.
+pub(super) enum StdUnready {
+    /// It could not be had.
+    Failed(Arc<DistError>),
+    /// The work ended without a result, as when it panicked.
+    Stopped,
+    /// It is still being fetched or indexed, as this says.
+    Going(Doing),
+}
+
+/// The JSON of std for `target`, chosen, fetched and archived by work that the calls for it share,
+/// waiting for it until `until` (requirements R-STD-6, R-ARCH-6 and R-WS-6).
+pub(super) async fn shared_std(
+    state: &ToolState,
+    target: &TargetTriple,
+    host: &TargetTriple,
+    at_least: Option<&Version>,
+    until: Instant,
+) -> Result<Arc<Chosen>, StdUnready> {
+    let wanted = load::StdWanted {
+        target: target.clone(),
+        host: host.clone(),
+        at_least: at_least.cloned(),
+        neutral_dir: state.cache.dir().to_owned(),
+    };
+    match load::std_json(&state.stds, &state.cache, &state.dist, wanted, until).await {
+        Joined::Done(Ok(chosen)) => Ok(chosen),
+        Joined::Done(Err(error)) => Err(StdUnready::Failed(error)),
+        Joined::Ended => Err(StdUnready::Stopped),
+        Joined::Going(doing) => Err(StdUnready::Going(doing)),
+    }
+}
+
 /// When to call again for a crate that is being fetched or indexed (requirement R-OUT-9).
 pub(super) const RETRY_AFTER_SECS: u64 = 10;
 
@@ -1329,6 +1364,37 @@ pub(super) const RETRY_AFTER_SECS: u64 = 10;
 /// work that goes on after the call stopped waiting for it (requirements R-ARCH-6 and R-OUT-9):
 /// `status: building`, why, when to call again, and the provenance of what was asked for.
 fn building(arguments: &Request, doing: Doing, warnings: &[Box<str>]) -> CallToolResult {
+    let what = match doing {
+        Doing::Fetching => "fetched from docs.rs",
+        Doing::Indexing => "indexed",
+    };
+    let being = format!("{} {} is being {what}", arguments.name, arguments.version);
+    building_response(docs_rs_provenance(arguments), doing, &being, warnings)
+}
+
+/// The response while the JSON of std for `target` is being chosen, fetched or indexed, before its
+/// nightly is known, so without its version (requirement R-OUT-9). `name` is std's crate asked for.
+pub(super) fn std_building(
+    name: &str,
+    target: &TargetTriple,
+    doing: Doing,
+    warnings: &[Box<str>],
+) -> CallToolResult {
+    let mut provenance = Map::new();
+    provenance.insert("source".to_owned(), json!("std"));
+    provenance.insert("crate".to_owned(), json!(name));
+    provenance.insert("target".to_owned(), json!(target.as_str()));
+    let what = match doing {
+        Doing::Fetching => "fetched from the Rust distribution server",
+        Doing::Indexing => "indexed",
+    };
+    let being = format!("the documentation of std for {target} is being {what}");
+    building_response(provenance, doing, &being, warnings)
+}
+
+/// The provenance of the release that `arguments` names on docs.rs, as far as it is known before
+/// its JSON is.
+fn docs_rs_provenance(arguments: &Request) -> Map<String, Value> {
     let mut provenance = Map::new();
     provenance.insert("source".to_owned(), json!("docs.rs"));
     provenance.insert("crate".to_owned(), json!(arguments.name.as_str()));
@@ -1341,6 +1407,17 @@ fn building(arguments: &Request, doing: Doing, warnings: &[Box<str>]) -> CallToo
         provenance.insert("index_fetched_at".to_owned(), json!(fetched_at));
     }
     provenance.insert("target".to_owned(), json!(arguments.target.as_str()));
+    provenance
+}
+
+/// The response with `provenance` while what it is of is being fetched or indexed, as `doing`
+/// says, and `being` tells people (requirement R-OUT-9).
+fn building_response(
+    provenance: Map<String, Value>,
+    doing: Doing,
+    being: &str,
+    warnings: &[Box<str>],
+) -> CallToolResult {
     let mut response = Map::new();
     response.insert("provenance".to_owned(), Value::Object(provenance));
     response.insert("status".to_owned(), json!("building"));
@@ -1349,16 +1426,11 @@ fn building(arguments: &Request, doing: Doing, warnings: &[Box<str>]) -> CallToo
     if !warnings.is_empty() {
         response.insert("warnings".to_owned(), json!(warnings));
     }
-    let what = match doing {
-        Doing::Fetching => "fetched from docs.rs",
-        Doing::Indexing => "indexed",
-    };
     response.insert(
         "hints".to_owned(),
         json!([format!(
-            "{} {} is being {what}, which goes on without this call; call again in about \
-             {RETRY_AFTER_SECS} seconds",
-            arguments.name, arguments.version
+            "{being}, which goes on without this call; call again in about {RETRY_AFTER_SECS} \
+             seconds"
         )]),
     );
     CallToolResult::structured(Value::Object(response))
@@ -1861,18 +1933,13 @@ async fn execute_std(
         );
     }
     let at_least = project_toolchain(&state).await;
-    let chosen = match std_json::choose(
-        &state.cache,
-        &state.dist,
-        state.cache.dir(),
-        &target,
-        &host.triple,
-        at_least.as_ref(),
-    )
-    .await
-    {
+    let chosen = match shared_std(&state, &target, &host.triple, at_least.as_ref(), until).await {
         Ok(chosen) => chosen,
-        Err(error) => return dist_error(krate, &error),
+        Err(StdUnready::Failed(error)) => return dist_error(krate, &error),
+        Err(StdUnready::Stopped) => return stopped(),
+        Err(StdUnready::Going(doing)) => {
+            return std_building(arguments.name.as_str(), &target, doing, &warnings);
+        },
     };
     warnings.extend(chosen.warnings.iter().cloned());
     let request = Request {

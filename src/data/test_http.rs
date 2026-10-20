@@ -93,6 +93,15 @@ pub(crate) fn serve_sequence(
 pub(crate) fn serve_sequence_with(
     responses: impl FnOnce(&str) -> Vec<(String, Vec<u8>)>,
 ) -> (String, mpsc::Receiver<String>) {
+    serve_sequence_after(responses, std::time::Duration::ZERO)
+}
+
+/// [`serve_sequence_with`] that answers each request after `delay`: for the tests of calls that
+/// stop waiting for a fetch.
+pub(crate) fn serve_sequence_after(
+    responses: impl FnOnce(&str) -> Vec<(String, Vec<u8>)>,
+    delay: std::time::Duration,
+) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a local port is free");
     let base_url = format!("http://{}", listener.local_addr().expect("bound"));
     let responses = responses(&base_url);
@@ -112,6 +121,7 @@ pub(crate) fn serve_sequence_with(
                 }
                 request_head.push_str(&line);
             }
+            thread::sleep(delay);
             let mut stream = reader.into_inner();
             stream
                 .write_all(closing(&head).as_bytes())

@@ -478,9 +478,9 @@ Claude Code 2.1.304、Linux で測った。
 **C3c の分け方 (2026-10-21)**: 下調べ (サブエージェント) の結果から、C3c を 4 つに分けた
 
 - C3c-1: 横断の検索の 0 件のときの `status: building` と、ビルド中のカーソル
-- C3c-2: std の取得 (配布物の要約・アーカイブの取得と展開・読める nightly への最大 30 日のさかのぼり・索引の作成) を、期限付きの共有の仕事にする。今は期限が効かない。展開中のロックの隙間を塞ぐ。配布物の取得の失敗を短い間覚える
+- C3c-2: std の取得 (配布物の要約・アーカイブの取得と展開・読める nightly への最大 30 日のさかのぼり・索引の作成) を、期限付きの共有の仕事にする。今は期限が効かない。展開中のロックの隙間を塞ぐ
 - C3c-3: `cargo metadata` の初回の取得を裏で続けられるようにする (今は呼び出しの future の中で走り、取り消すと cargo も止まる)。版を解決する前の `status: building` (provenance の `version`・`source` を省く)。`Activity::Fetching` をつなぐ
-- C3c-4: sparse index と `.crate` の一時的な失敗を、短い間ディスクに覚える。今は応答の無い相手に 1 回で約 30 秒 (接続の 10 秒 × 3 回) かかり、プロセスの数だけ直列に繰り返す
+- C3c-4: sparse index・`.crate`・配布物 (要約とアーカイブ) の一時的な失敗を、短い間ディスクに覚える。今は応答の無い相手に 1 回で約 30 秒 (接続の 10 秒 × 3 回) かかり、プロセスの数だけ直列に繰り返す。配布物の失敗は、書き始めてから同じ仕組みで扱えると分かったので C3c-2 から移した
 
 実測 (この PC、release ビルド): 取得 (展開と書き込み込み) と解析とアーカイブの書き込みは、tokio 1.54.0 (6.7 MB) が 0.2・0.06・0.08 秒、web-sys 0.3.106 (149 MB) が 1.0・1.2・0.8 秒、aws-sdk-ec2 1.269.0 (350 MB) が 2.5・4.3・3.6 秒。最大級でも既定の 20 秒に収まり、遅い回線や CI では超えうる。既定値 (待つ 20 秒・`retry_after_secs` 10 秒) は変えない
 
@@ -492,6 +492,22 @@ Claude Code 2.1.304、Linux で測った。
 - テスト (stdio): 依存の demo を遅い docs.rs から取る間の横断の検索は `status: building` (`fetching`・`partial`・`retry_after_secs`) で、後の検索は `demo::hello` を見つけ、`partial` が無く、要求は 1 回
 - 本物の Claude Code (利用者が試した。release ビルド、`limits.request_timeout_secs = 3` で待つのは 2 秒、空のキャッシュ) で aws-sdk-ec2 1.269.0 の `Client::describe_instances` を引いた: 1 回目と 2 回目は 2.0 秒で `status: building`、3 回目は 26 ms で答えた。docs.rs への要求は 1 回。モデルは記憶で答えず、待ってから呼び直した (1 回目の後は `retry_after_secs` の 10 秒より早い約 3 秒後、2 回目の後はシェルで待って約 18 秒後)。早い呼び直しの害は 2 秒の待ちが 1 回増えるだけなので、案内は変えない
 - そこで分かったこと: 呼び出しのログで、`status: building` だった呼び出しが、通信しなかったので `cache: hit` と記録されていた。ログの行に `status: building` を書き、そのときは `cache` を書かないようにした (利用者が C3c-1 に含めると決めた。R-OBS-1)。README のログの節も直した
+
+**C3c-2 (std の取得の時間の上限。2026-10-21)**:
+
+- std の JSON を選び (`std_json::choose`)、配布物から取って展開し、std・alloc・core のアーカイブを作るまでを、1 つの共有の仕事にした (`query::load::std_json`)。鍵は target と、プロジェクトの toolchain の版 (それより古い nightly は選ばないため)。待つ期限と切り離しは C3a と同じ
+  - 段は、選んで取る間が `fetching`、アーカイブを作る間が `indexing`
+  - アーカイブを先に 3 つとも作るのは、std の path のほとんどが alloc か core の re-export で、照会の中で作ると期限が効かないため。作れなかったものはログに書き、照会がもう一度作ってその理由を返す
+  - get_item (と同じ経路のツール) と、std の横断の検索の両方がこの仕事を待つ
+- 応答: nightly が決まる前なので、provenance は `source: std`・`crate`・`target` だけで `version` が無い。R-OUT-9 が版の解決の前は `version`・`source` を省けるとしているので、outputSchema の provenance の必須を `crate`・`target` だけにした。hints は「std for <target> is being fetched from the Rust distribution server」など。C3a の `building` を、provenance と案内の文を渡す形 (`building_response`) に分けた
+- 展開中のロックの隙間 (C2b と同じ形): 配布物の展開は blocking のスレッドで最後まで走るのに、ディレクトリのロックは待つタスクが abort されると先に外れていた。ロックを展開の作業に渡し、展開が終わってから外すようにした
+- テスト:
+  - `std_json`: 遅いローカルの配布物 (要約とアーカイブを 300 ms ずつ遅らせる) で、100 ms の期限の呼び出しは `Going(Fetching)`。後の呼び出しは配布物から選んだものを受け、std のアーカイブは仕事が作っていて、要求は要約とアーカイブの 2 回
+  - 版が決まる前の std の `status: building` の応答が、返しうる 7 つのツールの outputSchema に収まる (宣言の無い項目が無く、必須がある)。provenance の必須に `version` を残すと落ちる
+  - 結果の検証器の自己テスト (`tests/real_data`) は、必須を欠く例に provenance の `version` を使っていたので、`target` に変えた
+- テストの道具: `test_http::serve_sequence_after` (順に答える偽のサーバーを、各応答の前に待たせる) と、`dist::tests::setup_after`
+- 実測 (この PC、release ビルド、空のキャッシュ、rustup の見えない PATH で配布物から): `std::vec::Vec` の初回は 3.0 秒 (要約の取得・アーカイブの取得と展開・3 つのアーカイブの作成)。続く `core::option::Option` は 0 秒で、先に作った core のアーカイブが使われた。既定の待ち 20 秒に収まる
+- 利用者が、アーカイブを 3 つとも先に作る作りのままとすると決めた (代案は頼まれた crate だけ先に作ること。初回は速いが、re-export をたどる先の crate の作成に期限が効かない)
 
 ### 6.5 M2d
 

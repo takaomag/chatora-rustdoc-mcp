@@ -244,6 +244,7 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
         tools: Arc::new(tool::ToolState {
             docs_rs: tool::docs_rs(&network)?,
             archives: Flights::default(),
+            stds: Flights::default(),
             dist: Dist::new(&network, DistSettings::from_settings(settings))?,
             index: SparseIndex::new(cache.clone(), &network)?,
             // The `.crate` files that cargo has fetched are read before static.crates.io is asked.

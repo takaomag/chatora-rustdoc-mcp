@@ -62,7 +62,7 @@ use crate::{
         target::{self, HostTarget},
         waits::Waits,
     },
-    query::load::SharedArchive,
+    query::load::{SharedArchive, SharedStd},
 };
 
 /// What the tools share for the life of the server.
@@ -75,6 +75,9 @@ pub(super) struct ToolState {
     /// The archives being made from rustdoc JSON on docs.rs, shared by the calls that want them
     /// at once (requirements R-NW-2 and R-WS-6).
     pub(super) archives: Flights<SharedArchive>,
+    /// The JSON of std being chosen and fetched, shared by the calls that want it at once
+    /// (requirements R-STD-6 and R-WS-6).
+    pub(super) stds: Flights<SharedStd>,
     /// The client of the Rust distribution server, for std (requirement R-STD-6).
     pub(super) dist: Dist,
     /// The crates.io sparse index, for the versions of crates.
@@ -716,6 +719,53 @@ mod tests {
         let mut expected = names(&tool);
         expected.retain(|name| name != "project");
         assert_eq!(names(&without_project(tool)), expected);
+    }
+
+    /// The response while std is being fetched, whose provenance has no version yet, has only
+    /// what the `outputSchema` of the tools that may return it declare, and what they require
+    /// (requirement R-OUT-9).
+    #[test]
+    fn a_response_while_std_is_fetched_fits_the_schemas() {
+        let target = "x86_64-unknown-linux-gnu".parse().expect("a triple");
+        let result =
+            get_item::std_building("std", &target, crate::data::flight::Doing::Fetching, &[]);
+        let response = result.structured_content.expect("structured");
+        let tools = [
+            get_item::NAME,
+            crate_overview::NAME,
+            list_module::NAME,
+            list_impls::NAME,
+            list_methods::NAME,
+            list_implementors::NAME,
+            search_items::NAME,
+        ];
+        for tool in definitions()
+            .into_iter()
+            .filter(|tool| tools.contains(&tool.name.as_ref()))
+        {
+            let schema = Value::Object((*tool.output_schema.expect("a schema")).clone());
+            for (object, schema) in [
+                (&response, &schema),
+                (&response["provenance"], &schema["properties"]["provenance"]),
+            ] {
+                let fields = object.as_object().expect("an object");
+                for name in fields.keys() {
+                    assert!(
+                        schema["properties"].get(name).is_some(),
+                        "{}: {name} is not declared",
+                        tool.name
+                    );
+                }
+                for required in schema["required"].as_array().into_iter().flatten() {
+                    let required = required.as_str().expect("a name");
+                    assert!(
+                        fields.contains_key(required),
+                        "{}: {required} is missing",
+                        tool.name
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
