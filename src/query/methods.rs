@@ -229,6 +229,7 @@ pub fn list_methods<'a>(
         &type_path,
         options.expand_blanket,
     );
+    hint_elsewhere(view, &mut query, item, &type_path, request.name.as_str());
     let wanted = options.name.map(str::to_lowercase);
     methods.retain(|method| {
         let name = method.data.path.rsplit("::").next().unwrap_or_default();
@@ -287,6 +288,76 @@ pub fn list_methods<'a>(
     };
     fit(&mut response, shown, &page);
     Ok(response)
+}
+
+/// Hints for methods that the list cannot show (requirement R-TI-1): those of the type that
+/// `item` dereferences to, which are listed by it from M4, and those of a primitive type, which
+/// core defines more of than std or alloc.
+fn hint_elsewhere(
+    view: &CrateView<'_>,
+    query: &mut Query<'_>,
+    item: &Item,
+    type_path: &str,
+    krate: &str,
+) {
+    if matches!(item.inner, ItemEnum::Primitive(_)) {
+        if krate != "core" {
+            let name = type_path.rsplit("::").next().unwrap_or(type_path);
+            query.hint(format!(
+                "{krate} adds only a few methods to the primitive type {name}; most are defined \
+                 in core (and some in alloc): list them with crate core"
+            ));
+        }
+        return;
+    }
+    let Some(target) = deref_target(view, item) else {
+        return;
+    };
+    let shown = query.type_text(target);
+    let look_up = match target {
+        Type::Slice(_) => "path slice in crate core".to_owned(),
+        Type::Primitive(name) => format!("path {name} in crate core"),
+        Type::ResolvedPath(path) => format!("path {}", query.path_of(path.id)),
+        Type::DynTrait(_)
+        | Type::Generic(_)
+        | Type::FunctionPointer(_)
+        | Type::Tuple(_)
+        | Type::Array { .. }
+        | Type::Pat { .. }
+        | Type::ImplTrait(_)
+        | Type::Infer
+        | Type::RawPointer { .. }
+        | Type::BorrowedRef { .. }
+        | Type::QualifiedPath { .. } => "that type".to_owned(),
+    };
+    query.hint(format!(
+        "{type_path} dereferences to {shown} (it implements Deref), so the methods of {shown} \
+         can be called on it too; list them with list_methods on {look_up}"
+    ));
+}
+
+/// The `Target` of the `Deref` impl of `item`, if it has one.
+fn deref_target<'v>(view: &'v CrateView<'_>, item: &Item) -> Option<&'v Type> {
+    impls_of(item).iter().find_map(|&impl_id| {
+        let ItemEnum::Impl(contents) = &view.item(impl_id)?.inner else {
+            return None;
+        };
+        let trait_ref = contents.trait_.as_ref()?;
+        if trait_ref.path.rsplit("::").next() != Some("Deref") {
+            return None;
+        }
+        contents.items.iter().find_map(|&member| {
+            if let ItemEnum::AssocType {
+                type_: Some(target),
+                ..
+            } = &view.item(member)?.inner
+            {
+                Some(target)
+            } else {
+                None
+            }
+        })
+    })
 }
 
 /// The methods of a type, sorted out.

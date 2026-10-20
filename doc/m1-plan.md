@@ -758,6 +758,22 @@ D4 を 2 つに分けた。D4a は `tools/list` と `server/discover` が返す�
 - CI: `testdata` の job の手順を `--test real_data` に替えた (tokio 1.47.1 の JSON、serde 1.0.200 の index などをネットワークから取る)
 - 実行時間: release で 3.3 秒 (キャッシュが温まった後)
 
+#### E1 (2026-10-20)
+
+小さな eval を作って回した (R-QA-6・§5 の P5)。`eval/` に、問題集 (`cases.json`)、回すスクリプト (`run.py`。Python の標準ライブラリだけ)、問いの「このプロジェクト」に当たる fixture (版を testdata に合わせて `=` で固定。tokio の `net` はわざと外す) を置いた。使い方は `eval/README.md`。
+
+- 回し方: 問いごとに `claude -p --output-format stream-json` を fixture で起動する。このサーバーだけを読み (`--strict-mcp-config`)、組み込みのツールを外し (`--tools ""`)、利用者の設定を読まない (`--setting-sources project`)。利用者の CLAUDE.md は読まれる (答えが日本語になったので、答えの確かめ方に日本語の言い方も入れた)。結果は `eval/results/` (Git に入れない)
+- 問題: §3 の Q1〜Q9・Q17・Q20 の 16 問 (R-QA-6 が必ず含めるとしたメソッドのパス `Vec::iter`・`str::len`、feature で隠れた item、「X は Send か」を含む。umbrella crate は Q20)、`tool_result` の形の 2 問 (成功は `structuredContent` の JSON、エラーは `code` と `request_id` の JSON がモデルに渡ること。R-OUT-1・R-ERR-2)。ビルド中の応答は M2
+- 結果 (Claude Code 2.1.304、既定のモデル、2026-10-20): **18 問すべて正解**、呼び出し 26 回、1.01 ドル。セッション開始時の固定費 (最初の要求の入力トークン) は 14,716。`tool_result` は p50 1,090 文字・p95 5,530 文字 (約 270 / 1,380 トークン)。1 問あたりの入力トークンは多くが約 3 万 (固定費とツールの定義を 2 回送る分)
+  - 期待どおりのツールを選んだ。`Router` の場所は `search_items` を使わず `get_item` で直接引いた (正しい)。プロジェクトの tokio の版は `resolve_version` でなく `list_crates` で答えた (どちらでもよい)
+  - `tool_result` の形: 成功は `structuredContent` の JSON がそのまま、エラーは text の JSON (`is_error: true`、`code`・`request_id` 付き) がモデルに渡った
+- 見つかって直したこと: `Vec<T>` のメソッドの問い (Q7) で 4 回呼び、1 回エラーになった。`list_methods` が Deref 先に触れず、説明文が「Deref 先は `get_item` で」と案内していたので、モデルが `core::slice::iter` を `get_item` で推測して `item_not_found`、次に std の `slice` を `name: iter` で引いて 0 件 (std の primitive の slice には、`iter` を含むほとんどのメソッドが無い)、最後に core で見つけた
+  - `list_methods` の `hints` に、Deref の `Target` を書くようにした (「`alloc::vec::Vec` dereferences to `[T]`…; list them with list_methods on path slice in crate core」。`String` は `str`、`Arc<T>` や `MutexGuard` は `T`)。Deref 先のメソッドを一覧に入れるのは計画どおり M4
+  - primitive の型を core 以外の crate で引いたら、ほとんどのメソッドは core にある旨を `hints` に書く
+  - 説明文の案内を「`hints` が Deref 先を示すので、それにこのツールを呼び直す (primitive は crate `core`)」に直した
+  - 直した後の同じ問い: 呼び出し 2 回・エラー 0、入力トークン 98,527 → 38,956、0.19 → 0.23 ドル (答えが長くなった分。出力トークンは 2,057 → 1,506)
+- まだ: ツールの分け方を変えるほどの問題は見つからなかった。`detail` の既定、`alwaysLoad` の有無などの比較 (R-QA-6) と換算係数の校正は M5。tool search が有効な場合の固定費は測っていない
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

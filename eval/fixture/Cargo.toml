@@ -1,0 +1,13 @@
+# eval の問題が「このプロジェクト」と呼ぶ workspace。版は testdata/docs-rs-json.txt に合わせて固定する。
+# tokio の `net` はわざと有効にしない (feature で隠れた item の問題のため)。
+[package]
+name = "eval-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+axum = "=0.8.9"
+reqwest = { version = "=0.13.5", default-features = false }
+serde = { version = "=1.0.228", features = ["derive"] }
+tokio = { version = "=1.53.3", features = ["macros", "rt", "sync", "time"] }

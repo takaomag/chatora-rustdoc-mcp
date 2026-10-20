@@ -1,0 +1,130 @@
+[
+  {
+    "id": "q1-dependencies",
+    "question": "Q1",
+    "prompt": "What does this project depend on directly, and at which versions?",
+    "tools": ["list_crates"],
+    "answer": ["1\\.53\\.3", "0\\.8\\.9"]
+  },
+  {
+    "id": "q2-latest-axum",
+    "question": "Q2",
+    "prompt": "What is the latest release of axum on crates.io?",
+    "tools": ["resolve_version"],
+    "answer": ["0\\.\\d+\\.\\d+"]
+  },
+  {
+    "id": "q2-project-tokio",
+    "question": "Q2",
+    "prompt": "Which version of tokio does this project use?",
+    "tools": ["resolve_version", "list_crates"],
+    "answer": ["1\\.53\\.3"]
+  },
+  {
+    "id": "q3-overview",
+    "question": "Q3",
+    "prompt": "Give me an overview of the axum crate that this project uses: what is it, and how is it organized?",
+    "tools": ["crate_overview"],
+    "answer": ["routing"]
+  },
+  {
+    "id": "q4-where-is-router",
+    "question": "Q4",
+    "prompt": "Where is `Router` in axum, and how do I import it?",
+    "tools": ["search_items", "get_item"],
+    "answer": ["axum::Router"]
+  },
+  {
+    "id": "q4-unknown-name",
+    "question": "Q4",
+    "prompt": "Is there something in tokio for giving up on a future that takes too long? I don't know what it is called.",
+    "tools": ["search_items"],
+    "answer": ["timeout"]
+  },
+  {
+    "id": "q5-signature",
+    "question": "Q5",
+    "prompt": "What is the signature of `tokio::sync::Mutex::lock` in the tokio that this project uses, and can it panic?",
+    "tools": ["get_item"],
+    "answer": ["async fn lock"]
+  },
+  {
+    "id": "q6-module",
+    "question": "Q6",
+    "prompt": "What is in the `axum::routing` module, and does it re-export anything from other crates?",
+    "tools": ["list_module"],
+    "answer": ["MethodRouter", "\\bget\\b"]
+  },
+  {
+    "id": "q7-vec-methods",
+    "question": "Q7",
+    "prompt": "Which methods can I call on `Vec<T>`? Does `iter` come from `Vec` itself?",
+    "tools": ["list_methods"],
+    "answer": ["slice|スライス"]
+  },
+  {
+    "id": "q7-str-len",
+    "question": "Q7",
+    "prompt": "What does `str::len` return: the number of bytes or of characters?",
+    "tools": ["get_item", "list_methods", "search_items"],
+    "answer": ["byte|バイト"]
+  },
+  {
+    "id": "q8-send",
+    "question": "Q8",
+    "prompt": "Is `Arc<tokio::sync::Mutex<T>>` Send? Under which conditions?",
+    "tools": ["list_impls"],
+    "answer": ["T: Send"]
+  },
+  {
+    "id": "q8-traits",
+    "question": "Q8",
+    "prompt": "Which traits does `axum::Router` implement?",
+    "tools": ["list_impls"],
+    "answer": ["Clone"]
+  },
+  {
+    "id": "q9-implementors",
+    "question": "Q9",
+    "prompt": "Which types in tokio implement `AsyncRead`?",
+    "tools": ["list_implementors"],
+    "answer": ["TcpStream"]
+  },
+  {
+    "id": "q17-stability",
+    "question": "Q17",
+    "prompt": "Can I use `std::sync::LazyLock` with Rust 1.79?",
+    "tools": ["get_item"],
+    "answer": ["1\\.80"]
+  },
+  {
+    "id": "q20-umbrella",
+    "question": "Q20",
+    "prompt": "Where is `compio::io::AsyncWriteAt` defined, in which crate?",
+    "tools": ["get_item"],
+    "answer": ["compio[-_]io"]
+  },
+  {
+    "id": "feature-hidden",
+    "question": "R-QA-6",
+    "prompt": "Which feature of tokio do I need for `tokio::net::TcpStream`, and does this project enable it?",
+    "tools": ["get_item"],
+    "answer": ["\\bnet\\b"]
+  },
+  {
+    "id": "shape-result",
+    "question": "R-OUT-1",
+    "prompt": "Call get_item once for `tokio::sync::Mutex` in tokio 1.53.3 with detail brief, and tell me the version in its provenance.",
+    "tools": ["get_item"],
+    "answer": ["1\\.53\\.3"],
+    "shape": "structured"
+  },
+  {
+    "id": "shape-error",
+    "question": "R-ERR-2",
+    "prompt": "Call get_item once for `tokio::sync::NoSuchThing` in tokio 1.53.3, and tell me the error code and the request_id it returns.",
+    "tools": ["get_item"],
+    "answer": ["item_not_found"],
+    "shape": "error"
+  }
+]
