@@ -1,7 +1,7 @@
 //! The `search_items` tool: the items of a crate that match a query, a page at a time
 //! (requirements R-SR-1 to R-SR-5).
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use rmcp::model::{CallToolResult, JsonObject, Tool, ToolAnnotations};
 use serde_json::{Value, json};
@@ -11,8 +11,12 @@ use super::{
     ToolState,
     get_item::{self, Arguments, Searching},
     list_module::{self, CURSOR_EXAMPLE, CURSOR_FORM},
+    search_across,
 };
-use crate::query::{get_item::Detail, list_module::KINDS, search::Fields};
+use crate::{
+    data::target::TargetTriple,
+    query::{get_item::Detail, list_module::KINDS, search::Fields},
+};
 
 /// The name of the tool.
 pub(super) const NAME: &str = "search_items";
@@ -26,9 +30,25 @@ const MAX_LIMIT: usize = 200;
 /// The fields that `fields` takes.
 const FIELDS: &[&str] = &["name", "alias", "docs", "path"];
 
-/// How to pass `crate`, while the search of several crates is not there yet (C4b).
-const CRATE_EXAMPLE: &[&str] =
-    &[r#"pass the crate to search, for example {"crate": "tokio", "query": "mutex"}"#];
+/// What `search_items` searches.
+#[derive(Debug)]
+pub(super) enum SearchArguments {
+    /// One crate on docs.rs, as `get_item` reads it.
+    One(Arguments),
+    /// std with alloc and core.
+    Std {
+        target: Option<TargetTriple>,
+        detail: Detail,
+        searching: Searching,
+    },
+    /// The project's direct dependencies (requirement R-SR-2).
+    Dependencies {
+        project: Option<PathBuf>,
+        target: Option<TargetTriple>,
+        detail: Detail,
+        searching: Searching,
+    },
+}
 
 /// How to pass `query`, for `invalid_argument`.
 const QUERY_EXAMPLE: &[&str] = &[r#"pass words or a path, for example {"query": "sync::Mutex"}"#];
@@ -96,7 +116,7 @@ pub(super) fn definition() -> Tool {
                 "description": "The next_cursor of the previous page.",
             },
         },
-        "required": ["crate", "query"],
+        "required": ["query"],
     }));
     Tool::new(NAME, DESCRIPTION, input_schema)
         .with_title("Search a Rust crate")
@@ -115,10 +135,46 @@ pub(super) fn definition() -> Tool {
 /// (requirement R-OUT-1).
 fn output_schema() -> JsonObject {
     let strings = json!({ "type": "array", "items": { "type": "string" } });
+    // One crate's provenance, or with several crates the target and project they share and a
+    // source for each (requirement R-OUT-9).
+    let mut source = get_item::provenance_schema();
+    if let Some(properties) = source.get_mut("properties").and_then(Value::as_object_mut) {
+        for (name, schema) in [
+            (
+                "status",
+                json!({ "type": "string", "enum": ["ok", "building", "failed", "unavailable"] }),
+            ),
+            ("building_reason", json!({ "type": "string" })),
+            ("retry_after_secs", json!({ "type": "integer" })),
+            ("code", json!({ "type": "string" })),
+            ("reason", json!({ "type": "string" })),
+            ("retryable", json!({ "type": "boolean" })),
+        ] {
+            properties.insert(name.to_owned(), schema);
+        }
+    }
+    if let Some(fields) = source.as_object_mut() {
+        fields.insert("required".to_owned(), json!(["crate", "version", "target"]));
+    }
+    let mut provenance = get_item::provenance_schema();
+    if let Some(properties) = provenance
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.insert(
+            "sources".to_owned(),
+            json!({ "type": "array", "items": source }),
+        );
+    }
+    if let Some(fields) = provenance.as_object_mut() {
+        fields.insert("required".to_owned(), json!(["target"]));
+    }
     object(json!({
         "type": "object",
         "properties": {
-            "provenance": get_item::provenance_schema(),
+            "provenance": provenance,
+            "partial": { "type": "boolean" },
+            "retry_after_secs": { "type": "integer" },
             "warnings": strings,
             "data": {
                 "type": "object",
@@ -158,26 +214,9 @@ fn object(value: Value) -> JsonObject {
 /// Checks the arguments (requirement R-ARG-1).
 pub(super) fn parse_arguments(
     arguments: Option<&JsonObject>,
-) -> Result<Arguments, InvalidArgument> {
+) -> Result<SearchArguments, InvalidArgument> {
     let argument = |name| arguments.and_then(|arguments| arguments.get(name));
-    if argument("crate").is_none() {
-        return Err(InvalidArgument::new(
-            "`crate` is required: this version searches one crate at a time",
-            CRATE_EXAMPLE,
-        ));
-    }
-    let release = get_item::parse_release(arguments)?;
-    let query = match argument("query") {
-        Some(Value::String(query)) if !query.trim().is_empty() => query.trim(),
-        Some(_) | None => {
-            return Err(InvalidArgument::new(
-                "`query` is required and must be a string that is not empty",
-                QUERY_EXAMPLE,
-            ));
-        },
-    };
-    let fields = parse_fields(argument("fields"))?;
-    let kinds = list_module::parse_kinds(argument("kind"))?;
+    let searching = parse_searching(arguments)?;
     let detail = match argument("detail") {
         None => Detail::Brief,
         Some(Value::String(detail)) if detail.trim() == "brief" => Detail::Brief,
@@ -186,6 +225,65 @@ pub(super) fn parse_arguments(
             return Err(InvalidArgument::new("`detail` must be brief or normal", &[
                 r#"pass brief or normal, for example {"detail": "normal"}"#,
             ]));
+        },
+    };
+    if argument("crate").is_none() {
+        let target_example: &'static [&'static str] =
+            &[r#"pass a target triple, for example {"target": "x86_64-unknown-linux-gnu"}"#];
+        let target = match argument("target") {
+            None => None,
+            Some(Value::String(target)) => {
+                Some(target.trim().parse::<TargetTriple>().map_err(|error| {
+                    InvalidArgument::new(format!("`target` is not valid: {error}"), target_example)
+                })?)
+            },
+            Some(_) => {
+                return Err(InvalidArgument::new(
+                    "`target` must be a string",
+                    target_example,
+                ));
+            },
+        };
+        let project = match argument("project") {
+            None => None,
+            Some(Value::String(project)) => Some(PathBuf::from(project.trim())),
+            Some(_) => {
+                return Err(InvalidArgument::new("`project` must be a string", &[
+                    r#"pass the directory or the Cargo.toml of a workspace, for example {"project": "/home/me/app"}"#,
+                ]));
+            },
+        };
+        return Ok(SearchArguments::Dependencies {
+            project,
+            target,
+            detail,
+            searching,
+        });
+    }
+    let release = get_item::parse_release(arguments)?;
+    if release.name.as_str() == "std" && release.version.is_none() {
+        return Ok(SearchArguments::Std {
+            target: release.target,
+            detail,
+            searching,
+        });
+    }
+    Ok(SearchArguments::One(Arguments::for_search(
+        release, detail, searching,
+    )))
+}
+
+/// The arguments that say what and how to search, and the page: `query`, `fields`, `kind`,
+/// `limit` and `cursor`.
+fn parse_searching(arguments: Option<&JsonObject>) -> Result<Searching, InvalidArgument> {
+    let argument = |name| arguments.and_then(|arguments| arguments.get(name));
+    let query = match argument("query") {
+        Some(Value::String(query)) if !query.trim().is_empty() => query.trim(),
+        Some(_) | None => {
+            return Err(InvalidArgument::new(
+                "`query` is required and must be a string that is not empty",
+                QUERY_EXAMPLE,
+            ));
         },
     };
     let limit = match argument("limit") {
@@ -214,15 +312,15 @@ pub(super) fn parse_arguments(
             ));
         },
     };
-    Ok(Arguments::for_search(release, detail, Searching {
+    Ok(Searching {
         query: query.into(),
-        fields,
-        kinds,
+        fields: parse_fields(argument("fields"))?,
+        kinds: list_module::parse_kinds(argument("kind"))?,
         limit,
         offset,
         request_digest: format!("{CURSOR_FORM}.{request_digest}").into(),
         cursor_data,
-    }))
+    })
 }
 
 /// The fields that `fields` asks for: all of them if it is absent.
@@ -265,16 +363,69 @@ fn parse_fields(fields: Option<&Value>) -> Result<Fields, InvalidArgument> {
     Ok(chosen)
 }
 
-/// Searches as `get_item` looks an item up: the same version, target and cache.
-pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
-    get_item::execute(arguments, state).await
+/// Searches one crate as `get_item` looks an item up, or several together.
+pub(super) async fn execute(arguments: SearchArguments, state: Arc<ToolState>) -> CallToolResult {
+    match arguments {
+        SearchArguments::One(arguments) => get_item::execute(arguments, state).await,
+        SearchArguments::Std {
+            target,
+            detail,
+            searching,
+        } => {
+            let target = target.unwrap_or_else(|| state.host.triple.clone());
+            search_across::std(state, target, detail, searching).await
+        },
+        SearchArguments::Dependencies {
+            project,
+            target,
+            detail,
+            searching,
+        } => {
+            let target = target.unwrap_or_else(|| state.host.triple.clone());
+            dependencies(state, project, target, detail, searching).await
+        },
+    }
+}
+
+/// Searches the project's direct dependencies.
+#[cfg(feature = "local")]
+async fn dependencies(
+    state: Arc<ToolState>,
+    project: Option<PathBuf>,
+    target: TargetTriple,
+    detail: Detail,
+    searching: Searching,
+) -> CallToolResult {
+    search_across::dependencies(state, project, target, detail, searching).await
+}
+
+/// Without local features, there is no project to search the dependencies of.
+#[cfg(not(feature = "local"))]
+#[expect(
+    clippy::unused_async,
+    reason = "the same signature as with local features, where it reads the project"
+)]
+async fn dependencies(
+    _state: Arc<ToolState>,
+    _project: Option<PathBuf>,
+    _target: TargetTriple,
+    _detail: Detail,
+    _searching: Searching,
+) -> CallToolResult {
+    super::tool_error(
+        "invalid_argument",
+        "this server is built without local features, so it has no project to search the \
+         dependencies of; `crate` is required",
+        false,
+        &[r#"pass the crate to search, for example {"crate": "tokio"}"#],
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn arguments(value: Value) -> Result<Arguments, InvalidArgument> {
+    fn arguments(value: Value) -> Result<SearchArguments, InvalidArgument> {
         let Value::Object(arguments) = value else {
             panic!("the arguments are an object");
         };
@@ -290,7 +441,6 @@ mod tests {
     #[test]
     fn bad_arguments_are_invalid_arguments() {
         for (value, about) in [
-            (json!({ "query": "mutex" }), "`crate`"),
             (json!({ "crate": "tokio" }), "`query`"),
             (json!({ "crate": "tokio", "query": " " }), "`query`"),
             (

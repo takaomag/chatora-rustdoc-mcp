@@ -151,7 +151,7 @@ pub(super) async fn version_in_project(
 /// project's only one. `None` when there is no project. A project outside the default one is not
 /// read with cargo (requirement R-MCP-3), so it is an error until `build_external_docs` (M2).
 #[cfg(feature = "local")]
-fn workspace(
+pub(super) fn workspace(
     default: Option<&DefaultProject>,
     project: Option<&Path>,
 ) -> Result<Option<(Workspace, ProjectFrom)>, Box<CallToolResult>> {
@@ -220,7 +220,7 @@ fn project_not_found(why: &str, candidates: &[String]) -> CallToolResult {
 
 /// The tool error for a workspace whose packages cannot be resolved.
 #[cfg(feature = "local")]
-fn resolve_error(workspace: &Workspace, error: &ResolveError) -> CallToolResult {
+pub(super) fn resolve_error(workspace: &Workspace, error: &ResolveError) -> CallToolResult {
     let root = workspace.root.display();
     match error {
         ResolveError::NoCargoLock => error_result(&json!({

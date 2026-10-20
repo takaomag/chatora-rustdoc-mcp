@@ -539,6 +539,8 @@ enum Tier {
 
 /// One result, before it is shown.
 struct Hit {
+    /// Which crate of the search it is in.
+    source: usize,
     entry: u32,
     tier: Tier,
     /// Its name is the query with the same case, which goes first in its tier.
@@ -556,13 +558,66 @@ pub fn search_items<'a>(
     request: ItemRequest<'a>,
     options: SearchOptions<'_>,
 ) -> Result<SearchResponse<'a>, GetItemError> {
-    let data_digest = check_cursor(view, options)?;
-    let index = view.search_index();
-    let mut hits = rank(index, options);
-    hits.retain(|hit| {
-        options.kinds.is_empty()
-            || entry_kind(view, index, hit.entry).is_some_and(|kind| options.kinds.contains(&kind))
-    });
+    let found = search_across(&[Searched { view, request }], options)?;
+    let Found {
+        mut provenances,
+        warnings,
+        hints,
+        data,
+        page,
+    } = found;
+    let Some(provenance) = provenances.pop() else {
+        return Err(GetItemError::NotFound);
+    };
+    Ok(SearchResponse {
+        provenance,
+        warnings,
+        data,
+        page,
+        hints,
+    })
+}
+
+/// A crate to search, with the request that it is looked up with.
+#[derive(Debug, Clone, Copy)]
+pub struct Searched<'a> {
+    /// The crate.
+    pub view: &'a CrateView<'a>,
+    /// Its name, version, origin and how much to show.
+    pub request: ItemRequest<'a>,
+}
+
+/// What a search of one or more crates found.
+#[derive(Debug)]
+pub struct Found<'a> {
+    /// The provenance of each crate, in the order given.
+    pub provenances: Vec<Provenance<'a>>,
+    /// What the caller should know about the data.
+    pub warnings: Box<[Cow<'static, str>]>,
+    /// What to call next.
+    pub hints: Box<[Box<str>]>,
+    /// What was found.
+    pub data: SearchData<'a>,
+    /// Which part of the results this is.
+    pub page: Page,
+}
+
+/// Searches the crates of `searched` together (requirements R-SR-1 to R-SR-4): the statistics of
+/// BM25 are over all of them, and their results are ranked as one.
+///
+/// # Errors
+///
+/// Returns an error when the cursor does not fit.
+pub fn search_across<'a>(
+    searched: &[Searched<'a>],
+    options: SearchOptions<'_>,
+) -> Result<Found<'a>, GetItemError> {
+    let data_digest = check_cursor(searched, options)?;
+    let indexes: Vec<&ArchivedSearchIndex> = searched
+        .iter()
+        .map(|source| source.view.search_index())
+        .collect();
+    let hits = hits(searched, &indexes, options);
     let total = hits.len();
     if options.offset > total {
         return Err(GetItemError::BadCursor(
@@ -574,26 +629,41 @@ pub fn search_items<'a>(
         (None, 0) => first_page(&hits),
         (None, _) => DEFAULT_LIMIT,
     };
-    let mut query = Query::new(view, ItemRequest {
-        detail: match request.detail {
-            Detail::Brief => Detail::Brief,
-            Detail::Normal | Detail::Full => Detail::Normal,
-        },
-        ..request
-    });
-    let provenance = query.provenance();
+    let mut queries: Vec<Query<'a>> = searched
+        .iter()
+        .map(|source| {
+            Query::new(source.view, ItemRequest {
+                detail: match source.request.detail {
+                    Detail::Brief => Detail::Brief,
+                    Detail::Normal | Detail::Full => Detail::Normal,
+                },
+                ..source.request
+            })
+        })
+        .collect();
+    let provenances = queries.iter_mut().map(Query::provenance).collect();
     let items: Vec<ItemData<'a>> = hits
         .iter()
         .skip(options.offset)
         .take(shown)
-        .filter_map(|hit| result(view, &mut query, index, hit.entry, request.detail))
+        .filter_map(|hit| {
+            let source = searched.get(hit.source)?;
+            let query = queries.get_mut(hit.source)?;
+            result(
+                source.view,
+                query,
+                source.view.search_index(),
+                hit.entry,
+                source.request.detail,
+            )
+        })
         .collect();
     let did_you_mean = if total == 0 {
-        did_you_mean(index, options.query)
+        did_you_mean(&indexes, options.query)
     } else {
         Box::default()
     };
-    let Notes { warnings, hints } = query.finish();
+    let Notes { warnings, hints } = notes(queries);
     let page = |shown: usize| {
         let next = options.offset.saturating_add(shown);
         Page {
@@ -604,29 +674,99 @@ pub fn search_items<'a>(
                 .then(|| format!("{}.{data_digest}.{next}", options.cursor_request).into()),
         }
     };
-    let mut response = SearchResponse {
-        provenance,
+    let mut found = Found {
+        provenances,
         warnings,
+        hints,
         data: SearchData {
             query: options.query.into(),
             items: Vec::new(),
             did_you_mean,
         },
         page: page(0),
-        hints,
     };
-    fit(&mut response, items, &page);
-    Ok(response)
+    fit(&mut found, items, &page);
+    Ok(found)
+}
+
+/// The hits in all the crates, of the kinds asked for, best first.
+fn hits(
+    searched: &[Searched<'_>],
+    indexes: &[&ArchivedSearchIndex],
+    options: SearchOptions<'_>,
+) -> Vec<Hit> {
+    let stats = Stats::of(indexes, options.query);
+    let mut hits: Vec<Hit> = indexes
+        .iter()
+        .enumerate()
+        .flat_map(|(source, index)| {
+            let mut hits = rank(index, options, &stats);
+            for hit in &mut hits {
+                hit.source = source;
+            }
+            hits
+        })
+        .collect();
+    hits.retain(|hit| {
+        options.kinds.is_empty()
+            || searched.get(hit.source).is_some_and(|source| {
+                entry_kind(source.view, source.view.search_index(), hit.entry)
+                    .is_some_and(|kind| options.kinds.contains(&kind))
+            })
+    });
+    let path_of = |hit: &Hit| -> &str {
+        indexes
+            .get(hit.source)
+            .and_then(|index| entry_at(index, hit.entry))
+            .map_or("", |found| found.path.as_ref())
+    };
+    hits.sort_by(|a, b| {
+        (
+            a.tier,
+            !a.same_case,
+            Reverse(quantized(a.score)),
+            path_of(a),
+        )
+            .cmp(&(
+                b.tier,
+                !b.same_case,
+                Reverse(quantized(b.score)),
+                path_of(b),
+            ))
+    });
+    hits
+}
+
+/// The warnings and hints of all the queries, in order.
+fn notes(queries: Vec<Query<'_>>) -> Notes {
+    let (mut warnings, mut hints) = (Vec::new(), Vec::new());
+    for query in queries {
+        let notes = query.finish();
+        warnings.extend(notes.warnings);
+        hints.extend(notes.hints);
+    }
+    Notes {
+        warnings: warnings.into(),
+        hints: hints.into(),
+    }
 }
 
 /// The part of the data's digest that cursors carry, once the cursor in `options`, if any, is
-/// found to be for this data.
-fn check_cursor<'v>(
-    view: &CrateView<'v>,
+/// found to be for this data: that of the one crate, or a digest of those of all.
+fn check_cursor(
+    searched: &[Searched<'_>],
     options: SearchOptions<'_>,
-) -> Result<&'v str, GetItemError> {
-    let digest = view.source_digest();
-    let digest = digest.get(..16).unwrap_or(digest);
+) -> Result<String, GetItemError> {
+    let digest = if let [one] = searched {
+        one.view.source_digest().to_owned()
+    } else {
+        let joined: Vec<&str> = searched
+            .iter()
+            .map(|source| source.view.source_digest())
+            .collect();
+        crate::data::cache::sha256_hex(joined.join(".").as_bytes())
+    };
+    let digest = digest.get(..16).unwrap_or(&digest).to_owned();
     match options.cursor_data {
         Some(cursor_data) if cursor_data != digest => Err(GetItemError::BadCursor(
             "the data changed since the cursor was made; search again without the cursor",
@@ -635,9 +775,39 @@ fn check_cursor<'v>(
     }
 }
 
+/// The statistics of BM25 over the crates searched (requirement R-SR-3): how many items there
+/// are, and how many have each token of the query.
+struct Stats {
+    total: f64,
+    df: HashMap<String, f64>,
+}
+
+impl Stats {
+    fn of(indexes: &[&ArchivedSearchIndex], query: &str) -> Self {
+        let count = |n: usize| f64::from(u32::try_from(n).unwrap_or(u32::MAX));
+        let total = indexes.iter().map(|index| count(index.entries.len())).sum();
+        let df = tokens(query)
+            .into_iter()
+            .map(|token| {
+                let df = indexes
+                    .iter()
+                    .filter_map(|index| index.postings.get(token.as_str()))
+                    .map(|postings| count(postings.len()))
+                    .sum();
+                (token, df)
+            })
+            .collect();
+        Self { total, df }
+    }
+}
+
 /// The BM25 score of each item that has a token of the query, in the fields asked for
 /// (requirement R-SR-3).
-fn scores(index: &ArchivedSearchIndex, options: SearchOptions<'_>) -> HashMap<u32, f64> {
+fn scores(
+    index: &ArchivedSearchIndex,
+    options: SearchOptions<'_>,
+    stats: &Stats,
+) -> HashMap<u32, f64> {
     let fields = options.fields;
     let query = options.query.trim();
     let query_tokens: Vec<String> = {
@@ -647,14 +817,13 @@ fn scores(index: &ArchivedSearchIndex, options: SearchOptions<'_>) -> HashMap<u3
             .filter(|token| seen.insert(token.clone()))
             .collect()
     };
-    let total = f64::from(u32::try_from(index.entries.len()).unwrap_or(u32::MAX));
     let mut scores: HashMap<u32, f64> = HashMap::new();
     for token in &query_tokens {
         let Some(postings) = index.postings.get(token.as_str()) else {
             continue;
         };
-        let df = f64::from(u32::try_from(postings.len()).unwrap_or(u32::MAX));
-        let idf = ((total - df + 0.5) / (df + 0.5)).ln_1p();
+        let df = stats.df.get(token).copied().unwrap_or_default();
+        let idf = ((stats.total - df + 0.5) / (df + 0.5)).ln_1p();
         for posting in postings.iter() {
             let field = |on: bool, count: u16, weight: f64| {
                 if on { f64::from(count) * weight } else { 0.0 }
@@ -731,8 +900,8 @@ fn tiers(index: &ArchivedSearchIndex, options: SearchOptions<'_>) -> HashMap<u32
 
 /// The hits for the query, best first: by tier, then by score quantized, then by path, so that
 /// the order does not depend on rounding (requirement R-OUT-4).
-fn rank(index: &ArchivedSearchIndex, options: SearchOptions<'_>) -> Vec<Hit> {
-    let scores = scores(index, options);
+fn rank(index: &ArchivedSearchIndex, options: SearchOptions<'_>, stats: &Stats) -> Vec<Hit> {
+    let scores = scores(index, options, stats);
     let tiers = tiers(index, options);
     let mut candidates: HashSet<u32> = scores.keys().copied().collect();
     candidates.extend(tiers.keys().copied());
@@ -747,6 +916,7 @@ fn rank(index: &ArchivedSearchIndex, options: SearchOptions<'_>) -> Vec<Hit> {
             let score = scores.get(&entry).copied().unwrap_or_default() * authority * penalty;
             let name = found.path.rsplit("::").next().unwrap_or_default();
             Some(Hit {
+                source: 0,
                 entry,
                 tier: tiers.get(&entry).copied().unwrap_or(Tier::Partial),
                 same_case: name == options.query.trim(),
@@ -896,7 +1066,7 @@ fn first_sentence(docs: &str) -> Cow<'_, str> {
 /// Names of items spelt like `query`, when nothing matched (requirement R-SR-5): at most 5, by
 /// edit distance in characters, then by name, and only those similar enough. Better none than
 /// unrelated ones (requirement R-PR-7).
-fn did_you_mean(index: &ArchivedSearchIndex, query: &str) -> Box<[Box<str>]> {
+fn did_you_mean(indexes: &[&ArchivedSearchIndex], query: &str) -> Box<[Box<str>]> {
     let wanted = query
         .trim()
         .rsplit("::")
@@ -907,31 +1077,33 @@ fn did_you_mean(index: &ArchivedSearchIndex, query: &str) -> Box<[Box<str>]> {
     if wanted_len < 3 {
         return Box::default();
     }
-    let mut close: Vec<(usize, &str, &ArchivedEntry)> = index
-        .names
+    let mut close: Vec<(usize, &str, &ArchivedEntry)> = indexes
         .iter()
-        .filter_map(|(name, entries)| {
-            let distance = edit_distance(&wanted, name);
-            let longer = wanted_len.max(name.chars().count());
-            // At least 70% alike, and at most 3 edits.
-            if distance > 3 || distance.saturating_mul(10) > longer.saturating_mul(3) {
-                return None;
-            }
-            // Of the items with the name, one that is not a member, with the shortest path.
-            let best = entries
-                .iter()
-                .filter_map(|entry| entry_at(index, entry.to_native()))
-                .min_by_key(|found| {
-                    (
-                        found.parent.is_some(),
-                        found.path.len(),
-                        found.path.as_ref(),
-                    )
-                })?;
-            Some((distance, name.as_ref(), best))
+        .flat_map(|index| {
+            index.names.iter().filter_map(|(name, entries)| {
+                let distance = edit_distance(&wanted, name);
+                let longer = wanted_len.max(name.chars().count());
+                // At least 70% alike, and at most 3 edits.
+                if distance > 3 || distance.saturating_mul(10) > longer.saturating_mul(3) {
+                    return None;
+                }
+                // Of the items with the name, one that is not a member, with the shortest path.
+                let best = entries
+                    .iter()
+                    .filter_map(|entry| entry_at(index, entry.to_native()))
+                    .min_by_key(|found| {
+                        (
+                            found.parent.is_some(),
+                            found.path.len(),
+                            found.path.as_ref(),
+                        )
+                    })?;
+                Some((distance, name.as_ref(), best))
+            })
         })
         .collect();
-    close.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    close
+        .sort_unstable_by(|a, b| (a.0, a.1, a.2.path.as_ref()).cmp(&(b.0, b.1, b.2.path.as_ref())));
     close
         .into_iter()
         .take(5)
@@ -964,21 +1136,25 @@ fn edit_distance(a: &str, b: &str) -> usize {
     row.last().copied().unwrap_or_default()
 }
 
-/// Puts as many of `items` into `response` as fit in the budget, and at least one.
-fn fit<'a>(
-    response: &mut SearchResponse<'a>,
-    mut items: Vec<ItemData<'a>>,
-    page: &impl Fn(usize) -> Page,
-) {
+/// Puts as many of `items` into `found` as fit in the budget, and at least one
+/// (requirement R-OUT-3).
+fn fit<'a>(found: &mut Found<'a>, mut items: Vec<ItemData<'a>>, page: &impl Fn(usize) -> Page) {
     let mut shown = items.len();
     loop {
-        response.data.items = items;
-        response.page = page(shown);
-        let size = serde_json::to_string(&*response).map_or(0, |json| json.chars().count());
+        found.data.items = items;
+        found.page = page(shown);
+        let parts = (
+            &found.provenances,
+            &found.warnings,
+            &found.data,
+            &found.page,
+            &found.hints,
+        );
+        let size = serde_json::to_string(&parts).map_or(0, |json| json.chars().count());
         if size <= MAX_RESPONSE_CHARS || shown <= 1 {
             return;
         }
-        items = std::mem::take(&mut response.data.items);
+        items = std::mem::take(&mut found.data.items);
         shown = shown.saturating_sub(shown.div_ceil(4).max(1));
         items.truncate(shown);
     }
@@ -1108,6 +1284,7 @@ mod tests {
     #[test]
     fn the_first_page_ends_where_the_scores_drop() {
         let hit = |tier, score| Hit {
+            source: 0,
             entry: 0,
             tier,
             same_case: false,
@@ -1140,5 +1317,63 @@ mod tests {
         let drop = [hit(Tier::Partial, 1.0), hit(Tier::Partial, 0.4)];
         assert_eq!(first_page(&drop), 1);
         assert_eq!(first_page(&[]), 1);
+    }
+
+    #[test]
+    fn crates_searched_together_are_ranked_as_one() {
+        let archive = |name: &str| {
+            let mut parsed = parsed();
+            if let Some(root) = parsed.krate.index.get_mut(&Id(0)) {
+                root.name = Some(name.to_owned());
+            }
+            rkyv::to_bytes::<rkyv::rancor::Error>(&Indexed::new(parsed)).expect("archived")
+        };
+        let (first, second) = (archive("first"), archive("second"));
+        let access = |bytes| {
+            CrateView::new(
+                rkyv::access::<crate::query::across::ArchivedIndexed, rkyv::rancor::Error>(bytes)
+                    .expect("checked"),
+            )
+        };
+        let views = [access(&first), access(&second)];
+        let names: [CrateName; 2] = [
+            "first".parse().expect("a name"),
+            "second".parse().expect("a name"),
+        ];
+        let version = Version::new(1, 2, 3);
+        let searched: Vec<Searched<'_>> = views
+            .iter()
+            .zip(&names)
+            .map(|(view, name)| Searched {
+                view,
+                request: ItemRequest {
+                    name,
+                    version: &version,
+                    path: name.as_str(),
+                    origin: Origin::DocsRs {
+                        resolved_from: ResolvedFrom::CargoLock,
+                        project_from: None,
+                        build: None,
+                    },
+                    detail: Detail::Brief,
+                    project_features: None,
+                    follow: false,
+                    target: None,
+                },
+            })
+            .collect();
+        let found = search_across(&searched, SearchOptions {
+            query: "Mutex",
+            fields: Fields::ALL,
+            kinds: &["struct"],
+            limit: None,
+            offset: 0,
+            cursor_request: "c1.req",
+            cursor_data: None,
+        })
+        .expect("searched");
+        let paths: Vec<&str> = found.data.items.iter().map(|item| &*item.path).collect();
+        assert_eq!(paths, ["first::Mutex", "second::Mutex"]);
+        assert_eq!(found.provenances.len(), 2);
     }
 }

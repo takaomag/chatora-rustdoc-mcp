@@ -8,6 +8,7 @@ mod get_item;
 mod list_module;
 mod project;
 mod resolve_version;
+mod search_across;
 mod search_items;
 #[cfg(debug_assertions)]
 mod sleep;

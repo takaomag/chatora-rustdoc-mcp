@@ -303,6 +303,27 @@ impl PackageGraph {
         }
     }
 
+    /// The packages that the members depend on directly, but the members themselves, each once,
+    /// sorted by name and version. Whether each is built for a target, and in which builds, is for
+    /// the caller to tell (`cargo tree`).
+    #[must_use]
+    pub fn direct_packages(&self) -> Vec<&ProjectPackage> {
+        let mut indices: Vec<usize> = self
+            .direct
+            .iter()
+            .map(|direct| direct.package)
+            .filter(|package| !self.members.contains(package))
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        let mut packages: Vec<&ProjectPackage> = indices
+            .into_iter()
+            .filter_map(|index| self.packages.get(index))
+            .collect();
+        packages.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
+        packages
+    }
+
     /// The packages.
     #[must_use]
     pub fn packages(&self) -> &[ProjectPackage] {

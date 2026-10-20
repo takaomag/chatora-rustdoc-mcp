@@ -622,6 +622,19 @@ C3 を 2 つに分けた: C3a (`list_module` と一覧の共通の仕組み)、C
 - 分かっている限り: std を検索しても、core・alloc の item のメンバー (`Vec::push` など) は出ない (std の JSON には名前とパスしか無いため)。std の仲間の横断は C4b で扱う。今の nightly の `HashMap` には `doc(alias = "dict")` が無い
 - テスト: トークンの分け方、名前の一致が上に来ること、メンバーと他の crate の re-export、別名、語をつないだ名前、`did_you_mean` (似ていなければ出さない)、最初のページの打ち切り、引数の誤り、stdio で合成の crate を検索すること
 
+#### C4b (2026-10-20)
+
+利用者が決めた (推奨案): `crate` を省いた `search_items` は、プロジェクトの member の直接依存のうち、評価する target の通常のビルドか dev を含むビルドに入るもの (`cargo tree` の feature の組で判定) を横断する。build の依存と他の OS 向けは除く。std は含めず、`crate: "std"` のときに std・alloc・core を横断する。
+
+- 範囲 (R-SR-2): 依存グラフに「member の直接依存 (member を除く)」を返す口を足した。feature の組を取れなければ (`cargo_lock_raw` など) 直接依存をすべて範囲にして warnings に書く。path・git・別レジストリの依存は、docs.rs に無いので `sources` に `unavailable` (`local_build_required`) として載せる。プロジェクトが無いとき・ローカル機能が無い構成では `crate` が要る (`invalid_argument`)
+- 読み込み: 範囲の crate を並行に、アーカイブがあれば開き、無ければ docs.rs から JSON を取ってアーカイブを作る (`.crate` は読まない。範囲が広いと時間がかかるため、provenance の `features` は出さない)。20 秒 (R-ARCH-6 の 1 リクエストの上限 30 秒の内) で待つのをやめ、終わっていない crate は `sources` に `building` (`building_reason: fetching`・`retry_after_secs: 10`) で載せ、応答の最上位に `partial: true` と `retry_after_secs` を付ける。取得は裏で続き、キャッシュに入るので、次の呼び出しで使われる。失敗したものは `failed` に、`get_item` と同じ `code`・`reason`・`retryable` を付ける
+- 順位: BM25 の統計 (item の総数と各トークンの文書頻度) を範囲のすべての crate で合わせ、結果を 1 つの並びにする (R-SR-3)。カーソルのデータのダイジェストは、範囲の crate のダイジェストを並べたものの SHA-256 (取得が進んで範囲の中身が変わると、前のカーソルは「データが変わった」で拒まれる)
+- 応答 (R-OUT-9 の複数の crate の形): provenance は共通部分 (`target`・`project_from`) と、crate ごとの `sources` (検索したものは 1 つの crate の provenance に `status: ok` を足したもの)。欠けがあれば warnings の先頭に「N 個中 M 個を検索した。取得中 X、使えない Y」の 1 行だけを書く (R-SR-5)。outputSchema の provenance の必須は `target` だけにした
+- `kind` の絞り込みに `method`・`assoc_const`・`assoc_type` を足した (検索の結果にはメンバーが入るため)
+- 実データ: このリポジトリの直接依存は 27 crate で、キャッシュ済みなら初回の約 1.6 秒 (アーカイブを開き直す)、2 回目から 0.03 秒。`sha256 digest` → `sha2::Digest`・`sha2::Sha256`。`crate: "std"` の `Vec push` → `alloc::vec::Vec::push`
+- 分かっている限り: `HeaderMap` は直接依存の横断では見つからない (http は直接依存でなく、reqwest は `header` モジュールを丸ごと re-export しているので、索引には `reqwest::header` という名前しか入らない)。直接依存を横断すると完全一致が無いクエリでは部分一致が似た点数で並び、最初のページが上限の 50 件になりやすい (R-SR-4 の打ち切りの初期値は eval で調整する)
+- テスト: 2 つの crate を合わせた順位、stdio でプロジェクトが無いと `crate` が要ること
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

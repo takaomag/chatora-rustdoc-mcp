@@ -580,6 +580,16 @@ fn search_items_searches_a_cached_crate() {
     assert!(server.finish().success());
 }
 
+/// Without `crate`, `search_items` searches the project's dependencies, which needs a project.
+#[test]
+fn search_items_without_a_crate_needs_a_project() {
+    let mut server = Server::start();
+    server.send(&call_tool(1, "search_items", json!({ "query": "hello" })));
+    let error = text_json(&server.response(1)["result"]);
+    assert_eq!(error["code"], "invalid_argument", "{error}");
+    assert!(server.finish().success());
+}
+
 /// `resolve_version` answers without the network when there is nothing to resolve: std comes
 /// with the toolchain, and an argument that is not valid is a tool error (requirement R-ARG-1).
 #[test]

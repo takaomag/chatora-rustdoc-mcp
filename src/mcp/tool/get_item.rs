@@ -1530,7 +1530,7 @@ async fn execute_std(
 /// to be used for std (requirement R-STD-1). `None` without a single default workspace, or when
 /// its toolchain cannot be run without installing it.
 #[cfg(feature = "local")]
-async fn project_toolchain(state: &ToolState) -> Option<Version> {
+pub(super) async fn project_toolchain(state: &ToolState) -> Option<Version> {
     let project = state.project.as_ref()?;
     let [workspace] = &*project.workspaces else {
         return None;
@@ -1544,7 +1544,7 @@ async fn project_toolchain(state: &ToolState) -> Option<Version> {
     clippy::unused_async,
     reason = "the same signature as with local features, where it runs rustc"
 )]
-async fn project_toolchain(_state: &ToolState) -> Option<Version> {
+pub(super) async fn project_toolchain(_state: &ToolState) -> Option<Version> {
     None
 }
 
@@ -1627,7 +1627,7 @@ fn look_up_std(
 }
 
 /// The tool error for std that the distribution server could not give (requirement R-STD-6).
-fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
+pub(super) fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
     let message = format!(
         "the rustdoc JSON of {} could not be had: {}",
         krate.as_str(),
@@ -1724,7 +1724,7 @@ impl Lookup {
 }
 
 /// The tool error when the lookup was stopped because the server is shutting down.
-fn shutting_down() -> CallToolResult {
+pub(super) fn shutting_down() -> CallToolResult {
     super::tool_error(
         "internal_error",
         "the server stopped the lookup because it is shutting down",
@@ -1890,7 +1890,11 @@ fn release(arguments: &Request) -> String {
 
 /// The tool error for JSON that could not be loaded (§8).
 fn load_error(arguments: &Request, error: &LoadError) -> CallToolResult {
-    let release = release(arguments);
+    load_error_of(&release(arguments), error)
+}
+
+/// The tool error for the JSON of `release` (`name@version`) that could not be loaded (§8).
+pub(super) fn load_error_of(release: &str, error: &LoadError) -> CallToolResult {
     tracing::warn!(%release, error = %ErrorChain(error), "rustdoc JSON could not be loaded");
     let fetch = match error {
         LoadError::Fetch(fetch) => fetch,
@@ -1931,13 +1935,13 @@ fn load_error(arguments: &Request, error: &LoadError) -> CallToolResult {
             }));
         },
         LoadError::Unparsable { retry_after } => {
-            return remembered_error(&release, error, "unparsable", false, *retry_after, &[
+            return remembered_error(release, error, "unparsable", false, *retry_after, &[
                 "docs.rs served JSON that this server cannot parse; it is fetched again after \
                  retry_after_secs, or read by a newer version of the server",
             ]);
         },
         LoadError::Corrupt { retry_after } => {
-            return remembered_error(&release, error, "corrupt", true, *retry_after, &[
+            return remembered_error(release, error, "corrupt", true, *retry_after, &[
                 "check the disk that holds the cache, then try again after retry_after_secs",
             ]);
         },

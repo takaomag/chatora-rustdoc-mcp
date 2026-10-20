@@ -25,7 +25,8 @@ use super::{
     view::CrateView,
 };
 
-/// The kinds that `kind` takes, as `get_item` names them.
+/// The kinds that `kind` takes, as `get_item` names them. Members (`method` and the associated
+/// items) are found by `search_items`; `list_module` lists none.
 pub const KINDS: &[&str] = &[
     "module",
     "struct",
@@ -44,6 +45,9 @@ pub const KINDS: &[&str] = &[
     "extern_crate",
     "extern_type",
     "variant",
+    "method",
+    "assoc_const",
+    "assoc_type",
 ];
 
 /// How to list a module.
