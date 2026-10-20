@@ -817,6 +817,14 @@ README を M1 の実態に合わせ、crates.io への最初の公開を用意�
 - 公開の確認: `cargo publish --dry-run --locked` が通った (81 ファイル、1.1MiB、圧縮して 282KiB。`include` で `src`・`build.rs`・README・ライセンスだけ。説明文の Markdown は `src` の下)。テストのファイルが入らない旨の警告は、`include` で外しているため
 - 公開の手順 (利用者): CI が緑の main を push した後、`cargo login` (crates.io の API token)、`cargo publish --locked`。公開した版は消せない (yank はできる)。公開したら `cargo install --locked chatora-rustdoc-mcp` で入ることを確かめる
 
+#### Windows の CI の修正 (2026-10-20)
+
+1aeda28 の CI で、Windows だけ D1 のログのテストが 4 つ落ちた (`Access is denied`)。ログのファイルを追記だけで開いていたので、Windows の `LockFileEx` (`File::try_lock`) が使えなかった。読みも付けて開けばロックできるが、Windows のロックは強制なので、サーバーが動いている間はほかのプログラムがログを読めなくなる。
+
+- ログそのものはロックせず、プロセスごとに `<日付>-<PID>.lock` を作ってプロセスが終わるまでロックする。古いログを消すときは、その stem のロックが取れない (動いているプロセスがいる) ログを残す。終わったプロセスのロックのファイルは、その stem のログがすべて消えたら消す
+- 同じ日に同じ PID のプロセスが残したロックのファイルは、取り直して使う (ログの番号は続きから)
+- テスト: 終わったプロセスのロックのファイルが消えること、動いているプロセス (テストの中でロックを取る) のログが保持期間を過ぎても残ること
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

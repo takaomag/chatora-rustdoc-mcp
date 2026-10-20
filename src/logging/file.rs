@@ -2,6 +2,7 @@
 //! large, and old files removed (requirement R-OBS-2).
 
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, Write as _},
     path::{Path, PathBuf},
@@ -23,6 +24,9 @@ pub(super) const MARKER: &str = ".chatora-rustdoc-mcp-logs";
 /// The extension of the log files.
 const EXTENSION: &str = "jsonl";
 
+/// The extension of the file that a process locks while it writes the logs of its stem.
+const LOCK_EXTENSION: &str = "lock";
+
 /// How large the files may grow and how long they are kept (requirement R-OBS-2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Limits {
@@ -37,8 +41,10 @@ pub(super) struct Limits {
 /// The log file that this process writes, which only this process writes to.
 ///
 /// Each process has files of its own, named `<date>-<pid>.jsonl` and then `<date>-<pid>.2.jsonl`
-/// and so on, so that the servers of several sessions do not mix their lines. The file being
-/// written is locked, so that another process removing old logs leaves it alone.
+/// and so on, so that the servers of several sessions do not mix their lines. The process locks
+/// `<date>-<pid>.lock` while it runs, so that another process removing old logs leaves its files
+/// alone. The logs themselves are not locked: on Windows a lock would keep others from reading
+/// them.
 #[derive(Debug)]
 pub(super) struct LogFile {
     /// The directory of the logs.
@@ -46,6 +52,8 @@ pub(super) struct LogFile {
     /// `<date>-<pid>`, the start of the names of this process's files.
     stem: String,
     limits: Limits,
+    /// The lock file of `stem`, locked for the life of the process.
+    _lock: File,
     current: Mutex<Current>,
     /// A failure to write has been reported, so the next ones are not.
     failed: AtomicBool,
@@ -81,11 +89,13 @@ impl LogFile {
             )?;
         }
         let stem = format!("{}-{}", date(&now()), std::process::id());
+        let lock = lock(&dir.join(format!("{stem}.{LOCK_EXTENSION}")))?;
         let current = create(dir, &stem, 1)?;
         let log = Self {
             dir: dir.into(),
             stem,
             limits,
+            _lock: lock,
             current: Mutex::new(current),
             failed: AtomicBool::new(false),
         };
@@ -141,9 +151,7 @@ impl LogFile {
 
     /// Goes on to the next file. `Ok(true)` when it did.
     fn rotate(&self, current: &mut Current) -> io::Result<bool> {
-        let next = create(&self.dir, &self.stem, current.part.saturating_add(1))?;
-        // The old file is unlocked when it is closed, and may then be removed.
-        *current = next;
+        *current = create(&self.dir, &self.stem, current.part.saturating_add(1))?;
         Ok(true)
     }
 
@@ -161,24 +169,47 @@ impl LogFile {
     }
 }
 
-/// Creates the file `part` of `stem` in `dir`, or the next part when that is there (a process
-/// with the same id on the same day), and locks it.
+/// Locks the file at `path`, making it if it is not there. A process with the same id on the
+/// same day, which has ended, may have left it.
+fn lock(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(io::Error::other(format!(
+            "{} is locked by another process",
+            path.display()
+        ))),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// Whether a process holds the lock file at `path`. A lock file that is not there is not held.
+fn is_held(path: &Path) -> io::Result<bool> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// Creates the file `part` of `stem` in `dir`, or the next part when that is there (left by a
+/// process with the same id on the same day).
 fn create(dir: &Path, stem: &str, part: u32) -> io::Result<Current> {
     let mut part = part;
     loop {
         let path = dir.join(file_name(stem, part));
         match OpenOptions::new().append(true).create_new(true).open(&path) {
             Ok(file) => {
-                match file.try_lock() {
-                    Ok(()) => {},
-                    Err(TryLockError::WouldBlock) => {
-                        return Err(io::Error::other(format!(
-                            "{} was locked as soon as it was created",
-                            path.display()
-                        )));
-                    },
-                    Err(TryLockError::Error(error)) => return Err(error),
-                }
                 return Ok(Current {
                     file,
                     path,
@@ -203,22 +234,21 @@ fn file_name(stem: &str, part: u32) -> String {
     }
 }
 
-/// Whether `name` is that of a log file that this server writes: `<8 digits>-<digits>`, maybe a
-/// part number, and `.jsonl`.
-fn is_log_name(name: &str) -> bool {
-    let Some(stem) = name.strip_suffix(".jsonl") else {
-        return false;
-    };
-    let mut pieces = stem.splitn(2, '-');
-    let (Some(date), Some(rest)) = (pieces.next(), pieces.next()) else {
-        return false;
-    };
+/// The stem (`<8 digits>-<digits>`) of `name` when it is that of a log file that this server
+/// writes, `<stem>.jsonl` or `<stem>.<part>.jsonl`, or of a lock file, `<stem>.lock`, with whether
+/// it is a lock file.
+fn stem_of(name: &str) -> Option<(&str, bool)> {
     let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
-    let mut rest = rest.splitn(2, '.');
-    date.len() == 8
-        && digits(date)
-        && rest.next().is_some_and(digits)
-        && rest.next().is_none_or(digits)
+    let (stem, rest) = name.split_once('.')?;
+    let (date, pid) = stem.split_once('-')?;
+    if date.len() != 8 || !digits(date) || !digits(pid) {
+        return None;
+    }
+    if rest == LOCK_EXTENSION {
+        return Some((stem, true));
+    }
+    let part = rest.strip_suffix(EXTENSION)?;
+    (part.is_empty() || part.strip_suffix('.').is_some_and(digits)).then_some((stem, false))
 }
 
 /// See [`LogFile::collect_garbage`].
@@ -231,49 +261,66 @@ fn collect_garbage(dir: &Path, limits: Limits, now: SystemTime) -> io::Result<()
         Err(error) => return Err(error),
     }
     let mut logs = Vec::new();
+    let mut locks = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        if !entry.file_name().to_str().is_some_and(is_log_name) {
+        let name = entry.file_name();
+        let Some((stem, is_lock)) = name.to_str().and_then(stem_of) else {
             continue;
-        }
+        };
         // `DirEntry::metadata` does not follow symbolic links, which are left alone.
         let metadata = entry.metadata()?;
-        if metadata.is_file() {
-            logs.push((metadata.modified()?, metadata.len(), entry.path()));
+        if !metadata.is_file() {
+            continue;
+        }
+        if is_lock {
+            locks.push((stem.to_owned(), entry.path()));
+        } else {
+            logs.push((
+                metadata.modified()?,
+                metadata.len(),
+                entry.path(),
+                stem.to_owned(),
+            ));
         }
     }
+    // Whether the process of each stem still runs, asked once for each.
+    let mut held: HashMap<String, bool> = HashMap::new();
+    let mut is_running = |stem: &str| -> io::Result<bool> {
+        if let Some(&running) = held.get(stem) {
+            return Ok(running);
+        }
+        let running = is_held(&dir.join(format!("{stem}.{LOCK_EXTENSION}")))?;
+        held.insert(stem.to_owned(), running);
+        Ok(running)
+    };
     // The oldest first, then by name so that the order does not depend on the directory.
     logs.sort();
     let mut total = logs
         .iter()
-        .fold(0_u64, |total, (_, len, _)| total.saturating_add(*len));
-    for (modified, len, path) in logs {
+        .fold(0_u64, |total, (_, len, ..)| total.saturating_add(*len));
+    let mut kept: Vec<String> = Vec::new();
+    for (modified, len, path, stem) in logs {
         let expired = now
             .duration_since(modified)
             .is_ok_and(|age| age > limits.retention);
-        if (expired || total > limits.total_max_size) && remove_unless_in_use(&path)? {
+        if (expired || total > limits.total_max_size) && !is_running(&stem)? && remove(&path)? {
             total = total.saturating_sub(len);
+        } else {
+            kept.push(stem);
+        }
+    }
+    // The lock files of processes that have ended and whose logs are all gone.
+    for (stem, path) in locks {
+        if !kept.contains(&stem) && !is_running(&stem)? {
+            remove(&path)?;
         }
     }
     Ok(())
 }
 
-/// Removes the log at `path` unless a process holds its lock. `Ok(true)` when it was removed, or
-/// was already gone.
-fn remove_unless_in_use(path: &Path) -> io::Result<bool> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(error) => return Err(error),
-    };
-    match file.try_lock() {
-        Ok(()) => {},
-        Err(TryLockError::WouldBlock) => return Ok(false),
-        Err(TryLockError::Error(error)) => return Err(error),
-    }
-    // Windows does not remove a file that is open. Nothing locks it again in between: a process
-    // only locks the files it creates.
-    drop(file);
+/// Removes the file at `path`. `Ok(true)` when it was removed, or was already gone.
+fn remove(path: &Path) -> io::Result<bool> {
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
@@ -322,14 +369,21 @@ mod tests {
     }
 
     #[test]
-    fn only_the_names_of_logs_are_logs() {
-        assert!(is_log_name("20261020-1234.jsonl"));
-        assert!(is_log_name("20261020-1234.2.jsonl"));
-        assert!(!is_log_name("2026102-1234.jsonl"));
-        assert!(!is_log_name("20261020-.jsonl"));
-        assert!(!is_log_name("20261020-1234.x.jsonl"));
-        assert!(!is_log_name("20261020-1234.json"));
-        assert!(!is_log_name("notes.jsonl"));
+    fn only_the_names_of_logs_and_locks_have_stems() {
+        assert_eq!(
+            stem_of("20261020-1234.jsonl"),
+            Some(("20261020-1234", false))
+        );
+        assert_eq!(
+            stem_of("20261020-1234.2.jsonl"),
+            Some(("20261020-1234", false))
+        );
+        assert_eq!(stem_of("20261020-1234.lock"), Some(("20261020-1234", true)));
+        assert_eq!(stem_of("2026102-1234.jsonl"), None);
+        assert_eq!(stem_of("20261020-.jsonl"), None);
+        assert_eq!(stem_of("20261020-1234.x.jsonl"), None);
+        assert_eq!(stem_of("20261020-1234.json"), None);
+        assert_eq!(stem_of("notes.jsonl"), None);
     }
 
     #[test]
@@ -384,11 +438,11 @@ mod tests {
     }
 
     #[test]
-    fn old_logs_go_and_then_the_oldest_while_too_large_but_not_one_in_use() {
+    fn old_logs_go_and_then_the_oldest_while_too_large_but_not_those_of_running_processes() {
         let temp = tempfile::tempdir().expect("a temporary directory");
         let dir = temp.path();
         let log = LogFile::open(dir, LIMITS).expect("opened");
-        let in_use = log.path();
+        let own = log.path();
         fs::write(dir.join("notes.txt"), "x".repeat(2000)).expect("written");
         for (name, age_days) in [
             ("20200101-1.jsonl", 30),
@@ -405,25 +459,39 @@ mod tests {
                 .and_then(|file| file.set_modified(modified))
                 .expect("set");
         }
-        // The file in use is the newest; then 1600 bytes in the others is over the limit of 1000.
+        // Process 1 has ended and left its lock; process 2 still runs.
+        fs::write(dir.join("20200101-1.lock"), "").expect("written");
+        let running = lock(&dir.join("20200102-2.lock")).expect("locked");
+        // 1600 bytes are over the limit of 1000: 1 is past the retention, 2 runs, 3 goes.
         collect_garbage(dir, LIMITS, SystemTime::now()).expect("no error");
-        let in_use_name = in_use
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("a name")
-            .to_owned();
+        let own_name = |extension: &str| {
+            own.with_extension(extension)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("a name")
+                .to_owned()
+        };
         let mut expected = vec![
             MARKER.to_owned(),
-            "20200103-3.jsonl".to_owned(),
+            "20200102-2.jsonl".to_owned(),
+            "20200102-2.lock".to_owned(),
             "20200104-4.jsonl".to_owned(),
-            in_use_name,
+            own_name(EXTENSION),
+            own_name(LOCK_EXTENSION),
             "notes.txt".to_owned(),
         ];
         expected.sort();
         assert_eq!(names(dir), expected);
-        // Even past the retention, the file in use stays.
+        // Once process 2 has ended, past the retention only this process's files stay.
+        drop(running);
         collect_garbage(dir, LIMITS, SystemTime::now() + LIMITS.retention * 2).expect("no error");
-        assert!(in_use.exists());
-        assert!(!dir.join("20200104-4.jsonl").exists());
+        let mut expected = vec![
+            MARKER.to_owned(),
+            own_name(EXTENSION),
+            own_name(LOCK_EXTENSION),
+            "notes.txt".to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(names(dir), expected);
     }
 }
