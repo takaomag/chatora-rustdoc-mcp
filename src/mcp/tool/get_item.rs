@@ -27,6 +27,7 @@ use crate::{
     data::{
         self,
         LoadError,
+        Loaded,
         archive::Mapped,
         cache::Cache,
         crate_file::{self, DocsRsBuild},
@@ -1251,17 +1252,10 @@ async fn look_up_release(
     {
         arguments.in_build.sets = feature_sets(state, &arguments, &mut warnings).await;
     }
-    let looked_up = {
-        // Another call that loads the same crate goes first, and this one then finds its archive
-        // (requirements R-NW-2 and R-WS-6). The lock is let go before the path is followed into
-        // another crate.
-        let dir =
-            state
-                .cache
-                .docs_rs_dir(&arguments.name, &arguments.version, Some(&arguments.target));
-        let _held = state.cache.lock(&dir).await;
-        load_and_look_up(state, dir, arguments, &mut warnings).await
-    };
+    let dir = state
+        .cache
+        .docs_rs_dir(&arguments.name, &arguments.version, Some(&arguments.target));
+    let looked_up = load_and_look_up(state, dir, arguments, &mut warnings).await;
     match looked_up {
         Ok((looked_up, arguments)) => conclude(state, looked_up, arguments, warnings).await,
         Err(result) => *result,
@@ -1270,6 +1264,11 @@ async fn look_up_release(
 
 /// Looks the item up in the archive of the crate in `dir`, or else fetches the JSON of the crate,
 /// archives it there, and looks the item up in it.
+///
+/// The JSON is loaded by work that the calls for the same crate share, which goes on while one of
+/// them waits (requirements R-NW-2 and R-WS-6). The archive is then made under the lock of `dir`,
+/// so that a call that comes meanwhile opens it instead of making it again. The lock is let go
+/// before the path is followed into another crate.
 async fn load_and_look_up(
     state: &Arc<ToolState>,
     dir: PathBuf,
@@ -1282,7 +1281,8 @@ async fn load_and_look_up(
             Some(Err(arguments)) => *arguments,
             None => return Err(Box::new(shutting_down())),
         };
-    let loaded = match data::docs_rs_json(
+    let loaded = match data::shared_docs_rs_json(
+        &state.docs_rs_loads,
         &state.cache,
         &state.docs_rs,
         &arguments.name,
@@ -1294,16 +1294,23 @@ async fn load_and_look_up(
         Ok(loaded) => loaded,
         Err(error) => return Err(Box::new(load_error(&state.cache, &arguments, &error))),
     };
-    warnings.extend(loaded.warnings);
+    warnings.extend(loaded.warnings.iter().cloned());
+    let _held = state.cache.lock(&dir).await;
+    // Another call may have archived it while this one waited for the lock.
+    let arguments =
+        match look_up_archived(state.cache.clone(), dir.clone(), Box::new(arguments)).await {
+            Some(Ok((looked_up, arguments))) => return Ok((looked_up, *arguments)),
+            Some(Err(arguments)) => *arguments,
+            None => return Err(Box::new(shutting_down())),
+        };
     let lookup = Lookup {
         cache: state.cache.clone(),
         dir,
     };
-    let Some((looked_up, arguments, json)) = lookup.on_blocking(loaded.json, arguments).await
-    else {
+    let Some((looked_up, arguments, loaded)) = lookup.on_blocking(loaded, arguments).await else {
         return Err(Box::new(shutting_down()));
     };
-    recover(state, &lookup, looked_up, arguments, &json, warnings).await
+    recover(state, &lookup, looked_up, arguments, &loaded.json, warnings).await
 }
 
 /// The result of a lookup, or of the lookup in the crate that the path goes on in.
@@ -1753,7 +1760,11 @@ async fn recover(
             .await
             {
                 Ok(Some(json)) => {
-                    let Some((again, returned, _)) = lookup.on_blocking(json, arguments).await
+                    let loaded = Arc::new(Loaded {
+                        json,
+                        warnings: Vec::new(),
+                    });
+                    let Some((again, returned, _)) = lookup.on_blocking(loaded, arguments).await
                     else {
                         return Err(Box::new(shutting_down()));
                     };
@@ -1778,9 +1789,16 @@ async fn recover(
         .await
         {
             Ok(again) => {
-                warnings.extend(again.warnings);
-                let Some((again, returned, fetched)) =
-                    lookup.on_blocking(again.json, arguments).await
+                let Loaded {
+                    json,
+                    warnings: more,
+                } = again;
+                warnings.extend(more);
+                let loaded = Arc::new(Loaded {
+                    json,
+                    warnings: Vec::new(),
+                });
+                let Some((again, returned, fetched)) = lookup.on_blocking(loaded, arguments).await
                 else {
                     return Err(Box::new(shutting_down()));
                 };
@@ -1790,7 +1808,7 @@ async fn recover(
                         &returned.name,
                         &returned.version,
                         Some(&returned.target),
-                        &fetched,
+                        &fetched.json,
                     )
                     .await
                 {
@@ -2066,12 +2084,12 @@ impl Lookup {
     /// result. `None` if the runtime is shutting down; a panic goes on to `run_tool`.
     async fn on_blocking(
         &self,
-        json: Box<[u8]>,
+        loaded: Arc<Loaded>,
         arguments: Request,
-    ) -> Option<(Result<Value, Failure>, Request, Box<[u8]>)> {
+    ) -> Option<(Result<Value, Failure>, Request, Arc<Loaded>)> {
         let (cache, dir) = (self.cache.clone(), self.dir.clone());
         match crate::task::spawn_blocking(move || {
-            let looked_up = load::archive_json(&cache, &dir, &json)
+            let looked_up = load::archive_json(&cache, &dir, &loaded.json)
                 .map_err(|error| match error {
                     load::LoadError::Parse(error) => Failure::Parse(error),
                     load::LoadError::Archive(error) | load::LoadError::Read(error) => {
@@ -2079,7 +2097,7 @@ impl Lookup {
                     },
                 })
                 .and_then(|mapped| look_up_in(&mapped, &arguments));
-            (looked_up, arguments, json)
+            (looked_up, arguments, loaded)
         })
         .await
         {

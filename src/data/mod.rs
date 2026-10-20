@@ -21,6 +21,7 @@ pub mod docs_rs;
 #[cfg(feature = "local")]
 pub mod features;
 pub mod fetches;
+pub mod flight;
 pub mod format_version;
 mod http;
 #[cfg(feature = "local")]
@@ -45,6 +46,7 @@ pub mod version;
 use std::{
     io,
     path::Path,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -56,6 +58,7 @@ use self::{
     cache::{Cache, CachedJson, with_suffix},
     crate_name::CrateName,
     docs_rs::{DocsRs, FetchError},
+    flight::Flights,
     format_version::Header,
     target::TargetTriple,
 };
@@ -82,6 +85,52 @@ pub struct Loaded {
     /// What the response warns about, such as a cached JSON that was damaged and fetched again
     /// (requirement R-CA-4).
     pub warnings: Vec<Box<str>>,
+}
+
+/// A rustdoc JSON loaded for the calls that wanted it at once, or why it could not be.
+pub type SharedJson = Result<Arc<Loaded>, Arc<LoadError>>;
+
+/// [`docs_rs_json`], shared by the calls that want the same JSON at once.
+///
+/// The work goes on while one of them waits for it (requirements R-NW-2 and R-WS-6). It holds the
+/// lock of the crate's directory in the cache, so that other processes take turns, too
+/// (requirement R-CA-4).
+///
+/// # Errors
+///
+/// Returns the error of [`docs_rs_json`], or an error of the cache when the work ended without a
+/// result, as when it panicked.
+pub async fn shared_docs_rs_json(
+    flights: &Flights<SharedJson>,
+    cache: &Cache,
+    docs_rs: &DocsRs,
+    name: &CrateName,
+    version: &Version,
+    target: Option<&TargetTriple>,
+) -> SharedJson {
+    let dir = cache.docs_rs_dir(name, version, target);
+    let key = dir.to_string_lossy().into_owned();
+    let (cache, docs_rs, name, version, target) = (
+        cache.clone(),
+        docs_rs.clone(),
+        name.clone(),
+        version.clone(),
+        target.cloned(),
+    );
+    flights
+        .join(&key, async move || {
+            let _held = cache.lock(&dir).await;
+            docs_rs_json(&cache, &docs_rs, &name, &version, target.as_ref())
+                .await
+                .map(Arc::new)
+                .map_err(Arc::new)
+        })
+        .await
+        .unwrap_or_else(|| {
+            Err(Arc::new(LoadError::Cache(io::Error::other(
+                "the work that loads the rustdoc JSON stopped",
+            ))))
+        })
 }
 
 /// Why rustdoc JSON could not be loaded.
@@ -741,6 +790,32 @@ mod tests {
             std::fs::read_to_string(place.join("61.json.sha256")).expect("the digest"),
             cache::sha256_hex(SERDE_61)
         );
+    }
+
+    /// The call that started a load is called off while another waits for it: the load goes on
+    /// for the other, and docs.rs is asked once (requirements R-NW-2 and R-WS-6).
+    #[tokio::test]
+    async fn a_load_goes_on_while_another_call_waits_for_it() {
+        let (base_url, requests) = test_http::serve_slowly(SERDE_61, Duration::from_millis(300));
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let docs_rs = DocsRs::for_local_test(&base_url);
+        let flights = Arc::new(Flights::default());
+        let call = || {
+            let (flights, cache, docs_rs) = (Arc::clone(&flights), cache.clone(), docs_rs.clone());
+            tokio::spawn(async move {
+                let (name, version) = serde();
+                shared_docs_rs_json(&flights, &cache, &docs_rs, &name, &version, None).await
+            })
+        };
+        let first = call();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = call();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        first.abort();
+        let loaded = second.await.expect("joined").expect("loaded");
+        assert_eq!(&*loaded.json, SERDE_61);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -47,11 +47,13 @@ use crate::data::{metadata::Resolver, project::DefaultProject};
 use crate::{
     config::Settings,
     data::{
+        SharedJson,
         cache::Cache,
         crate_file::StaticCrates,
         dist::Dist,
         docs_rs::DocsRs,
         fetches::Fetches,
+        flight::Flights,
         sparse_index::SparseIndex,
         target::{self, HostTarget},
     },
@@ -64,6 +66,9 @@ pub(super) struct ToolState {
     pub(super) cache: Cache,
     /// The docs.rs client.
     pub(super) docs_rs: DocsRs,
+    /// The rustdoc JSON being loaded from docs.rs, shared by the calls that want it at once
+    /// (requirements R-NW-2 and R-WS-6).
+    pub(super) docs_rs_loads: Flights<SharedJson>,
     /// The client of the Rust distribution server, for std (requirement R-STD-6).
     pub(super) dist: Dist,
     /// The crates.io sparse index, for the versions of crates.

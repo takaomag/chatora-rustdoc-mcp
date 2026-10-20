@@ -339,33 +339,41 @@ async fn load_release(
     target: &TargetTriple,
 ) -> Outcome {
     let dir = state.cache.docs_rs_dir(name, version, Some(target));
-    // A call that loads the same crate goes first, and this one then finds its archive
-    // (requirements R-NW-2 and R-WS-6).
-    let _held = state.cache.lock(&dir).await;
-    let (cache, opened_dir) = (state.cache.clone(), dir.clone());
-    let opened = crate::task::spawn_blocking(move || load::open_archived(&cache, &opened_dir))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten();
-    if let Some(mapped) = opened {
+    let open = async || {
+        let (cache, opened_dir) = (state.cache.clone(), dir.clone());
+        crate::task::spawn_blocking(move || load::open_archived(&cache, &opened_dir))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+    };
+    if let Some(mapped) = open().await {
         return Outcome::Loaded(mapped);
     }
-    let loaded =
-        match crate::data::docs_rs_json(&state.cache, &state.docs_rs, name, version, Some(target))
-            .await
-        {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                let result = get_item::load_error_of(
-                    &state.cache,
-                    name,
-                    &format!("{name}@{version}"),
-                    &error,
-                );
-                return Outcome::Failed(failure_of(&result));
-            },
-        };
+    // The JSON is loaded by work that the calls for the same crate share, and archived under the
+    // lock of its directory, so that a call that comes meanwhile opens the archive (requirements
+    // R-NW-2 and R-WS-6).
+    let loaded = match crate::data::shared_docs_rs_json(
+        &state.docs_rs_loads,
+        &state.cache,
+        &state.docs_rs,
+        name,
+        version,
+        Some(target),
+    )
+    .await
+    {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let result =
+                get_item::load_error_of(&state.cache, name, &format!("{name}@{version}"), &error);
+            return Outcome::Failed(failure_of(&result));
+        },
+    };
+    let _held = state.cache.lock(&dir).await;
+    if let Some(mapped) = open().await {
+        return Outcome::Loaded(mapped);
+    }
     let cache = state.cache.clone();
     let archived =
         crate::task::spawn_blocking(move || load::archive_json(&cache, &dir, &loaded.json)).await;
