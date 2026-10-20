@@ -405,6 +405,12 @@ pub enum GetItemError {
         /// What the item is.
         kind: &'static str,
     },
+    /// The path names an item that is not a type, whose impls to list (requirement R-TI-2).
+    #[error("the path names a {kind}, not a type")]
+    NotAType {
+        /// What the item is.
+        kind: &'static str,
+    },
     /// The cursor is not for this data or goes past its end (requirement R-OUT-3).
     #[error("{0}")]
     BadCursor(&'static str),
@@ -1053,13 +1059,23 @@ impl<'a> Query<'a> {
     fn impl_header(&mut self, parent: Id, member: Id) -> Option<Box<str>> {
         let (impl_item, _) = path_index::own_impls(self.view, parent)
             .find(|(_, contents)| contents.items.contains(&member))?;
+        Some(self.impl_text(impl_item))
+    }
+
+    /// The header of `impl_item`, an `impl`, with its where clause, as Rust writes it.
+    pub(super) fn impl_text(&mut self, impl_item: &Item) -> Box<str> {
         let mut header = self.renderer.signature(impl_item);
         let predicates = self.renderer.where_predicates(impl_item);
         for (position, predicate) in predicates.iter().enumerate() {
             header.push_str(if position == 0 { " where " } else { ", " });
             header.push_str(predicate);
         }
-        Some(header.into())
+        header.into()
+    }
+
+    /// The where predicates of `item`, as Rust writes them.
+    pub(super) fn where_text(&mut self, item: &Item) -> Vec<String> {
+        self.renderer.where_predicates(item)
     }
 
     /// The fields of a struct with named fields or of a union, one each. A tuple struct has them

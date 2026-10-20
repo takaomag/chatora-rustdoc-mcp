@@ -4,6 +4,7 @@ pub mod across;
 pub mod cfg;
 pub mod docs;
 pub mod get_item;
+pub mod impls;
 pub mod list_module;
 pub mod load;
 pub mod overview;

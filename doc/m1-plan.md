@@ -635,6 +635,20 @@ C3 を 2 つに分けた: C3a (`list_module` と一覧の共通の仕組み)、C
 - 分かっている限り: `HeaderMap` は直接依存の横断では見つからない (http は直接依存でなく、reqwest は `header` モジュールを丸ごと re-export しているので、索引には `reqwest::header` という名前しか入らない)。直接依存を横断すると完全一致が無いクエリでは部分一致が似た点数で並び、最初のページが上限の 50 件になりやすい (R-SR-4 の打ち切りの初期値は eval で調整する)
 - テスト: 2 つの crate を合わせた順位、stdio でプロジェクトが無いと `crate` が要ること
 
+#### C5 (2026-10-20)
+
+`list_impls` を足した (R-TI-2・R-SH-4・R-TI-5 の型の分。§3 Q8)。
+
+- 対象の impl: rustdoc が型に付けた impl の一覧から、`for` がその型のもの (プリミティブ型はすべて) と blanket impl を取る。`get_item` が使う `own_impls` は blanket impl を落とす (`for` が `T` なので) ため使わない。その型が trait の型引数に現れるだけの impl (`impl From<Elapsed> for io::Error`) は除く
+- 分類は構造のフィールドだけ (R-TI-2): `is_synthetic` → auto、`blanket_impl` → blanket、trait が無い → inherent、`is_negative` → negative、`#[automatically_derived]` → derive、ほかは trait
+- `auto_traits` (R-TI-2): auto trait ごとに `yes`・`no`・`if <条件>` を 1 つにまとめる。auto trait かどうかは、その crate のデータで合成された impl に出てくる trait と、その crate の `is_auto` の trait で決める。合成された impl のほか、明示的な impl (`unsafe impl<T: Sync + Send> Send for Arc<T>`) と negative impl (`Rc` の `!Send`) もここに入れる。条件は impl の型引数の境界と where 句から作り、何も縛らない `?Sized` は除く。不安定な `Freeze`・`UnsafeUnpin` は隠す (名前の一覧で。分類ではなく表示の既定なので R-TI-2 の「名前で推測しない」には当たらない)
+- `std_blanket` (R-SH-4): core・alloc・std の汎用 trait (`From`・`Into`・`TryFrom`・`TryInto`・`Borrow`・`BorrowMut`・`Any`・`ToOwned`・`ToString`・`CloneToUninit`) の blanket impl は名前だけを並べる。ほかの blanket impl は `impls` に 1 行ずつ (trait の crate を添える)
+- `impls`: 出どころの順 (この crate → 依存 → std)、同じ出どころの中は分類・trait・見出しの順 (R-OUT-4)。各項目は `kind`・`trait` (定義のパス)・`crate` (別の crate のとき)・`header` (where 句込みの impl の見出し)。型には `non_exhaustive` と `has_private_fields` (R-TI-5) を付ける。ページングは `list_module` と同じカーソル
+- 型でない item を指したら `invalid_argument` (`NotAType`)。他の crate から re-export された型はたどる (`std::sync::Arc` → `alloc::sync::Arc`)
+- 実データ: `tokio::sync::Mutex` は `Send`・`Sync` が `if T: Send`、tracing の `Instrument` などが blanket。`std::sync::Arc` は `Send`・`Sync` が `if T: Sync + Send, A: Allocator + Send + Sync`。`std::rc::Rc` は `Send`・`Sync` が `no`。これで「`Arc<Mutex<T>>` は Send か」に、2 つの条件を組み合わせて答えられる。axum の `WebSocketUpgrade` は blanket impl が 8 個 (`VZip`・`Same`・`ErasedDestructor` など)
+- 扱っていないこと: trait 側の境界情報 (`sealed`・`dyn_compatible`・required / provided。R-TI-5) は C7 (`list_implementors`) で扱う。`Arc<Mutex<T>>` のような型の式をそのまま引くことはできない (型ごとに引いて組み合わせる)
+- テスト: 条件の作り方 (型引数の境界・where 句・`?Sized`・入れ子の `<>`)、型の impl、モジュールを指したときのエラー、引数
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

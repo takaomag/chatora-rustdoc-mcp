@@ -51,6 +51,7 @@ use crate::{
             ResolvedFrom,
             get_item,
         },
+        impls::{ImplOptions, list_impls},
         list_module::{ListOptions, list_module},
         load,
         overview::crate_overview,
@@ -129,6 +130,20 @@ pub(super) enum What {
     Overview,
     /// The items that match a query (`search_items`).
     Search(Box<Searching>),
+    /// The traits that the type implements (`list_impls`).
+    Impls(Box<Paging>),
+}
+
+/// A page of a list: how many items, from where, and what the cursor was made for
+/// (requirement R-OUT-3).
+#[derive(Debug, Clone)]
+pub(super) struct Paging {
+    pub(super) limit: usize,
+    pub(super) offset: usize,
+    /// What cursors start with: the form and the digest of the arguments.
+    pub(super) request_digest: Box<str>,
+    /// The digest of the data that the cursor was made for, when there is a cursor.
+    pub(super) cursor_data: Option<Box<str>>,
 }
 
 /// How `search_items` searches (requirements R-SR-1 to R-SR-5).
@@ -206,6 +221,21 @@ impl Arguments {
             shape: Shape {
                 detail,
                 what: What::Search(Box::new(searching)),
+            },
+        }
+    }
+
+    /// The arguments of `list_impls`: those that name a release, the type's path, and the page.
+    pub(super) fn for_impls(release: ReleaseArguments, path: &str, paging: Paging) -> Self {
+        Self {
+            path: with_crate_name(&release.name, path.trim_start_matches("::")),
+            name: release.name,
+            version: release.version,
+            project: release.project,
+            target: release.target,
+            shape: Shape {
+                detail: Detail::Normal,
+                what: What::Impls(Box::new(paging)),
             },
         }
     }
@@ -1867,6 +1897,16 @@ fn respond_in(
             .map_err(Failure::Item)?;
             return serde_json::to_value(&response).map_err(Failure::Serialize);
         },
+        What::Impls(paging) => {
+            let response = list_impls(view, request, ImplOptions {
+                limit: paging.limit,
+                offset: paging.offset,
+                cursor_request: &paging.request_digest,
+                cursor_data: paging.cursor_data.as_deref(),
+            })
+            .map_err(Failure::Item)?;
+            return serde_json::to_value(&response).map_err(Failure::Serialize);
+        },
         What::List(listing) => listing,
     };
     let kinds: Vec<&str> = listing.kinds.to_vec();
@@ -2074,6 +2114,12 @@ fn item_error(arguments: &Request, error: &GetItemError) -> CallToolResult {
         GetItemError::NotAModule { kind } => error_result(&json!({
             "code": "invalid_argument",
             "message": format!("{release} has a {kind}, not a module, at {}", arguments.path),
+            "retryable": false,
+            "suggestions": [format!("call get_item with the path {}", arguments.path)],
+        })),
+        GetItemError::NotAType { kind } => error_result(&json!({
+            "code": "invalid_argument",
+            "message": format!("{release} has a {kind}, not a type, at {}", arguments.path),
             "retryable": false,
             "suggestions": [format!("call get_item with the path {}", arguments.path)],
         })),
