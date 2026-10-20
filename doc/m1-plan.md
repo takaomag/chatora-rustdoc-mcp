@@ -872,6 +872,44 @@ README を M1 の実態に合わせ、crates.io への最初の公開を用意�
 - git の依存の取得 (子の cargo) は別の話で、サーバーは token を扱わない。利用者の資格情報が使われ、認証で失敗したら利用者の端末で通すよう案内する (R-WS-6・R-WS-7。変更なし)
 - GitHub CLI (gh) は必須にしない (利用者が決めた。推奨案。2026-10-20): GitHub API は匿名でも読める公開リポジトリにだけ使い、token は rate limit を緩めるためだけなので、その小さな機能のために導入の条件を gh にしない。`gh api` を毎回子で呼ぶとキーリングの許可のダイアログが出うるうえ、ETag・rate limit の待ち・ミラー (R-CA-8)・オフラインの扱いが gh の出力の解析になる。git の依存は子の cargo が取得し、cargo は libgit2 の経路でも git の CLI の経路でも git の `credential.helper` を使うので、利用者が `gh auth setup-git` を実行していれば gh の認証情報がそのまま効く。そこで、`cargo metadata` が git の認証の失敗で落ちたときの warnings (今は Cargo.lock を直接読む経路だけ) に `cargo fetch` と `gh auth setup-git` の案内を足した。§8 の `fetch_failed` の `auth` の案内と README にも M1 の終わりに足す。GitHub 以外 (GitLab・Bitbucket・自前のサーバー) は cargo と git の設定に任せる (変更なし)
 
+#### 要件への反映の判断 (2026-10-20)
+
+§7 の手順 1 として、§6 の記録から要件に反映するものの一覧をサブエージェントに作らせ (約 140 項目)、判断が要るものを 17 件に絞って利用者が決めた (16 件は推奨案)。一覧の残り (細部の追加・事実の更新・決定済み) は、要件の次の版にそのまま反映する。
+
+| # | 件 | 決定 |
+| --- | --- | --- |
+| 1 | 他の crate への re-export を定義元のパス (`alloc::vec::Vec`、`http::header::HeaderMap`) で返している (R-PR-2 は窓口のパス) | 実装を要件に合わせる。公開前に |
+| 2 | 1GB 級の JSON をディスクへ展開する (R-NW-3) が無い (512MiB を超えると `too_large`) | 要件を改め、Q-22 (解析のストリーム化) と一緒に M4 以降 |
+| 3 | §9.1 の M1 の目標 | E2 の案のまま (キャッシュ済みの照会は p50 < 10ms・p95 < 50ms、新しいプロセスで core を開くのは < 150ms、中規模の正規化 < 500ms、core の正規化 < 3s)。アーカイブは開くときに検証し続け、プロセスの中で使い回す形で Q-23 を解決にする |
+| 4 | 一覧の `detail` の既定 | ツールごとの既定にする (1 つの item を返すツールは `normal`、一覧は `brief`)。設定 `output.detail` は 1 つの item を返すツールの既定だけを変える |
+| 5 | `list_crates` の provenance (R-OUT-9 は `sources` の形の例に挙げている) | 要件を実装に合わせる (provenance は 1 つ) |
+| 6 | `resolve_version` の `docs_rs_json` (R-DS-5 は `rustdoc_json`) | 要件を実装に合わせる |
+| 7 | 利用者の `net.offline` での `offline_miss` (R-WS-7) | M2 でビルドと一緒に |
+| 8 | ログのロックのファイルを消すこと (R-CA-4 の「ロックファイルを消さない」) | 今日の日付のものは消さない (同じ日に同じ PID のプロセスが取り直すのと競合しないため)。要件には、ログのロックはプロセスごとで、古い日付のものは消すと書く |
+| 9 | canary の std のスナップショット (R-QA-4) | 要件を今の形 (代表の item が引けることと R-QA-1 の予算) に改める |
+| 10 | R-FT-2 の `also_reexported_at` ごとの条件・`doc(auto_cfg(hide))`・`reexport_of` の条件 | M4 で feature の機能と一緒に |
+| 11 | index の取り直しが通信で失敗したとき | 古いものを warnings 付きで使う |
+| 12 | モジュールを丸ごと re-export した先の item の検索の索引 (R-SR-1)、R-TI-4 の逆引き索引 | M4 で依存グラフ全体の索引と一緒に |
+| 13 | `cargo metadata`・`cargo tree` の合流と失敗の保持、`limits.memory` (R-MEM-1)、設定ファイルと知らない設定の知らせ | M2、M5、M2 |
+| 14 | §4 の未決: どの glob で trait がスコープに入るか (R-PR-2)、`source_signature` (R-OUT-2) | M4、添えない (描けない例が見つかったら戻す) |
+| 15 | R-OUT-7 の normal の impl の見出し、一覧の `docs: none` | 要件を今の形に改める (impl は `list_impls`、一覧は既定の `brief` で本文なし) |
+| 16 | `default_unstable` (R-STD-2)、`list_impls`・`list_implementors` の各項目の feature の注記 (R-FT-2)、存在しない crate の 5 分の否定キャッシュ (R-ERR-3) | 3 つとも公開前に入れる |
+| 17 | 1 つの crate の照会の 30 秒の上限と `status: building` (R-ARCH-6)、暗黙の member と `cargo metadata` の workspace のルートの突き合わせ | どちらも M2 |
+
+ソースで確かめて片付いたもの: 想定外の HTTP ステータスは `retryable: false` で §8 どおり。Q-18 (ジェネリックな型の auto trait) は、impl の型引数の境界と where 句から条件を作る形で答えた (C5)。R-PR-1 の「パッケージ名と lib 名」は、引数で両方を受けることは満たしている。
+
+公開前に入れるもの (上の 1・8・11・16): 応答のパスを窓口のパスにする、今日の日付のログのロックを消さない、古い index を使う、`default_unstable`、`list_impls`・`list_implementors` の feature の注記、存在しない crate の否定キャッシュ。
+
+結果 (2026-10-20。すべて入れた):
+
+- 窓口のパス (1): 別の crate の item を re-export で引いたとき (std の中の std → alloc・core と、docs.rs の crate → 別の crate・std の両方)、`data.path` を引かれたパス (`std::vec::Vec`、`reqwest::header::HeaderMap`) にし、定義元の crate でのパス (`alloc::vec::Vec`、`http::HeaderMap`) を `data.defined_at` に出す。crate は provenance のまま (データの出どころ)。`data` の中の `path`・`parent` のうち定義元のパスの下にあるもの (`list_methods` のメソッド、`list_module` の item、member の型) も引かれたパスの下に移す。シグネチャの中の型のパス (`alloc::alloc::Global`) と `also_reexported_at` は定義元の crate のまま。2 つ以上の crate をたどったとき (futures → futures_util → core) は内側から順に移し、`defined_at` は最後の crate のパス。対象は `get_item`・`list_module`・`list_methods`・`list_impls`・`list_implementors`
+- その途中で見つけた既存の不具合: 一覧のカーソルを、行き先へたどる前の crate のデータで検査していたので、docs.rs の crate をまたぐ re-export (`reqwest::header`) の 2 ページ目が必ず「データが変わった」で弾かれていた (std の中は先に行き先を開くので起きない)。4 つの一覧とも、たどるかを決めた後に検査する
+- ログのロック (8): 今日の日付のロックのファイルは GC で消さない
+- 古い index (11): crates.io の index に通信できない (`Network`・`Transient`・想定外のステータス) とき、キャッシュの index を使い、新しい版が抜けうる旨を warnings に出す (`resolve_version`・`get_item` ほか版を決める呼び出し)
+- `default_unstable` (16): 関数・関連定数・関連型の既定が unstable なら `stability.default_unstable` に feature を出し、stable の実装では書く必要がある旨を warnings に出す
+- feature の注記 (16): `list_impls`・`list_implementors` の各項目に、その impl 自身の条件 (`required_features`・`other_cfg`・`cfg_source`・`enabled_in_project`・`enabled_in_dev_only`) を出す。型や trait の条件は `get_item` の側にあるので繰り返さない
+- 否定キャッシュ (16): crates.io の index に無い crate を 5 分覚え、その間は index を引かない
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

@@ -130,6 +130,7 @@ fn output_schema() -> JsonObject {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "defined_at": get_item::defined_at_schema(),
                     "docs": { "type": "string" },
                     "docs_truncated": { "type": "boolean" },
                     "items": { "type": "array", "items": get_item::data_schema() },

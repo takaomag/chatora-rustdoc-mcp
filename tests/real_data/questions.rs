@@ -79,11 +79,14 @@ fn item_questions() -> Vec<Question> {
             "what must I write to implement `Iterator`?",
             json!({ "crate": "std", "path": "iter::Iterator" }),
             |result| {
-                result["data"]["items"].as_array().is_some_and(|items| {
-                    items
-                        .iter()
-                        .any(|item| item["name"] == "next" && item["provided"] == false)
-                })
+                // Shown at the path asked for, not at that of core (requirement R-PR-2).
+                result["data"]["path"] == "std::iter::Iterator"
+                    && result["data"]["defined_at"] == "core::iter::Iterator"
+                    && result["data"]["items"].as_array().is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|item| item["name"] == "next" && item["provided"] == false)
+                    })
             },
         ),
         question(

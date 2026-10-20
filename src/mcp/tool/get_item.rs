@@ -468,6 +468,34 @@ pub(super) fn provenance_schema() -> Value {
     })
 }
 
+/// The properties of `Conditions` in `query::get_item`, which a list's entries that are not items
+/// of their own have (an `impl`), taken from those of [`data_schema`].
+pub(super) fn conditions_properties() -> JsonObject {
+    let data = data_schema();
+    [
+        "required_features",
+        "other_cfg",
+        "cfg_source",
+        "enabled_in_project",
+        "enabled_in_dev_only",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        let schema = data.get("properties")?.get(name)?;
+        Some((name.to_owned(), schema.clone()))
+    })
+    .collect()
+}
+
+/// The schema of `defined_at`, which [`show_at_entry`] adds to `data`.
+pub(super) fn defined_at_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "When the path asked for is a re-export of another crate's item, the \
+                        item's path in that crate, the crate of provenance.",
+    })
+}
+
 /// The schema of `data`: `ItemData` in `query::get_item`.
 pub(super) fn data_schema() -> Value {
     let strings = json!({ "type": "array", "items": { "type": "string" } });
@@ -478,6 +506,7 @@ pub(super) fn data_schema() -> Value {
                 "type": "string",
                 "description": "The canonical path, or in a list the path it is listed at.",
             },
+            "defined_at": defined_at_schema(),
             "canonical": {
                 "type": "string",
                 "description": "In a list, the canonical path of an item listed at another.",
@@ -534,12 +563,14 @@ pub(super) fn data_schema() -> Value {
             "stability": {
                 "type": "object",
                 "description": "For std: since which Rust release it is stable, or the feature it \
-                                needs; the same for its use in const.",
+                                needs; the same for its use in const; and the feature that the \
+                                default of a trait's item needs.",
                 "properties": {
                     "stable_since": { "type": "string" },
                     "unstable_feature": { "type": "string" },
                     "const_stable_since": { "type": "string" },
                     "const_unstable_feature": { "type": "string" },
+                    "default_unstable": { "type": "string" },
                 },
             },
             "also_reexported_at": strings,
@@ -791,6 +822,7 @@ async fn resolve(
         .entry(&name)
         .await
         .map_err(|error| Box::new(index_error(&name, &error)))?;
+    warnings.extend(entry.stale.clone());
     // docs.rs has the project's package only if it is the one on crates.io (requirement R-VR-2).
     #[cfg(feature = "local")]
     if let Some(found) = &from_project {
@@ -1185,7 +1217,7 @@ async fn follow(
         },
     };
     if result.is_error != Some(true) {
-        return result;
+        return result_at_entry(result, &destination.entry);
     }
     let mut warnings = warnings;
     warnings.push(
@@ -1204,6 +1236,92 @@ async fn follow(
         result
     } else {
         fallback
+    }
+}
+
+/// `result`, shown at `entry` by [`show_at_entry`].
+fn result_at_entry(mut result: CallToolResult, entry: &str) -> CallToolResult {
+    result
+        .structured_content
+        .take()
+        .map_or(result, |mut response| {
+            show_at_entry(&mut response, entry);
+            CallToolResult::structured(response)
+        })
+}
+
+/// Shows `response`, of an item found through a re-export of another crate's item, at the path
+/// asked for, `entry` (`std::vec::Vec`), rather than at its path in that crate (`alloc::vec::Vec`),
+/// which goes in `defined_at` (requirement R-PR-2). The paths of its members and of the items in
+/// it go under `entry` too. A response already shown at an entry, after a path was followed
+/// through more than one crate, keeps its `defined_at`.
+fn show_at_entry(response: &mut Value, entry: &str) {
+    let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(defined) = data.get("path").and_then(Value::as_str).map(str::to_owned) else {
+        return;
+    };
+    if defined == entry {
+        return;
+    }
+    for value in data.values_mut() {
+        rebase(value, &defined, entry);
+    }
+    if let Some(Value::String(path)) = data.get_mut("path") {
+        entry.clone_into(path);
+    }
+    // The type of a member: that of `alloc::vec::Vec::push` is `std::vec::Vec`.
+    if let Some(((defined_parent, member), (entry_parent, asked_member))) =
+        defined.rsplit_once("::").zip(entry.rsplit_once("::"))
+        && member == asked_member
+        && let Some(Value::String(parent)) = data.get_mut("parent")
+        && parent == defined_parent
+    {
+        entry_parent.clone_into(parent);
+    }
+    if data.contains_key("defined_at") {
+        return;
+    }
+    // Right after `path`.
+    for (key, value) in std::mem::take(data) {
+        let after = key == "path";
+        data.insert(key, value);
+        if after {
+            data.insert("defined_at".to_owned(), Value::String(defined.clone()));
+        }
+    }
+}
+
+/// Moves the paths in `value` that are `from` or under it (`alloc::vec::Vec::push`) to `to`
+/// (`std::vec::Vec::push`).
+fn rebase(value: &mut Value, from: &str, to: &str) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                match value {
+                    Value::String(path) if key == "path" || key == "parent" => {
+                        if let Some(rest) = path.strip_prefix(from)
+                            && (rest.is_empty() || rest.starts_with("::"))
+                        {
+                            *path = format!("{to}{rest}");
+                        }
+                    },
+                    Value::Null
+                    | Value::Bool(_)
+                    | Value::Number(_)
+                    | Value::String(_)
+                    | Value::Array(_)
+                    | Value::Object(_) => rebase(value, from, to),
+                }
+            }
+        },
+        Value::Array(values) => {
+            for value in values {
+                rebase(value, from, to);
+            }
+        },
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {},
     }
 }
 
@@ -1273,6 +1391,7 @@ async fn destination_request(
             .entry(&name)
             .await
             .map_err(|error| Box::new(index_error(&name, &error)))?;
+        warnings.extend(entry.stale.clone());
         let resolved = VersionSpec::Latest
             .resolve(&entry.versions)
             .map_err(|no_version| {
@@ -1595,11 +1714,14 @@ async fn execute_std(
         (looked_up, request)
     });
     match task.await {
-        Ok(((looked_up, through), request)) => {
+        Ok(((mut looked_up, through), request)) => {
             if let [asked, .., found] = through.as_slice() {
                 warnings.push(
                     format!("{asked} is a re-export of {found}, shown from its crate").into(),
                 );
+                if let Ok(response) = &mut looked_up {
+                    show_at_entry(response, asked);
+                }
             }
             finish(looked_up, &request, &warnings)
         },
@@ -2383,6 +2505,59 @@ mod tests {
 
     /// Every property of a full response is declared in the output schema.
     #[test]
+    fn an_item_found_through_a_reexport_is_shown_at_the_path_asked_for() {
+        // A member, and the type of a list.
+        let mut member = json!({
+            "provenance": { "crate": "alloc" },
+            "data": {
+                "path": "alloc::vec::Vec::push",
+                "kind": "method",
+                "parent": "alloc::vec::Vec",
+            },
+        });
+        show_at_entry(&mut member, "std::vec::Vec::push");
+        assert_eq!(
+            member["data"].to_string(),
+            json!({
+                "path": "std::vec::Vec::push",
+                "defined_at": "alloc::vec::Vec::push",
+                "kind": "method",
+                "parent": "std::vec::Vec",
+            })
+            .to_string()
+        );
+        let mut list = json!({ "data": {
+            "path": "alloc::vec::Vec",
+            "methods": [
+                { "path": "alloc::vec::Vec::push", "parent": "alloc::vec::Vec" },
+                // Not under the type: a path of another item, or text.
+                { "path": "alloc::vec::Vector", "signature": "fn f(alloc::vec::Vec)" },
+            ],
+        }});
+        show_at_entry(&mut list, "std::vec::Vec");
+        assert_eq!(
+            list["data"],
+            json!({
+                "path": "std::vec::Vec",
+                "defined_at": "alloc::vec::Vec",
+                "methods": [
+                    { "path": "std::vec::Vec::push", "parent": "std::vec::Vec" },
+                    { "path": "alloc::vec::Vector", "signature": "fn f(alloc::vec::Vec)" },
+                ],
+            })
+        );
+        // Followed through another crate: the path where it is defined stays.
+        show_at_entry(&mut list, "my_crate::Vec");
+        assert_eq!(list["data"]["path"], "my_crate::Vec");
+        assert_eq!(list["data"]["defined_at"], "alloc::vec::Vec");
+        assert_eq!(list["data"]["methods"][0]["path"], "my_crate::Vec::push");
+        // A member's type is the asked one only when the member is.
+        let mut renamed = json!({ "data": { "path": "other::Thing", "parent": "other" } });
+        show_at_entry(&mut renamed, "my_crate::Alias");
+        assert_eq!(renamed["data"]["parent"], "other");
+    }
+
+    #[test]
     fn the_output_schema_covers_the_response() {
         use crate::query::get_item::{
             Deprecated,
@@ -2451,6 +2626,7 @@ mod tests {
                     unstable_feature: some_str(),
                     const_stable_since: some_str(),
                     const_unstable_feature: some_str(),
+                    default_unstable: some_str(),
                 }),
                 also_reexported_at: many(),
                 reexport_of: Some(ReexportOf {

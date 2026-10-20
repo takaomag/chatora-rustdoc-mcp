@@ -226,6 +226,29 @@ pub enum ResolvedFrom {
     Reexport,
 }
 
+/// The conditions of an entry of a list that is not an item of its own, such as an `impl`.
+///
+/// They are those that it is written with, without those of the type or trait it is listed for
+/// (requirement R-FT-2), and empty when it has none.
+#[derive(Debug, Default, Serialize)]
+pub struct Conditions {
+    /// The features it needs, as [`ItemData::required_features`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_features: Option<Box<str>>,
+    /// The other conditions it needs, as [`ItemData::other_cfg`].
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub other_cfg: Box<[Box<str>]>,
+    /// Where they were read, as [`ItemData::cfg_source`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfg_source: Option<&'static str>,
+    /// Whether the project's normal build has it, as [`ItemData::enabled_in_project`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_in_project: Option<Enabled>,
+    /// As [`ItemData::enabled_in_dev_only`].
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub enabled_in_dev_only: bool,
+}
+
 /// One item, as of `detail=normal` (requirement R-OUT-7), with the signature before the prose
 /// (requirement R-SH-1).
 #[derive(Debug, Default, Serialize)]
@@ -334,6 +357,11 @@ pub struct StabilityNote<'a> {
     /// The feature that its use in `const` needs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub const_unstable_feature: Option<&'a str>,
+    /// The feature that the default body (or value) of a trait's item needs, when the item itself
+    /// is stable but the default is not (requirement R-STD-2): an implementation of the trait
+    /// that leaves it out relies on an unstable default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_unstable: Option<&'a str>,
 }
 
 /// A section of the documentation.
@@ -426,6 +454,9 @@ pub enum GetItemError {
 /// Where a path goes on in another crate (requirement R-PR-4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Destination {
+    /// The path asked for, with the crate's name (`reqwest::header::HeaderMap`), at which the
+    /// item found there is shown (requirement R-PR-2).
+    pub entry: Box<str>,
     /// The path asked for, up to the re-export (`reqwest::header`).
     pub reexport: Box<str>,
     /// What it re-exports, by its path in the other crate (`http::header`).
@@ -880,6 +911,40 @@ impl<'a> Query<'a> {
         (note.stable_since, note.unstable_feature) = level(item.stability.as_deref());
         (note.const_stable_since, note.const_unstable_feature) =
             level(item.const_stability.as_deref());
+        let default_unstable = match &item.inner {
+            ItemEnum::Function(function) => function.default_unstable.as_deref(),
+            ItemEnum::AssocConst {
+                default_unstable, ..
+            }
+            | ItemEnum::AssocType {
+                default_unstable, ..
+            } => default_unstable.as_deref(),
+            ItemEnum::Module(_)
+            | ItemEnum::ExternCrate { .. }
+            | ItemEnum::Use(_)
+            | ItemEnum::Union(_)
+            | ItemEnum::Struct(_)
+            | ItemEnum::StructField(_)
+            | ItemEnum::Enum(_)
+            | ItemEnum::Variant(_)
+            | ItemEnum::Trait(_)
+            | ItemEnum::TraitAlias(_)
+            | ItemEnum::Impl(_)
+            | ItemEnum::TypeAlias(_)
+            | ItemEnum::Constant { .. }
+            | ItemEnum::Static(_)
+            | ItemEnum::ExternType
+            | ItemEnum::Macro(_)
+            | ItemEnum::ProcMacro(_)
+            | ItemEnum::Primitive(_) => None,
+        };
+        note.default_unstable = default_unstable.map(|default| default.feature.as_str());
+        if let Some(feature) = note.default_unstable {
+            self.warnings.push(Cow::Owned(format!(
+                "the default of {path} is unstable (#![feature({feature})]): an implementation \
+                 on stable Rust must write it"
+            )));
+        }
         let project_release = match self.request.origin {
             Origin::Std {
                 project_release, ..
@@ -900,7 +965,30 @@ impl<'a> Query<'a> {
                 "{path} is stable since Rust {since}, after the project's toolchain {project}"
             )));
         }
-        (note.stable_since.is_some() || note.unstable_feature.is_some()).then_some(note)
+        (note.stable_since.is_some()
+            || note.unstable_feature.is_some()
+            || note.default_unstable.is_some())
+        .then_some(note)
+    }
+
+    /// The conditions that the entry `id` of a list is written with (an `impl`), or none.
+    pub(super) fn own_conditions(&self, id: Id) -> Conditions {
+        let mut data = ItemData::default();
+        self.cfg_note(id, None, &mut data);
+        if data.required_features.is_none() && data.other_cfg.is_empty() {
+            // Only that some could not be read is worth telling.
+            return Conditions {
+                cfg_source: data.cfg_source.filter(|source| *source == "unknown"),
+                ..Conditions::default()
+            };
+        }
+        Conditions {
+            required_features: data.required_features,
+            other_cfg: data.other_cfg,
+            cfg_source: data.cfg_source,
+            enabled_in_project: data.enabled_in_project,
+            enabled_in_dev_only: data.enabled_in_dev_only,
+        }
     }
 
     /// Fills in the conditions that the item `id` needs (requirement R-FT-2): its own, those of
@@ -1261,6 +1349,7 @@ impl<'a> Query<'a> {
             return None;
         }
         Some(Destination {
+            entry: path.into(),
             reexport: crossing.reexport.path.joined(),
             reexported: crossing
                 .reexport
@@ -2132,7 +2221,7 @@ pub(super) mod tests {
     }
 
     /// The conditions of the re-export of `Mutex`, of the `impl` of `lock`, and of the enum.
-    fn with_cfgs(krate: &mut Crate) {
+    pub(in crate::query) fn with_cfgs(krate: &mut Crate) {
         let mut add = |id: u32, text: &str| {
             if let Some(item) = krate.index.get_mut(&Id(id)) {
                 item.attrs.push(Attribute::Other(text.to_owned()));
@@ -2339,6 +2428,7 @@ pub(super) mod tests {
         };
         let other = || Some(("other".parse().expect("a name"), Version::new(0, 5, 1)));
         assert_eq!(destination("my_crate::Thing"), Destination {
+            entry: "my_crate::Thing".into(),
             reexport: "my_crate::Thing".into(),
             reexported: "other::inner::Thing".into(),
             path: "other::inner::Thing".into(),
@@ -2346,10 +2436,14 @@ pub(super) mod tests {
             release: other(),
             is_std: false,
         });
-        // A path under the re-export goes on under its target.
+        // A path under the re-export goes on under its target, and is shown where it was asked.
+        let under = destination("my_crate::Thing::method");
         assert_eq!(
-            destination("my_crate::Thing::method").path,
-            "other::inner::Thing::method".into()
+            (under.entry, under.path),
+            (
+                "my_crate::Thing::method".into(),
+                "other::inner::Thing::method".into()
+            )
         );
         // The items of this crate are found here.
         assert!(followed("my_crate::Mutex", |_| {}).is_none());
@@ -2402,6 +2496,12 @@ pub(super) mod tests {
                 level: StabilityLevel::Unstable,
             }));
             lock.const_stability = stable("1.90.0");
+            if let ItemEnum::Function(function) = &mut lock.inner {
+                function.default_unstable =
+                    Some(Box::new(rustdoc_types::ProvidedDefaultUnstable {
+                        feature: "lock_default".to_owned(),
+                    }));
+            }
         }
         let bytes = archive(krate);
         let view = CrateView::new(archived(&bytes));
@@ -2443,8 +2543,13 @@ pub(super) mod tests {
         assert_eq!(
             look_up("my_crate::Mutex::lock"),
             (
-                json!({ "unstable_feature": "mutex_lock", "const_stable_since": "1.90.0" }),
+                json!({
+                    "unstable_feature": "mutex_lock",
+                    "const_stable_since": "1.90.0",
+                    "default_unstable": "lock_default",
+                }),
                 json!([
+                    "the default of my_crate::Mutex::lock is unstable (#![feature(lock_default)]): an implementation on stable Rust must write it",
                     "my_crate::Mutex::lock is unstable: it needs a nightly toolchain and #![feature(mutex_lock)]"
                 ])
             )

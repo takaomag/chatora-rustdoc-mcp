@@ -5,16 +5,19 @@
 //! [`TTL`]; after that, it is checked again with a conditional request, so that a crate that has
 //! not changed costs no body (`304`).
 //!
-//! Retries and merging the same requests (R-NW-2), and caching that a crate does not exist
-//! (R-ERR-3), come later in M1.
+//! When the index cannot be reached, a file in the cache is used however old, with the reason in
+//! [`IndexEntry::stale`]. That a crate is not in the index is remembered for [`MISSING_TTL`]
+//! (requirement R-ERR-3).
 
 use std::{
+    collections::HashMap,
     io,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
+use parking_lot::Mutex;
 use reqwest::{StatusCode, header};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -37,6 +40,10 @@ pub const DEFAULT_BASE_URL: &str = "https://index.crates.io";
 /// `cache-control: max-age=600` of the index.
 pub const TTL: Duration = Duration::from_secs(600);
 
+/// How long a crate that is not in the index is remembered as missing, so that asking for it again
+/// does not ask the index again (requirement R-ERR-3).
+pub const MISSING_TTL: Duration = Duration::from_mins(5);
+
 /// Largest index file held in memory. serde's, with a few hundred versions, is about 165 KB.
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -48,6 +55,8 @@ pub struct SparseIndex {
     base_url: Arc<str>,
     cache: Cache,
     ttl: Duration,
+    /// The crates found missing from the index, by the name asked for, and when.
+    missing: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 /// The index entry of a crate.
@@ -60,6 +69,9 @@ pub struct IndexEntry {
     pub versions: Box<[IndexVersion]>,
     /// When the index file was fetched or last confirmed unchanged.
     pub fetched_at: SystemTime,
+    /// Why a file in the cache older than the TTL was used: the index could not be reached. The
+    /// latest versions may be missing from it.
+    pub stale: Option<Box<str>>,
 }
 
 /// One published version of a crate.
@@ -149,7 +161,7 @@ struct Line {
 }
 
 /// How a cached index file was fetched, kept next to it.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Record {
     /// The `etag` of the response, for `If-None-Match`.
     etag: Option<String>,
@@ -187,6 +199,7 @@ impl SparseIndex {
             base_url: base_url.into(),
             cache,
             ttl: TTL,
+            missing: Arc::default(),
         })
     }
 
@@ -201,6 +214,7 @@ impl SparseIndex {
             base_url: base_url.into(),
             cache,
             ttl,
+            missing: Arc::default(),
         }
     }
 
@@ -212,12 +226,25 @@ impl SparseIndex {
     /// Returns [`IndexError::NotFound`] when no spelling is in the index, and another error when
     /// the index or the cache cannot be read.
     pub async fn entry(&self, name: &CrateName) -> Result<IndexEntry, IndexError> {
+        let key = name.as_str().to_ascii_lowercase();
+        if self
+            .missing
+            .lock()
+            .get(&key)
+            .is_some_and(|at| at.elapsed() < MISSING_TTL)
+        {
+            return Err(IndexError::NotFound);
+        }
         for spelling in spellings(name) {
             match self.entry_at(&spelling).await {
                 Err(IndexError::NotFound) => {},
                 found => return found,
             }
         }
+        let mut missing = self.missing.lock();
+        missing.retain(|_, at| at.elapsed() < MISSING_TTL);
+        missing.insert(key, Instant::now());
+        drop(missing);
         Err(IndexError::NotFound)
     }
 
@@ -241,6 +268,44 @@ impl SparseIndex {
             }
         }
 
+        let fetched = self
+            .fetch(name, cached.as_ref(), body_path, record_path, now)
+            .await;
+        match (fetched, cached) {
+            // The index cannot be reached: the file in the cache is used, however old.
+            (
+                Err(
+                    error @ (IndexError::Network(_)
+                    | IndexError::Transient { .. }
+                    | IndexError::UnexpectedStatus { .. }),
+                ),
+                Some(cached),
+            ) => {
+                let fetched_at = system_time(cached.record.fetched_at);
+                let mut entry = parse(&cached.body, fetched_at).map_err(IndexError::Malformed)?;
+                entry.stale = Some(
+                    format!(
+                        "the crates.io index could not be reached ({error}), so the versions are \
+                         those it listed when it was last read; newer ones may be missing"
+                    )
+                    .into(),
+                );
+                Ok(entry)
+            },
+            (fetched, _) => fetched,
+        }
+    }
+
+    /// Fetches the index file at the lowercase `name`, or confirms `cached` with a conditional
+    /// request, and caches what comes.
+    async fn fetch(
+        &self,
+        name: &str,
+        cached: Option<&Cached>,
+        body_path: PathBuf,
+        record_path: PathBuf,
+        now: SystemTime,
+    ) -> Result<IndexEntry, IndexError> {
         let mut request = self
             .client
             .get(format!("{}/{}", self.base_url, index_path(name)));
@@ -257,7 +322,7 @@ impl SparseIndex {
                 let entry = parse(&cached.body, now).map_err(IndexError::Malformed)?;
                 let record = Record {
                     fetched_at: unix_seconds(now),
-                    ..cached.record
+                    ..cached.record.clone()
                 };
                 write_record_later(record_path, record).await;
                 Ok(entry)
@@ -346,6 +411,7 @@ fn parse(body: &[u8], fetched_at: SystemTime) -> Result<IndexEntry, MalformedLin
         name: name.ok_or(MalformedLine::Empty)?.into(),
         versions: versions.into(),
         fetched_at,
+        stale: None,
     })
 }
 
@@ -526,12 +592,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_crate_is_not_found() {
+    async fn a_missing_crate_is_not_found_and_remembered() {
         let (index, _requests, _dir) = index(vec![status("404 Not Found")], TTL);
         assert!(matches!(
             index.entry(&name("nope")).await,
             Err(IndexError::NotFound)
         ));
+        // Remembered: the server, which has no second response, is not asked again.
+        assert!(matches!(
+            index.entry(&name("nope")).await,
+            Err(IndexError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_cached_file_stands_in_when_the_index_cannot_be_reached() {
+        // The file goes stale at once; then the index answers 503 to each of the 3 attempts.
+        let unavailable = || status("503 Service Unavailable");
+        let (index, _requests, _dir) = index(
+            vec![
+                ok(SERDE_INDEX, "\"v1\""),
+                unavailable(),
+                unavailable(),
+                unavailable(),
+            ],
+            Duration::ZERO,
+        );
+        let fresh = index.entry(&name("serde")).await.expect("found");
+        assert_eq!(fresh.stale, None);
+        let stale = index.entry(&name("serde")).await.expect("from the cache");
+        assert_eq!(stale.versions, fresh.versions);
+        assert!(
+            stale
+                .stale
+                .as_deref()
+                .is_some_and(|why| why.contains("could not be reached")),
+            "{:?}",
+            stale.stale
+        );
     }
 
     #[tokio::test]

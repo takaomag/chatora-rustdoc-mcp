@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use super::{
     get_item::{
+        Conditions,
         GetItemError,
         ItemRequest,
         MAX_RESPONSE_CHARS,
@@ -108,6 +109,9 @@ pub struct Implementor {
     pub kind: &'static str,
     /// The `impl` as Rust writes it, with its where clause.
     pub header: Box<str>,
+    /// The features and other conditions that the `impl` is written with (requirement R-FT-2).
+    #[serde(flatten)]
+    pub conditions: Conditions,
 }
 
 /// The implementors of the trait at `request.path` in its crate.
@@ -122,6 +126,12 @@ pub fn list_implementors<'a>(
 ) -> Result<ImplementorsResponse<'a>, GetItemError> {
     let digest = view.source_digest();
     let data_digest = digest.get(..16).unwrap_or(digest);
+    let mut query = Query::new(view, request);
+    let provenance = query.provenance();
+    let with_root = with_root_name(view, request.name, request.path);
+    let path = with_root.as_deref().unwrap_or(request.path);
+    let trait_id = find_trait(view, &mut query, path, request.follow)?;
+    // Checked in the crate that the path goes on in, if it does.
     if let Some(cursor_data) = options.cursor_data
         && cursor_data != data_digest
     {
@@ -129,11 +139,6 @@ pub fn list_implementors<'a>(
             "the data changed since the cursor was made; list again without the cursor",
         ));
     }
-    let mut query = Query::new(view, request);
-    let provenance = query.provenance();
-    let with_root = with_root_name(view, request.name, request.path);
-    let path = with_root.as_deref().unwrap_or(request.path);
-    let trait_id = find_trait(view, &mut query, path, request.follow)?;
     let Some(item) = view.item(trait_id) else {
         return Err(GetItemError::NotFound);
     };
@@ -244,6 +249,7 @@ fn implementors_of(
             ty: query.type_text(&contents.for_),
             kind,
             header: query.impl_text(impl_item),
+            conditions: query.own_conditions(impl_item.id),
         });
     }
     (entries, has_negative_impls)

@@ -227,6 +227,7 @@ async fn from_crates_io(
         Ok(entry) => entry,
         Err(error) => return get_item::index_error(&name, &error),
     };
+    warnings.extend(entry.stale.clone());
     let spec = &decided.spec;
     let resolved = match spec.resolve(&entry.versions) {
         Ok(resolved) => resolved,

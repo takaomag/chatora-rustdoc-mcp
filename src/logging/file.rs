@@ -397,10 +397,13 @@ fn collect_garbage(dir: &Path, limits: Limits, now: SystemTime) -> io::Result<()
         }
         stems_left.push(log.stem.clone());
     }
-    // The lock files of processes that have ended and whose logs are all gone.
+    // The lock files of processes that have ended and whose logs are all gone. Those of today
+    // stay: a new process with the same id may be taking one again (decided before the first
+    // release, 2026-10-20), and its name has the date, so no process takes an older one.
+    let today = date(&self::now());
     for (stem, path) in locks {
         let running = being_written.get(&stem).is_some_and(|&last| last > 0);
-        if stems_left.contains(&stem) || running {
+        if stems_left.contains(&stem) || running || stem.starts_with(&today) {
             continue;
         }
         match is_held(&path) {
@@ -511,6 +514,18 @@ mod tests {
         for name in done {
             assert!(!dir.join(&name).exists(), "{name}");
         }
+    }
+
+    #[test]
+    fn a_lock_of_today_stays_and_an_older_one_goes() {
+        let temp = tempfile::tempdir().expect("a temporary directory");
+        let dir = temp.path();
+        fs::write(dir.join(MARKER), "").expect("written");
+        let today = format!("{}-999999.{LOCK_EXTENSION}", date(&now()));
+        fs::write(dir.join(&today), "").expect("written");
+        fs::write(dir.join("20200101-1.lock"), "").expect("written");
+        collect_garbage(dir, LIMITS, SystemTime::now()).expect("no error");
+        assert_eq!(names(dir), [MARKER.to_owned(), today]);
     }
 
     #[test]

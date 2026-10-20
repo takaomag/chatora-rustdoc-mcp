@@ -79,7 +79,7 @@ pub(super) fn definition() -> Tool {
 /// (requirement R-OUT-1).
 fn output_schema() -> JsonObject {
     let strings = json!({ "type": "array", "items": { "type": "string" } });
-    object(json!({
+    let mut schema = json!({
         "type": "object",
         "properties": {
             "provenance": get_item::provenance_schema(),
@@ -88,6 +88,7 @@ fn output_schema() -> JsonObject {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "defined_at": get_item::defined_at_schema(),
                     "kind": { "type": "string" },
                     "non_exhaustive": { "type": "boolean" },
                     "has_private_fields": { "type": "boolean" },
@@ -129,7 +130,14 @@ fn output_schema() -> JsonObject {
             "hints": strings,
         },
         "required": ["provenance", "data", "page"],
-    }))
+    });
+    // Each entry has the conditions that its `impl` is written with (requirement R-FT-2).
+    if let Some(Value::Object(properties)) =
+        schema.pointer_mut("/properties/data/properties/impls/items/properties")
+    {
+        properties.extend(get_item::conditions_properties());
+    }
+    object(schema)
 }
 
 /// The object inside `value`, which is always an object here.

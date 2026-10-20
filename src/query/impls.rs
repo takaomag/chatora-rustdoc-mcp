@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use super::{
     get_item::{
+        Conditions,
         GetItemError,
         ItemRequest,
         MAX_RESPONSE_CHARS,
@@ -114,6 +115,9 @@ pub struct ImplEntry {
     pub trait_crate: Option<Box<str>>,
     /// The `impl` as Rust writes it, with its where clause.
     pub header: Box<str>,
+    /// The features and other conditions that the `impl` is written with (requirement R-FT-2).
+    #[serde(flatten)]
+    pub conditions: Conditions,
 }
 
 /// How an `impl` was made (requirement R-TI-2).
@@ -168,6 +172,12 @@ pub fn list_impls<'a>(
 ) -> Result<ImplsResponse<'a>, GetItemError> {
     let digest = view.source_digest();
     let data_digest = digest.get(..16).unwrap_or(digest);
+    let mut query = Query::new(view, request);
+    let provenance = query.provenance();
+    let with_root = with_root_name(view, request.name, request.path);
+    let path = with_root.as_deref().unwrap_or(request.path);
+    let ty = find_type(view, &mut query, path, request.follow)?;
+    // Checked in the crate that the path goes on in, if it does.
     if let Some(cursor_data) = options.cursor_data
         && cursor_data != data_digest
     {
@@ -175,11 +185,6 @@ pub fn list_impls<'a>(
             "the data changed since the cursor was made; list again without the cursor",
         ));
     }
-    let mut query = Query::new(view, request);
-    let provenance = query.provenance();
-    let with_root = with_root_name(view, request.name, request.path);
-    let path = with_root.as_deref().unwrap_or(request.path);
-    let ty = find_type(view, &mut query, path, request.follow)?;
     let Some(item) = view.item(ty) else {
         return Err(GetItemError::NotFound);
     };
@@ -328,6 +333,7 @@ fn classify(view: &CrateView<'_>, query: &mut Query<'_>, item: &Item, ty: Id) ->
                 trait_path,
                 trait_crate,
                 header,
+                conditions: query.own_conditions(impl_id),
             },
         ));
     }
@@ -564,7 +570,12 @@ mod tests {
     use crate::{
         data::crate_name::CrateName,
         query::{
-            get_item::{Detail, Origin, ResolvedFrom, tests::parsed},
+            get_item::{
+                Detail,
+                Origin,
+                ResolvedFrom,
+                tests::{parsed, with_cfgs},
+            },
             view::tests::{archive, archived},
         },
     };
@@ -610,6 +621,120 @@ mod tests {
             list_impls(&view, request("my_crate::sync"), options),
             Err(GetItemError::NotAType { kind: "module" })
         ));
+    }
+
+    #[test]
+    fn an_impl_tells_its_own_cfg_but_not_that_of_its_type() {
+        let mut krate = parsed().krate;
+        with_cfgs(&mut krate);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::new(1, 2, 3);
+        let request = ItemRequest {
+            name: &name,
+            version: &version,
+            path: "my_crate::Mutex",
+            origin: Origin::DocsRs {
+                resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
+                build: None,
+            },
+            detail: Detail::Normal,
+            project_features: None,
+            follow: false,
+            target: None,
+        };
+        let options = ImplOptions {
+            limit: 50,
+            offset: 0,
+            cursor_request: "c1.req",
+            cursor_data: None,
+        };
+        let response = list_impls(&view, request, options).expect("listed");
+        let data = serde_json::to_value(&response).expect("serializes")["data"].clone();
+        // `sync`, which the re-export of `Mutex` needs, is in `get_item` of the type.
+        assert_eq!(
+            data["impls"],
+            json!([{
+                "kind": "inherent",
+                "header": "impl my_crate::Mutex",
+                "other_cfg": ["tokio_unstable"],
+                "cfg_source": "cfg_trace",
+            }])
+        );
+    }
+
+    #[test]
+    fn a_cursor_is_checked_in_the_crate_that_the_path_goes_on_in() {
+        use crate::query::{
+            implementors::{ImplementorOptions, list_implementors},
+            list_module::{ListOptions, list_module},
+            methods::{MethodOptions, list_methods},
+        };
+
+        let bytes = archive(parsed().krate);
+        let view = CrateView::new(archived(&bytes));
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::new(1, 2, 3);
+        // `Thing` is a re-export of another crate's item, and the cursor is of that crate's data.
+        let request = ItemRequest {
+            name: &name,
+            version: &version,
+            path: "my_crate::Thing",
+            origin: Origin::DocsRs {
+                resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
+                build: None,
+            },
+            detail: Detail::Normal,
+            project_features: None,
+            follow: true,
+            target: None,
+        };
+        let (cursor_request, cursor_data) = ("c1.req", Some("0123456789abcdef"));
+        let results = [
+            list_impls(&view, request, ImplOptions {
+                limit: 50,
+                offset: 10,
+                cursor_request,
+                cursor_data,
+            })
+            .err(),
+            list_methods(&view, request, MethodOptions {
+                name: None,
+                from: &[],
+                expand_blanket: false,
+                limit: 50,
+                offset: 10,
+                cursor_request,
+                cursor_data,
+            })
+            .err(),
+            list_implementors(&view, request, ImplementorOptions {
+                limit: 50,
+                offset: 10,
+                cursor_request,
+                cursor_data,
+            })
+            .err(),
+            list_module(&view, request, ListOptions {
+                recursive: false,
+                depth: 1,
+                kinds: &[],
+                limit: 50,
+                offset: 10,
+                cursor_request,
+                cursor_data,
+            })
+            .err(),
+        ];
+        for result in results {
+            assert!(
+                matches!(result, Some(GetItemError::Elsewhere(_))),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]

@@ -137,13 +137,6 @@ pub fn list_module<'a>(
 ) -> Result<ModuleResponse<'a>, GetItemError> {
     let index = view.index();
     let data_digest = digest_part(view.source_digest());
-    if let Some(cursor_data) = options.cursor_data
-        && cursor_data != data_digest
-    {
-        return Err(GetItemError::BadCursor(
-            "the data changed since the cursor was made; list again without the cursor",
-        ));
-    }
     // The items are listed as `brief` or `normal` would show them; `full` shows each as
     // `get_item` does by default.
     let item_detail = match request.detail {
@@ -158,6 +151,14 @@ pub fn list_module<'a>(
     let with_root = with_root_name(view, request.name, request.path);
     let path = with_root.as_deref().unwrap_or(request.path);
     let module = find_module(view, &mut query, path, request.follow)?;
+    // Checked in the crate that the path goes on in, if it does.
+    if let Some(cursor_data) = options.cursor_data
+        && cursor_data != data_digest
+    {
+        return Err(GetItemError::BadCursor(
+            "the data changed since the cursor was made; list again without the cursor",
+        ));
+    }
     let Some(item) = view.item(module) else {
         return Err(GetItemError::NotFound);
     };

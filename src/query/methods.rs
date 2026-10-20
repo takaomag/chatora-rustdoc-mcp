@@ -201,6 +201,12 @@ pub fn list_methods<'a>(
 ) -> Result<MethodsResponse<'a>, GetItemError> {
     let digest = view.source_digest();
     let data_digest = digest.get(..16).unwrap_or(digest);
+    let mut query = Query::new(view, request);
+    let provenance = query.provenance();
+    let with_root = with_root_name(view, request.name, request.path);
+    let path = with_root.as_deref().unwrap_or(request.path);
+    let ty = find_type(view, &mut query, path, request.follow)?;
+    // Checked in the crate that the path goes on in, if it does.
     if let Some(cursor_data) = options.cursor_data
         && cursor_data != data_digest
     {
@@ -208,11 +214,6 @@ pub fn list_methods<'a>(
             "the data changed since the cursor was made; list again without the cursor",
         ));
     }
-    let mut query = Query::new(view, request);
-    let provenance = query.provenance();
-    let with_root = with_root_name(view, request.name, request.path);
-    let path = with_root.as_deref().unwrap_or(request.path);
-    let ty = find_type(view, &mut query, path, request.follow)?;
     let Some(item) = view.item(ty) else {
         return Err(GetItemError::NotFound);
     };

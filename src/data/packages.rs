@@ -692,6 +692,7 @@ checksum = "ab"
             }]
             .into(),
             fetched_at: SystemTime::UNIX_EPOCH,
+            stale: None,
         };
         let check = |name: &str, checksum: &str| {
             let package = packages
