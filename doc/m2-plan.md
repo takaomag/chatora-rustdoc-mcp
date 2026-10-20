@@ -377,6 +377,12 @@ Claude Code 2.1.304、Linux で測った。
 - テスト (`tests/local/git_failures.rs`): 5 つの失敗 × 2 つの取り方 × 3 つのコマンドの 30 通りで `classify` が `fetch_failed` の理由を当てることと、同じリポジトリのタグ `v1` は取れること (対照) を、3 つの OS で確かめる。`classify` を公開した (統合テストから呼ぶため)
 - cargo は、git の CLI の失敗と、一時的かもしれない要求の失敗を、`net.retry` (既定 3) の回数だけ間を置いて試し直す。無いブランチのような決定的な失敗も試し直すので、30 通りで合計 170 秒 (1 回あたり平均約 6 秒) かかった。テストは `net.retry = 0` にした。製品は利用者の設定のまま (C3 の時間の上限と `status: building` がこの待ちを受け止める)
 
+**B6 (`.crate` を手元の cargo のキャッシュから読む。2026-10-20)**:
+
+- `StaticCrates` は、`.crate` が自分のキャッシュに無ければ、static.crates.io に要求する前に `$CARGO_HOME/registry/cache/` の crates.io のレジストリ (`index.crates.io-…`・`github.com-…`。名前の末尾のハッシュは cargo の版で変わりうる) から `<name>-<version>.crate` を探し、crates.io の index の checksum と合えば使って自分のキャッシュに入れる。合わなければ取りに行く。オフラインでも使える。`$CARGO_HOME` の求め方は `data::cargo_home` にまとめ、`Resolver` と共有した
+- static.crates.io からの取得がダウンロード数に数えられるか (レビュアーが挙げた件): crates.io は 2024-03 から static.crates.io の CDN のログでダウンロードを数え ([crates.io: Download changes](https://blog.rust-lang.org/2024/03/11/crates-io-download-changes/))、2025-10-29 に cargo の User-Agent の要求だけを数えるようにした ([rust-lang/crates.io#12210](https://github.com/rust-lang/crates.io/pull/12210))。このサーバーは自分の User-Agent (`chatora-rustdoc-mcp/<版> (+<リポジトリ>)`。R-NW-1) を送るので、数えられない。README の通信の節に書いた
+- テスト: cargo のキャッシュに置いた `.crate` を、オフラインの (要求すればエラーになる) クライアントが読めること、checksum の合わないものは使わないこと
+
 ### 6.4 M2c
 
 (まだ無い)

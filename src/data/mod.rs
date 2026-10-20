@@ -572,6 +572,16 @@ where
     text.parse().map_err(serde::de::Error::custom)
 }
 
+/// `$CARGO_HOME`, or `~/.cargo` when it is unset or empty, as cargo finds it. `None` without a
+/// home directory.
+#[must_use]
+pub fn cargo_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| etcetera::home_dir().ok().map(|home| home.join(".cargo")))
+}
+
 /// `time` in RFC 3339 and UTC, to the second: `2026-10-20T01:02:03Z`. A time before the Unix
 /// epoch is the epoch.
 #[must_use]

@@ -247,10 +247,7 @@ impl Resolver {
     /// A resolver that runs cargo offline when `offline` is set.
     #[must_use]
     pub fn new(offline: bool) -> Self {
-        let cargo_home = std::env::var_os("CARGO_HOME")
-            .filter(|home| !home.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| etcetera::home_dir().ok().map(|home| home.join(".cargo")));
+        let cargo_home = super::cargo_home();
         Self {
             offline,
             cargo_home,

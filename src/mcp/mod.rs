@@ -245,7 +245,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
             docs_rs: DocsRs::new(&network)?,
             dist: Dist::new(&network, DistSettings::from_settings(settings))?,
             index: SparseIndex::new(cache.clone(), &network)?,
-            static_crates: StaticCrates::new(&network)?,
+            // The `.crate` files that cargo has fetched are read before static.crates.io is asked.
+            static_crates: StaticCrates::new(&network)?.with_cargo_home(crate::data::cargo_home()),
             // Found in the background below: rustc may be slow to start (requirement R-MCP-11).
             host: tokio::sync::OnceCell::new(),
             cache,

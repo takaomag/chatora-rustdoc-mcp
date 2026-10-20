@@ -4,7 +4,9 @@
 
 use std::{
     collections::BTreeSet,
+    fs,
     io::{self, Read as _},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -39,6 +41,8 @@ pub struct StaticCrates {
     base_url: Arc<str>,
     /// Whether no request may be sent (`network.offline`, requirement R-CA-7).
     offline: bool,
+    /// `$CARGO_HOME`, whose `registry/cache` holds the `.crate` files that cargo has fetched.
+    cargo_home: Option<Arc<Path>>,
 }
 
 /// Why the `.crate` or its `Cargo.toml` could not be read.
@@ -118,7 +122,51 @@ impl StaticCrates {
             client: http::client_builder(network).build()?,
             base_url: base_url.into(),
             offline: network.offline,
+            cargo_home: None,
         })
+    }
+
+    /// The client that looks for a `.crate` among those that cargo has fetched into
+    /// `cargo_home` before fetching it (doc/m2-plan.md, B6).
+    #[must_use]
+    pub fn with_cargo_home(mut self, cargo_home: Option<PathBuf>) -> Self {
+        self.cargo_home = cargo_home.map(Into::into);
+        self
+    }
+
+    /// The `.crate` of `name` at `version` that cargo has fetched, if one with `checksum` is in
+    /// `$CARGO_HOME/registry/cache/<registry>/`. The registries are those of crates.io: its
+    /// sparse index (`index.crates.io-…`) and its git index (`github.com-…`), whose directory names
+    /// end in a hash that cargo versions may change.
+    fn fetched_by_cargo(
+        &self,
+        name: &CrateName,
+        version: &Version,
+        checksum: &str,
+    ) -> Option<Box<[u8]>> {
+        let registries = fs::read_dir(self.cargo_home.as_ref()?.join("registry/cache")).ok()?;
+        let file = format!("{name}-{version}.crate");
+        registries
+            .filter_map(Result::ok)
+            .filter(|registry| {
+                let name = registry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("index.crates.io-") || name.starts_with("github.com-")
+            })
+            .find_map(|registry| {
+                let path = registry.path().join(&file);
+                let size = fs::metadata(&path)
+                    .ok()
+                    .filter(fs::Metadata::is_file)?
+                    .len();
+                if size > MAX_CRATE_BYTES {
+                    return None;
+                }
+                let contents = fs::read(&path).ok()?;
+                super::cache::sha256_hex(&contents)
+                    .eq_ignore_ascii_case(checksum)
+                    .then(|| contents.into_boxed_slice())
+            })
     }
 
     /// The `.crate` of `name` at `version`, from the cache, or else fetched, checked against
@@ -146,7 +194,10 @@ impl StaticCrates {
         let Some(checksum) = checksum else {
             return Ok(None);
         };
-        let contents = self.fetch(name, version).await?;
+        let contents = match self.fetched_by_cargo(name, version, checksum) {
+            Some(contents) => contents,
+            None => self.fetch(name, version).await?,
+        };
         if !super::cache::sha256_hex(&contents).eq_ignore_ascii_case(checksum) {
             return Err(CrateError::ChecksumMismatch);
         }
@@ -460,6 +511,46 @@ pub(crate) mod tests {
             .into_inner()
             .and_then(GzEncoder::finish)
             .expect("finished")
+    }
+
+    /// A `.crate` that cargo has fetched is read from its cache and checked, and static.crates.io
+    /// is not asked; one of another checksum is not taken (doc/m2-plan.md, B6).
+    #[tokio::test]
+    async fn a_crate_that_cargo_has_fetched_is_read_from_its_cache() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let home = dir.path().join("cargo-home");
+        let registry = home.join("registry/cache/index.crates.io-1949cf8c6b5b557f");
+        fs::create_dir_all(&registry).expect("made");
+        let contents = crate_file(
+            "demo",
+            "0.1.0",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        fs::write(registry.join("demo-0.1.0.crate"), &contents).expect("written");
+        let checksum = super::super::cache::sha256_hex(&contents);
+        // Offline, a request to static.crates.io would be an error.
+        let network = Network {
+            offline: true,
+            ..Network::default()
+        };
+        let crates = StaticCrates::with_base_url("http://127.0.0.1:9", &network)
+            .expect("a client")
+            .with_cargo_home(Some(home));
+        let (name, version) = (
+            "demo".parse::<CrateName>().expect("a name"),
+            Version::new(0, 1, 0),
+        );
+        let cache = Cache::at(&dir.path().join("cache"));
+        let read = crates
+            .crate_file(&cache, &name, &version, Some(&checksum))
+            .await
+            .expect("from cargo's cache");
+        assert_eq!(read.as_deref(), Some(&*contents));
+        let other = Cache::at(&dir.path().join("other"));
+        assert!(matches!(
+            crates.crate_file(&other, &name, &version, Some("00")).await,
+            Err(CrateError::Offline)
+        ));
     }
 
     fn build(manifest: &str) -> DocsRsBuild {
