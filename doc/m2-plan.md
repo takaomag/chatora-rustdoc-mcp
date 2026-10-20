@@ -257,7 +257,15 @@ Claude Code 2.1.304、Linux で測った。
 
 ### 6.2 M2a
 
-(まだ無い)
+**A1 (テストの道具。2026-10-20、Linux、cargo 1.99.1、git 2.56.0)**:
+
+- 置き場所: 道具は `tests/common/` の `isolated.rs` (隔離した環境)・`registry.rs` (偽の crates.io)・`git.rs` (リポジトリと worktree)。cargo と git を起動するテストは、統合テストの `tests/local/` にまとめた (道具のテストは `tests/local/tools.rs`)。テスト用の crate の約束と種類は `tests/fixtures/README.md`
+- 隔離した環境 (`Isolated::apply`): `HOME`・`XDG_CONFIG_HOME`・`CARGO_HOME` を一時ディレクトリに向ける。git の設定は、`GIT_CONFIG_NOSYSTEM=1` と空の `GIT_CONFIG_GLOBAL` で読ませない。問い合わせは `GIT_TERMINAL_PROMPT=0`・`GCM_INTERACTIVE=never`・`SSH_ASKPASS_REQUIRE=never` で止める。テストの環境から、`CARGO`・`__CARGO`・`RUSTC`・`RUSTDOC`・`RUSTFLAGS`・`GIT_`・`SSH_ASKPASS` で始まる変数を外す (`cargo test` が渡す `CARGO_*` と、利用者の `CARGO_TARGET_DIR`・`RUSTC_WRAPPER` などを子に渡さない)。`RUSTUP_HOME`・`RUSTUP_TOOLCHAIN`・`PATH` は残す (rustup の proxy が toolchain を見つけるため。rustup は proxy で起動したプロセスに `RUSTUP_HOME` と `RUSTUP_TOOLCHAIN` を渡すので、テストの子の cargo はテストと同じ toolchain になる)
+  - 確かめたこと: 隔離した cargo home の `config.toml` の alias が効く。`git config --list --show-origin --show-scope` が、コマンドラインで渡した識別子のほかに何も出さない
+  - libgit2 (cargo の既定の git) は `GIT_CONFIG_NOSYSTEM` を見ないので、`/etc/gitconfig` は読みうる。利用者ごとの設定と資格情報は `HOME` を移すことで外れる
+  - 製品のコードが起動する cargo (`data::cargo::project_command`) にはこの環境は届かない。製品の経路で外へ出るテストは、サーバーのバイナリを隔離した環境で起動して行う (要る段で決める)
+- 偽の crates.io (`FakeRegistry`): 隔離した cargo home の `config.toml` で `[source.crates-io] replace-with` を `sparse+http://127.0.0.1:<port>/index/` に向けると、cargo は http の sparse index から依存を取った (確かめていなかった件。取れた)。要求は `config.json`・index の各 crate・`dl` の `.crate` だけ。Cargo.lock の `source` は crates.io (`registry+https://github.com/rust-lang/crates.io-index`) になるので、テストのプロジェクトは crates.io に依存するプロジェクトと同じ形になる。`.crate` はテストの中で tar と gzip で作り (`<名前>-<版>/` の下に Cargo.toml とファイル)、`cargo check` で依存として展開・コンパイルできた
+- worktree: `git worktree add` で `<リポジトリ>/.claude/worktrees/agent-1` に作った linked worktree の `.git` はファイルで、`gitdir: <リポジトリ>/.git/worktrees/agent-1` を持つ (A2 の P3 の判定に使う形)
 
 ### 6.3 M2b
 
