@@ -517,6 +517,15 @@ C1d も 3 つに分けた: C1d-1 (cfg を読んで item の条件を出す)、C1
 - 扱っていないこと: `also_reexported_at` の各パスの条件 (正準パスと違うときだけ添える。R-FT-2)、`#[doc(auto_cfg(hide(...)))]`、crate の外への re-export (`reexport_of`) の条件
 - テスト: 3 系統の読み取り (位置の読み飛ばし、入れ子、読めないもの)、`doc`・`docsrs` の畳み方、feature の書き方と 3 値の評価、re-export・`impl`・enum からの継承、条件の無い item
 
+#### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
+
+利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。
+
+- v0.15 の「`GITHUB_TOKEN` は読まない」の理由 (他のツール向けの token を使わない) は、守りとして弱かった。同じ要件が書くとおり、信頼したリポジトリは hook で環境変数も読める。守るべきは送り先なので、token は公式の `api.github.com` にだけ送り、ミラー (R-CA-8) には送らない
+- `gh auth token` は実行しない。今の gh は既定で token を OS のキーリングに置き、取り出すときにキーリングの許可のダイアログが出うるため (M0 で git の CLI が出した askpass のダイアログと同じ問題)
+- token が無くても匿名で使う。rate limit に当たったときだけ、token の渡し方 (`export GH_TOKEN=$(gh auth token)` か設定) を案内する
+- git の依存の取得 (子の cargo) は別の話で、サーバーは token を扱わない。利用者の資格情報が使われ、認証で失敗したら利用者の端末で通すよう案内する (R-WS-6・R-WS-7。変更なし)
+
 ## 7. M1 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める
