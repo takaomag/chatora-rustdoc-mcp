@@ -3,7 +3,7 @@
 //!
 //! Each child runs in a group of its own with its descendants: a new session on Unix (which is
 //! also a new process group, without a controlling terminal), and a Job Object on Windows.
-//! Dropping a [`Child`] stops the whole group, so that a call that is cancelled or runs too long
+//! Dropping a `Child` stops the whole group, so that a call that is cancelled or runs too long
 //! leaves no grandchild behind (git, rustc, build scripts). [`stop_all`] stops every group, for
 //! when the server ends.
 //!
@@ -310,7 +310,7 @@ mod windows {
             let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             let size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
-                .map_err(|_| io::Error::other("the limits do not fit"))?;
+                .map_err(|_too_large| io::Error::other("the limits do not fit"))?;
             // SAFETY: the information is the extended limits, of the size given, which live
             // across the call.
             let set = unsafe {
