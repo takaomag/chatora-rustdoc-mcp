@@ -267,6 +267,20 @@ Claude Code 2.1.304、Linux で測った。
 - 偽の crates.io (`FakeRegistry`): 隔離した cargo home の `config.toml` で `[source.crates-io] replace-with` を `sparse+http://127.0.0.1:<port>/index/` に向けると、cargo は http の sparse index から依存を取った (確かめていなかった件。取れた)。要求は `config.json`・index の各 crate・`dl` の `.crate` だけ。Cargo.lock の `source` は crates.io (`registry+https://github.com/rust-lang/crates.io-index`) になるので、テストのプロジェクトは crates.io に依存するプロジェクトと同じ形になる。`.crate` はテストの中で tar と gzip で作り (`<名前>-<版>/` の下に Cargo.toml とファイル)、`cargo check` で依存として展開・コンパイルできた
 - worktree: `git worktree add` で `<リポジトリ>/.claude/worktrees/agent-1` に作った linked worktree の `.git` はファイルで、`gitdir: <リポジトリ>/.git/worktrees/agent-1` を持つ (A2 の P3 の判定に使う形)
 
+**A2 (Q-32 の反映。2026-10-20、Linux、cargo 1.99.1、git 2.56.0)**:
+
+- P3 (worktree を既定のプロジェクトと同じに扱う): `DefaultProject::contains` が、既定のプロジェクトの workspace のほかに、同じ git リポジトリの別の作業ツリーの同じ場所 (作業ツリーのルートからの相対パスが同じ) にある workspace を含める。作業ツリーは、上へたどって最初の `.git` で決める。`.git` がディレクトリならそれが共有の git ディレクトリ。ファイルなら linked worktree で、`gitdir:` が指す記録 (`<リポジトリ>/.git/worktrees/<名前>`) の `gitdir` ファイルがその `.git` ファイルを指し返し、`commondir` ファイルが共有の git ディレクトリを指すときだけ認める (写した `.git` ファイルや手で書いたものでは加わらない)。git は起動しない
+  - 決定 (P3) は「linked worktree」だったが、実装では「同じリポジトリの別の作業ツリー」とした。`claude --worktree` で開いたセッション (既定のプロジェクトが linked worktree) から、メインの作業ツリーを `project` で指した場合も同じ理由で含める
+  - 作業ツリーの別の場所の workspace (worktree の中の、既定のプロジェクトの workspace と違う相対パスのもの) は含めない。メインの作業ツリーでも、既定のプロジェクトの workspace 以外は既定のプロジェクトでないのと同じ
+  - 記録のパスは、絶対 (git の既定) と相対 (`worktree.useRelativePaths`) の両方を読む。単体テストは手で書いた記録で、`tests/local/worktree.rs` は `git worktree add` で作った記録で確かめた
+- サブディレクトリでの起動 (利用者が決めた。2026-10-20): 決めたディレクトリに Cargo.toml が無く、直下の子にも無ければ、git の作業ツリーのルートまで上へたどり、最初の Cargo.toml の workspace を既定のプロジェクトにする。直下の子の workspace を探すときも、作業ツリーのルートまで上を見る (`crates/` で開くと、`crates/a` を単独の package ではなく、リポジトリの workspace の member として扱う)。git の外では、今までどおり上へ探さない。要件の R-MCP-3 の「上方向には探さない」を改める (§7)
+- P5: instructions の版の規則に 1 文、9 つのツールの `project` 引数の説明の末尾に 1 文 (共通の定数 `PROJECT_IN_A_WORKTREE`) を足した。長さの検査 (R-QA-5) は通る
+- P8: `project_from` の値を `claude_project_dir` に改めた (3 つのツールの outputSchema の enum も)
+- 入れ子の worktree の影響 (cargo 1.99.1 で確かめた):
+  - `members = ["*"]` や `["**"]` は、worktree が無くてもリポジトリの `.git` ディレクトリに当たり、cargo が「Cargo.toml が無い」で失敗する。worktree (`.claude/`) が増やす新しい失敗は無い。`crates/*` のような形は当たらない
+  - worktree の中で cargo を起動すると、worktree のルートの workspace が使われる (メインのリポジトリの workspace は拾わない)。既定のプロジェクトは `.claude` が Cargo.toml を持たないので、そこを含めない
+- README: プロジェクトの決め方の段落と Security の節 (cargo を起動する範囲) に、worktree とサブディレクトリでの起動を書いた
+
 ### 6.3 M2b
 
 (まだ無い)
@@ -293,6 +307,7 @@ Claude Code 2.1.304、Linux で測った。
 2. requirements.md を次の版にし、§14 に経緯を書く。少なくとも次を入れる
    - R-MCP-3 と Q-32: §6.1 の実測 (通常の起動・`claude --worktree`・subagent の worktree・`--add-dir` で、サーバーが受け取るディレクトリと worktree の置き場所)、§5 の P3 (linked worktree を既定と同じに扱う)・P4・P5 の決定と A2 で確かめたこと (サブディレクトリでの起動、入れ子の worktree の影響)。R-MCP-3 の「M2 の前に確かめる (Q-32)」の文を改め、Q-32 を §11.1 (解決したもの) に移す
    - §7.3 の `project_from` の値 (P8)
+   - R-MCP-3 のサブディレクトリでの起動 (git の作業ツリーの中で上へ探す。直下の子の workspace も作業ツリーのルートまで上を見る。§6.2 の A2)
    - Q-29・Q-31 の答え (§4 の各行)
    - §8: `local_build_required` の扱い (M2 で使われなくなるか)、ビルドの状態の値 (R-OUT-9)
    - R-SC-4 の `readme` の扱いを M3 に送る

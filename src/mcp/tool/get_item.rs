@@ -384,9 +384,9 @@ pub(super) fn definition() -> Tool {
             },
             "project": {
                 "type": "string",
-                "description": "The workspace (its directory or Cargo.toml) whose Cargo.lock \
+                "description": const_format::concatcp!("The workspace (its directory or Cargo.toml) whose Cargo.lock \
                                 decides the version when none is given. Defaults to the project \
-                                Claude Code was opened in.",
+                                Claude Code was opened in.", super::PROJECT_IN_A_WORKTREE),
             },
             "path": {
                 "type": "string",
@@ -447,7 +447,7 @@ pub(super) fn provenance_schema() -> Value {
             },
             "project_from": {
                 "type": "string",
-                "enum": ["argument", "CLAUDE_PROJECT_DIR", "cwd"],
+                "enum": ["argument", "claude_project_dir", "cwd"],
             },
             "toolchain": { "type": "string" },
             "std_from": {

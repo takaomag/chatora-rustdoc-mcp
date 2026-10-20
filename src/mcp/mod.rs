@@ -92,7 +92,9 @@ const FIND: &str = "";
 const VERSIONS: &str = "- Versions: without a version, a tool uses the one in the project's \
                         Cargo.lock (the project Claude Code was opened in, or `project`), or else \
                         the latest release; `provenance` tells which and why. `resolve_version` \
-                        is not needed first.\n";
+                        is not needed first. Working in another git worktree of the project, as a \
+                        subagent may, pass the worktree's directory as `project`: the server sees \
+                        only the directory Claude Code was opened in.\n";
 #[cfg(not(feature = "local"))]
 const VERSIONS: &str = "- Versions: without a version, a tool uses the latest release, as this \
                         server is built without reading projects: give the version that the \

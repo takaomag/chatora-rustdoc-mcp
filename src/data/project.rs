@@ -2,7 +2,8 @@
 //! belongs to (requirement R-MCP-3).
 //!
 //! Manifests are read as data, with Cargo's rules, without running cargo: the lookup tools run
-//! cargo only for the default project, so whether a path is in it has to be known first.
+//! cargo only for the default project, so whether a path is in it has to be known first. So are
+//! the files that git keeps for its working trees, without running git.
 
 use std::{
     ffi::OsString,
@@ -25,7 +26,8 @@ pub struct Workspace {
 pub enum ProjectFrom {
     /// The `project` argument of the tool.
     Argument,
-    /// The environment variable `CLAUDE_PROJECT_DIR`.
+    /// The environment variable `CLAUDE_PROJECT_DIR` (`claude_project_dir`, in snake case as the
+    /// other values).
     ClaudeProjectDir,
     /// The working directory of the server.
     Cwd,
@@ -37,7 +39,7 @@ impl ProjectFrom {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Argument => "argument",
-            Self::ClaudeProjectDir => "CLAUDE_PROJECT_DIR",
+            Self::ClaudeProjectDir => "claude_project_dir",
             Self::Cwd => "cwd",
         }
     }
@@ -45,6 +47,10 @@ impl ProjectFrom {
 
 /// The default project: the workspace of the directory Claude Code was opened in, or, when that
 /// directory has no `Cargo.toml`, the workspaces directly inside it (requirement R-MCP-3).
+///
+/// When there is none there either, in a git working tree, it is the workspace of the nearest
+/// `Cargo.toml` above the directory in the tree: Claude Code may be opened in a directory such as
+/// `src` (§6.1 of doc/m2-plan.md).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefaultProject {
     /// The directory it was found from.
@@ -54,6 +60,29 @@ pub struct DefaultProject {
     /// The workspaces, by root. Empty when there is none; more than one when `dir` has none
     /// itself but has several directly inside it.
     pub workspaces: Box<[Workspace]>,
+    /// The git working tree that `dir` is in, if any, and where the workspaces are in it.
+    tree: Option<DefaultTree>,
+}
+
+/// Where the default project is in its git working tree. The same places in the other working
+/// trees of the repository are the default project, too (doc/m2-plan.md §5, P3): a subagent in a
+/// worktree of its own works on the same code, and the server sees only the directory that
+/// Claude Code was opened in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DefaultTree {
+    /// The git directory that the working trees of the repository share.
+    common_dir: PathBuf,
+    /// The roots of the default project's workspaces, relative to the root of the working tree.
+    workspaces: Box<[PathBuf]>,
+}
+
+/// A git working tree: the main one of a repository, or a linked one (`git worktree add`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkingTree {
+    /// The directory that has `.git`.
+    root: PathBuf,
+    /// The git directory that the working trees of the repository share, with symlinks resolved.
+    common_dir: PathBuf,
 }
 
 /// Why the workspace of a path could not be found.
@@ -110,6 +139,9 @@ impl DefaultProject {
     /// The default project, from `CLAUDE_PROJECT_DIR` if it is set and not empty, or else from the
     /// working directory `cwd`. It is decided once, at startup, so that a repository cloned
     /// inside later does not join it (requirement R-MCP-3). `None` when neither is known.
+    ///
+    /// No workspace is looked for above the git working tree that the directory is in, or, out
+    /// of git, above the directory, so that an unrelated one is not picked up.
     #[must_use]
     pub fn find(claude_project_dir: Option<OsString>, cwd: Option<PathBuf>) -> Option<Self> {
         let (dir, from) = match claude_project_dir.filter(|dir| !dir.is_empty()) {
@@ -117,30 +149,107 @@ impl DefaultProject {
             None => (cwd?, ProjectFrom::Cwd),
         };
         let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+        let tree = working_tree(&dir);
+        let boundary = tree
+            .as_ref()
+            .map_or(dir.as_path(), |tree| tree.root.as_path());
         let mut workspaces = if dir.join("Cargo.toml").is_file() {
             readable_workspace(&dir, None).into_iter().collect()
         } else {
-            children_workspaces(&dir)
+            children_workspaces(&dir, boundary)
         };
+        if workspaces.is_empty()
+            && let Some(above) = dir
+                .ancestors()
+                .skip(1)
+                .take_while(|ancestor| ancestor.starts_with(boundary))
+                .find(|ancestor| ancestor.join("Cargo.toml").is_file())
+        {
+            workspaces.extend(readable_workspace(above, Some(boundary)));
+        }
         workspaces.sort();
         workspaces.dedup();
+        let tree = tree.map(|tree| DefaultTree {
+            workspaces: workspaces
+                .iter()
+                .filter_map(|workspace| workspace.root.strip_prefix(&tree.root).ok())
+                .map(Path::to_path_buf)
+                .collect(),
+            common_dir: tree.common_dir,
+        });
         Some(Self {
             dir,
             from,
             workspaces: workspaces.into(),
+            tree,
         })
     }
 
-    /// Whether `workspace` is (one of) the default project's.
+    /// Whether `workspace` is (one of) the default project's: one of its workspaces, or the same
+    /// workspace in another working tree of its git repository.
     #[must_use]
     pub fn contains(&self, workspace: &Workspace) -> bool {
-        self.workspaces.contains(workspace)
+        if self.workspaces.contains(workspace) {
+            return true;
+        }
+        let Some(default) = &self.tree else {
+            return false;
+        };
+        working_tree(&workspace.root).is_some_and(|tree| {
+            tree.common_dir == default.common_dir
+                && workspace
+                    .root
+                    .strip_prefix(&tree.root)
+                    .is_ok_and(|relative| default.workspaces.iter().any(|root| root == relative))
+        })
     }
 }
 
+/// The git working tree that `dir` is in: the nearest `.git` above it, read as git keeps it. A
+/// `.git` file is a linked working tree only when its record in the repository points back at it,
+/// so that a copied or hand-written file does not join a repository. `None` when there is none,
+/// or the `.git` found is neither.
+fn working_tree(dir: &Path) -> Option<WorkingTree> {
+    for root in dir.ancestors() {
+        let dot_git = root.join(".git");
+        let Ok(metadata) = fs::symlink_metadata(&dot_git) else {
+            continue;
+        };
+        let common_dir = if metadata.is_dir() {
+            dunce::canonicalize(&dot_git).ok()?
+        } else if metadata.is_file() {
+            linked_common_dir(&dot_git)?
+        } else {
+            return None;
+        };
+        return Some(WorkingTree {
+            root: root.to_path_buf(),
+            common_dir,
+        });
+    }
+    None
+}
+
+/// The shared git directory of the linked working tree whose `.git` file is `dot_git`. The file
+/// names the tree's own git directory (`gitdir: <repository>/.git/worktrees/<name>`), whose
+/// `gitdir` file names the `.git` file back, and whose `commondir` file names the shared one.
+/// Paths may be relative, to the file's directory.
+fn linked_common_dir(dot_git: &Path) -> Option<PathBuf> {
+    let read = |path: &Path| fs::read_to_string(path).ok();
+    let own = read(dot_git)?;
+    let own = dot_git.parent()?.join(own.strip_prefix("gitdir:")?.trim());
+    let own = dunce::canonicalize(own).ok()?;
+    let back = own.join(read(&own.join("gitdir"))?.trim());
+    if dunce::canonicalize(back).ok()? != dunce::canonicalize(dot_git).ok()? {
+        return None;
+    }
+    dunce::canonicalize(own.join(read(&own.join("commondir"))?.trim())).ok()
+}
+
 /// The workspaces of the directories directly inside `dir` that have a `Cargo.toml`, without
-/// looking above `dir` for a workspace they belong to. Symlinked directories are not followed.
-fn children_workspaces(dir: &Path) -> Vec<Workspace> {
+/// looking above `boundary` for a workspace they belong to. Symlinked directories are not
+/// followed.
+fn children_workspaces(dir: &Path, boundary: &Path) -> Vec<Workspace> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -149,7 +258,7 @@ fn children_workspaces(dir: &Path) -> Vec<Workspace> {
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
         .filter(|child| child.join("Cargo.toml").is_file())
-        .filter_map(|child| readable_workspace(&child, Some(dir)))
+        .filter_map(|child| readable_workspace(&child, Some(boundary)))
         .collect()
 }
 
@@ -460,6 +569,113 @@ mod tests {
             workspace_of(dir.path()),
             Err(ProjectError::NoManifest(_))
         ));
+    }
+
+    /// A repository at `repo` with the linked working tree `repo/.claude/worktrees/w`, its records
+    /// written as git writes them (relative, as with `worktree.useRelativePaths`), and a working
+    /// tree `x` whose `.git` file names the record of `w`, which does not point back at it. Each
+    /// has a package at its root, and `w` another one in `sub`. `other` is another repository.
+    fn repository_with_worktrees() -> tempfile::TempDir {
+        tree(&[
+            ("repo/Cargo.toml", PACKAGE),
+            ("repo/.git/HEAD", "ref: refs/heads/main\n"),
+            ("repo/.git/worktrees/w/commondir", "../..\n"),
+            (
+                "repo/.git/worktrees/w/gitdir",
+                "../../../.claude/worktrees/w/.git\n",
+            ),
+            (
+                "repo/.claude/worktrees/w/.git",
+                "gitdir: ../../../.git/worktrees/w\n",
+            ),
+            ("repo/.claude/worktrees/w/Cargo.toml", PACKAGE),
+            ("repo/.claude/worktrees/w/sub/Cargo.toml", PACKAGE),
+            (
+                "repo/.claude/worktrees/x/.git",
+                "gitdir: ../../../.git/worktrees/w\n",
+            ),
+            ("repo/.claude/worktrees/x/Cargo.toml", PACKAGE),
+            ("other/.git/HEAD", "ref: refs/heads/main\n"),
+            ("other/Cargo.toml", PACKAGE),
+        ])
+    }
+
+    #[test]
+    fn in_a_git_working_tree_the_workspace_above_is_the_default_project() {
+        let dir = tree(&[
+            ("repo/.git/HEAD", "ref: refs/heads/main\n"),
+            ("repo/Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("repo/crates/a/Cargo.toml", PACKAGE),
+            ("repo/docs/notes.md", ""),
+            (
+                "plain/Cargo.toml",
+                "[workspace]\nmembers = [\"crates/*\"]\n",
+            ),
+            ("plain/crates/a/Cargo.toml", PACKAGE),
+            ("plain/docs/notes.md", ""),
+        ]);
+        let find = |path: &str| {
+            DefaultProject::find(Some(dir.path().join(path).into()), None)
+                .expect("a directory")
+                .workspaces
+        };
+        let repo = [Workspace {
+            root: root(&dir, "repo"),
+        }];
+        // Opened in a directory without a manifest, or in one whose children are members.
+        assert_eq!(&*find("repo/docs"), repo);
+        assert_eq!(&*find("repo/crates"), repo);
+        // Out of git, nothing above is looked at.
+        assert_eq!(&*find("plain/docs"), []);
+        assert_eq!(&*find("plain/crates"), [Workspace {
+            root: root(&dir, "plain/crates/a"),
+        }]);
+    }
+
+    #[test]
+    fn the_same_workspace_in_another_working_tree_is_the_default_project() {
+        let dir = repository_with_worktrees();
+        let project =
+            DefaultProject::find(Some(dir.path().join("repo").into()), None).expect("a directory");
+        let workspace = |path: &str| workspace_of(&dir.path().join(path)).expect("a workspace");
+        assert!(project.contains(&workspace("repo/.claude/worktrees/w")));
+        // Another place in the working tree, a `.git` file that its record does not point back
+        // at, and another repository are not.
+        assert!(!project.contains(&workspace("repo/.claude/worktrees/w/sub")));
+        assert!(!project.contains(&workspace("repo/.claude/worktrees/x")));
+        assert!(!project.contains(&workspace("other")));
+
+        // Nor is the default project's own place opened from the linked working tree, the other
+        // way round: the main working tree is.
+        let from_worktree = DefaultProject::find(
+            Some(dir.path().join("repo/.claude/worktrees/w").into()),
+            None,
+        )
+        .expect("a directory");
+        assert!(from_worktree.contains(&workspace("repo")));
+        assert!(!from_worktree.contains(&workspace("other")));
+    }
+
+    #[test]
+    fn a_record_with_an_absolute_path_is_read_too() {
+        let dir = repository_with_worktrees();
+        let worktree = root(&dir, "repo/.claude/worktrees/w");
+        fs::write(
+            dir.path().join("repo/.claude/worktrees/w/.git"),
+            format!(
+                "gitdir: {}\n",
+                root(&dir, "repo/.git/worktrees/w").display()
+            ),
+        )
+        .expect("written");
+        fs::write(
+            dir.path().join("repo/.git/worktrees/w/gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .expect("written");
+        let project =
+            DefaultProject::find(Some(dir.path().join("repo").into()), None).expect("a directory");
+        assert!(project.contains(&Workspace { root: worktree }));
     }
 
     #[test]

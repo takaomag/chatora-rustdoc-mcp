@@ -53,8 +53,8 @@ pub(super) fn definition() -> Tool {
             },
             "project": {
                 "type": "string",
-                "description": "The workspace whose Cargo.lock decides the version. Defaults to \
-                                the project Claude Code was opened in.",
+                "description": const_format::concatcp!("The workspace whose Cargo.lock decides the version. Defaults to \
+                                the project Claude Code was opened in.", super::PROJECT_IN_A_WORKTREE),
             },
             "scope": {
                 "type": "string",

@@ -193,6 +193,12 @@ pub(super) fn definitions() -> Vec<Tool> {
     }
 }
 
+/// The end of every tool's description of `project` (doc/m2-plan.md §5, P5): the server sees only
+/// the directory that Claude Code was opened in, not the worktree of a subagent, so one that works
+/// in a worktree has to pass it.
+const PROJECT_IN_A_WORKTREE: &str = " In another git worktree of the project, such as a \
+                                     subagent's, pass the worktree's directory.";
+
 /// `tool` without the `project` argument, which does nothing without local features: no argument
 /// is declared that is not used (requirements R-ARCH-3 and R-QA-5).
 fn without_project(mut tool: Tool) -> Tool {

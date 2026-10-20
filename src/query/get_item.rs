@@ -158,7 +158,7 @@ pub struct Provenance<'a> {
     /// How the version was chosen. Not for std.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_from: Option<ResolvedFrom>,
-    /// Where the project that decided the version came from: `argument`, `CLAUDE_PROJECT_DIR` or
+    /// Where the project that decided the version came from: `argument`, `claude_project_dir` or
     /// `cwd` (requirement R-MCP-3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_from: Option<&'static str>,

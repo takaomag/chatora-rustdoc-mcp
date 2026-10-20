@@ -16,3 +16,5 @@ mod isolated;
 #[path = "../common/registry.rs"]
 mod registry;
 mod tools;
+#[cfg(feature = "local")]
+mod worktree;
