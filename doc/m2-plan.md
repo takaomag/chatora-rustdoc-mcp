@@ -338,6 +338,17 @@ Claude Code 2.1.304、Linux で測った。
 - `data::child::Child::output_watching` で stderr を 1 行ずつ読みながら待ち、`data::cargo::run_reporting` が `Activity` (`Running`・`WaitingForLock`) の変わり目を知らせる。ロック待ちの行の後にほかの行が出たら、ロックが取れて動いているとみなして `Running` に戻す。応答の `building_reason: waiting_for_lock` につなぐのは C3・D3
 - テスト: std の `File::lock` でパッケージキャッシュのロックを握り (cargo と同じく Unix は `flock`、Windows は `LockFileEx`)、本物の cargo が `WaitingForLock` を知らせ、ロックを外すと正常に終わることを 3 つの OS で確かめる
 
+**B3a (cargo の設定の読み方。2026-10-20)**: B3 を、設定を読む部品と `cargo metadata` の鍵 (B3a) と、プロジェクトの `build.target` を照会に使うこと (B3b) に分けた
+
+- 合成の規則は、nightly の cargo 1.101 の `cargo -Zunstable-options config get build.target` を物差しにして、隔離した環境で確かめた (stable の cargo 1.99.1 では設定の値を出せない。`include` の効き目は、取り込んだファイルの `[alias]` が効くかで stable でも確かめた)。cargo 自身に読ませる手段は、stable には無い
+  - 読むファイル: cargo を起動するディレクトリとその上のすべての `.cargo/config` (`config.toml` と両方あれば拡張子の無いほうを使い、cargo は警告を出す) か `.cargo/config.toml`、と `$CARGO_HOME/config(.toml)`。`$CARGO_HOME` が上のどれかの `.cargo` と同じなら、そこで 1 回だけ読む
+  - 優先度 (低い順): `$CARGO_HOME`、上のディレクトリを上から順に、環境変数 `CARGO_BUILD_TARGET`。`include` が指すファイルは、指したファイルのすぐ下 (入れ子はさらに下)
+  - 合成: 文字列は優先度の高いものが勝つ。配列は低い順につなぐ。同じキーに文字列と配列が混ざると cargo は設定を読めずに失敗する (`cargo version` 以外のコマンド)。`CARGO_BUILD_TARGET` は文字列を置き換え、配列なら末尾に足す
+  - `include`: パスか `{ path, optional }` の表の配列で、パスは指したファイルからの相対。文字列で書くと失敗する (stable 1.99.1 でも)。`optional` でないファイルが無くても失敗する
+  - member のディレクトリの設定が効かないことは、cargo を workspace のルートで起動している (M1 の B5b) ので、ルートから上だけを読めば足りる
+- `data::cargo_config::read`: 上の規則で `build.target` (文字列か配列) と `[unstable] build-std` の有無を求め、読みうるファイルの一覧 (無いものと、`include` が指すものを含む) を返す。cargo が失敗する場合はエラーにする
+- `cargo metadata` の鍵 (M1 の B5b の残り): `include` が指すファイルを足した。取り込んだファイルを変えると結果を使い直さないことをテストで確かめた
+
 ### 6.4 M2c
 
 (まだ無い)

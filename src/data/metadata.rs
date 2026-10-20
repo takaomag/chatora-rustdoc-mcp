@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 use super::{
     blocking,
     cargo::{self, Failure, RunError},
+    cargo_config,
     cargo_lock::CargoLock,
     features::{self, FeatureSets},
     project::{self, Workspace},
@@ -265,7 +266,12 @@ impl Resolver {
             Ok(metadata) => metadata,
             Err(because) => return Ok(Arc::new(Resolution::CargoLockRaw { lock, because })),
         };
-        let files = self.input_files(&root, &metadata);
+        let files = with_included(
+            self.input_files(&root, &metadata),
+            &root,
+            self.cargo_home.clone(),
+        )
+        .await;
         let resolution = Arc::new(Resolution::Metadata { metadata, lock });
         // Kept only if Cargo.lock did not change while cargo ran, so that a result is never kept
         // under inputs newer than it.
@@ -383,6 +389,29 @@ impl Resolver {
     }
 }
 
+/// `files` with those that cargo's settings for the workspace at `root` include (Q-31), sorted.
+/// Settings that cannot be read make cargo fail as well; the settings files in `files` still
+/// tell when they change.
+async fn with_included(
+    files: Vec<PathBuf>,
+    root: &Path,
+    cargo_home: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let root = root.to_path_buf();
+    let base = files.clone();
+    blocking(move || {
+        let mut files = files;
+        if let Ok(config) = cargo_config::read(&root, cargo_home.as_deref(), None) {
+            files.extend(config.files);
+        }
+        files.sort();
+        files.dedup();
+        Ok(files)
+    })
+    .await
+    .unwrap_or(base)
+}
+
 /// Reads the contents of `files` and expands the `members` patterns of the workspace at `root`.
 /// `None` when the patterns cannot be expanded, so that nothing is kept or reused.
 async fn read_inputs(root: &Path, files: Vec<PathBuf>) -> Option<Inputs> {
@@ -473,6 +502,26 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first, &changed),
             "a member manifest is an input"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_that_the_cargo_settings_include_is_an_input() {
+        let (dir, workspace) = workspace();
+        let settings = dir.path().join(".cargo");
+        fs::create_dir_all(&settings).expect("made");
+        fs::write(settings.join("config.toml"), "include = [\"more.toml\"]\n").expect("written");
+        fs::write(settings.join("more.toml"), "[alias]\nprobe = \"version\"\n").expect("written");
+        let resolver = Resolver::new(true);
+        let first = resolver.resolve(&workspace).await.expect("resolved");
+        assert!(matches!(&*first, Resolution::Metadata { .. }), "{first:?}");
+        let again = resolver.resolve(&workspace).await.expect("resolved");
+        assert!(Arc::ptr_eq(&first, &again), "kept");
+        fs::write(settings.join("more.toml"), "[alias]\nprobe = \"help\"\n").expect("written");
+        let changed = resolver.resolve(&workspace).await.expect("resolved");
+        assert!(
+            !Arc::ptr_eq(&first, &changed),
+            "an included file is an input"
         );
     }
 
