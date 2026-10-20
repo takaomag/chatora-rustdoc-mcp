@@ -1473,6 +1473,84 @@ fn the_build_target_of_the_project_is_the_target_of_a_lookup() {
     assert!(server.finish().success());
 }
 
+/// A workspace whose package `app` depends on `demo` 0.1.0 from crates.io, taken from a vendor
+/// directory (source replacement), so that cargo resolves it offline. Cargo.lock records the
+/// checksum of the `.crate` in the test cache, as for the release on crates.io.
+#[cfg(feature = "local")]
+fn workspace_using_demo() -> TempDir {
+    let dir = TempDir::new().expect("a temporary directory");
+    let write = |path: &str, contents: &str| {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+        std::fs::write(path, contents).expect("written");
+    };
+    write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\ndemo = \"0.1.0\"\n",
+    );
+    write("src/lib.rs", "");
+    write(
+        "vendor/demo/Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write("vendor/demo/src/lib.rs", "");
+    write(
+        "vendor/demo/.cargo-checksum.json",
+        &json!({ "files": {}, "package": sha256_hex(&demo_crate_file()) }).to_string(),
+    );
+    write(
+        ".cargo/config.toml",
+        "[source.crates-io]\nreplace-with = \"vendored\"\n\n\
+         [source.vendored]\ndirectory = \"vendor\"\n",
+    );
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    dir
+}
+
+/// With the version given, the project's build still tells whether an item is in it when the
+/// project has that release from crates.io (requirements R-VR-1 and R-FT-2; M2's B8). Without
+/// the project, it does not.
+#[cfg(feature = "local")]
+#[test]
+fn a_given_version_that_the_project_has_tells_whether_items_are_in_its_build() {
+    let offline = [("CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE", "true")];
+    let lookup = call_tool(
+        1,
+        "get_item",
+        json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET }),
+    );
+    let project = workspace_using_demo();
+    let mut server = Server::start_with(Some(project.path()), &offline);
+    write_old_demo_index(&server);
+    server.send(&lookup);
+    let found = server.response(1)["result"]["structuredContent"].clone();
+    assert_eq!(found["provenance"]["resolved_from"], "explicit", "{found}");
+    assert_eq!(
+        found["provenance"]["project_from"], "claude_project_dir",
+        "{found}"
+    );
+    assert_eq!(found["data"]["enabled_in_project"], true, "{found}");
+    assert!(server.finish().success());
+
+    let mut server = Server::start_with(None, &offline);
+    write_old_demo_index(&server);
+    server.send(&lookup);
+    let found = server.response(1)["result"]["structuredContent"].clone();
+    assert_eq!(found["provenance"]["resolved_from"], "explicit", "{found}");
+    assert!(found["data"].get("enabled_in_project").is_none(), "{found}");
+    assert!(server.finish().success());
+}
+
 /// A project that builds for a target of its own is not documented for it yet: the host's target
 /// is used, with a warning (decided in M2's B3b, until D7).
 #[cfg(feature = "local")]

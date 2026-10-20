@@ -803,8 +803,15 @@ async fn resolve(
             DocsRsCheck::NotCratesIo,
         )));
     }
+    // When the project did not decide the version, its build still tells `enabled_in_project`
+    // if it has the release from crates.io (requirement R-VR-1), which the index tells below.
     #[cfg(feature = "local")]
-    let checked_later = from_project.is_some();
+    let same_release = match from_project {
+        None => same_release(state, &name, project.as_deref(), &spec).await,
+        Some(_) => None,
+    };
+    #[cfg(feature = "local")]
+    let checked_later = from_project.is_some() || same_release.is_some();
     #[cfg(not(feature = "local"))]
     let checked_later = false;
     if !checked_later && let Some(version) = cached_exact(state, &name, &spec, &target) {
@@ -832,7 +839,11 @@ async fn resolve(
         .map_err(|no_version| Box::new(version_not_found(state, &entry, &spec, &no_version)))?;
     warnings.extend(resolved.warnings.into_iter().map(Into::into));
     #[cfg(feature = "local")]
-    let (resolved_from, project_from, in_build) = chosen_by(&spec, from_project);
+    let same_release = same_release.and_then(|same| {
+        the_release_in_build(same, &resolved.version.version, &entry, &mut warnings)
+    });
+    #[cfg(feature = "local")]
+    let (resolved_from, project_from, in_build) = chosen_by(&spec, from_project, same_release);
     #[cfg(not(feature = "local"))]
     let (resolved_from, project_from, in_build) = chosen_by(&spec);
     // The name as published, for docs.rs and the cache, and at the head of the path as code writes
@@ -884,23 +895,83 @@ fn cached_request(
     }
 }
 
-/// How the version was chosen, where the project came from if it chose it, and the project's
-/// build of the crate.
+/// The project's packages from crates.io of `name` (the one `project` names, or the default
+/// project), when one may be the release that `spec` asks for: the crates.io index then tells
+/// whether it is ([`the_release_in_build`]).
+#[cfg(feature = "local")]
+async fn same_release(
+    state: &ToolState,
+    name: &CrateName,
+    project: Option<&std::path::Path>,
+    spec: &VersionSpec,
+) -> Option<project::FromCratesIo> {
+    let same = project::crates_io_in_project(state, name, project).await?;
+    let may_be = match spec {
+        VersionSpec::Exact(version) => same
+            .packages
+            .iter()
+            .any(|package| package.version == *version),
+        VersionSpec::Requirement(_) | VersionSpec::Latest => true,
+    };
+    may_be.then_some(same)
+}
+
+/// The project's workspace and where it came from, when its package of `same` at `version` is the
+/// release on crates.io (its checksum is the index's): its build then tells `enabled_in_project`
+/// (requirements R-VR-1 and R-FT-2). A copy that differs is warned about.
+#[cfg(feature = "local")]
+fn the_release_in_build(
+    same: project::FromCratesIo,
+    version: &Version,
+    entry: &IndexEntry,
+    warnings: &mut Vec<Box<str>>,
+) -> Option<(Workspace, &'static str)> {
+    let package = same
+        .packages
+        .iter()
+        .find(|package| package.version == *version)?;
+    let check = package.docs_rs_check(entry);
+    if check == DocsRsCheck::Allowed {
+        return Some((same.workspace, same.project_from));
+    }
+    warnings.push(
+        format!(
+            "the project's {}@{} is {}, so whether items are in its build is not shown",
+            package.name,
+            package.version,
+            not_on_docs_rs(package, check)
+        )
+        .into(),
+    );
+    None
+}
+
+/// How the version was chosen, where the project came from if it chose it or has the same
+/// release (`same_release`), and the project's build of the crate.
 #[cfg(feature = "local")]
 fn chosen_by(
     spec: &VersionSpec,
     from_project: Option<Box<project::Found>>,
+    same_release: Option<(Workspace, &'static str)>,
 ) -> (ResolvedFrom, Option<&'static str>, InBuild) {
-    from_project.map_or_else(
-        || chosen_by_argument(spec),
-        |found| {
+    if let Some(found) = from_project {
+        let in_build = InBuild {
+            workspace: Some(found.workspace),
+            sets: None,
+        };
+        return (found.resolved_from, Some(found.project_from), in_build);
+    }
+    let (resolved_from, ..) = chosen_by_argument(spec);
+    match same_release {
+        Some((workspace, project_from)) => {
             let in_build = InBuild {
-                workspace: Some(found.workspace),
+                workspace: Some(workspace),
                 sets: None,
             };
-            (found.resolved_from, Some(found.project_from), in_build)
+            (resolved_from, Some(project_from), in_build)
         },
-    )
+        None => (resolved_from, None, InBuild::default()),
+    }
 }
 
 /// How the version was chosen: without local features, by the argument.

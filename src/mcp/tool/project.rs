@@ -128,6 +128,47 @@ pub(super) async fn version_in_project(
     }))
 }
 
+/// The project's packages from crates.io named `name`, for a lookup that gives the version: if
+/// one is at the version looked up, the project's build of it tells `enabled_in_project`
+/// (requirements R-VR-1 and R-FT-2). The project is the one `project` names, or else the default
+/// project. `None` when there is none, it is not resolved by `cargo metadata`, or it has no such
+/// package: the lookup goes on without it, as before.
+#[cfg(feature = "local")]
+pub(super) async fn crates_io_in_project(
+    state: &ToolState,
+    name: &CrateName,
+    project: Option<&Path>,
+) -> Option<FromCratesIo> {
+    let (workspace, project_from) = workspace(state.project.as_ref(), project).ok()??;
+    let resolution = state.resolver.resolve(&workspace).await.ok()?;
+    // The build's features are known only from `cargo metadata` and `cargo tree`.
+    let Resolution::Metadata { .. } = &*resolution else {
+        return None;
+    };
+    let packages: Vec<ProjectPackage> = PackageGraph::new(&resolution)
+        .crates_io_named(name.as_str())
+        .into_iter()
+        .cloned()
+        .collect();
+    (!packages.is_empty()).then(|| FromCratesIo {
+        packages,
+        project_from: project_from.as_str(),
+        workspace,
+    })
+}
+
+/// The project's packages from crates.io of one name.
+#[cfg(feature = "local")]
+#[derive(Debug)]
+pub(super) struct FromCratesIo {
+    /// The packages, one for each version.
+    pub(super) packages: Vec<ProjectPackage>,
+    /// Where the project came from (§7.3).
+    pub(super) project_from: &'static str,
+    /// The workspace, whose build decides `enabled_in_project`.
+    pub(super) workspace: Workspace,
+}
+
 /// Without local features, there is no project context (requirement R-ARCH-3).
 #[cfg(not(feature = "local"))]
 #[expect(

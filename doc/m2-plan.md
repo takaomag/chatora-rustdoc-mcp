@@ -395,6 +395,15 @@ Claude Code 2.1.304、Linux で測った。
 - テスト (`tests/local/build_scope.rs`、fixture は `tests/fixtures/build-scope/`): resolver 1 と 2 の workspace (proc-macro の member が使う member、build の依存の member、OS ごとの依存、dev だけ・build だけ・proc-macro の下だけの依存) で、範囲 (package と host 用か target 用か) が `cargo check --workspace --all-targets --target <host>` の作る unit と一致すること、名指しできるかの判定が `cargo rustdoc -p` の panic の有無と一致すること (proc-macro の member の下の依存だけは上のとおり安全側に違う)、wasm32 では wasm32 だけの依存が範囲に入ることを確かめる。ライブラリが cargo をテストのプロセスの環境で起動するので、テストのバイナリをこのテストだけ隔離した環境の子として起動し直す (`isolated::in_isolated_child`)
 - feature の組 (`data::features`) の、同じ package が host 用と target 用の両方の根に出るときの選び方 (M1 の B5d) は変えていない。上の逆向きの木で正確にできるが、D3 で feature の組を見直すときに合わせる
 
+**B8 (版を明示しても、プロジェクトと同じ crates.io の版なら `enabled_in_project`。2026-10-20)**:
+
+- 版を引数で決めた照会 (完全一致・semver 要件・`latest`) でも、プロジェクト (`project` 引数の、なければ既定のプロジェクト) がその名前の crates.io の package を持てば、解決した版と照合する。同じ版で、Cargo.lock の checksum が sparse index と合えば、プロジェクトの build で `enabled_in_project`・`enabled_in_dev_only` を出し、provenance に `project_from` を載せる。`resolved_from` は `explicit` などのまま。全ツールが `get_item` の解決を通るので、`crate_overview`・`list_*`・`search_items` (1 crate) にも効く
+- 同じ版だが checksum が合わない (vendor や patch) ときは、出さずに warnings に書く。プロジェクトの取得元のものを返すのは D7 (R-VR-1 の残り)
+- プロジェクトが無い、`cargo metadata` が失敗した、候補が複数で決まらないときは、今までどおりプロジェクトなしで続ける (版を明示した照会は止めない。R-MCP-3)
+- 照合の候補があるときは、版を明示していてもキャッシュだけで済ませず sparse index を読む (checksum の照合のため。オフラインでは手元の index を使う)。候補が無ければ今までどおりキャッシュだけで返す
+- テスト (`tests/stdio.rs`): crates.io の `demo` 0.1.0 を vendor のディレクトリから読むプロジェクト (Cargo.lock の checksum を、テストのキャッシュの `.crate` の sha256 にした) で、オフラインのサーバーに `demo@0.1.0` を引かせると `enabled_in_project` と `project_from` が付き、プロジェクトの無いサーバーでは付かない。照合を外すと落ちることを確かめた
+- CI で見つけた B1 のテストの揺れ: SIGTERM の後に止めた cargo を、サーバーが回収するまでの間 zombie として残り、`kill -0` が成功して「まだ動いている」と数えていた (B7 の CI の Linux)。`ps` の状態で zombie を止まったものとして数えるようにした。あわせて、pid のファイルを中身が書かれる前に読んで空の pid を調べ、確かめずに通ることがありえたので、中身を待つようにした
+
 ### 6.4 M2c
 
 (まだ無い)

@@ -392,6 +392,17 @@ impl PackageGraph {
         &self.packages
     }
 
+    /// The packages from crates.io whose crates.io name is `name`, with `-` and `_` and the case
+    /// not told apart: those that docs.rs may have, for a lookup that gives the version.
+    #[must_use]
+    pub fn crates_io_named(&self, name: &str) -> Vec<&ProjectPackage> {
+        let key = normalize(name);
+        self.packages
+            .iter()
+            .filter(|package| package.source == Source::CratesIo && normalize(&package.name) == key)
+            .collect()
+    }
+
     /// The package that `name` means: the extern name of a member's dependency, or the package
     /// or lib name of a package, with `-` and `_` and the case not told apart (requirement
     /// R-PR-1). Of several versions of one package, the one a member depends on directly is
