@@ -25,6 +25,7 @@ const KEYS: &[&str] = &[
     "cache.dir",
     "limits.concurrent_calls",
     "limits.extract_max_size",
+    "limits.request_timeout_secs",
     "log.dir",
     "log.file_max_size",
     "log.filter",

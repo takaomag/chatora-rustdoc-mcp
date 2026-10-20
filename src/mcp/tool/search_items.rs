@@ -120,7 +120,7 @@ pub(super) fn definition() -> Tool {
     }));
     Tool::new(NAME, DESCRIPTION, input_schema)
         .with_title("Search a Rust crate")
-        .with_raw_output_schema(Arc::new(output_schema()))
+        .with_raw_output_schema(Arc::new(super::with_building(output_schema())))
         .with_annotations(super::annotations())
 }
 
@@ -137,7 +137,7 @@ fn output_schema() -> JsonObject {
                 "status",
                 json!({ "type": "string", "enum": ["ok", "building", "failed", "unavailable"] }),
             ),
-            ("building_reason", json!({ "type": "string" })),
+            ("building_reason", super::building_reason_schema()),
             ("retry_after_secs", json!({ "type": "integer" })),
             ("code", json!({ "type": "string" })),
             ("reason", json!({ "type": "string" })),

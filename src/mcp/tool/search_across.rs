@@ -1,32 +1,31 @@
 //! Searching several crates together: the project's direct dependencies when no crate is given,
 //! or std with alloc and core (requirements R-SR-2 and R-SR-5).
 //!
-//! The crates are loaded at once, up to a time limit. Those still being fetched then are left
-//! out of this answer, which says so (`partial`); their fetching goes on, for the next call.
+//! The crates are loaded at once, up to a time limit (requirement R-ARCH-6). Those still being
+//! fetched or indexed then are left out of this answer, which says so (`partial`); their loading
+//! goes on, for the next call.
 
-use std::sync::Arc;
 #[cfg(feature = "local")]
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use rmcp::model::CallToolResult;
 use semver::Version;
 use serde_json::{Map, Value, json};
+#[cfg(feature = "local")]
+use tokio::time::Instant;
 
 use super::{
     ErrorChain,
     ToolState,
     get_item::{self, Searching},
 };
-#[cfg(feature = "local")]
-use crate::data::{
-    features::FeatureSets,
-    packages::{PackageGraph, Source},
-};
 use crate::{
     data::{
         archive::Mapped,
         crate_name::CrateName,
         dist::StdCrate,
+        flight::Doing,
         std_json::{self, Chosen},
         target::TargetTriple,
     },
@@ -38,14 +37,18 @@ use crate::{
         view::CrateView,
     },
 };
-
 #[cfg(feature = "local")]
-/// How long a search waits for the crates of its scope (requirement R-ARCH-6 limits a request
-/// to 30 seconds).
-const WAIT: Duration = Duration::from_secs(20);
+use crate::{
+    data::{
+        features::FeatureSets,
+        flight::Joined,
+        packages::{PackageGraph, Source},
+    },
+    query::load::ArchiveError,
+};
 
-/// When to ask again for the crates still being fetched.
-const RETRY_AFTER_SECS: u64 = 10;
+/// When to ask again for the crates still being fetched or indexed.
+const RETRY_AFTER_SECS: u64 = get_item::RETRY_AFTER_SECS;
 
 /// A crate of the scope, and how it fared.
 struct Member {
@@ -60,7 +63,7 @@ enum Outcome {
     Loaded(Arc<Mapped<Indexed>>),
     /// It could not be loaded: the code, the reason and whether trying again may help (§8).
     Failed(Value),
-    /// It was still being fetched when the search stopped waiting.
+    /// It was still being fetched or indexed, as this says, when the search stopped waiting.
     #[cfg_attr(
         not(feature = "local"),
         expect(
@@ -68,7 +71,7 @@ enum Outcome {
             reason = "only the dependencies of a project are fetched at once"
         )
     )]
-    Fetching,
+    Going(Doing),
 }
 
 /// Searches the project's direct dependencies that its normal build or its build with the
@@ -82,6 +85,7 @@ pub(super) async fn dependencies(
     searching: Searching,
     mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
+    let until = state.until();
     let (workspace, project_from) =
         match super::project::workspace(state.project.as_ref(), project.as_deref()) {
             Ok(Some(found)) => found,
@@ -145,10 +149,10 @@ pub(super) async fn dependencies(
         members.push(Member {
             name,
             version,
-            outcome: Outcome::Fetching,
+            outcome: Outcome::Going(Doing::Fetching),
         });
     }
-    let loaded = load_all(&state, loads, &target).await;
+    let loaded = load_all(&state, loads, &target, until).await;
     for member in &mut members {
         if let Some(outcome) = loaded
             .iter()
@@ -158,7 +162,7 @@ pub(super) async fn dependencies(
             member.outcome = match &outcome.2 {
                 Outcome::Loaded(mapped) => Outcome::Loaded(Arc::clone(mapped)),
                 Outcome::Failed(failure) => Outcome::Failed(failure.clone()),
-                Outcome::Fetching => Outcome::Fetching,
+                Outcome::Going(doing) => Outcome::Going(*doing),
             };
         }
     }
@@ -288,16 +292,15 @@ struct Context {
     searching: Searching,
 }
 
-/// Loads the archives of `releases` at once, waiting up to [`WAIT`]. A load that has not
+/// Loads the archives of `releases` at once, waiting for them until `until`. Loading what has not
 /// finished then goes on, so that the next search has it.
 #[cfg(feature = "local")]
 async fn load_all(
     state: &Arc<ToolState>,
     releases: Vec<(CrateName, Version)>,
     target: &TargetTriple,
+    until: Instant,
 ) -> Vec<(CrateName, Version, Outcome)> {
-    let now = tokio::time::Instant::now();
-    let deadline = now.checked_add(WAIT).unwrap_or(now);
     let handles: Vec<_> = releases
         .into_iter()
         .map(|(name, version)| {
@@ -305,89 +308,78 @@ async fn load_all(
             let (task_name, task_version) = (name.clone(), version.clone());
             // Aborted if the call is cancelled while it waits (requirement R-WS-6).
             let handle = super::AbortOnDrop::new(super::spawn(async move {
-                load_release(&state, &task_name, &task_version, &target).await
+                load_release(&state, &task_name, &task_version, &target, until).await
             }));
             (name, version, handle)
         })
         .collect();
     let mut outcomes = Vec::new();
-    for (name, version, mut handle) in handles {
-        let outcome = match tokio::time::timeout_at(deadline, &mut handle).await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => {
-                tracing::error!(%error, "loading a crate to search did not finish");
-                Outcome::Failed(json!({ "code": "internal_error", "retryable": true }))
-            },
-            // The task goes on, and writes the cache for the next search.
-            Err(_) => {
-                handle.detach();
-                Outcome::Fetching
-            },
-        };
+    for (name, version, handle) in handles {
+        let outcome = handle.await.unwrap_or_else(|error| {
+            tracing::error!(%error, "loading a crate to search did not finish");
+            Outcome::Failed(json!({ "code": "internal_error", "retryable": true }))
+        });
         outcomes.push((name, version, outcome));
     }
     outcomes
 }
 
 /// The archive of `name` at `version` for `target`: from the cache, or made from its JSON on
-/// docs.rs.
+/// docs.rs by work that the calls for it share, waiting for it until `until`.
 #[cfg(feature = "local")]
 async fn load_release(
     state: &ToolState,
     name: &CrateName,
     version: &Version,
     target: &TargetTriple,
+    until: Instant,
 ) -> Outcome {
     let dir = state.cache.docs_rs_dir(name, version, Some(target));
-    let open = async || {
-        let (cache, opened_dir) = (state.cache.clone(), dir.clone());
-        crate::task::spawn_blocking(move || load::open_archived(&cache, &opened_dir))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .flatten()
-    };
-    if let Some(mapped) = open().await {
+    let cache = state.cache.clone();
+    let opened = crate::task::spawn_blocking(move || load::open_archived(&cache, &dir))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+    if let Some(mapped) = opened {
         return Outcome::Loaded(mapped);
     }
-    // The JSON is loaded by work that the calls for the same crate share, and archived under the
-    // lock of its directory, so that a call that comes meanwhile opens the archive (requirements
-    // R-NW-2 and R-WS-6).
-    let loaded = match crate::data::shared_docs_rs_json(
-        &state.docs_rs_loads,
+    let archived = load::docs_rs_archive(
+        &state.archives,
         &state.cache,
         &state.docs_rs,
         name,
         version,
         Some(target),
+        until,
     )
-    .await
-    {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            let result =
-                get_item::load_error_of(&state.cache, name, &format!("{name}@{version}"), &error);
-            return Outcome::Failed(failure_of(&result));
-        },
-    };
-    let _held = state.cache.lock(&dir).await;
-    if let Some(mapped) = open().await {
-        return Outcome::Loaded(mapped);
-    }
-    let cache = state.cache.clone();
-    let archived =
-        crate::task::spawn_blocking(move || load::archive_json(&cache, &dir, &loaded.json)).await;
+    .await;
     match archived {
-        Ok(Ok(mapped)) => Outcome::Loaded(mapped),
-        Ok(Err(error)) => {
-            tracing::warn!(%name, %version, error = %ErrorChain(&error), "a crate to search could not be archived");
-            Outcome::Failed(json!({
-                "code": "docs_unavailable",
-                "reason": "unparsable",
-                "retryable": false,
-            }))
+        Joined::Done(Ok(archived)) => Outcome::Loaded(Arc::clone(&archived.mapped)),
+        Joined::Done(Err(error)) => match &*error {
+            ArchiveError::Load(error) => {
+                let result = get_item::load_error_of(
+                    &state.cache,
+                    name,
+                    &format!("{name}@{version}"),
+                    error,
+                );
+                Outcome::Failed(failure_of(&result))
+            },
+            ArchiveError::Make(error) => {
+                tracing::warn!(%name, %version, error = %ErrorChain(error), "a crate to search could not be archived");
+                Outcome::Failed(json!({
+                    "code": "docs_unavailable",
+                    "reason": "unparsable",
+                    "retryable": false,
+                }))
+            },
+            ArchiveError::Stopped => {
+                Outcome::Failed(json!({ "code": "internal_error", "retryable": true }))
+            },
         },
-        Err(_) => Outcome::Failed(json!({ "code": "internal_error", "retryable": true })),
+        Joined::Ended => Outcome::Failed(json!({ "code": "internal_error", "retryable": true })),
+        Joined::Going(doing) => Outcome::Going(doing),
     }
 }
 
@@ -433,7 +425,7 @@ fn search_members(
         .iter()
         .filter_map(|member| match &member.outcome {
             Outcome::Loaded(mapped) => Some((member, CrateView::new(mapped.get()))),
-            Outcome::Failed(_) | Outcome::Fetching => None,
+            Outcome::Failed(_) | Outcome::Going(_) => None,
         })
         .collect();
     let toolchain = context.std.as_ref().map(|std| std.chosen.json.toolchain());
@@ -574,10 +566,10 @@ fn sources(
                     source.extend(failure.clone());
                 }
             },
-            Outcome::Fetching => {
+            Outcome::Going(doing) => {
                 fetching = fetching.saturating_add(1);
                 source.insert("status".to_owned(), json!("building"));
-                source.insert("building_reason".to_owned(), json!("fetching"));
+                source.insert("building_reason".to_owned(), json!(doing.as_str()));
                 source.insert("retry_after_secs".to_owned(), json!(RETRY_AFTER_SECS));
             },
         }

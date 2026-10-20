@@ -37,7 +37,6 @@ use crate::{
         cache::{Cache, CacheError},
         crate_file::StaticCrates,
         dist::{Dist, DistSettings},
-        docs_rs::DocsRs,
         flight::Flights,
         sparse_index::SparseIndex,
     },
@@ -243,8 +242,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
     let network = Network::from_settings(settings);
     let server = Server {
         tools: Arc::new(tool::ToolState {
-            docs_rs: DocsRs::new(&network)?,
-            docs_rs_loads: Flights::default(),
+            docs_rs: tool::docs_rs(&network)?,
+            archives: Flights::default(),
             dist: Dist::new(&network, DistSettings::from_settings(settings))?,
             index: SparseIndex::new(cache.clone(), &network)?,
             // The `.crate` files that cargo has fetched are read before static.crates.io is asked.
@@ -263,6 +262,7 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
             // cargo runs with `--offline` in offline mode (requirement R-CA-7).
             resolver: Resolver::new(network.offline),
             calls: tool::CallLimit::from_settings(settings),
+            wait: tool::wait_for_work(settings),
         }),
     };
     settings.report();

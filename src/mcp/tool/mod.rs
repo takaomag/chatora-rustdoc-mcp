@@ -21,7 +21,7 @@ mod search_items;
 #[cfg(debug_assertions)]
 mod sleep;
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use rmcp::{
     model::{
@@ -30,6 +30,7 @@ use rmcp::{
         CallToolResult,
         ContentBlock,
         ErrorData,
+        JsonObject,
         Tool,
         ToolAnnotations,
     },
@@ -39,6 +40,7 @@ use serde_json::{Value, json};
 use tokio::{
     sync::{OnceCell, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
+    time::Instant,
 };
 use tracing::Instrument as _;
 
@@ -47,7 +49,7 @@ use crate::data::{metadata::Resolver, project::DefaultProject};
 use crate::{
     config::Settings,
     data::{
-        SharedJson,
+        Network,
         cache::Cache,
         crate_file::StaticCrates,
         dist::Dist,
@@ -57,6 +59,7 @@ use crate::{
         sparse_index::SparseIndex,
         target::{self, HostTarget},
     },
+    query::load::SharedArchive,
 };
 
 /// What the tools share for the life of the server.
@@ -66,9 +69,9 @@ pub(super) struct ToolState {
     pub(super) cache: Cache,
     /// The docs.rs client.
     pub(super) docs_rs: DocsRs,
-    /// The rustdoc JSON being loaded from docs.rs, shared by the calls that want it at once
-    /// (requirements R-NW-2 and R-WS-6).
-    pub(super) docs_rs_loads: Flights<SharedJson>,
+    /// The archives being made from rustdoc JSON on docs.rs, shared by the calls that want them
+    /// at once (requirements R-NW-2 and R-WS-6).
+    pub(super) archives: Flights<SharedArchive>,
     /// The client of the Rust distribution server, for std (requirement R-STD-6).
     pub(super) dist: Dist,
     /// The crates.io sparse index, for the versions of crates.
@@ -87,6 +90,9 @@ pub(super) struct ToolState {
     pub(super) resolver: Resolver,
     /// The calls being handled, at most `limits.concurrent_calls` (requirement R-SEC-7).
     pub(super) calls: CallLimit,
+    /// How long a call waits for work that goes on without it, such as fetching and indexing a
+    /// crate (requirement R-ARCH-6). See [`wait_for_work`].
+    pub(super) wait: Duration,
 }
 
 impl ToolState {
@@ -97,6 +103,34 @@ impl ToolState {
             .get_or_init(|| target::host_target(self.cache.dir()))
             .await
     }
+
+    /// Until when a call that starts now waits for work that goes on without it.
+    pub(super) fn until(&self) -> Instant {
+        let now = Instant::now();
+        now.checked_add(self.wait).unwrap_or(now)
+    }
+}
+
+/// `limits.request_timeout_secs` unless set (requirement R-ARCH-6).
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// How long a call waits for work that goes on without it: two thirds of the time a call may take,
+/// the setting `limits.request_timeout_secs` (requirements R-ARCH-6 and R-DIST-3), which leaves the
+/// rest for what the call does before and after the work. The call then returns `status:
+/// building`, or `partial` across crates (requirement R-OUT-9).
+pub(super) fn wait_for_work(settings: &Settings) -> Duration {
+    let secs = settings
+        .get("limits.request_timeout_secs", |value| {
+            value
+                .whole_number()
+                .filter(|secs| *secs > 0)
+                .ok_or("a whole number of seconds from 1")
+        })
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+        .saturating_mul(2)
+        .checked_div(3)
+        .unwrap_or_default()
 }
 
 /// The most tool calls handled at once (requirement R-SEC-7). Over it, a call gets `busy`.
@@ -179,6 +213,28 @@ const TEST_TOOLS_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_TOOLS";
 fn test_tools() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(TEST_TOOLS_ENV_VAR).is_some_and(|value| value == "1"))
+}
+
+/// The environment variable that points the docs.rs client of a debug build with the tool for
+/// testing at a server of the tests, for the tests of work that takes long (`tests/stdio.rs`). Like
+/// [`TEST_TOOLS_ENV_VAR`], it is not a setting.
+#[cfg(debug_assertions)]
+const TEST_DOCS_RS_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_DOCS_RS_URL";
+
+/// The docs.rs client: of docs.rs, or of the server of the tests that [`TEST_DOCS_RS_ENV_VAR`]
+/// names in a debug build with the tool for testing.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be set up.
+pub(super) fn docs_rs(network: &Network) -> Result<DocsRs, reqwest::Error> {
+    #[cfg(debug_assertions)]
+    if test_tools()
+        && let Ok(base_url) = std::env::var(TEST_DOCS_RS_ENV_VAR)
+    {
+        return DocsRs::with_base_url(&base_url, network);
+    }
+    DocsRs::new(network)
 }
 
 /// Definitions of every tool, in the order `tools/list` returns them.
@@ -402,25 +458,17 @@ where
 
 /// A task that is aborted when this is dropped before it finishes. Tokio's `JoinHandle` lets the
 /// task go on.
-pub(super) struct AbortOnDrop<T>(Option<JoinHandle<T>>);
+pub(super) struct AbortOnDrop<T>(JoinHandle<T>);
 
 impl<T> AbortOnDrop<T> {
     pub(super) const fn new(handle: JoinHandle<T>) -> Self {
-        Self(Some(handle))
-    }
-
-    /// Lets the task go on after this is dropped: it fills the cache for later calls.
-    #[cfg(feature = "local")]
-    pub(super) fn detach(mut self) {
-        drop(self.0.take());
+        Self(handle)
     }
 }
 
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
-        if let Some(handle) = &self.0 {
-            handle.abort();
-        }
+        self.0.abort();
     }
 }
 
@@ -431,11 +479,43 @@ impl<T> Future for AbortOnDrop<T> {
         mut self: std::pin::Pin<&mut Self>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // Only `detach` takes the handle, and it consumes `self`.
-        self.0.as_mut().map_or(std::task::Poll::Pending, |handle| {
-            std::pin::Pin::new(handle).poll(context)
-        })
+        std::pin::Pin::new(&mut self.0).poll(context)
     }
+}
+
+/// The schema of `building_reason`: why a crate is not ready yet (requirement R-OUT-9).
+pub(super) fn building_reason_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["building", "waiting_for_lock", "waiting_for_slot", "fetching", "indexing"],
+    })
+}
+
+/// `schema`, the `outputSchema` of a tool that looks a crate up, with the fields of the response
+/// while the crate is being fetched or indexed, which has no `data` (requirement R-OUT-9):
+/// `status`, `building_reason` and `retry_after_secs`, after `provenance`. Its root has no
+/// `anyOf`, so what only some responses have is optional (requirement R-OUT-1).
+pub(super) fn with_building(schema: JsonObject) -> JsonObject {
+    let mut schema = schema;
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        let mut with = JsonObject::new();
+        for (name, property) in std::mem::take(properties) {
+            let after = name == "provenance";
+            with.insert(name, property);
+            if after {
+                with.insert(
+                    "status".to_owned(),
+                    json!({ "type": "string", "enum": ["building"] }),
+                );
+                with.insert("building_reason".to_owned(), building_reason_schema());
+                with.entry("retry_after_secs")
+                    .or_insert_with(|| json!({ "type": "integer" }));
+            }
+        }
+        *properties = with;
+    }
+    schema.insert("required".to_owned(), json!(["provenance"]));
+    schema
 }
 
 /// Arguments that a tool cannot use (requirement R-ARG-1).
@@ -483,8 +563,6 @@ fn error_result(body: &Value) -> CallToolResult {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     /// Returns the JSON in `content[0].text` of a tool result.

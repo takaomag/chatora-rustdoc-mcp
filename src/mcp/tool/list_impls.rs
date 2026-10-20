@@ -71,7 +71,7 @@ pub(super) fn definition() -> Tool {
     }));
     Tool::new(NAME, DESCRIPTION, input_schema)
         .with_title("List a Rust type's impls")
-        .with_raw_output_schema(Arc::new(output_schema()))
+        .with_raw_output_schema(Arc::new(super::with_building(output_schema())))
         .with_annotations(super::annotations())
 }
 

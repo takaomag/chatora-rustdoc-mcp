@@ -87,6 +87,7 @@ and in the environment as `CHATORA_RUSTDOC_MCP_LOG__DIR`: the key in capitals, w
 | `cache.dir` | see [Cache](#cache) | The directory of the cache (an absolute path) |
 | `limits.concurrent_calls` | `16` | How many tool calls are handled at once; more get `busy` |
 | `limits.extract_max_size` | `"4GiB"` | The most bytes unpacked from one archive of the standard library |
+| `limits.request_timeout_secs` | `30` | How long a tool call may take. A call waits two thirds of it for a crate to be fetched and indexed; the work then goes on in the background, and the call answers `status: building` with `retry_after_secs` |
 | `log.dir` | see [Logs](#logs) | The directory of the log files (an absolute path) |
 | `log.file_max_size` | `"20MB"` | The size of a file before the next one (`KB`, `MB`, `GB`, `KiB`, `MiB`, `GiB`) |
 | `log.retention_days` | `14` | How many days files are kept |

@@ -442,7 +442,23 @@ Claude Code 2.1.304、Linux で測った。
 - C3 に回したもの: 失敗が覚えられない取得 (std の要約、sparse index、`.crate`) は、通信先が応答しないと 1 回で約 30 秒かかり、ロックを待っていた各プロセスが順に同じ失敗を繰り返す (セッションの数だけ直列に重なる)。docs.rs の JSON は一時的な失敗を覚えるので当たらない。時間の上限を入れる C3 で、短い間失敗を覚えることと一緒に扱う
 - 記録に残して直さないもの: 試し直しで待つ側が負け続けうる公平性 (OS の中で待つ側とプロセスの中の次の持ち主が先に取る)、NFS や SMB で `try_lock` がワーカーのスレッドを止めうること、`locks/` が増え続けること (消さない決まり。綴りの候補・nightly の日付ごとに増える)、UID の違うプロセスの共有 (0600 のロックファイルを開けず、排他なしになる。キャッシュの書き込みもそもそも壊れる)
 
-(まだ無い)
+**C3a (1 つの crate の照会の時間の上限と `status: building`。2026-10-21)**: C3 を、docs.rs の crate の時間の上限と応答の形 (C3a)、進捗の通知 (C3b)、std の配布物・`cargo metadata` の初回の取得・失敗を覚えない取得・ビルド中のカーソル (C3c) に分けた
+
+- 設定 `limits.request_timeout_secs` (既定 30 秒) を足した。呼び出しが裏で続く仕事を待つのは、その 3 分の 2 (既定 20 秒。M1 の横断の検索の 20 秒と同じ) まで。残りは版の解決など仕事の前後に使う。期限は呼び出しの始め (ツールの `execute`) から数える
+- docs.rs の crate は、取得からアーカイブの作成までを 1 つの共有の仕事にした (`query::load::docs_rs_archive`)。C2b の JSON だけの共有はやめた。get_item の `recover` にあった取得し直し (別の形式、壊れた JSON) も仕事の中に移した。get_item と横断の検索は、(1) ロックなしでアーカイブを開く、(2) 仕事を期限まで待つ、(3) アーカイブで引く、の順になった。横断の検索も取得し直しをするようになった
+- 期限を過ぎたら仕事を切り離す (`Flights::join` が `Joined::Going` を返す)。仕事への参照を持つタスクを終わるまで残すので、待つ側がすべて取り消されても止まらない。応答は `provenance`・`status: building`・`building_reason`・`retry_after_secs` (10)・`warnings`・`hints` の順にした
+  - `provenance` は source・crate・version・resolved_from・project_from・index_fetched_at・target
+  - `building_reason` は `fetching` か `indexing`。仕事が今の段を `Stage` に書く
+  - path が他の crate に続くとき (R-PR-4) も、続く先の crate が期限に間に合わなければ、その crate の `status: building` を返す。呼び直せば続く先で引ける
+- 横断の検索は、待つ期限を設定から取る。取得中の crate の `sources` の `building_reason` には、`fetching` か `indexing` を入れる
+- アーカイブの二重の解析 (C2b から回した件): ディレクトリのロックを blocking の作業に渡し、作業が終わってから外すようにした。仕事のタスクが abort されてもロックは外れない
+- outputSchema: 1 つの crate を引く 7 つのツールに `status` (`building`)・`building_reason` (R-OUT-9 の 5 つの値)・`retry_after_secs` を足した。必須は `provenance` だけにした (ルートに `anyOf` を置かないため。R-OUT-1)。横断の検索の `sources` の `building_reason` も同じ 5 つの値にした
+- テストの口: debug ビルドでテスト用のツールが有効なとき (`CHATORA_RUSTDOC_TEST_TOOLS=1`) だけ、`CHATORA_RUSTDOC_TEST_DOCS_RS_URL` で docs.rs の URL を差し替えられる (設定ではない)
+- テスト:
+  - `Flights`: 期限で `Going` と今の段を返す。待つ側をすべて取り消しても仕事は続き、後の呼び出しが結果を受ける
+  - `docs_rs_archive`: 始めた呼び出しを取り消しても続く。期限を過ぎても続き、要求は 1 回。ロックは blocking の作業が終わるまで持つ
+  - stdio: 遅い docs.rs で、1 回目の呼び出しは `status: building` で、outputSchema を通る。後の呼び出しは答えを受け、要求は 1 回
+- `AbortOnDrop::detach` は使われなくなったので消した
 
 ### 6.5 M2d
 

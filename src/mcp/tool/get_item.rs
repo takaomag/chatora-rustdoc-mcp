@@ -8,7 +8,8 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use semver::Version;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use tokio::time::Instant;
 
 use super::{
     ErrorChain,
@@ -27,13 +28,13 @@ use crate::{
     data::{
         self,
         LoadError,
-        Loaded,
         archive::Mapped,
         cache::Cache,
         crate_file::{self, DocsRsBuild},
         crate_name::CrateName,
         dist::{DistError, StdCrate},
         docs_rs::FetchError,
+        flight::{Doing, Joined},
         rustdoc_json::ParseError,
         sparse_index::{IndexEntry, IndexError},
         std_json::{self, Chosen},
@@ -55,7 +56,7 @@ use crate::{
         implementors::{ImplementorOptions, list_implementors},
         impls::{ImplOptions, list_impls},
         list_module::{ListOptions, list_module},
-        load,
+        load::{self, ArchiveError},
         methods::{MethodOptions, list_methods},
         overview::crate_overview,
         search::{Fields, SearchOptions, search_items},
@@ -327,6 +328,8 @@ struct Request {
     /// When the crates.io index that decided the version was read, when it was older than its
     /// TTL (requirements R-CA-3 and R-CA-7), in RFC 3339.
     index_fetched_at: Option<Box<str>>,
+    /// Until when the call waits for work that goes on without it (requirement R-ARCH-6).
+    until: Instant,
 }
 
 /// The most crates that a path is followed into, through re-exports of their items, after the
@@ -409,7 +412,7 @@ pub(super) fn definition() -> Tool {
     }));
     Tool::new(NAME, DESCRIPTION, input_schema)
         .with_title("Get a Rust item")
-        .with_raw_output_schema(Arc::new(output_schema()))
+        .with_raw_output_schema(Arc::new(super::with_building(output_schema())))
         .with_annotations(super::annotations())
 }
 
@@ -763,6 +766,7 @@ async fn resolve(
     arguments: Arguments,
     target: TargetTriple,
     mut warnings: Vec<Box<str>>,
+    until: Instant,
 ) -> Result<(Request, Vec<Box<str>>), Box<CallToolResult>> {
     let Arguments {
         name,
@@ -817,7 +821,7 @@ async fn resolve(
     let checked_later = false;
     if !checked_later && let Some(version) = cached_exact(state, &name, &spec, &target) {
         return Ok((
-            cached_request(name, version, &path, target, shape),
+            cached_request(name, version, &path, target, shape, until),
             warnings,
         ));
     }
@@ -867,6 +871,7 @@ async fn resolve(
         resolved_from,
         target,
         shape,
+        until,
     };
     Ok((request, warnings))
 }
@@ -879,6 +884,7 @@ fn cached_request(
     path: &str,
     target: TargetTriple,
     shape: Shape,
+    until: Instant,
 ) -> Request {
     Request {
         version,
@@ -893,6 +899,7 @@ fn cached_request(
         in_build: InBuild::default(),
         hops: 0,
         index_fetched_at: None,
+        until,
     }
 }
 
@@ -1216,14 +1223,15 @@ fn same_crate_name(a: &str, b: &str) -> bool {
 /// Looks the item up in the archive of the crate, or else loads the JSON of the crate and archives
 /// it first, on a blocking thread, since parsing a large crate takes a large part of a second.
 pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
+    let until = state.until();
     if let Some(krate) = std_crate(&arguments.name) {
-        return execute_std(arguments, krate, state, Vec::new()).await;
+        return execute_std(arguments, krate, state, Vec::new(), until).await;
     }
     let (target, warnings) = match &arguments.target {
         Some(target) => (target.clone(), Vec::new()),
         None => project::default_target(&state, arguments.project.as_deref()).await,
     };
-    let (arguments, warnings) = match resolve(&state, arguments, target, warnings).await {
+    let (arguments, warnings) = match resolve(&state, arguments, target, warnings, until).await {
         Ok(resolved) => resolved,
         Err(error) => return *error,
     };
@@ -1262,13 +1270,12 @@ async fn look_up_release(
     }
 }
 
-/// Looks the item up in the archive of the crate in `dir`, or else fetches the JSON of the crate,
-/// archives it there, and looks the item up in it.
+/// Looks the item up in the archive of the crate in `dir`, or else in the archive that work made
+/// from the JSON of the crate on docs.rs.
 ///
-/// The JSON is loaded by work that the calls for the same crate share, which goes on while one of
-/// them waits (requirements R-NW-2 and R-WS-6). The archive is then made under the lock of `dir`,
-/// so that a call that comes meanwhile opens it instead of making it again. The lock is let go
-/// before the path is followed into another crate.
+/// The calls for the same crate share the work, which holds the lock of `dir` (requirements R-NW-2,
+/// R-WS-6 and R-CA-4). A call waits for it until `until` in the request, and then returns
+/// `status: building` while the work goes on (requirements R-ARCH-6 and R-OUT-9).
 async fn load_and_look_up(
     state: &Arc<ToolState>,
     dir: PathBuf,
@@ -1281,36 +1288,117 @@ async fn load_and_look_up(
             Some(Err(arguments)) => *arguments,
             None => return Err(Box::new(shutting_down())),
         };
-    let loaded = match data::shared_docs_rs_json(
-        &state.docs_rs_loads,
+    let archived = match load::docs_rs_archive(
+        &state.archives,
         &state.cache,
         &state.docs_rs,
         &arguments.name,
         &arguments.version,
         Some(&arguments.target),
+        arguments.until,
     )
     .await
     {
-        Ok(loaded) => loaded,
-        Err(error) => return Err(Box::new(load_error(&state.cache, &arguments, &error))),
+        Joined::Done(Ok(archived)) => archived,
+        Joined::Done(Err(error)) => {
+            return Err(Box::new(archive_error(&state.cache, &arguments, &error)));
+        },
+        Joined::Ended => return Err(Box::new(stopped())),
+        Joined::Going(doing) => return Err(Box::new(building(&arguments, doing, warnings))),
     };
-    warnings.extend(loaded.warnings.iter().cloned());
-    let _held = state.cache.lock(&dir).await;
-    // Another call may have archived it while this one waited for the lock.
-    let arguments =
-        match look_up_archived(state.cache.clone(), dir.clone(), Box::new(arguments)).await {
-            Some(Ok((looked_up, arguments))) => return Ok((looked_up, *arguments)),
-            Some(Err(arguments)) => *arguments,
-            None => return Err(Box::new(shutting_down())),
-        };
-    let lookup = Lookup {
-        cache: state.cache.clone(),
-        dir,
+    warnings.extend(archived.warnings.iter().cloned());
+    let mapped = Arc::clone(&archived.mapped);
+    let task = crate::task::spawn_blocking(move || {
+        let looked_up = look_up_in(&mapped, &arguments);
+        (looked_up, arguments)
+    });
+    match task.await {
+        Ok(done) => Ok(done),
+        Err(error) => {
+            let error = crate::task::resume_if_panic(error);
+            tracing::error!(%error, "the get_item lookup did not finish");
+            Err(Box::new(shutting_down()))
+        },
+    }
+}
+
+/// When to call again for a crate that is being fetched or indexed (requirement R-OUT-9).
+pub(super) const RETRY_AFTER_SECS: u64 = 10;
+
+/// The response while the crate of `arguments` is being fetched or indexed, as `doing` says, by
+/// work that goes on after the call stopped waiting for it (requirements R-ARCH-6 and R-OUT-9):
+/// `status: building`, why, when to call again, and the provenance of what was asked for.
+fn building(arguments: &Request, doing: Doing, warnings: &[Box<str>]) -> CallToolResult {
+    let mut provenance = Map::new();
+    provenance.insert("source".to_owned(), json!("docs.rs"));
+    provenance.insert("crate".to_owned(), json!(arguments.name.as_str()));
+    provenance.insert("version".to_owned(), json!(arguments.version.to_string()));
+    provenance.insert("resolved_from".to_owned(), json!(arguments.resolved_from));
+    if let Some(project_from) = arguments.project_from {
+        provenance.insert("project_from".to_owned(), json!(project_from));
+    }
+    if let Some(fetched_at) = &arguments.index_fetched_at {
+        provenance.insert("index_fetched_at".to_owned(), json!(fetched_at));
+    }
+    provenance.insert("target".to_owned(), json!(arguments.target.as_str()));
+    let mut response = Map::new();
+    response.insert("provenance".to_owned(), Value::Object(provenance));
+    response.insert("status".to_owned(), json!("building"));
+    response.insert("building_reason".to_owned(), json!(doing.as_str()));
+    response.insert("retry_after_secs".to_owned(), json!(RETRY_AFTER_SECS));
+    if !warnings.is_empty() {
+        response.insert("warnings".to_owned(), json!(warnings));
+    }
+    let what = match doing {
+        Doing::Fetching => "fetched from docs.rs",
+        Doing::Indexing => "indexed",
     };
-    let Some((looked_up, arguments, loaded)) = lookup.on_blocking(loaded, arguments).await else {
-        return Err(Box::new(shutting_down()));
-    };
-    recover(state, &lookup, looked_up, arguments, &loaded.json, warnings).await
+    response.insert(
+        "hints".to_owned(),
+        json!([format!(
+            "{} {} is being {what}, which goes on without this call; call again in about \
+             {RETRY_AFTER_SECS} seconds",
+            arguments.name, arguments.version
+        )]),
+    );
+    CallToolResult::structured(Value::Object(response))
+}
+
+/// The tool error when the archive of the crate of `arguments` could not be made (§8).
+fn archive_error(cache: &Cache, arguments: &Request, error: &ArchiveError) -> CallToolResult {
+    match error {
+        ArchiveError::Load(error) => load_error(cache, arguments, error),
+        ArchiveError::Make(load::LoadError::Parse(error)) => parse_error(arguments, error),
+        ArchiveError::Make(load::LoadError::Archive(error) | load::LoadError::Read(error)) => {
+            kept_in_memory_error(error)
+        },
+        ArchiveError::Stopped => shutting_down(),
+    }
+}
+
+/// The tool error when a crate could not be archived, not even in memory.
+fn kept_in_memory_error(error: &std::io::Error) -> CallToolResult {
+    tracing::error!(%error, "the crate could not be archived");
+    super::tool_error(
+        "internal_error",
+        "the server could not keep the crate in memory",
+        false,
+        &["check the server's stderr log"],
+    )
+}
+
+/// The tool error when the work that loads the crate ended without a result, as when it
+/// panicked: the panic hook has written why to stderr.
+pub(super) fn stopped() -> CallToolResult {
+    super::tool_error(
+        "internal_error",
+        "the work that loads the crate stopped without a result (a bug)",
+        true,
+        &[
+            "call again; if it fails again, report the bug to the server's maintainers, with the \
+           server's stderr log",
+        ],
+    )
 }
 
 /// The result of a lookup, or of the lookup in the crate that the path goes on in.
@@ -1354,7 +1442,14 @@ async fn follow(
                 target: Some(origin.target.clone()),
                 shape: origin.shape.clone(),
             };
-            Box::pin(execute_std(arguments, krate, Arc::clone(state), followed)).await
+            Box::pin(execute_std(
+                arguments,
+                krate,
+                Arc::clone(state),
+                followed,
+                origin.until,
+            ))
+            .await
         },
         Some(_) | None => {
             match destination_request(state, &destination, &origin, &mut followed).await {
@@ -1589,6 +1684,7 @@ async fn destination_request(
         in_build: InBuild::default(),
         hops: origin.hops.saturating_add(1),
         index_fetched_at,
+        until: origin.until,
     })
 }
 
@@ -1643,6 +1739,7 @@ async fn in_project_build(
         hops: origin.hops.saturating_add(1),
         // The version is the project's, not the index's.
         index_fetched_at: None,
+        until: origin.until,
     })
 }
 
@@ -1733,98 +1830,6 @@ async fn docs_rs_build(
     }
 }
 
-/// When `looked_up` failed because the JSON did not parse, tries again as far as that can help:
-/// another format (requirement R-DS-2), or the JSON fetched once more (requirement R-CA-4).
-/// Returns the result to finish with, or the tool error to return as it is (boxed, as a result is
-/// large).
-async fn recover(
-    state: &ToolState,
-    lookup: &Lookup,
-    looked_up: Result<Value, Failure>,
-    arguments: Request,
-    json: &[u8],
-    warnings: &mut Vec<Box<str>>,
-) -> Result<(Result<Value, Failure>, Request), Box<CallToolResult>> {
-    Ok(match &looked_up {
-        // A format this server does not read: docs.rs may have the release in another one
-        // (requirement R-DS-2).
-        Err(Failure::Parse(ParseError::UnsupportedFormat { found, .. })) => {
-            match data::docs_rs_json_in_another_format(
-                &state.cache,
-                &state.docs_rs,
-                &arguments.name,
-                &arguments.version,
-                Some(&arguments.target),
-                *found,
-            )
-            .await
-            {
-                Ok(Some(json)) => {
-                    let loaded = Arc::new(Loaded {
-                        json,
-                        warnings: Vec::new(),
-                    });
-                    let Some((again, returned, _)) = lookup.on_blocking(loaded, arguments).await
-                    else {
-                        return Err(Box::new(shutting_down()));
-                    };
-                    (again, returned)
-                },
-                Ok(None) => (looked_up, arguments),
-                Err(error) => return Err(Box::new(load_error(&state.cache, &arguments, &error))),
-            }
-        },
-        // Its header was read when it was fetched, yet it does not parse: docs.rs may have served
-        // it broken, so it is fetched again, once (requirement R-CA-4).
-        Err(Failure::Parse(
-            ParseError::Json { .. } | ParseError::FormatMismatch { .. } | ParseError::TooDeep,
-        )) => match data::refetch_unparsable(
-            &state.cache,
-            &state.docs_rs,
-            &arguments.name,
-            &arguments.version,
-            Some(&arguments.target),
-            json,
-        )
-        .await
-        {
-            Ok(again) => {
-                let Loaded {
-                    json,
-                    warnings: more,
-                } = again;
-                warnings.extend(more);
-                let loaded = Arc::new(Loaded {
-                    json,
-                    warnings: Vec::new(),
-                });
-                let Some((again, returned, fetched)) = lookup.on_blocking(loaded, arguments).await
-                else {
-                    return Err(Box::new(shutting_down()));
-                };
-                if let Err(Failure::Parse(_)) = &again
-                    && let Err(error) = data::remember_unparsable(
-                        &state.cache,
-                        &returned.name,
-                        &returned.version,
-                        Some(&returned.target),
-                        &fetched.json,
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %ErrorChain(&error), "failed to remember a JSON that cannot be parsed");
-                }
-                (again, returned)
-            },
-            Err(error) => return Err(Box::new(load_error(&state.cache, &arguments, &error))),
-        },
-        Ok(_)
-        | Err(Failure::Parse(_) | Failure::Archive(_) | Failure::Item(_) | Failure::Serialize(_)) => {
-            (looked_up, arguments)
-        },
-    })
-}
-
 /// The crate of std that `name` is, if it is one (requirement R-STD-1).
 pub(super) fn std_crate(name: &CrateName) -> Option<StdCrate> {
     StdCrate::from_name(&name.as_str().to_ascii_lowercase().replace('-', "_"))
@@ -1838,6 +1843,7 @@ async fn execute_std(
     krate: StdCrate,
     state: Arc<ToolState>,
     mut warnings: Vec<Box<str>>,
+    until: Instant,
 ) -> CallToolResult {
     let host = state.host().await;
     let target = if let Some(target) = &arguments.target {
@@ -1885,6 +1891,7 @@ async fn execute_std(
         in_build: InBuild::default(),
         hops: 0,
         index_fetched_at: None,
+        until,
     };
     let cache = state.cache.clone();
     let task = crate::task::spawn_blocking(move || {
@@ -2072,45 +2079,6 @@ async fn look_up_archived(
     }
 }
 
-/// Where the JSON of the crate is archived.
-struct Lookup {
-    cache: Cache,
-    dir: PathBuf,
-}
-
-impl Lookup {
-    /// Parses `json`, archives it, and looks the item up, on a blocking thread, since parsing a
-    /// large crate takes a large part of a second. The arguments and the JSON come back with the
-    /// result. `None` if the runtime is shutting down; a panic goes on to `run_tool`.
-    async fn on_blocking(
-        &self,
-        loaded: Arc<Loaded>,
-        arguments: Request,
-    ) -> Option<(Result<Value, Failure>, Request, Arc<Loaded>)> {
-        let (cache, dir) = (self.cache.clone(), self.dir.clone());
-        match crate::task::spawn_blocking(move || {
-            let looked_up = load::archive_json(&cache, &dir, &loaded.json)
-                .map_err(|error| match error {
-                    load::LoadError::Parse(error) => Failure::Parse(error),
-                    load::LoadError::Archive(error) | load::LoadError::Read(error) => {
-                        Failure::Archive(error)
-                    },
-                })
-                .and_then(|mapped| look_up_in(&mapped, &arguments));
-            (looked_up, arguments, loaded)
-        })
-        .await
-        {
-            Ok(done) => Some(done),
-            Err(error) => {
-                let error = crate::task::resume_if_panic(error);
-                tracing::error!(%error, "the get_item lookup did not finish");
-                None
-            },
-        }
-    }
-}
-
 /// The tool error when the lookup was stopped because the server is shutting down.
 pub(super) fn shutting_down() -> CallToolResult {
     super::tool_error(
@@ -2134,15 +2102,7 @@ fn finish(
         },
         Err(Failure::Parse(error)) => parse_error(arguments, &error),
         Err(Failure::Item(error)) => item_error(arguments, &error),
-        Err(Failure::Archive(error)) => {
-            tracing::error!(%error, "the crate could not be archived");
-            super::tool_error(
-                "internal_error",
-                "the server could not keep the crate in memory",
-                false,
-                &["check the server's stderr log"],
-            )
-        },
+        Err(Failure::Archive(error)) => kept_in_memory_error(&error),
         Err(Failure::Serialize(error)) => {
             tracing::error!(%error, "the get_item response could not be serialized");
             super::tool_error(
@@ -2699,6 +2659,7 @@ mod tests {
             in_build: InBuild::default(),
             hops: 0,
             index_fetched_at: None,
+            until: Instant::now(),
         };
         let candidates = (0..25).map(|n| format!("item {n}").into()).collect();
         let result = item_error(&request, &GetItemError::Ambiguous { candidates });

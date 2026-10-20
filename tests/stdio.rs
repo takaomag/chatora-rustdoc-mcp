@@ -19,7 +19,11 @@ use std::{
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -529,9 +533,11 @@ fn tools_list_is_cacheable_and_not_paginated() {
         !cfg!(feature = "local")
     );
     assert_eq!(get_item["annotations"]["openWorldHint"], true);
+    // A response while the crate is being fetched has no `data` (requirement R-OUT-9).
+    assert_eq!(get_item["outputSchema"]["required"], json!(["provenance"]));
     assert_eq!(
-        get_item["outputSchema"]["required"],
-        json!(["provenance", "data"])
+        get_item["outputSchema"]["properties"]["status"]["enum"],
+        json!(["building"])
     );
     assert_eq!(result["ttlMs"], 3_600_000);
     assert_eq!(result["cacheScope"], "public");
@@ -1201,6 +1207,12 @@ fn refusing_proxy() -> String {
 /// Puts in the server's cache the crates.io index file of `demo`, which lists only 0.1.0, as read
 /// long ago (2023-11-14T22:13:20Z), past its TTL.
 fn write_old_demo_index(server: &Server) {
+    write_demo_index(server, 1_700_000_000);
+}
+
+/// Puts in the server's cache the crates.io index file of `demo`, which lists only 0.1.0, as read
+/// at `fetched_at` (seconds since the Unix epoch).
+fn write_demo_index(server: &Server, fetched_at: u64) {
     let index = server.cache.path().join("index.crates.io/de/mo/demo");
     std::fs::create_dir_all(index.parent().expect("a parent")).expect("made");
     let line = json!({
@@ -1214,7 +1226,7 @@ fn write_old_demo_index(server: &Server) {
     std::fs::write(&index, format!("{line}\n")).expect("written");
     std::fs::write(
         index.with_file_name("demo.meta.json"),
-        json!({ "etag": null, "last_modified": null, "fetched_at": 1_700_000_000 }).to_string(),
+        json!({ "etag": null, "last_modified": null, "fetched_at": fetched_at }).to_string(),
     )
     .expect("written");
 }
@@ -1563,4 +1575,90 @@ fn a_target_of_its_own_falls_back_to_the_host_with_a_warning() {
     let listed = server.response(1)["result"]["structuredContent"].clone();
     assert!(warns(&listed, "a target of its own"), "{listed}");
     assert!(server.finish().success());
+}
+
+/// The URL of a server on this machine that answers every request with `body` after `delay`, and
+/// the number of requests it has had.
+fn slow_server(body: Vec<u8>, delay: Duration) -> (String, Arc<AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port is free");
+    let url = format!("http://{}", listener.local_addr().expect("bound"));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&requests);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let body = body.clone();
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 0) && line != "\r\n" {
+                    line.clear();
+                }
+                thread::sleep(delay);
+                let mut stream = reader.into_inner();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                // What the server makes of it is what the test looks at.
+                let _written = stream
+                    .write_all(head.as_bytes())
+                    .and_then(|()| stream.write_all(&body));
+            });
+        }
+    });
+    (url, requests)
+}
+
+/// A crate whose JSON takes longer to fetch than a call waits is `status: building`, which the
+/// tool's `outputSchema` allows, and the fetch goes on without the call, so that a later call
+/// has the item: docs.rs is asked once (requirements R-ARCH-6, R-OUT-9 and R-WS-6).
+#[test]
+fn a_crate_that_takes_long_to_fetch_is_building_and_then_answered() {
+    let json = serde_json::to_vec(&demo_crate()).expect("serializes");
+    let (docs_rs, requests) = slow_server(json, Duration::from_secs(2));
+    let mut server = Server::start_with(None, &[
+        ("CHATORA_RUSTDOC_TEST_DOCS_RS_URL", docs_rs.as_str()),
+        // A call waits two thirds of a second.
+        ("CHATORA_RUSTDOC_MCP_LIMITS__REQUEST_TIMEOUT_SECS", "1"),
+        ("NO_PROXY", "127.0.0.1"),
+        ("no_proxy", "127.0.0.1"),
+    ]);
+    // The JSON is not cached; the index and the `.crate` are, so that only docs.rs is asked.
+    std::fs::remove_dir_all(server.cache.path().join("docs.rs")).expect("removed");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    write_demo_index(&server, now);
+    let arguments = json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET });
+    server.send(&call_tool(1, "get_item", arguments.clone()));
+    let result = server.response(1)["result"].clone();
+    assert_eq!(result["isError"], false, "{result}");
+    let building = &result["structuredContent"];
+    assert_eq!(building["status"], "building", "{building}");
+    assert_eq!(building["building_reason"], "fetching");
+    assert_eq!(building["retry_after_secs"], 10);
+    assert_eq!(building["provenance"]["crate"], "demo");
+    assert_eq!(building["provenance"]["version"], "0.1.0");
+    assert!(building.get("data").is_none());
+    // Called again until the fetch that went on has ended.
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(20))
+        .expect("in range");
+    let mut id = 1;
+    let answered = loop {
+        thread::sleep(Duration::from_millis(500));
+        id += 1;
+        server.send(&call_tool(id, "get_item", arguments.clone()));
+        let result = server.response(id)["result"].clone();
+        if result["structuredContent"].get("status").is_none() {
+            break result;
+        }
+        assert!(Instant::now() < deadline, "still {result}");
+    };
+    assert_eq!(answered["isError"], false, "{answered}");
+    assert_eq!(answered["structuredContent"]["data"]["path"], "demo::hello");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
 }

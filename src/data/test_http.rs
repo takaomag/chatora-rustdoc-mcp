@@ -8,7 +8,7 @@ use std::{
 };
 
 /// Serves one HTTP response on a local port, and sends back the request head it received.
-pub(super) fn serve_once(head: &str, body: &[u8]) -> (String, mpsc::Receiver<String>) {
+pub(crate) fn serve_once(head: &str, body: &[u8]) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a local port is free");
     let base_url = format!("http://{}", listener.local_addr().expect("bound"));
     let (sender, request) = mpsc::channel();
@@ -39,7 +39,7 @@ pub(super) fn serve_once(head: &str, body: &[u8]) -> (String, mpsc::Receiver<Str
 
 /// Serves `body` with 200 to every request on a local port, each after `delay`, and counts the
 /// requests: for the tests of calls that come while a fetch is under way.
-pub(super) fn serve_slowly(
+pub(crate) fn serve_slowly(
     body: &[u8],
     delay: std::time::Duration,
 ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -82,7 +82,7 @@ pub(super) fn serve_slowly(
 
 /// Serves `responses` (a head and a body each) in turn on a local port, one connection each, and
 /// sends back the request heads it received.
-pub(super) fn serve_sequence(
+pub(crate) fn serve_sequence(
     responses: Vec<(String, Vec<u8>)>,
 ) -> (String, mpsc::Receiver<String>) {
     serve_sequence_with(|_| responses)
@@ -90,7 +90,7 @@ pub(super) fn serve_sequence(
 
 /// [`serve_sequence`] with responses made from the base URL of the server, for bodies that name
 /// URLs on it.
-pub(super) fn serve_sequence_with(
+pub(crate) fn serve_sequence_with(
     responses: impl FnOnce(&str) -> Vec<(String, Vec<u8>)>,
 ) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a local port is free");

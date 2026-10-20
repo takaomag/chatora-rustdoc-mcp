@@ -9,12 +9,19 @@ use std::{
 };
 
 use parking_lot::{Condvar, Mutex};
+use semver::Version;
+use tokio::time::Instant;
 
 use super::across::{ARCHIVE_SCHEMA, Indexed};
 use crate::data::{
+    self,
     archive::{self, Header, Mapped},
-    cache::{self, Cache},
+    cache::{self, Cache, PathGuard},
+    crate_name::CrateName,
+    docs_rs::DocsRs,
+    flight::{Doing, Flights, Joined, Stage},
     rustdoc_json::{self, ParseError},
+    target::TargetTriple,
 };
 
 /// Why a crate could not be loaded from its JSON.
@@ -29,6 +36,220 @@ pub enum LoadError {
     /// The JSON could not be read.
     #[error("the rustdoc JSON could not be read")]
     Read(#[source] io::Error),
+}
+
+/// The archive of a release's rustdoc JSON from docs.rs, and the warnings about how the JSON was
+/// loaded, such as a cached JSON that was damaged and fetched again (requirement R-CA-4).
+#[derive(Debug)]
+pub struct Archived {
+    /// The archive.
+    pub mapped: Arc<Mapped<Indexed>>,
+    /// What the response warns about.
+    pub warnings: Vec<Box<str>>,
+}
+
+/// Why the archive of a release's rustdoc JSON from docs.rs could not be made.
+#[derive(Debug, thiserror::Error)]
+pub enum ArchiveError {
+    /// The JSON could not be loaded.
+    #[error(transparent)]
+    Load(#[from] data::LoadError),
+    /// The archive could not be made from the JSON.
+    #[error(transparent)]
+    Make(#[from] LoadError),
+    /// The work was stopped, as the server is shutting down.
+    #[error("the work that makes the archive was stopped")]
+    Stopped,
+}
+
+/// The archive of a release for the calls that wanted it at once, or why it could not be made.
+pub type SharedArchive = Result<Arc<Archived>, Arc<ArchiveError>>;
+
+/// The archive of `name` at `version` for `target`, made from its rustdoc JSON on docs.rs by work
+/// that the calls for the release share (requirements R-NW-2 and R-WS-6).
+///
+/// A call waits for the work until `until`. The work then goes on, so that a later call finds the
+/// archive, and [`Joined::Going`] says what it is doing (requirements R-ARCH-6 and R-OUT-9).
+///
+/// The work holds the lock of the release's directory in the cache, so that other calls and
+/// processes open the archive instead of making it again (requirement R-CA-4). When every call
+/// stops waiting for it before any has been told that it goes on, the work stops; the lock is
+/// then let go at once, but not while the JSON is parsed and archived, which cannot be stopped.
+pub async fn docs_rs_archive(
+    flights: &Flights<SharedArchive>,
+    cache: &Cache,
+    docs_rs: &DocsRs,
+    name: &CrateName,
+    version: &Version,
+    target: Option<&TargetTriple>,
+    until: Instant,
+) -> Joined<SharedArchive> {
+    let dir = cache.docs_rs_dir(name, version, target);
+    let key = dir.to_string_lossy().into_owned();
+    let release = Release {
+        cache: cache.clone(),
+        docs_rs: docs_rs.clone(),
+        name: name.clone(),
+        version: version.clone(),
+        target: target.cloned(),
+        dir,
+    };
+    flights
+        .join(&key, until, async move |stage| {
+            release
+                .archive(&stage)
+                .await
+                .map(Arc::new)
+                .map_err(Arc::new)
+        })
+        .await
+}
+
+/// A release on docs.rs, whose archive is made in its directory of the cache.
+struct Release {
+    cache: Cache,
+    docs_rs: DocsRs,
+    name: CrateName,
+    version: Version,
+    target: Option<TargetTriple>,
+    dir: PathBuf,
+}
+
+impl Release {
+    /// The archive, made from the JSON unless another call or process has made it, and the
+    /// JSON fetched again, or in another format, when it cannot be parsed (requirements R-CA-4
+    /// and R-DS-2). The work tells `stage` what it does.
+    async fn archive(&self, stage: &Stage) -> Result<Archived, ArchiveError> {
+        let (cache, dir) = (self.cache.clone(), self.dir.clone());
+        let (opened, held) = holding(self.cache.lock(&self.dir).await, move || {
+            open_archived(&cache, &dir)
+        })
+        .await?;
+        match opened {
+            Ok(Some(mapped)) => {
+                return Ok(Archived {
+                    mapped,
+                    warnings: Vec::new(),
+                });
+            },
+            Ok(None) => {},
+            Err(error) => tracing::warn!(%error, "the archive of the crate could not be read"),
+        }
+        let target = self.target.as_ref();
+        let loaded = data::docs_rs_json(
+            &self.cache,
+            &self.docs_rs,
+            &self.name,
+            &self.version,
+            target,
+        )
+        .await?;
+        let mut warnings = loaded.warnings;
+        stage.set(Doing::Indexing);
+        let (made, json, held) = self.make(loaded.json, held).await?;
+        let made = match &made {
+            // A format this server does not read: docs.rs may have the release in another one
+            // (requirement R-DS-2).
+            Err(LoadError::Parse(ParseError::UnsupportedFormat { found, .. })) => {
+                stage.set(Doing::Fetching);
+                match data::docs_rs_json_in_another_format(
+                    &self.cache,
+                    &self.docs_rs,
+                    &self.name,
+                    &self.version,
+                    target,
+                    *found,
+                )
+                .await?
+                {
+                    Some(json) => {
+                        stage.set(Doing::Indexing);
+                        self.make(json, held).await?.0
+                    },
+                    None => made,
+                }
+            },
+            // Its header was read when it was fetched, yet it does not parse: docs.rs may have
+            // served it broken, so it is fetched again, once (requirement R-CA-4).
+            Err(LoadError::Parse(
+                ParseError::Json { .. } | ParseError::FormatMismatch { .. } | ParseError::TooDeep,
+            )) => {
+                stage.set(Doing::Fetching);
+                let again = data::refetch_unparsable(
+                    &self.cache,
+                    &self.docs_rs,
+                    &self.name,
+                    &self.version,
+                    target,
+                    &json,
+                )
+                .await?;
+                warnings.extend(again.warnings);
+                stage.set(Doing::Indexing);
+                let (made, json, _held) = self.make(again.json, held).await?;
+                if let Err(LoadError::Parse(_)) = &made
+                    && let Err(error) = data::remember_unparsable(
+                        &self.cache,
+                        &self.name,
+                        &self.version,
+                        target,
+                        &json,
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, "failed to remember a JSON that cannot be parsed");
+                }
+                made
+            },
+            Ok(_) | Err(_) => {
+                drop(held);
+                made
+            },
+        };
+        Ok(Archived {
+            mapped: made?,
+            warnings,
+        })
+    }
+
+    /// Parses `json`, indexes it and archives it, holding the lock `held` until it is done. The
+    /// JSON and the lock come back with the result.
+    async fn make(
+        &self,
+        json: Box<[u8]>,
+        held: PathGuard,
+    ) -> Result<
+        (
+            Result<Arc<Mapped<Indexed>>, LoadError>,
+            Box<[u8]>,
+            PathGuard,
+        ),
+        ArchiveError,
+    > {
+        let (cache, dir) = (self.cache.clone(), self.dir.clone());
+        let ((made, json), held) = holding(held, move || {
+            let made = archive_json(&cache, &dir, &json);
+            (made, json)
+        })
+        .await?;
+        Ok((made, json, held))
+    }
+}
+
+/// Runs `work` on a blocking thread, which lets the lock `held` go when the work ends, even when
+/// the task that waits for it is aborted: the work cannot be stopped, and another call must not do
+/// it again meanwhile (requirement R-WS-6). The lock comes back with the result.
+async fn holding<R: Send + 'static>(
+    held: PathGuard,
+    work: impl FnOnce() -> R + Send + 'static,
+) -> Result<(R, PathGuard), ArchiveError> {
+    crate::task::spawn_blocking(move || (work(), held))
+        .await
+        .map_err(|error| {
+            let error = crate::task::resume_if_panic(error);
+            tracing::debug!(%error, "the work that makes an archive was stopped");
+            ArchiveError::Stopped
+        })
 }
 
 /// The most archives kept open in the process. Each is a mapping of its file, which the kernel can
@@ -400,5 +621,97 @@ mod tests {
             })
             .sum();
         assert_eq!(parsed, 1);
+    }
+
+    /// A release of a crate called `c`, which [`JSON`] documents.
+    fn c() -> (CrateName, Version) {
+        ("c".parse().expect("valid"), Version::new(1, 0, 0))
+    }
+
+    /// A deadline that a test does not reach.
+    fn later() -> Instant {
+        Instant::now()
+            .checked_add(std::time::Duration::from_secs(60))
+            .expect("in range")
+    }
+
+    /// The call that started the work is called off while another waits for it: the work goes on
+    /// for the other, and docs.rs is asked once (requirements R-NW-2 and R-WS-6).
+    #[tokio::test]
+    async fn the_work_goes_on_while_another_call_waits_for_it() {
+        let (base_url, requests) =
+            data::test_http::serve_slowly(JSON, std::time::Duration::from_millis(300));
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (cache, docs_rs) = (Cache::at(dir.path()), DocsRs::for_local_test(&base_url));
+        let flights = Arc::new(Flights::default());
+        let call = || {
+            let (flights, cache, docs_rs) = (Arc::clone(&flights), cache.clone(), docs_rs.clone());
+            tokio::spawn(async move {
+                let (name, version) = c();
+                docs_rs_archive(&flights, &cache, &docs_rs, &name, &version, None, later()).await
+            })
+        };
+        let first = call();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = call();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        first.abort();
+        let Joined::Done(Ok(archived)) = second.await.expect("joined") else {
+            panic!("archived");
+        };
+        assert_eq!(
+            CrateView::new(archived.mapped.get()).crate_version(),
+            Some("1.0.0")
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A call that stops waiting at its deadline is told that the crate is being fetched, and the
+    /// work goes on, so that a later call has the archive, which docs.rs was asked for once
+    /// (requirements R-ARCH-6 and R-OUT-9).
+    #[tokio::test]
+    async fn the_work_goes_on_past_the_deadline() {
+        let (base_url, requests) =
+            data::test_http::serve_slowly(JSON, std::time::Duration::from_millis(300));
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (cache, docs_rs) = (Cache::at(dir.path()), DocsRs::for_local_test(&base_url));
+        let flights = Flights::default();
+        let (name, version) = c();
+        let soon = Instant::now() + std::time::Duration::from_millis(50);
+        let first = docs_rs_archive(&flights, &cache, &docs_rs, &name, &version, None, soon).await;
+        assert!(matches!(first, Joined::Going(Doing::Fetching)), "{first:?}");
+        // Archived by the work that went on, which no call waits for.
+        let place = cache.docs_rs_dir(&name, &version, None);
+        let deadline = later();
+        while open_archived(&cache, &place).expect("no error").is_none() {
+            assert!(Instant::now() < deadline, "not archived");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let later =
+            docs_rs_archive(&flights, &cache, &docs_rs, &name, &version, None, later()).await;
+        assert!(matches!(later, Joined::Done(Ok(_))), "{later:?}");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The lock is let go when the blocking work ends, not when the task that waits for it is
+    /// aborted, so that another call does not make the archive again meanwhile (requirement
+    /// R-WS-6).
+    #[tokio::test]
+    async fn the_lock_is_held_until_the_blocking_work_ends() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let place = dir.path().join("docs.rs/c/1.0.0/_default");
+        let waiting = tokio::spawn(holding(cache.lock(&place).await, || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        waiting.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            cache.try_lock(&place).is_none(),
+            "held by the blocking work"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(cache.try_lock(&place).is_some(), "let go when it ended");
     }
 }

@@ -128,7 +128,7 @@ impl DocsRs {
     /// A client for a test server on this machine, which bypasses any proxy that the environment
     /// sets (`HTTP_PROXY`), so that the tests do not depend on it.
     #[cfg(test)]
-    pub(super) fn for_local_test(base_url: &str) -> Self {
+    pub(crate) fn for_local_test(base_url: &str) -> Self {
         Self {
             client: http::client_builder(&Network::default())
                 .no_proxy()
