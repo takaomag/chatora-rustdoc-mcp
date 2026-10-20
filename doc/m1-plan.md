@@ -671,6 +671,21 @@ C3 を 2 つに分けた: C3a (`list_module` と一覧の共通の仕組み)、C
 - 実データ: `tower::Service` は items がすべて required で dyn compatible、crate の中の実装者は `&'a mut S` と `Box<S>` の 2 つ (tower-service の中だけなので。Q9 の「自分の依存の中で」は M4)。`std::iter::Iterator` は `next` と `Item` が required、ほかは provided で、negative impl (`!Iterator for [T]`) があり、公開の実装者が 115。`std::marker::Send` は `unsafe auto trait` で、`!Send for *const T` などの negative impl を含む 544
 - テスト: required / provided、非公開の supertrait による `sealed`、実装者と見出し、`scope` の引数
 
+#### C8 (2026-10-20)
+
+`list_crates` を足した (§6.3。§3 Q1)。プロジェクトが要るので、ローカル機能のある構成でだけ組み込み、無い構成では `tools/list` にも出さない (R-ARCH-4)。
+
+- 範囲: 既定 (`scope: direct`) は workspace member とその直接依存、`scope: all` で依存グラフのすべてのパッケージ。`crate` を渡すと、その名前のパッケージ (版ごと) だけを、`used_by` (member からその crate までの依存の連鎖。`cargo tree -i` に相当。短い順に 5 つまで) 付きで返す。並びは member → 直接依存 → ほか、その中は名前・版の順。ページングは `list_module` と同じカーソル (データのダイジェストはパッケージと版の一覧から)
+- 各項目: `crate`・`version` (Cargo.lock の解決された版)・`source` (`crates.io`・`path`・`git`・`registry`)・`member`・`direct`・`build` (評価する target の通常のビルドに入るなら `normal`、dev を含むビルドにだけなら `dev`、どちらにも入らなければ `none`。`cargo tree` の feature の組で判定)・`features` (通常のビルド、無ければ dev を含むビルドの feature)・`docs_rs_json: cached` (キャッシュにあるとき。ネットワークには出ない)。advisory の件数は計画どおり M4
+- provenance は 1 つ (`source: project`・`workspace`・`project_from`・`resolved_from`・`target`)。`cargo metadata` が失敗して Cargo.lock を直接読んだとき (`cargo_lock_raw`) は、member と path の依存を見分けられず、ビルドに入るかも分からない旨を warnings に書く
+- 依存グラフに、member か・直接依存か・member からの連鎖を返す口を足した (連鎖の探索は幅優先で、循環を避け、調べる部分連鎖を 1 万までに抑える)
+- 実データ (このリポジトリ): member と直接依存の 28 crate (`insta`・`tempfile` は `build: dev`)、全体で 269。`crate: windows-sys` は 0.52.0 と 0.61.2 の 2 版で、0.52.0 は reqwest → quinn → quinn-proto → ring などの経路、0.61.2 は etcetera・tempfile・tokio から (どちらも Linux では `build: none`)
+- テスト: 引数、stdio で合成の workspace の crate を一覧すること、`tools/list` の一覧 (ローカル機能の有無で `list_crates` が出るか)
+
+#### M1c の終わり (2026-10-20)
+
+C2〜C8 で M1 のツール (`list_crates`・`resolve_version`・`crate_overview`・`get_item`・`search_items`・`list_module`・`list_methods`・`list_impls`・`list_implementors`) が揃った。§3 の問いのうち、Q1 (`list_crates`)・Q2 (`resolve_version`)・Q3 (`crate_overview`)・Q4 (`search_items`)・Q5 (`get_item`)・Q6 (`list_module`)・Q8 (`list_impls`)・Q17 (`get_item` の `stability`)・Q20 (`get_item` の追跡) に答えられる。Q7 は固有と trait 由来だけ (Deref 先とプリミティブは M4)、Q9 は trait の crate の中だけ (依存グラフ全体は M4)。
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。

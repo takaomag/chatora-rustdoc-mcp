@@ -416,31 +416,22 @@ fn tools_list_is_cacheable_and_not_paginated() {
         .iter()
         .map(|tool| &tool["name"])
         .collect();
-    // `sleep` is only in debug builds.
-    let expected: &[&str] = if cfg!(debug_assertions) {
-        &[
-            "crate_overview",
-            "get_item",
-            "list_implementors",
-            "list_impls",
-            "list_methods",
-            "list_module",
-            "resolve_version",
-            "search_items",
-            "sleep",
-        ]
-    } else {
-        &[
-            "crate_overview",
-            "get_item",
-            "list_implementors",
-            "list_impls",
-            "list_methods",
-            "list_module",
-            "resolve_version",
-            "search_items",
-        ]
-    };
+    // `list_crates` needs local features, and `sleep` is only in debug builds.
+    let mut expected = vec!["crate_overview", "get_item"];
+    if cfg!(feature = "local") {
+        expected.push("list_crates");
+    }
+    expected.extend([
+        "list_implementors",
+        "list_impls",
+        "list_methods",
+        "list_module",
+        "resolve_version",
+        "search_items",
+    ]);
+    if cfg!(debug_assertions) {
+        expected.push("sleep");
+    }
     assert_eq!(names, expected);
     let get_item = result["tools"]
         .as_array()
@@ -593,6 +584,22 @@ fn search_items_without_a_crate_needs_a_project() {
     server.send(&call_tool(1, "search_items", json!({ "query": "hello" })));
     let error = text_json(&server.response(1)["result"]);
     assert_eq!(error["code"], "invalid_argument", "{error}");
+    assert!(server.finish().success());
+}
+
+/// `list_crates` lists the crates of the project at their resolved versions (§3 Q1).
+#[cfg(feature = "local")]
+#[test]
+fn list_crates_lists_the_project() {
+    let project = demo_workspace();
+    let mut server = Server::start_in(Some(project.path()));
+    server.send(&call_tool(1, "list_crates", json!({ "target": TARGET })));
+    let response = server.response(1);
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["provenance"]["source"], "project", "{response}");
+    assert_eq!(content["data"]["crates"][0]["crate"], "demo", "{response}");
+    assert_eq!(content["data"]["crates"][0]["member"], true);
+    assert_eq!(content["data"]["crates"][0]["source"], "path");
     assert!(server.finish().success());
 }
 

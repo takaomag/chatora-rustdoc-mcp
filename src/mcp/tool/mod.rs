@@ -5,6 +5,8 @@
 
 mod crate_overview;
 mod get_item;
+#[cfg(feature = "local")]
+mod list_crates;
 mod list_implementors;
 mod list_impls;
 mod list_methods;
@@ -83,6 +85,9 @@ pub(super) fn definitions() -> Vec<Tool> {
     vec![
         crate_overview::definition(),
         get_item::definition(),
+        // A project is needed, which only local features read (requirement R-ARCH-4).
+        #[cfg(feature = "local")]
+        list_crates::definition(),
         list_implementors::definition(),
         list_impls::definition(),
         list_methods::definition(),
@@ -119,6 +124,13 @@ pub(super) async fn call(
                     .await
                     .into(),
             ),
+            Err(error) => Ok(error.into_result().into()),
+        },
+        #[cfg(feature = "local")]
+        list_crates::NAME => match list_crates::parse_arguments(request.arguments.as_ref()) {
+            Ok(arguments) => Ok(run_tool(list_crates::execute(arguments, Arc::clone(state)))
+                .await
+                .into()),
             Err(error) => Ok(error.into_result().into()),
         },
         list_implementors::NAME => {

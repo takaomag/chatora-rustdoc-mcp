@@ -303,6 +303,68 @@ impl PackageGraph {
         }
     }
 
+    /// Whether `package`, one of [`Self::packages`], is a workspace member.
+    #[must_use]
+    pub fn is_member(&self, package: &ProjectPackage) -> bool {
+        self.index_of(package)
+            .is_some_and(|index| self.members.contains(&index))
+    }
+
+    /// Whether a member depends on `package`, one of [`Self::packages`], directly.
+    #[must_use]
+    pub fn is_direct(&self, package: &ProjectPackage) -> bool {
+        self.index_of(package)
+            .is_some_and(|index| self.direct.iter().any(|direct| direct.package == index))
+    }
+
+    /// The chains of packages from a member down to `package`, one of [`Self::packages`], as
+    /// `cargo tree -i` shows them: shortest first, at most `max` of them, each without a cycle.
+    #[must_use]
+    pub fn paths_to(&self, package: &ProjectPackage, max: usize) -> Vec<Vec<&ProjectPackage>> {
+        /// How many partial chains are looked at, against graphs where they multiply.
+        const MAX_STEPS: usize = 10_000;
+        let Some(target) = self.index_of(package) else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        let mut queue = std::collections::VecDeque::from([vec![target]]);
+        let mut steps = 0_usize;
+        while let Some(chain) = queue.pop_front() {
+            steps = steps.saturating_add(1);
+            if found.len() >= max || steps > MAX_STEPS {
+                break;
+            }
+            let Some(&last) = chain.last() else {
+                continue;
+            };
+            if self.members.contains(&last) {
+                found.push(
+                    chain
+                        .iter()
+                        .rev()
+                        .filter_map(|&index| self.packages.get(index))
+                        .collect(),
+                );
+                continue;
+            }
+            for &user in self.dependents.get(last).map_or(&[][..], |users| users) {
+                if !chain.contains(&user) {
+                    let mut longer = chain.clone();
+                    longer.push(user);
+                    queue.push_back(longer);
+                }
+            }
+        }
+        found
+    }
+
+    /// Where `package` is in [`Self::packages`].
+    fn index_of(&self, package: &ProjectPackage) -> Option<usize> {
+        self.packages
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, package))
+    }
+
     /// The packages that the members depend on directly, but the members themselves, each once,
     /// sorted by name and version. Whether each is built for a target, and in which builds, is for
     /// the caller to tell (`cargo tree`).
