@@ -109,7 +109,7 @@ M2 は、自分の workspace と、docs.rs で引けないコードの文書を�
 | D4 | 鮮度: 内容ダイジェストの鍵 (R-WS-4 の一覧)、mtime は一次の絞り込みだけ、dep-info は同じ引数に `--emit=dep-info` を付けた 2 回目の rustdoc で取る、ビルドの前に鍵を取り、それより新しい mtime があれば次回は鮮度切れ。再ビルド中は直近の JSON を `stale: true`・`stale_reason: rebuilding`・`built_at` 付きで返す。ソースがその後に変わっていれば LSP を案内する (R-WS-9)。入れ子の worktree や target dir を走査しない (§6.1) | R-WS-4・R-WS-9・R-CA-2・Q-31 | (a) `include_str!` で README を読む member、`#[path]` のモジュール、build.rs が生成するコード、workspace の外の path 依存 | 共通の印。member を編集すると再ビルドされ、編集しなければされないテスト (完了条件の「編集後に正しく再ビルドされる」)。ビルドの間の編集が次回に拾われるテスト |
 | D5 | 失敗: `build_failed` に診断を先頭 N 件 (`build.max_diagnostics`、初期値 2。1 件 3,500 文字・合計 8,000 文字以内)、JSON の診断が無ければ stderr の末尾。一時的な失敗 (シグナル・サーバーが止めたもの・`cargo fetch --locked` の失敗) と決定的な失敗 (`refresh` まで R-WS-4 の鍵でキャッシュ。`timeout` を含む) を分ける。`toolchain_too_old` (E0658・`requires rustc`)。引数 `refresh` と、それが解く記録の一覧 (§6.4)。失敗の判定に使う文言をテストに固定する | R-WS-7・R-ERR-2・§6.4・§8 | (a) 壊れた build.rs、コンパイルエラーのある member。(e) `rust-version` が toolchain より新しい crate | 共通の印。決定的な失敗が 2 回目にビルドせずに返り、`refresh` でやり直すテスト。エラーの text が 1 万文字以内のテスト |
 | D6 | private item と workspace の照会: 公開パスの無い member の item を crate 内のパス (`crate::a::b::Item`) と可視性で示す。trait の item と enum の variant は親の可視性を継ぐ。依存と std の非公開 item は出さない。自分の workspace の crate の検索は private な item も含める。ローカルの JSON は版付きの `html_root_url` を持たないので、member どうしの参照の版は依存グラフで決める | R-PR-2・R-SH-5・R-SR-4・R-WS-3・R-PR-4 | (a) private のモジュール・`pub(crate)`・`pub(in path)`・private な型を返す公開の関数。(f) member の間の A→B→C の re-export、umbrella の member、crate をまたぐ glob | 共通の印。`list_impls` で自分の型 (§3 の Q8 の `MyType`) に答えられる。private な item を検索で引けるテスト。依存の private な item が出ないテスト |
-| D7 | docs.rs で引けない依存を照会のツールにつなぐ: `local_build_required` (path・git・別レジストリ・checksum の不一致) と、既定のプロジェクトの依存で求める target の JSON が無いとき (`no_target_json`) をローカルビルドに置き換える (ビルドしてよい組は B7。名指しできない依存は `build_unsupported`、判定できなければ `scope_unknown`)。照会のツールに実際のビルド target と違う `target` を渡されたらビルドしない。明示した版がプロジェクトの版と同じなら、プロジェクトの取得元のものを返して warnings を付ける (R-VR-1 の残り)。`crate` を省いた `search_items` の範囲に workspace を足す (R-SR-2)。ビルド中の crate は `sources` に `building` | R-TG-1・R-DS-1・R-VR-2・R-VR-1・R-MCP-3・R-WS-5・R-SR-2・R-SR-5 | (d) と (a) を組み合わせた workspace (path 依存、別のレジストリの依存 (偽の crates.io を別のレジストリとして)、checksum の合わない vendor)。(b) git の依存。(g) 依存の多い workspace (テストの中で生成) | 共通の印。path・git・別レジストリの依存を引けるテスト。docs.rs のモックで target の JSON が無い依存がローカルビルドされるテスト。範囲の外の target を渡すとビルドしないテスト |
+| D7 | docs.rs で引けない依存を照会のツールにつなぐ: `local_build_required` (path・git・別レジストリ・checksum の不一致) と、既定のプロジェクトの依存で求める target の JSON が無いとき (`no_target_json`) をローカルビルドに置き換える (ビルドしてよい組は B7。名指しできない依存は `build_unsupported`、判定できなければ `scope_unknown`)。照会のツールに実際のビルド target と違う `target` を渡されたらビルドしない。明示した版がプロジェクトの版と同じなら、プロジェクトの取得元のものを返して warnings を付ける (R-VR-1 の残り)。`crate` を省いた `search_items` の範囲に workspace を足す (R-SR-2)。ビルド中の crate は `sources` に `building` | R-TG-1・R-DS-1・R-VR-2・R-VR-1・R-MCP-3・R-WS-5・R-SR-2・R-SR-5 | (d) と (a) を組み合わせた workspace (path 依存、別のレジストリの依存 (偽の crates.io を別のレジストリとして)、checksum の合わない vendor)。(b) git の依存。(g) 依存の多い workspace (テストの中で生成) | 共通の印。path・git・別レジストリの依存を引けるテスト。docs.rs のモックで target の JSON が無い依存がローカルビルドされるテスト。範囲の外の target を渡すとビルドしないテスト。CI の `testdata` の job で、実データのテスト (`real_data`) を macOS・Windows でも回す (A4b で Linux だけにした条件を外す) |
 
 ### 3.5 M2e: 外のツール `build_external_docs`
 
@@ -313,6 +313,12 @@ Claude Code 2.1.304、Linux で測った。
 
 - 試験用の `sleep` ツール: debug ビルドで、環境変数 `CHATORA_RUSTDOC_TEST_TOOLS=1` があるときだけ出す (release ビルドには今までどおり無い)。統合テストはサーバーを起動するときにこの変数を渡す。`cargo install --debug` で入れたバイナリは、変数が無ければ出さない。変数は設定ではないので、設定の接頭辞 (`CHATORA_RUSTDOC_MCP_`) の外の名前にした。変数を空にしたサーバーが `sleep` を出さず、呼ぶと `-32602` になることのテストを足した
 - CI に `package` の job を足し、`cargo publish --dry-run --locked` を回す (R-DIST-1)。公開される package のファイルは `src/`・ライセンス・README・build.rs・Cargo.toml・Cargo.lock (`cargo package --list` で確かめた)
+
+**A4b (実データのテストを 3 つの OS で。2026-10-20)**: CI の `testdata` の job を 3 つの OS の matrix にした (キャッシュの鍵に OS を入れ、テストデータの取得の段は bash で回す)。
+
+- `testdata` (docs.rs の JSON の読み込み) と `std_dist` (std) は、macOS・Windows でも通った
+- `real_data` は、macOS (`aarch64-apple-darwin`) と Windows (`x86_64-pc-windows-msvc`) で、4 つのテストがすべて `no_target_json` で落ちた (macOS で 14 件、Windows で 13 件の応答。ほかの原因は無かった)。照会の多くが target を省いてホストの target を引き、docs.rs が新しいリリースを Linux の target でしか作らないため。M1 の「実質的に Linux 向け」の制限そのもの
+- 利用者が決めた: D7 (ローカルビルド) まで `real_data` は Linux だけで回し、D7 の終わりの印に「3 つの OS で `real_data` が通る」を足した
 
 ### 6.3 M2b
 
