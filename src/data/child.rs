@@ -45,6 +45,48 @@ impl Child {
         drop(group);
         output
     }
+
+    /// [`Self::output`], handing each line of stderr to `on_line` as it comes, as cargo's
+    /// `Blocking waiting for file lock` (requirement R-WS-2). Without `\n`, the last line is
+    /// handed over when stderr ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the child cannot be waited for, or its output read.
+    pub(super) async fn output_watching(
+        self,
+        mut on_line: impl FnMut(&str) + Send,
+    ) -> io::Result<Output> {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+        let Self { mut child, group } = self;
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let read_stdout = async {
+            let mut read = Vec::new();
+            if let Some(mut stdout) = stdout {
+                stdout.read_to_end(&mut read).await?;
+            }
+            Ok::<_, io::Error>(read)
+        };
+        let read_stderr = async {
+            let mut read = Vec::new();
+            if let Some(stderr) = stderr {
+                let mut stderr = tokio::io::BufReader::new(stderr);
+                let mut line = Vec::new();
+                while stderr.read_until(b'\n', &mut line).await? > 0 {
+                    on_line(&String::from_utf8_lossy(&line));
+                    read.append(&mut line);
+                }
+            }
+            Ok::<_, io::Error>(read)
+        };
+        let (stdout, stderr, status) = tokio::try_join!(read_stdout, read_stderr, child.wait())?;
+        drop(group);
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
 }
 
 /// Stops the group under its number in [`GROUPS`] when dropped.

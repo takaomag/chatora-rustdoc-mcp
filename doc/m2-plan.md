@@ -332,6 +332,12 @@ Claude Code 2.1.304、Linux で測った。
 - テスト: 単体テスト (孫を起動する子を落とすと孫も止まる。3 つの OS。テストが本当に検出することを、止める処理を外して落ちることで確かめた。Linux で子がセッションの長であること)。統合テスト (Unix): `build.rustc` に孫を起動してハングする rustc を置き、`list_crates` で cargo を起動してから、stdin を閉じると 2 秒以内に cargo・rustc・孫が止まり、別の cargo も起動されない。SIGTERM でも同じで、サーバーも終わる。Linux では、サーバーを SIGKILL しても cargo が止まる (`PR_SET_PDEATHSIG`。cargo が起動した rustc と孫は残る。C4 で起動時に片付ける)
 - Windows の Job Object と孫の扱いは、手元でコンパイルできない (依存の C のコードのため) ので、CI で確かめる
 
+**B2 (ロック待ちの検出。2026-10-20、cargo 1.99.1)**:
+
+- cargo は、ほかの cargo がパッケージキャッシュのロックを持っていると、stderr に `    Blocking waiting for file lock on package cache` を出して待つ (隔離した `CARGO_HOME` の `.package-cache` を `flock` で握って `cargo metadata` で確かめた)。ロックの対象で `on build directory` などに変わるので、照合は `Blocking waiting for file lock` までにした
+- `data::child::Child::output_watching` で stderr を 1 行ずつ読みながら待ち、`data::cargo::run_reporting` が `Activity` (`Running`・`WaitingForLock`) の変わり目を知らせる。ロック待ちの行の後にほかの行が出たら、ロックが取れて動いているとみなして `Running` に戻す。応答の `building_reason: waiting_for_lock` につなぐのは C3・D3
+- テスト: std の `File::lock` でパッケージキャッシュのロックを握り (cargo と同じく Unix は `flock`、Windows は `LockFileEx`)、本物の cargo が `WaitingForLock` を知らせ、ロックを外すと正常に終わることを 3 つの OS で確かめる
+
 ### 6.4 M2c
 
 (まだ無い)

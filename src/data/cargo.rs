@@ -106,15 +106,55 @@ pub(super) fn project_command(root: &Path, offline: bool) -> tokio::process::Com
     command
 }
 
+/// What a cargo command is doing, as its stderr tells: for `building_reason` (requirements
+/// R-WS-2 and R-OUT-9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    /// Running, as far as its stderr tells.
+    Running,
+    /// Waiting for a lock that another cargo holds, as that of the package cache, which
+    /// rust-analyzer and the user's own builds share (`waiting_for_lock`).
+    WaitingForLock,
+}
+
+/// The line that cargo writes to stderr while it waits for a lock: `Blocking waiting for file
+/// lock on package cache`, or `on build directory` (cargo 1.99.1).
+const WAITING_FOR_LOCK: &str = "Blocking waiting for file lock";
+
 /// Runs `command` to the end, and stops it after [`MAX_RUN_TIME`].
 ///
 /// # Errors
 ///
 /// Returns an error when cargo cannot be started or runs too long.
 pub(super) async fn run(command: tokio::process::Command) -> Result<Output, RunError> {
+    run_reporting(command, |_| {}).await
+}
+
+/// [`run`], telling `on_activity` when cargo starts to wait for a lock, and when it goes on: any
+/// later line of its stderr means that it has the lock.
+///
+/// # Errors
+///
+/// Returns an error when cargo cannot be started or runs too long.
+pub(super) async fn run_reporting(
+    command: tokio::process::Command,
+    mut on_activity: impl FnMut(Activity) + Send,
+) -> Result<Output, RunError> {
     let child = child::spawn(command).await.map_err(RunError::NotStarted)?;
+    let mut activity = Activity::Running;
+    let output = child.output_watching(|line| {
+        let now = if line.contains(WAITING_FOR_LOCK) {
+            Activity::WaitingForLock
+        } else {
+            Activity::Running
+        };
+        if now != activity {
+            activity = now;
+            on_activity(now);
+        }
+    });
     // Dropped on the timeout, or when the call is cancelled, which stops the whole group.
-    tokio::time::timeout(MAX_RUN_TIME, child.output())
+    tokio::time::timeout(MAX_RUN_TIME, output)
         .await
         .map_err(|_elapsed| RunError::TimedOut)?
         .map_err(RunError::NotStarted)
@@ -261,5 +301,63 @@ mod tests {
         let tail = stderr_tail(&failed(&long));
         assert_eq!(tail.chars().count(), MAX_STDERR_CHARS);
         assert!(tail.ends_with("end"));
+    }
+}
+
+/// What cargo itself does while another holds a lock, on every OS: cargo locks with `flock` on
+/// Unix and `LockFileEx` on Windows, as `File::lock` does.
+#[cfg(test)]
+mod lock_tests {
+    use std::{fs, sync::Arc};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn waiting_for_the_lock_of_the_package_cache_is_told() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (home, project) = (dir.path().join("cargo-home"), dir.path().join("project"));
+        fs::create_dir_all(project.join("src")).expect("made");
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("written");
+        fs::write(project.join("src/lib.rs"), "").expect("written");
+        // Without dependencies, as `generate-lockfile` would write it, which `--locked` refuses.
+        fs::write(
+            project.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"p\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("written");
+        fs::create_dir_all(&home).expect("made");
+        let cargo = |args: &[&str]| {
+            let mut command = project_command(&project, true);
+            command.args(args).env("CARGO_HOME", &home);
+            command
+        };
+
+        // Another cargo, such as rust-analyzer's, holds the package cache.
+        let lock = fs::File::create(home.join(".package-cache")).expect("made");
+        lock.lock().expect("locked");
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let metadata = {
+            let seen = Arc::clone(&seen);
+            tokio::spawn(run_reporting(
+                cargo(&["metadata", "--format-version", "1"]),
+                move |activity| seen.lock().push(activity),
+            ))
+        };
+        let waited = async {
+            while !seen.lock().contains(&Activity::WaitingForLock) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), waited)
+            .await
+            .expect("cargo told that it waits for the lock");
+        lock.unlock().expect("unlocked");
+        let output = metadata.await.expect("the task ends").expect("cargo runs");
+        assert!(output.status.success(), "{}", stderr_tail(&output));
+        assert_eq!(seen.lock().first(), Some(&Activity::WaitingForLock));
     }
 }
