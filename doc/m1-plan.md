@@ -799,6 +799,16 @@ D4 を 2 つに分けた。D4a は `tools/list` と `server/discover` が返す�
   - ferritin のホスト版との比較: ferritin の `get` は、ドキュメント全文・メソッドの一覧・実装の一覧を 1 回で返し、tokio の `Mutex` で約 5,000 文字、`std::vec::Vec` で約 21,000 文字、axum の `Router` で約 7,000 文字、serde の `Serialize` で約 2,000 文字 (2026-10-20)。こちらは `get_item` が 0.6〜1.2KB で、メソッドは `list_methods` (`Mutex` で 3.7KB、`Vec` で 10.8KB)、実装は `list_impls` に分かれる。必要な分だけ引けば、こちらが小さい
 - ビルドの待ちと docs.rs からの取得の時間 (取得込みの p50 < 3s) は測っていない (回線と docs.rs で決まるため。R-WS-6 のビルドは M2)
 
+#### E3 (2026-10-20)
+
+canary と live の docs.rs の smoke test を足した (R-QA-4)。`.github/workflows/canary.yml` が毎日 03:17 UTC (と手動) に回し、定期実行で失敗したら Issue (label `canary`) を開き、続けて失敗したらコメントを足し、通ったら閉じる。
+
+- 最新の nightly (`tests/canary.rs` の 1 つ目): その場で作る小さな crate (feature で隠れた関数、Unix だけの関数、`doc(cfg)` 付きの型) の rustdoc JSON を、docs.rs と同じく `--cfg docsrs` で nightly に作らせ、読めること (新しい `format_version` なら落ちる)、`Attribute::Other` の cfg の表記から feature・platform・`doc(cfg)` の条件を読めること (表記が変われば落ちる) を確かめる
+- live の docs.rs (2 つ目、空のキャッシュで): serde・tokio・anyhow の最新版を読め、形式が対応範囲にあること。存在しない crate は `crate_not_found`、存在しない版は `version_not_found` (R-DS-6)、2025-05-23 より前の版 (serde 1.0.100) は `docs_unavailable` (`no_json`)、tokio の最新版の `aarch64-apple-darwin` は `docs_unavailable` (`no_target_json`)。docs.rs が複数の target を作るように戻れば最後が落ちるので、そのときは案内の文面を直す (R-TG-1)
+- std: dist の最新の nightly の std (`tests/std_dist.rs`) も同じ job で回す
+- 手元で両方通った (nightly 2026-10-19 の rustc、docs.rs は 2026-10-20 時点)。Issue の開閉は、GitHub で定期実行が回るまで確かめられない (手動の実行では開閉しない)
+- まだ: beta の toolchain に `RUSTC_BOOTSTRAP` を付けた合成の workspace のローカルビルド (R-QA-4 の 4 つ目) はローカルビルドを入れる M2 で。std のスナップショットの変化の検知は、今は代表の item が引けることと形式 58〜60 の写しの確認だけで、スナップショットの比較は入れていない (nightly ごとに文面が変わり、Issue が開きっぱなしになるため。R-QA-1 の予算 (E2) で大きさの変化は捕まえる)
+
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
 
 利用者が決めた (推奨案): GitHub API の token を、設定の `github.token` → 環境変数 `GH_TOKEN` → `GITHUB_TOKEN` → gh の設定ファイル (`hosts.yml` の `oauth_token`) の順で探す。
