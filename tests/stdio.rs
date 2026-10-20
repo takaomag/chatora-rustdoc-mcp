@@ -1654,6 +1654,15 @@ fn a_crate_that_takes_long_to_fetch_is_building_and_then_answered() {
     assert_eq!(answered["isError"], false, "{answered}");
     assert_eq!(answered["structuredContent"]["data"]["path"], "demo::hello");
     assert_eq!(requests.load(Ordering::SeqCst), 1);
+    // The log tells a call that answered `building` from one that the cache answered.
+    let log = server.log();
+    let calls: Vec<&Value> = log.iter().filter(|line| line["kind"] == "call").collect();
+    let first = calls.first().expect("a record of the first call");
+    assert_eq!(first["status"], "building", "{first}");
+    assert!(first.get("cache").is_none(), "{first}");
+    let last = calls.last().expect("a record of the last call");
+    assert!(last.get("status").is_none(), "{last}");
+    assert_eq!(last["cache"], "hit", "{last}");
 }
 
 /// A server whose docs.rs is the server `docs_rs`, whose calls wait for work two thirds of
@@ -1661,7 +1670,17 @@ fn a_crate_that_takes_long_to_fetch_is_building_and_then_answered() {
 /// that only docs.rs is asked. Only a debug build takes the test server for docs.rs.
 #[cfg(debug_assertions)]
 fn server_with_slow_docs_rs(docs_rs: &str, timeout_secs: &str) -> Server {
-    let server = Server::start_with(None, &[
+    server_in_with_slow_docs_rs(None, docs_rs, timeout_secs)
+}
+
+/// [`server_with_slow_docs_rs`] whose default project is `project`, if any.
+#[cfg(debug_assertions)]
+fn server_in_with_slow_docs_rs(
+    project: Option<&Path>,
+    docs_rs: &str,
+    timeout_secs: &str,
+) -> Server {
+    let server = Server::start_with(project, &[
         ("CHATORA_RUSTDOC_TEST_DOCS_RS_URL", docs_rs),
         (
             "CHATORA_RUSTDOC_MCP_LIMITS__REQUEST_TIMEOUT_SECS",
@@ -1751,4 +1770,43 @@ fn a_cancelled_call_tells_no_more_progress() {
     let later = server.messages_during(Duration::from_secs(4));
     assert!(later.is_empty(), "sent after cancellation: {later:?}");
     assert!(server.finish().success());
+}
+
+/// A search of the project's dependencies that finds nothing while they are still being fetched
+/// is `status: building`, not an answer that nothing matches; the next search finds the item
+/// (requirement R-OUT-9).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn a_search_that_finds_nothing_while_crates_are_fetched_is_building() {
+    let json = serde_json::to_vec(&demo_crate()).expect("serializes");
+    let (docs_rs, requests) = slow_server(json, Duration::from_secs(2));
+    let project = workspace_using_demo();
+    let mut server = server_in_with_slow_docs_rs(Some(project.path()), &docs_rs, "1");
+    let arguments = json!({ "query": "hello", "target": TARGET });
+    server.send(&call_tool(1, "search_items", arguments.clone()));
+    let result = server.response(1)["result"].clone();
+    let building = &result["structuredContent"];
+    assert_eq!(building["status"], "building", "{result}");
+    assert_eq!(building["building_reason"], "fetching");
+    assert_eq!(building["partial"], true);
+    assert_eq!(building["retry_after_secs"], 10);
+    assert_eq!(building["provenance"]["sources"][0]["status"], "building");
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(20))
+        .expect("in range");
+    let mut id = 1;
+    let found = loop {
+        thread::sleep(Duration::from_millis(500));
+        id += 1;
+        server.send(&call_tool(id, "search_items", arguments.clone()));
+        let result = server.response(id)["result"].clone();
+        if result["structuredContent"].get("status").is_none() {
+            break result;
+        }
+        assert!(Instant::now() < deadline, "still {result}");
+    };
+    let found = &found["structuredContent"];
+    assert!(found.get("partial").is_none(), "{found}");
+    assert_eq!(found["data"]["items"][0]["path"], "demo::hello", "{found}");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
 }

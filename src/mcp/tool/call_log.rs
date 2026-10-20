@@ -94,17 +94,22 @@ impl Call {
             .as_ref()
             .map(|structured| sources(&structured["provenance"]))
             .unwrap_or_default();
-        self.log(error.flatten(), &response, &sources);
+        // `building`, when the answer is still to come (requirement R-OUT-9).
+        let status = result
+            .structured_content
+            .as_ref()
+            .and_then(|structured| structured.get("status")?.as_str());
+        self.log(error.flatten(), status, &response, &sources);
     }
 
     /// Logs a call that was rejected with a JSON-RPC error, such as one to an unknown tool.
     pub(super) fn finish_rejected(self, error: &ErrorData) {
         let code = format!("jsonrpc {}", error.code.0);
-        self.log(Some(code), "", &[]);
+        self.log(Some(code), None, "", &[]);
     }
 
     /// Writes the record of the call to the log file.
-    fn log(self, error: Option<String>, response: &str, sources: &[String]) {
+    fn log(self, error: Option<String>, status: Option<&str>, response: &str, sources: &[String]) {
         let chars = response.chars().count();
         let fetches = self.fetches.to_vec();
         let mut record = json!({
@@ -121,7 +126,11 @@ impl Call {
             if let Some(error) = error {
                 record.insert("error".to_owned(), error.into());
             }
-            if !sources.is_empty() {
+            if let Some(status) = status {
+                record.insert("status".to_owned(), status.into());
+            }
+            // Whether the cache had what the call answered with: not told without an answer.
+            if !sources.is_empty() && status.is_none() {
                 record.insert("sources".to_owned(), json!(sources));
                 // Whether the cache had everything the call needed: nothing was downloaded. A
                 // request that only confirmed what the cache has (304) does not count.

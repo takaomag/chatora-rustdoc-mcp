@@ -475,6 +475,24 @@ Claude Code 2.1.304、Linux で測った。
 - clippy の `large_futures` に当たったので、ツールの future を `Box::pin` でヒープに置いた
 - テスト用の docs.rs を使う stdio のテスト (C3a のものを含む) は、口が debug ビルドだけなので `#[cfg(debug_assertions)]` にした。前提を渡さないレビュー (サブエージェント) の指摘で、`biased` と、テストの待ちの余裕 (4 秒待つ間に tick 1 回) と、応答の届く順に依らない照合を足した。応答の順の件は、手元の全体のテストで一度落ちて確かめた
 
+**C3c の分け方 (2026-10-21)**: 下調べ (サブエージェント) の結果から、C3c を 4 つに分けた
+
+- C3c-1: 横断の検索の 0 件のときの `status: building` と、ビルド中のカーソル
+- C3c-2: std の取得 (配布物の要約・アーカイブの取得と展開・読める nightly への最大 30 日のさかのぼり・索引の作成) を、期限付きの共有の仕事にする。今は期限が効かない。展開中のロックの隙間を塞ぐ。配布物の取得の失敗を短い間覚える
+- C3c-3: `cargo metadata` の初回の取得を裏で続けられるようにする (今は呼び出しの future の中で走り、取り消すと cargo も止まる)。版を解決する前の `status: building` (provenance の `version`・`source` を省く)。`Activity::Fetching` をつなぐ
+- C3c-4: sparse index と `.crate` の一時的な失敗を、短い間ディスクに覚える。今は応答の無い相手に 1 回で約 30 秒 (接続の 10 秒 × 3 回) かかり、プロセスの数だけ直列に繰り返す
+
+実測 (この PC、release ビルド): 取得 (展開と書き込み込み) と解析とアーカイブの書き込みは、tokio 1.54.0 (6.7 MB) が 0.2・0.06・0.08 秒、web-sys 0.3.106 (149 MB) が 1.0・1.2・0.8 秒、aws-sdk-ec2 1.269.0 (350 MB) が 2.5・4.3・3.6 秒。最大級でも既定の 20 秒に収まり、遅い回線や CI では超えうる。既定値 (待つ 20 秒・`retry_after_secs` 10 秒) は変えない
+
+**C3c-1 (横断の検索の 0 件と、ビルド中のカーソル。2026-10-21)**:
+
+- 結果が 0 件で、範囲に読み込み中 (取得か索引の作成) の crate があれば、最上位に `status: building` と `building_reason` (索引の作成中のものがあれば `indexing`、無ければ `fetching`) を付ける (R-OUT-9)。`partial`・`retry_after_secs`・`data`・`page` はそのまま返す (`did_you_mean` が役に立ちうるため)。hints で、待ってから呼び直すよう案内する
+- ビルド中のカーソル (R-OUT-3): 利用者が「今のまま拒み、案内を足す」と決めた。カーソルは検索した crate のダイジェストに束縛したままで、読み込み中の crate が揃うと「データが変わった」で拒まれる。読み込み中の crate があって次のページがあるときは、hints でそのことと、最初から検索し直すことを案内する
+- warnings の文言を「still being fetched」から「still being loaded」にした (索引の作成中も数えるため)
+- テスト (stdio): 依存の demo を遅い docs.rs から取る間の横断の検索は `status: building` (`fetching`・`partial`・`retry_after_secs`) で、後の検索は `demo::hello` を見つけ、`partial` が無く、要求は 1 回
+- 本物の Claude Code (利用者が試した。release ビルド、`limits.request_timeout_secs = 3` で待つのは 2 秒、空のキャッシュ) で aws-sdk-ec2 1.269.0 の `Client::describe_instances` を引いた: 1 回目と 2 回目は 2.0 秒で `status: building`、3 回目は 26 ms で答えた。docs.rs への要求は 1 回。モデルは記憶で答えず、待ってから呼び直した (1 回目の後は `retry_after_secs` の 10 秒より早い約 3 秒後、2 回目の後はシェルで待って約 18 秒後)。早い呼び直しの害は 2 秒の待ちが 1 回増えるだけなので、案内は変えない
+- そこで分かったこと: 呼び出しのログで、`status: building` だった呼び出しが、通信しなかったので `cache: hit` と記録されていた。ログの行に `status: building` を書き、そのときは `cache` を書かないようにした (利用者が C3c-1 に含めると決めた。R-OBS-1)。README のログの節も直した
+
 ### 6.5 M2d
 
 (まだ無い)
@@ -498,6 +516,10 @@ Claude Code 2.1.304、Linux で測った。
    - R-WS-7 の照合の一覧: git の無いタグとブランチの `failed to find tag`・`failed to find branch` (B5)。cargo に `CARGO_TERM_COLOR=never` を渡すこと (B2)
    - R-CA-4・Q-29・R-DIST-3: ロックファイルをキャッシュの `locks/` に置くこと (C1。利用者が決めた)、名前の作り方、記録の形式の版をパスに入れること
    - R-MCP-3・R-WS-5・R-FT-2 の範囲の判定 (B7): `--target` を付けない形でも M0 と同じだったこと (「付けない形での再確認は M2」の文を改める)。`--prefix indent` の見出しで辺の種類を読むこと、2 つ出る member の根を逆向きの木で決めること、取得元での対応付け、名指しできる依存の定め方 (dev を含まない解決で target 用か proc-macro) と、proc-macro の member の下の依存を安全側に名指しできないとすること
+   - R-ARCH-6・R-WS-6・§9 の設定の表 (C3a): `limits.request_timeout_secs` (既定 30 秒) を設定ファイルと環境変数で読むこと。呼び出しが裏の仕事を待つのはその 3 分の 2 までで、残りは版の解決など仕事の前後に使うこと。期限は呼び出しの始めから数えること。M1 の横断の検索の 20 秒も、この 3 分の 2 から出すようにしたこと
+   - R-OUT-9 (C3a): 1 つの crate の `status: building` の応答の項目と並び (`provenance`・`status`・`building_reason`・`retry_after_secs`・`warnings`・`hints`)、`retry_after_secs` の値 (10 秒)、path が他の crate に続くときは続く先の crate の `status: building` を返すこと。outputSchema では、1 つの crate を引くツールの必須を `provenance` だけにしたこと (R-OUT-1 のルートに `anyOf` を置かない決まりから)。`building_reason` の 5 つの値は、いま使わないものも宣言したこと
+   - R-WS-6 (C3a・C3b): 取得と索引の作成は呼び出しの間で共有する 1 つの仕事で、待つ側が `retry_after_secs` を返したら切り離すこと (以後は取り消しで止めない)。ロックは blocking の作業が終わるまで持つこと。進捗の通知の間隔 (3 秒)、`progress` の値 (経過秒数を 3 ずつ。`total` なし)、`message` の形 (`fetching serde 1.0.228 (3 s)`、仕事が複数なら件数)、送るのは `tools/call` の入口の 1 か所であること。`sleep` は自分で送ること
+   - R-QA-5 (C3a): テスト用の口 `CHATORA_RUSTDOC_TEST_DOCS_RS_URL` (debug ビルドで `CHATORA_RUSTDOC_TEST_TOOLS=1` のときだけ効く。設定ではない)
    - §8: `local_build_required` の扱い (M2 で使われなくなるか)、ビルドの状態の値 (R-OUT-9)
    - R-SC-4 の `readme` の扱いを M3 に送る
    - §12 の M2 の到達点と、M3 以降に回したもの

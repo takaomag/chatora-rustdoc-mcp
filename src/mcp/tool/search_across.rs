@@ -433,28 +433,7 @@ fn search_members(
         .iter()
         .map(|(member, view)| Searched {
             view,
-            request: ItemRequest {
-                name: &member.name,
-                version: &member.version,
-                path: member.name.as_str(),
-                origin: match (&context.std, &toolchain) {
-                    (Some(std), Some(toolchain)) => Origin::Std {
-                        toolchain,
-                        std_from: std.chosen.json.source(),
-                        why: &std.chosen.why,
-                        project_release: std.project_release.as_ref(),
-                    },
-                    (Some(_) | None, _) => Origin::DocsRs {
-                        resolved_from: context.resolved_from,
-                        project_from: context.project_from,
-                        build: None,
-                    },
-                },
-                detail: context.detail,
-                project_features: project_features(context, member),
-                follow: false,
-                target: Some(context.target.as_str()),
-            },
+            request: request_of(member, context, toolchain.as_deref()),
         })
         .collect();
     let searching = &context.searching;
@@ -481,7 +460,7 @@ fn search_members(
         warnings.insert(
             0,
             format!(
-                "{} of {} crates were searched: {fetching} still being fetched, {failed} not \
+                "{} of {} crates were searched: {fetching} still being loaded, {failed} not \
                  available (see provenance.sources)",
                 loaded.len(),
                 members.len()
@@ -489,14 +468,18 @@ fn search_members(
             .into(),
         );
     }
-    let mut provenance = Map::new();
-    provenance.insert("target".to_owned(), json!(context.target.as_str()));
-    if let Some(project_from) = context.project_from {
-        provenance.insert("project_from".to_owned(), json!(project_from));
-    }
-    provenance.insert("sources".to_owned(), Value::Array(sources));
     let mut response = Map::new();
-    response.insert("provenance".to_owned(), Value::Object(provenance));
+    response.insert("provenance".to_owned(), provenance(context, sources));
+    // Nothing found while crates are still being loaded: the answer is still to come
+    // (requirement R-OUT-9).
+    let nothing_yet = fetching > 0 && found.page.total == 0;
+    if nothing_yet {
+        response.insert("status".to_owned(), json!("building"));
+        response.insert(
+            "building_reason".to_owned(),
+            json!(building_reason(members)),
+        );
+    }
     if failed > 0 || fetching > 0 {
         response.insert("partial".to_owned(), json!(true));
     }
@@ -516,10 +499,90 @@ fn search_members(
         "page".to_owned(),
         serde_json::to_value(&found.page).unwrap_or_default(),
     );
-    if !found.hints.is_empty() {
-        response.insert("hints".to_owned(), json!(found.hints));
+    let hints = hints(
+        &found.hints,
+        nothing_yet,
+        fetching > 0 && found.page.has_more,
+    );
+    if !hints.is_empty() {
+        response.insert("hints".to_owned(), Value::Array(hints));
     }
     CallToolResult::structured(Value::Object(response))
+}
+
+/// The request of the search of `member`, whose provenance is that of std (of `toolchain`) when
+/// std is searched.
+fn request_of<'a>(
+    member: &'a Member,
+    context: &'a Context,
+    toolchain: Option<&'a str>,
+) -> ItemRequest<'a> {
+    ItemRequest {
+        name: &member.name,
+        version: &member.version,
+        path: member.name.as_str(),
+        origin: match (&context.std, toolchain) {
+            (Some(std), Some(toolchain)) => Origin::Std {
+                toolchain,
+                std_from: std.chosen.json.source(),
+                why: &std.chosen.why,
+                project_release: std.project_release.as_ref(),
+            },
+            (Some(_) | None, _) => Origin::DocsRs {
+                resolved_from: context.resolved_from,
+                project_from: context.project_from,
+                build: None,
+            },
+        },
+        detail: context.detail,
+        project_features: project_features(context, member),
+        follow: false,
+        target: Some(context.target.as_str()),
+    }
+}
+
+/// The provenance of the response: what the crates searched share, and each one's `sources`
+/// (requirement R-OUT-9).
+fn provenance(context: &Context, sources: Vec<Value>) -> Value {
+    let mut provenance = Map::new();
+    provenance.insert("target".to_owned(), json!(context.target.as_str()));
+    if let Some(project_from) = context.project_from {
+        provenance.insert("project_from".to_owned(), json!(project_from));
+    }
+    provenance.insert("sources".to_owned(), Value::Array(sources));
+    Value::Object(provenance)
+}
+
+/// The hints of the response: those of the search, and what to do when crates are still being
+/// loaded and nothing was found (`nothing_yet`) or there is a next page (`cursor_while_loading`).
+fn hints(found: &[Box<str>], nothing_yet: bool, cursor_while_loading: bool) -> Vec<Value> {
+    let mut hints: Vec<Value> = found.iter().map(|hint| json!(hint)).collect();
+    if nothing_yet {
+        hints.push(json!(format!(
+            "no item matched in the crates searched so far; call again in about \
+             {RETRY_AFTER_SECS} seconds to search the crates still being loaded too"
+        )));
+    } else if cursor_while_loading {
+        // The cursor is bound to the crates searched (requirement R-OUT-3).
+        hints.push(json!(
+            "once the crates still being loaded are in, this cursor is refused as the data \
+             changed; then search again without the cursor"
+        ));
+    }
+    hints
+}
+
+/// Why the crates of `members` that are still being loaded are not in yet: `indexing` when any is
+/// being indexed, as that is the last step (requirement R-OUT-9).
+fn building_reason(members: &[Member]) -> &'static str {
+    let indexing = members
+        .iter()
+        .any(|member| matches!(member.outcome, Outcome::Going(Doing::Indexing)));
+    if indexing {
+        Doing::Indexing.as_str()
+    } else {
+        Doing::Fetching.as_str()
+    }
 }
 
 /// Which crate of `searched` the others' items are shown through: std, which re-exports the
