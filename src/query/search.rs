@@ -491,6 +491,10 @@ pub struct SearchOptions<'a> {
     pub cursor_request: &'a str,
     /// The digest of the data that the cursor was made for, when there is one.
     pub cursor_data: Option<&'a str>,
+    /// Which of the crates searched together the others' items are shown through (std, for
+    /// alloc and core): at its public paths for them, and without its own re-exports of them
+    /// (requirement R-PR-2).
+    pub entry: Option<usize>,
 }
 
 /// The result of `search_items` (the common shape of §7.3).
@@ -617,7 +621,13 @@ pub fn search_across<'a>(
         .iter()
         .map(|source| source.view.search_index())
         .collect();
-    let hits = hits(searched, &indexes, options);
+    let entry = options
+        .entry
+        .and_then(|entry| EntryCrate::new(searched, entry));
+    let mut hits = hits(searched, &indexes, options);
+    if let Some(entry) = &entry {
+        hits.retain(|hit| !entry.hides(hit, &indexes));
+    }
     let total = hits.len();
     if options.offset > total {
         return Err(GetItemError::BadCursor(
@@ -649,13 +659,25 @@ pub fn search_across<'a>(
         .filter_map(|hit| {
             let source = searched.get(hit.source)?;
             let query = queries.get_mut(hit.source)?;
-            result(
+            let mut item = result(
                 source.view,
                 query,
                 source.view.search_index(),
                 hit.entry,
                 source.request.detail,
-            )
+            )?;
+            if let Some(entry) = &entry
+                && hit.source != entry.source
+                && let Some(found) = entry_at(source.view.search_index(), hit.entry)
+            {
+                entry.show(
+                    &mut item,
+                    source.view,
+                    view::native(&found.id),
+                    found.parent.as_ref().map(view::native),
+                );
+            }
+            Some(item)
         })
         .collect();
     let did_you_mean = if total == 0 {
@@ -687,6 +709,151 @@ pub fn search_across<'a>(
     };
     fit(&mut found, items, &page);
     Ok(found)
+}
+
+/// A crate searched together with crates whose items it re-exports, such as std with alloc and
+/// core, and the paths at which it re-exports them (requirement R-PR-2).
+struct EntryCrate<'a> {
+    /// Which crate of the search it is.
+    source: usize,
+    view: &'a CrateView<'a>,
+    /// The other crates, as code writes their names.
+    others: Vec<&'a str>,
+    /// The path in another crate of each item it re-exports (`alloc::vec`), and the shortest
+    /// public path at which it does (`std::vec`).
+    reexported: HashMap<Box<str>, Box<str>>,
+}
+
+impl<'a> EntryCrate<'a> {
+    fn new(searched: &[Searched<'a>], source: usize) -> Option<Self> {
+        let view = searched.get(source)?.view;
+        let others: Vec<&str> = searched
+            .iter()
+            .enumerate()
+            .filter(|&(at, _)| at != source)
+            .map(|(_, other)| other.request.name.as_str())
+            .collect();
+        let mut entry = Self {
+            source,
+            view,
+            others,
+            reexported: HashMap::new(),
+        };
+        for reexport in view.index().external_reexports() {
+            if let Some(definition) = &reexport.definition
+                && is_of(view, reexport.target, &entry.others)
+            {
+                entry.add(definition.joined(), reexport.path.joined());
+            }
+        }
+        // The others' re-exports of each other's items, at this crate's paths for them: std
+        // re-exports `alloc::borrow`, which re-exports `core::borrow::Borrow`. Glob re-exports of
+        // other crates' modules (`std::hash` of `core::hash`) are left out, as `get_item` does not
+        // follow them (requirement R-PR-3): those items keep the paths of their crates.
+        let mut reexported = Vec::new();
+        for (at, other) in searched.iter().enumerate() {
+            if at == source {
+                continue;
+            }
+            for reexport in other.view.index().external_reexports() {
+                if let Some(definition) = &reexport.definition
+                    && is_of(other.view, reexport.target, &entry.others)
+                    && let Some(path) = entry.path_of(&reexport.path.joined())
+                {
+                    reexported.push((definition.joined(), path));
+                }
+            }
+        }
+        for (definition, path) in reexported {
+            entry.add(definition, path);
+        }
+        Some(entry)
+    }
+
+    /// Records that this crate re-exports the item at `definition` in another crate at `path`,
+    /// unless it does at a shorter one.
+    fn add(&mut self, definition: Box<str>, path: Box<str>) {
+        if self
+            .reexported
+            .get(&definition)
+            .is_none_or(|shortest| shorter(&path, shortest))
+        {
+            self.reexported.insert(definition, path);
+        }
+    }
+
+    /// `hit` is this crate's re-export of an item of the others, which is found there.
+    fn hides(&self, hit: &Hit, indexes: &[&ArchivedSearchIndex]) -> bool {
+        hit.source == self.source
+            && indexes
+                .get(hit.source)
+                .and_then(|index| entry_at(index, hit.entry))
+                .is_some_and(|found| {
+                    found.external && is_of(self.view, view::native(&found.id), &self.others)
+                })
+    }
+
+    /// Shows `item` (`id`, a member of `parent` if it has one) of the crate of `view`, another
+    /// one, at this crate's path for it. This crate re-exports items by their definition paths
+    /// (`alloc::collections::vec_deque::VecDeque`), which may differ from the canonical paths
+    /// there (`alloc::collections::VecDeque`), so both are tried: the path that is shortest once
+    /// the rest is added wins, then the first in lexicographic order.
+    fn show(&self, item: &mut ItemData<'_>, view: &CrateView<'_>, id: Id, parent: Option<Id>) {
+        let definition = |id| view.summary(id).map(|summary| summary.path.join("::"));
+        let name = item.path.rsplit("::").next().unwrap_or_default();
+        let defined = parent.map_or_else(
+            || definition(id),
+            |parent| definition(parent).map(|parent| format!("{parent}::{name}")),
+        );
+        if let Some(path) = self.shown_at(&item.path, defined.as_deref()) {
+            item.path = path;
+        }
+        if let Some(shown) = &mut item.parent
+            && let Some(path) = self.shown_at(shown, parent.and_then(definition).as_deref())
+        {
+            *shown = path;
+        }
+    }
+
+    /// This crate's path for the item at `canonical` (and `defined`) in another crate.
+    fn shown_at(&self, canonical: &str, defined: Option<&str>) -> Option<Box<str>> {
+        let by_definition = defined.and_then(|defined| self.path_of(defined));
+        match (self.path_of(canonical), by_definition) {
+            (Some(a), Some(b)) => Some(if shorter(&b, &a) { b } else { a }),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// `path`, of another crate, at this crate's path for it, if it re-exports a prefix of it.
+    fn path_of(&self, path: &str) -> Option<Box<str>> {
+        let mut best: Option<String> = None;
+        let mut end = path.len();
+        loop {
+            let (prefix, rest) = (path.get(..end)?, path.get(end..)?);
+            if let Some(there) = self.reexported.get(prefix) {
+                let shown = format!("{there}{rest}");
+                if best.as_ref().is_none_or(|best| shorter(&shown, best)) {
+                    best = Some(shown);
+                }
+            }
+            match prefix.rfind("::") {
+                Some(at) => end = at,
+                None => return best.map(String::into_boxed_str),
+            }
+        }
+    }
+}
+
+/// The item `id`, which is not in the crate of `view`, is of one of `crates`.
+fn is_of(view: &CrateView<'_>, id: Id, crates: &[&str]) -> bool {
+    view.summary(id)
+        .and_then(|summary| view.external_crate(summary.crate_id))
+        .is_some_and(|krate| crates.contains(&krate.name.as_str()))
+}
+
+/// `a` has fewer segments than `b`, or as many and comes first.
+fn shorter(a: &str, b: &str) -> bool {
+    (a.matches("::").count(), a) < (b.matches("::").count(), b)
 }
 
 /// The hits in all the crates, of the kinds asked for, best first.
@@ -1222,6 +1389,7 @@ mod tests {
                 offset: 0,
                 cursor_request: "c1.req",
                 cursor_data: None,
+                entry: None,
             },
         )
         .expect("searched");
@@ -1370,10 +1538,106 @@ mod tests {
             offset: 0,
             cursor_request: "c1.req",
             cursor_data: None,
+            entry: None,
         })
         .expect("searched");
         let paths: Vec<&str> = found.data.items.iter().map(|item| &*item.path).collect();
         assert_eq!(paths, ["first::Mutex", "second::Mutex"]);
         assert_eq!(found.provenances.len(), 2);
+    }
+
+    #[test]
+    fn items_reexported_by_the_entry_crate_are_shown_at_its_paths() {
+        // `first` re-exports `Mutex` of `second` as `first::Thing`, by its definition path, which
+        // is not its canonical path there (as std re-exports
+        // `alloc::collections::vec_deque::VecDeque`).
+        let defined = || {
+            ["second", "sync", "mutex", "Mutex"]
+                .map(ToOwned::to_owned)
+                .to_vec()
+        };
+        let archive = |name: &str| {
+            let mut parsed = parsed();
+            let krate = &mut parsed.krate;
+            if let Some(root) = krate.index.get_mut(&Id(0)) {
+                root.name = Some(name.to_owned());
+            }
+            if name == "first" {
+                if let Some(thing) = krate.paths.get_mut(&Id(20)) {
+                    thing.path = defined();
+                    thing.kind = rustdoc_types::ItemKind::Struct;
+                }
+                if let Some(other) = krate.external_crates.get_mut(&1) {
+                    "second".clone_into(&mut other.name);
+                }
+            } else if let Some(mutex) = krate.paths.get_mut(&Id(3)) {
+                mutex.path = defined();
+            }
+            rkyv::to_bytes::<rkyv::rancor::Error>(&Indexed::new(parsed)).expect("archived")
+        };
+        let (first, second) = (archive("first"), archive("second"));
+        let access = |bytes| {
+            CrateView::new(
+                rkyv::access::<crate::query::across::ArchivedIndexed, rkyv::rancor::Error>(bytes)
+                    .expect("checked"),
+            )
+        };
+        let views = [access(&first), access(&second)];
+        let names: [CrateName; 2] = [
+            "first".parse().expect("a name"),
+            "second".parse().expect("a name"),
+        ];
+        let version = Version::new(1, 2, 3);
+        let searched: Vec<Searched<'_>> = views
+            .iter()
+            .zip(&names)
+            .map(|(view, name)| Searched {
+                view,
+                request: ItemRequest {
+                    name,
+                    version: &version,
+                    path: name.as_str(),
+                    origin: Origin::DocsRs {
+                        resolved_from: ResolvedFrom::CargoLock,
+                        project_from: None,
+                        build: None,
+                    },
+                    detail: Detail::Brief,
+                    project_features: None,
+                    follow: false,
+                    target: None,
+                },
+            })
+            .collect();
+        let paths = |query, entry| {
+            let found = search_across(&searched, SearchOptions {
+                query,
+                fields: Fields::ALL,
+                kinds: &[],
+                limit: Some(10),
+                offset: 0,
+                cursor_request: "c1.req",
+                cursor_data: None,
+                entry,
+            })
+            .expect("searched");
+            found
+                .data
+                .items
+                .iter()
+                .map(|item| {
+                    (
+                        item.path.to_string(),
+                        item.parent.as_deref().map(str::to_owned),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let at = |path: &str, parent: Option<&str>| (path.to_owned(), parent.map(str::to_owned));
+        assert!(paths("lock", Some(0)).contains(&at("first::Thing::lock", Some("first::Thing"))));
+        assert!(paths("lock", None).contains(&at("second::Mutex::lock", Some("second::Mutex"))));
+        // The re-export itself is left out: the item is found in its crate.
+        assert!(paths("Thing", None).contains(&at("first::Thing", None)));
+        assert!(!paths("Thing", Some(0)).contains(&at("first::Thing", None)));
     }
 }

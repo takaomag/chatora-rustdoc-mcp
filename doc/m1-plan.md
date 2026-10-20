@@ -909,6 +909,7 @@ README を M1 の実態に合わせ、crates.io への最初の公開を用意�
 - `default_unstable` (16): 関数・関連定数・関連型の既定が unstable なら `stability.default_unstable` に feature を出し、stable の実装では書く必要がある旨を warnings に出す
 - feature の注記 (16): `list_impls`・`list_implementors` の各項目に、その impl 自身の条件 (`required_features`・`other_cfg`・`cfg_source`・`enabled_in_project`・`enabled_in_dev_only`) を出す。型や trait の条件は `get_item` の側にあるので繰り返さない
 - 否定キャッシュ (16): crates.io の index に無い crate を 5 分覚え、その間は index を引かない
+- std の検索の窓口のパス (v0.19 の反映の途中で見つけ、利用者が公開前に直すと決めた): `crate: "std"` の検索が alloc・core の item を定義元のパス (`alloc::vec::Vec::push`) で返し、std の prelude の re-export (`std::prelude::rust_2015::Vec` など) がページを埋めていた。alloc・core の結果を std の re-export のパスに写し (std が定義パスで指すもの、alloc がさらに core から re-export するものも。残りを足して最も短いもの)、std 自身の re-export の項目を除く。glob の re-export (`std::hash` の `core::hash::*`) で写すと `get_item` で引けないパスになる (crate をまたぐ glob をたどらない) ので写さない。12 の問いの 30 件ずつ (321 件) を `get_item` で引き直し、std のパス 270 件のうち引けないのは、同じパスに 2 つの item があるもの (trait と derive マクロなど。種類を指定すれば引ける) と、置き換える前から引けない primitive のメソッドだけだった
 
 ## 7. M1 の終わり方
 

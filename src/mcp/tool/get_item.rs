@@ -2069,6 +2069,7 @@ fn respond_in(
                 offset: searching.offset,
                 cursor_request: &searching.request_digest,
                 cursor_data: searching.cursor_data.as_deref(),
+                entry: None,
             })
             .map_err(Failure::Item)?;
             return serde_json::to_value(&response).map_err(Failure::Serialize);

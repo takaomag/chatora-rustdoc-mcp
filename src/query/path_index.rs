@@ -390,6 +390,17 @@ impl ArchivedPathIndex {
         self.external_reexport(&key)
     }
 
+    /// Every re-export of another crate's item, in no particular order.
+    pub fn external_reexports(&self) -> impl Iterator<Item = ExternalReexport> + '_ {
+        self.external_reexports
+            .values()
+            .map(|reexport| ExternalReexport {
+                path: PublicPath::from_archived(&reexport.path),
+                target: view::native(&reexport.target),
+                definition: reexport.definition.as_ref().map(PublicPath::from_archived),
+            })
+    }
+
     /// The re-export of another crate's item at the public path `key`.
     fn external_reexport(&self, key: &str) -> Option<ExternalReexport> {
         let reexport = self.external_reexports.get(key)?;

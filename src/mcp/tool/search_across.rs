@@ -461,6 +461,7 @@ fn search_members(
         offset: searching.offset,
         cursor_request: &searching.request_digest,
         cursor_data: searching.cursor_data.as_deref(),
+        entry: entry_crate(context, &searched),
     }) {
         Ok(found) => found,
         Err(error) => {
@@ -513,6 +514,15 @@ fn search_members(
         response.insert("hints".to_owned(), json!(found.hints));
     }
     CallToolResult::structured(Value::Object(response))
+}
+
+/// Which crate of `searched` the others' items are shown through: std, which re-exports the
+/// items of alloc and core, when they are searched together (requirement R-PR-2).
+fn entry_crate(context: &Context, searched: &[Searched<'_>]) -> Option<usize> {
+    context.std.as_ref()?;
+    searched
+        .iter()
+        .position(|source| source.request.name.as_str() == "std")
 }
 
 /// The sources of the response (requirement R-OUT-9): the provenance of each crate searched,
