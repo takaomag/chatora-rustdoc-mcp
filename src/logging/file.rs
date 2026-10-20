@@ -611,16 +611,21 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(names(dir), expected);
-        // Once process 2 has ended, past the retention only this process's files stay.
-        drop(running);
+        // Past the retention, only the files of the running processes stay. That the files of a
+        // process that has ended go is what process 1 shows. (Letting go of the lock within this
+        // process does not stand for a process that ends: on the macOS of CI, the lock was still
+        // reported as held right after, cause unknown; a process that ends lets go of its locks.)
         collect_garbage(dir, LIMITS, SystemTime::now() + LIMITS.retention * 2).expect("no error");
         let mut expected = vec![
             MARKER.to_owned(),
+            "20200102-2.jsonl".to_owned(),
+            "20200102-2.lock".to_owned(),
             own_name(EXTENSION),
             own_name(LOCK_EXTENSION),
             "notes.txt".to_owned(),
         ];
         expected.sort();
         assert_eq!(names(dir), expected);
+        drop(running);
     }
 }

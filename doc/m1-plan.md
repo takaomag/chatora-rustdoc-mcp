@@ -857,6 +857,8 @@ README を M1 の実態に合わせ、crates.io への最初の公開を用意�
 - 11・12 (c): README の Cache と Security の節を直した (std の大きさと消し方、起動時の `rustc -vV`、rustup による導入、リダイレクトとプロキシ、キャッシュの親の `rust-toolchain.toml`)
 - 12 (a)(b): `project` を外すのに `shift_remove` を使う (引数の多い `list_module` で順が崩れないことを確かめるテストを足し、`remove` に戻すと落ちることを確かめた)。否定キャッシュに覚えた `unparsable` を `retryable: true` にした (`retry_after_secs` の無い `unparsable` は `false` のまま)
 
+- 69bfd2b の CI で、macOS だけログの削除のテストが落ちた。テストの中でほかのプロセスの代わりにロックを取って放した直後に、別の fd から確かめると、macOS ではまだ取られていると出た (std は macOS でも `flock`。原因は分かっていない)。運用ではプロセスが終わればロックは放されるので、テストを「ほかのプロセスがロックを持つ間は残る」ことだけを確かめる形にした (終わったプロセスのファイルが消えることは、ロックのファイルだけを残したプロセス 1 で確かめている)
+
 レビュアーのほかの指摘は M2 以降に回す: プロセスをまたぐロック (Windows で 2 つのセッションが同じアーカイブを同時に書くと、相手が mmap しているファイルを置き換えにいく)、取り消しや時間切れで孫のプロセス (git など) が残ること、`cargo metadata` の失敗を覚えず同時の呼び出しを束ねないこと、`.crate` の取得が crates.io のダウンロード数に数えられうること、`project_from` の値 `CLAUDE_PROJECT_DIR` などの名前、`--debug` でインストールすると `sleep` ツールが出ること、`real_data` などの実データのテストと罠のテストが Linux でしか回らないこと、`cargo publish --dry-run` が CI に無いこと。
 
 #### R-NW-4 の見直し (2026-10-20。M1 の終わりに要件へ反映する)
