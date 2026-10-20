@@ -1,7 +1,8 @@
 //! The disk cache (requirements R-CA-1, R-CA-2 and R-CA-4).
 //!
 //! The rustdoc JSON fetched from docs.rs is kept as it came, with a digest of its contents, and the
-//! crates.io sparse index next to it. Locks across processes (M2) and the GC (R-CA-5) come later.
+//! crates.io sparse index next to it. Locks are taken within this process and across processes
+//! (`process_lock`). The GC (R-CA-5) comes later.
 
 use std::{
     cmp::Reverse,
@@ -13,7 +14,7 @@ use std::{
     sync::{
         Arc,
         Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -86,13 +87,22 @@ impl DirLocks {
     }
 }
 
-/// Logs that the OS could not lock `path` in the cache.
+/// How long [`Cache::lock_blocking`] waits for another process.
+const BLOCKING_LOCK_LIMIT: Duration = Duration::from_secs(60);
+
+/// Logs that the OS could not lock `path` in the cache: as a warning the first time, as on a cache
+/// where no lock file can be made it would come with every call.
 fn lock_failed(path: &Path, error: &io::Error) {
-    tracing::warn!(
-        path = %path.display(),
-        %error,
-        "the cache could not be locked against other processes"
-    );
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        tracing::debug!(path = %path.display(), %error, "the cache could not be locked against other processes");
+    } else {
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "the cache could not be locked against other processes; this is logged once"
+        );
+    }
 }
 
 /// A rustdoc JSON read from the cache.
@@ -191,22 +201,64 @@ impl Cache {
     }
 
     /// [`Self::lock`] for a blocking thread. It must not be called from async code.
+    ///
+    /// It waits for another process at most a minute, and then goes on without the
+    /// OS lock, with a log line: the thread cannot be called off, and the other process may have
+    /// stopped. Doing the work twice costs time and memory, and what is written stays whole.
     pub fn lock_blocking(&self, path: &Path) -> PathGuard {
         let within = self.locks.of(path).blocking_lock_owned();
-        let across =
-            process_lock::lock_blocking(&self.root, &self.lock_key(path), LockMode::Exclusive)
-                .inspect_err(|error| lock_failed(path, error))
-                .ok();
+        let across = match process_lock::lock_blocking(
+            &self.root,
+            &self.lock_key(path),
+            LockMode::Exclusive,
+            BLOCKING_LOCK_LIMIT,
+        ) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    limit_secs = BLOCKING_LOCK_LIMIT.as_secs(),
+                    "another process held the cache that long; going on without waiting for it"
+                );
+                None
+            },
+            Err(error) => {
+                lock_failed(path, &error);
+                None
+            },
+        };
         PathGuard {
             _within: within,
             _across: across,
         }
     }
 
-    /// The key of the OS lock of `path`: its path in the cache with `/`, the same in every
-    /// process and on every OS.
+    /// Holds `path` as [`Self::lock`] does if no other task or process holds it, without waiting,
+    /// or returns `None`: for work that may skip what is in use, as removing what is unused.
+    #[must_use]
+    pub fn try_lock(&self, path: &Path) -> Option<PathGuard> {
+        let within = self.locks.of(path).try_lock_owned().ok()?;
+        match process_lock::try_lock(&self.root, &self.lock_key(path), LockMode::Exclusive) {
+            Ok(Some(across)) => Some(PathGuard {
+                _within: within,
+                _across: Some(across),
+            }),
+            Ok(None) => None,
+            Err(error) => {
+                lock_failed(path, &error);
+                Some(PathGuard {
+                    _within: within,
+                    _across: None,
+                })
+            },
+        }
+    }
+
+    /// The key of the OS lock of `path`: `cache:` and its path in the cache with `/`, the same
+    /// in every process and on every OS. The kind before `:` keeps it apart from the locks of
+    /// other things (`process_lock`).
     fn lock_key(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root).map_or_else(
+        let relative = path.strip_prefix(&self.root).map_or_else(
             |_| path.display().to_string(),
             |relative| {
                 relative
@@ -215,7 +267,8 @@ impl Cache {
                     .collect::<Vec<_>>()
                     .join("/")
             },
-        )
+        );
+        format!("cache:{relative}")
     }
 
     /// The directory of the rustdoc JSON fetched from docs.rs for `name` at `version`, built for
@@ -700,12 +753,13 @@ mod tests {
 
     #[tokio::test]
     async fn tasks_that_lock_the_same_path_take_turns() {
-        let cache = Cache::at(Path::new("/nonexistent"));
-        let path = Path::new("/nonexistent/docs.rs/tokio");
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let path = &dir.path().join("docs.rs/tokio");
         let held = cache.lock(path).await;
         // Another path is not held.
-        drop(cache.lock(Path::new("/nonexistent/docs.rs/serde")).await);
-        let (other, path_owned) = (cache.clone(), path.to_path_buf());
+        drop(cache.lock(&dir.path().join("docs.rs/serde")).await);
+        let (other, path_owned) = (cache.clone(), path.clone());
         let waiting = tokio::spawn(async move { drop(other.lock(&path_owned).await) });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!waiting.is_finished(), "the lock was taken twice");
@@ -716,8 +770,20 @@ mod tests {
             .expect("no panic");
         // The locks that nobody holds are forgotten when another is made.
         assert_eq!(cache.locks.0.lock().len(), 2);
-        drop(cache.lock(Path::new("/nonexistent/docs.rs/rand")).await);
+        drop(cache.lock(&dir.path().join("docs.rs/rand")).await);
         assert_eq!(cache.locks.0.lock().len(), 1);
+    }
+
+    /// The key is shared with servers of other versions, so it must not change (see
+    /// `process_lock::lock_path`).
+    #[test]
+    fn the_lock_key_of_a_path_does_not_change() {
+        let cache = Cache::at(Path::new("cache"));
+        let (name, version) = serde();
+        assert_eq!(
+            cache.lock_key(&cache.docs_rs_dir(&name, &version, None)),
+            "cache:docs.rs/serde/1.0.228/_default"
+        );
     }
 
     fn serde() -> (CrateName, Version) {

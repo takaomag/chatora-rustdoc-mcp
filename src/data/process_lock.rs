@@ -20,6 +20,12 @@ use std::{
 /// The directory of the lock files in the cache directory, which GC and `cache clear` leave.
 pub const LOCKS_DIR: &str = "locks";
 
+/// The first pause between tries to take a lock that another holds.
+const MIN_PAUSE: Duration = Duration::from_millis(5);
+
+/// The longest pause between tries.
+const MAX_PAUSE: Duration = Duration::from_millis(250);
+
 /// How a lock is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockMode {
@@ -39,6 +45,11 @@ pub struct ProcessLock {
 
 /// The lock file of `key` in the cache at `root`: the first 32 hex digits of the key's SHA-256,
 /// so that names are short and safe on every OS.
+///
+/// Servers of different versions find each other's locks by these names, so neither the way the
+/// name is made nor the keys may change (a test pins them). A key starts with the kind of what it
+/// locks and `:` (`cache:` for a path in the cache), so that the locks of different kinds, which
+/// may be shared or exclusive, never meet on one file.
 #[must_use]
 pub fn lock_path(root: &Path, key: &str) -> PathBuf {
     let digest = super::cache::sha256_hex(key.as_bytes());
@@ -66,11 +77,9 @@ pub fn try_lock(root: &Path, key: &str, mode: LockMode) -> io::Result<Option<Pro
 ///
 /// Returns an error when the lock file cannot be made or opened, or the OS fails to lock it.
 pub async fn lock(root: &Path, key: &str, mode: LockMode) -> io::Result<ProcessLock> {
-    /// The longest pause between tries.
-    const MAX_PAUSE: Duration = Duration::from_millis(250);
     let path = lock_path(root, key);
     let mut file = super::blocking(move || open(&path)).await?;
-    let mut pause = Duration::from_millis(5);
+    let mut pause = MIN_PAUSE;
     loop {
         // The same open file each time: a lock is the open file's, and trying does not block.
         let again = file.try_clone()?;
@@ -83,18 +92,37 @@ pub async fn lock(root: &Path, key: &str, mode: LockMode) -> io::Result<ProcessL
     }
 }
 
-/// [`lock`] for a blocking thread, which waits in the OS. It must not be called from async code.
+/// [`lock`] for a blocking thread, which waits at most `limit`, or returns `None`. It must not be
+/// called from async code.
+///
+/// It tries again and again, as [`lock`] does, instead of waiting in the OS: a blocking thread
+/// cannot be called off, and another process that holds the lock may have stopped (a stopped
+/// session, a debugger), which would keep the thread, and this process when it ends, waiting.
 ///
 /// # Errors
 ///
 /// Returns an error when the lock file cannot be made or opened, or the OS fails to lock it.
-pub fn lock_blocking(root: &Path, key: &str, mode: LockMode) -> io::Result<ProcessLock> {
-    let file = open(&lock_path(root, key))?;
-    match mode {
-        LockMode::Exclusive => file.lock()?,
-        LockMode::Shared => file.lock_shared()?,
+pub fn lock_blocking(
+    root: &Path,
+    key: &str,
+    mode: LockMode,
+    limit: Duration,
+) -> io::Result<Option<ProcessLock>> {
+    let start = std::time::Instant::now();
+    let mut file = open(&lock_path(root, key))?;
+    let mut pause = MIN_PAUSE;
+    loop {
+        let again = file.try_clone()?;
+        if let Some(lock) = try_lock_file(file, mode)? {
+            return Ok(Some(lock));
+        }
+        if start.elapsed() >= limit {
+            return Ok(None);
+        }
+        file = again;
+        std::thread::sleep(pause);
+        pause = pause.saturating_mul(2).min(MAX_PAUSE);
     }
-    Ok(ProcessLock { _file: file })
 }
 
 /// Locks `file` in `mode` if no other holder stands in the way.
@@ -208,6 +236,37 @@ mod tests {
     }
 
     #[test]
+    fn a_blocking_wait_gives_up_at_its_limit() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        let _held = try_lock(root, "key", LockMode::Exclusive)
+            .expect("locked")
+            .expect("free");
+        let start = Instant::now();
+        let waited = lock_blocking(root, "key", LockMode::Exclusive, Duration::from_millis(100))
+            .expect("tried");
+        assert!(waited.is_none(), "held by another");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(
+            lock_blocking(root, "other", LockMode::Exclusive, Duration::ZERO)
+                .expect("tried")
+                .is_some()
+        );
+    }
+
+    /// The name is shared with servers of other versions, so it must not change.
+    #[test]
+    fn the_name_of_a_lock_does_not_change() {
+        let path = lock_path(Path::new("cache"), "cache:docs.rs/serde/1.0.228/_default");
+        assert_eq!(
+            path,
+            Path::new("cache")
+                .join(LOCKS_DIR)
+                .join("6d886635d2339ea8faa503738ed94f39.lock")
+        );
+    }
+
+    #[test]
     fn the_lock_file_is_in_the_locks_directory_and_kept() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = lock_path(dir.path(), "docs.rs/serde/1.0.0");
@@ -253,7 +312,9 @@ mod tests {
         let locked = BufReader::new(stdout)
             .lines()
             .map_while(Result::ok)
-            .any(|line| line == "locked");
+            // With one test thread (`RUST_TEST_THREADS=1`, or one CPU), libtest writes the line
+            // that names the test before what the test prints, on the same line.
+            .any(|line| line.ends_with("locked"));
         assert!(locked, "the other process took the lock");
         assert!(
             try_lock(root, "key", LockMode::Exclusive)

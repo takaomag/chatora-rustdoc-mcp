@@ -80,7 +80,11 @@ fn serve() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         },
     };
-    match runtime.block_on(chatora_rustdoc_mcp::mcp::serve(&settings)) {
+    let served = runtime.block_on(chatora_rustdoc_mcp::mcp::serve(&settings));
+    // Not the drop of the runtime, which waits for the work on blocking threads however long it
+    // takes: an archive being made, or a wait for a lock that another process holds.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    match served {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             // Print the whole chain of causes on one line.

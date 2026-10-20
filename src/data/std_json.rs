@@ -306,10 +306,14 @@ fn note_use(cache: &Cache, dir: PathBuf) {
     }
     let cache = cache.clone();
     drop(crate::task::spawn_blocking(move || {
+        // Under the lock of the directory, which another process takes to remove it.
+        let held = cache.lock_blocking(&dir);
         if let Err(error) = fs::write(dir.join(USED_FILE), b"") {
             tracing::warn!(path = %dir.display(), %error, "the use of a nightly's std could not be noted");
         }
-        if let Err(error) = remove_unused(&cache.dir().join("std"), &dir, SystemTime::now()) {
+        drop(held);
+        if let Err(error) = remove_unused(&cache, &cache.dir().join("std"), &dir, SystemTime::now())
+        {
             tracing::warn!(%error, "the std of old nightlies could not all be removed");
         }
     }));
@@ -321,7 +325,12 @@ fn note_use(cache: &Cache, dir: PathBuf) {
 /// the unpacking is complete, or archives) are removed, and symbolic links are not followed.
 /// Each that cannot be removed is left (Windows does not remove a file that another process
 /// maps), and the last error is returned after the rest are done.
-fn remove_unused(std_dir: &Path, keep: &Path, now: SystemTime) -> io::Result<()> {
+///
+/// A directory is removed under its lock in `cache`, taken without waiting: one that another
+/// task or process holds is in use and left, and one that was used while this waited is seen so
+/// (requirement R-CA-4). The mark that the unpacking is complete goes first, so that what is left
+/// when the rest cannot all be removed counts as not unpacked.
+fn remove_unused(cache: &Cache, std_dir: &Path, keep: &Path, now: SystemTime) -> io::Result<()> {
     let subdirectories = |dir: &Path| -> Vec<PathBuf> {
         fs::read_dir(dir)
             .into_iter()
@@ -345,7 +354,17 @@ fn remove_unused(std_dir: &Path, keep: &Path, now: SystemTime) -> io::Result<()>
             if dir == keep || !made_here(&dir) || !unused(&dir, now) {
                 continue;
             }
-            if let Err(error) = fs::remove_dir_all(&dir) {
+            let Some(_held) = cache.try_lock(&dir) else {
+                continue;
+            };
+            if !unused(&dir, now) {
+                continue;
+            }
+            let removed = match fs::remove_file(dir.join(dist::COMPLETE_FILE)) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+                Ok(()) | Err(_) => fs::remove_dir_all(&dir),
+            };
+            if let Err(error) = removed {
                 failed = Some(error);
             }
         }
@@ -589,10 +608,20 @@ mod tests {
             30,
         );
         let not_ours = make("ddddddddd/x86_64-unknown-linux-gnu", "notes.txt", 30);
-        remove_unused(std_dir, &in_use, now).expect("no error");
+        // Old, but held: another server may have just begun to use it.
+        let held = make(
+            "eeeeeeeee/x86_64-unknown-linux-gnu",
+            dist::COMPLETE_FILE,
+            30,
+        );
+        let cache = Cache::at(std_dir);
+        let holding = cache.try_lock(&held).expect("free");
+        remove_unused(&cache, std_dir, &in_use, now).expect("no error");
         assert!(!old.exists() && !std_dir.join("aaaaaaaaa").exists());
         assert!(!local.exists() && !std_dir.join("local/0123abcd").exists());
         assert!(recent.exists() && in_use.exists() && not_ours.exists());
+        assert!(held.join(dist::COMPLETE_FILE).exists(), "left whole");
+        drop(holding);
     }
 
     #[test]
