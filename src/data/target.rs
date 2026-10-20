@@ -121,7 +121,7 @@ fn stand_in(why: Cow<'static, str>) -> HostTarget {
 /// distributed as a static musl binary, while the Rust that users write for runs on glibc.
 #[must_use]
 pub fn build_target() -> TargetTriple {
-    let built_for = env!("CHATORA_RUSTDOC_MCP_BUILD_TARGET");
+    let built_for = env!("CHATORA_RUSTDOC_BUILD_TARGET");
     musl_as_gnu(built_for)
         .parse()
         // Cargo always sets the target of a build script, and rustc's targets are valid.

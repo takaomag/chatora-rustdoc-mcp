@@ -28,15 +28,18 @@ use rmcp::{
     transport::stdio,
 };
 
-use crate::data::{
-    cache::{Cache, CacheError},
-    crate_file::StaticCrates,
-    dist::Dist,
-    docs_rs::DocsRs,
-    sparse_index::SparseIndex,
-};
 #[cfg(feature = "local")]
 use crate::data::{metadata::Resolver, project::DefaultProject};
+use crate::{
+    config::Settings,
+    data::{
+        cache::{Cache, CacheError},
+        crate_file::StaticCrates,
+        dist::Dist,
+        docs_rs::DocsRs,
+        sparse_index::SparseIndex,
+    },
+};
 
 /// Protocol versions this server implements (requirement R-MCP-2).
 const SUPPORTED_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
@@ -206,7 +209,8 @@ pub enum ServeError {
     Cancelled(#[source] tokio::task::JoinError),
 }
 
-/// Runs the MCP server over stdio until the client closes the connection.
+/// Runs the MCP server over stdio until the client closes the connection, with `settings`
+/// (requirement R-DIST-3), which were read when it started.
 ///
 /// It must run inside a Tokio runtime.
 ///
@@ -218,7 +222,7 @@ pub enum ServeError {
 /// # Panics
 ///
 /// Resumes the panic of a task of the MCP session.
-pub async fn serve() -> Result<(), ServeError> {
+pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "starting the MCP server over stdio"
@@ -230,7 +234,10 @@ pub async fn serve() -> Result<(), ServeError> {
         "version": env!("CARGO_PKG_VERSION"),
         "pid": std::process::id(),
     }));
-    let cache = Cache::open_default()?;
+    let cache = Cache::open(settings);
+    // After the first line of the log file, which starts what this run logs.
+    settings.report();
+    let cache = cache?;
     let server = Server {
         tools: Arc::new(tool::ToolState {
             docs_rs: DocsRs::new()?,
@@ -249,9 +256,10 @@ pub async fn serve() -> Result<(), ServeError> {
             ),
             #[cfg(feature = "local")]
             resolver: Resolver::new(false),
-            calls: tool::CallLimit::from_env(),
+            calls: tool::CallLimit::from_settings(settings),
         }),
     };
+    settings.report();
     // The host target is found while the session starts, not before it: rustc may be slow to
     // start the first time (requirement R-MCP-11). The first tool call waits for it.
     let tools = Arc::clone(&server.tools);

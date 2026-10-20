@@ -52,7 +52,7 @@ Every response says where its data came from (`provenance`): the crate, the vers
 
 ## Cache
 
-rustdoc JSON and what the server makes of it are cached in `$XDG_CACHE_HOME/chatora-rustdoc-mcp/` (`~/.cache/chatora-rustdoc-mcp/` when unset) on Linux and macOS, and in `%LOCALAPPDATA%\chatora-rustdoc-mcp\cache\` on Windows; `CHATORA_RUSTDOC_MCP_CACHE__DIR` (an absolute path; a relative one is replaced by the default, which the log says) moves it.
+rustdoc JSON and what the server makes of it are cached in `$XDG_CACHE_HOME/chatora-rustdoc-mcp/` (`~/.cache/chatora-rustdoc-mcp/` when unset) on Linux and macOS, and in `%LOCALAPPDATA%\chatora-rustdoc-mcp\cache\` on Windows; the setting `cache.dir` (an absolute path; see [Settings](#settings)) moves it.
 
 The standard library takes about 175 MB for each nightly. The server uses the latest nightly (or, when it writes a rustdoc JSON format that this version of the server does not read, the newest one of the last 30 days that it reads), so a new one comes each day it is used; the standard library of a nightly unused for 7 days is removed. A large crate takes tens of MB, and nothing else is removed from the cache yet; deleting the directory is safe while no server runs. A command to manage the cache is planned.
 
@@ -67,25 +67,30 @@ The server writes a log file of JSON Lines, a new one for each run, in `$XDG_STA
 
 Warnings and errors go there too, with the `request_id` of the call they happened in. GitHub tokens and the contents of responses are not logged. A file larger than 20MB is followed by another; files older than 14 days, and the oldest while all of them are over 50MB, are removed, except those a running server is writing. Nothing is removed from a directory the server did not create (one with no `.chatora-rustdoc-mcp-logs` file).
 
-The server also logs to stderr. These environment variables change the logs:
-
-| Variable | Default | |
-| --- | --- | --- |
-| `CHATORA_RUSTDOC_MCP_LOG__DIR` | as above | The directory of the log files (an absolute path) |
-| `CHATORA_RUSTDOC_MCP_LOG__FILE_MAX_SIZE` | `20MB` | The size of a file before the next one (`KB`, `MB`, `GB`, `KiB`, `MiB`, `GiB`) |
-| `CHATORA_RUSTDOC_MCP_LOG__RETENTION_DAYS` | `14` | How many days files are kept |
-| `CHATORA_RUSTDOC_MCP_LOG__TOTAL_MAX_SIZE` | `50MB` | The size of all files together |
-| `CHATORA_RUSTDOC_MCP_LOG__FILTER` | `info` | Which lines stderr gets, in [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax; if any part is not valid, the default is used. The log file is not filtered |
+The server also logs to stderr. The `log` settings (see [Settings](#settings)) change the logs.
 
 ## Settings
 
-Settings are environment variables for now; a settings file is planned. Besides those of the cache and the logs above:
+The server reads its settings when it starts, from `chatora-rustdoc-mcp/config.toml` in `$XDG_CONFIG_HOME` (`~/.config` when unset) on Linux and macOS and in `%APPDATA%` on Windows, or from the file that `CHATORA_RUSTDOC_MCP_CONFIG` names (an absolute path), and from environment variables, which win over the file. A key such as `log.dir` is written in the file as
 
-| Variable | Default | |
+```toml
+[log]
+dir = "/var/log/chatora-rustdoc-mcp"
+```
+
+and in the environment as `CHATORA_RUSTDOC_MCP_LOG__DIR`: the key in capitals, with `__` between its parts. An empty variable counts as unset. In the environment, a number is digits, and a size or a path is the text itself.
+
+| Key | Default | |
 | --- | --- | --- |
-| `CHATORA_RUSTDOC_MCP_LIMITS__CONCURRENT_CALLS` | `16` | How many tool calls are handled at once; more get `busy` |
+| `cache.dir` | see [Cache](#cache) | The directory of the cache (an absolute path) |
+| `limits.concurrent_calls` | `16` | How many tool calls are handled at once; more get `busy` |
+| `log.dir` | see [Logs](#logs) | The directory of the log files (an absolute path) |
+| `log.file_max_size` | `"20MB"` | The size of a file before the next one (`KB`, `MB`, `GB`, `KiB`, `MiB`, `GiB`) |
+| `log.retention_days` | `14` | How many days files are kept |
+| `log.total_max_size` | `"50MB"` | The size of all files together |
+| `log.filter` | `"info"` | Which lines stderr gets, in [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax; if any part is not valid, the default is used. The log file is not filtered |
 
-A setting with a value that is not valid is replaced by its default, which the log says.
+The server always starts: a file that cannot be read or is not TOML is ignored, a value that is not valid is replaced by its default, and a key that this version does not read, in the file or as a `CHATORA_RUSTDOC_MCP_` variable, is ignored. The log says each of them, so that a misspelled setting does not go unnoticed.
 
 ## Security
 

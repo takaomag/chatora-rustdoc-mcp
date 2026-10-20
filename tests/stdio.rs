@@ -240,6 +240,10 @@ impl Server {
     fn start_with(project: Option<&Path>, env: &[(&str, &str)]) -> Self {
         let cache = test_cache();
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"));
+        // Not the config file of the user who runs the tests (requirement R-DIST-3).
+        let config = cache.path().join("config.toml");
+        std::fs::write(&config, "").expect("written");
+        command.env("CHATORA_RUSTDOC_MCP_CONFIG", config);
         command.envs(env.iter().copied());
         match project {
             Some(project) => command.env("CLAUDE_PROJECT_DIR", project),
@@ -1078,5 +1082,41 @@ fn subscriptions_listen_is_acknowledged_with_no_notifications() {
         "method": "notifications/cancelled",
         "params": { "requestId": 5 },
     }));
+    assert!(server.finish().success());
+}
+
+/// The values of the config file are read, and what is wrong in it is logged after the first line
+/// of the log file, without stopping the server (requirements R-DIST-3 and R-OBS-1).
+#[test]
+fn the_config_file_is_read_and_its_problems_are_logged() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "[log]\nretention_days = \"many\"\nretention = 1\n").expect("written");
+    let mut server = Server::start_with(None, &[(
+        "CHATORA_RUSTDOC_MCP_CONFIG",
+        config.to_str().expect("UTF-8"),
+    )]);
+    server.send(&request(1, "tools/list", json!({})));
+    assert!(server.response(1)["result"]["tools"].is_array());
+    let log = server.log();
+    assert_eq!(log[0]["kind"], "start", "{log:?}");
+    let warnings: Vec<&str> = log
+        .iter()
+        .filter(|line| line["level"] == "WARN")
+        .filter_map(|line| line["message"].as_str())
+        .collect();
+    let path = config.display().to_string();
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    for expected in [
+        format!("log.retention_days in {path} is \"many\", but it must be"),
+        format!("log.retention in {path} is not a setting of this version"),
+    ] {
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with(&expected)),
+            "{expected:?} in {warnings:?}"
+        );
+    }
     assert!(server.finish().success());
 }

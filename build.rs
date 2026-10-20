@@ -5,5 +5,7 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     // Cargo always sets TARGET for a build script; an empty value makes the fallback unusable.
     let target = std::env::var("TARGET").unwrap_or_default();
-    println!("cargo::rustc-env=CHATORA_RUSTDOC_MCP_BUILD_TARGET={target}");
+    // Not under `CHATORA_RUSTDOC_MCP_`, the prefix of the settings (requirement R-DIST-3): cargo
+    // sets it for `cargo run` and `cargo test` too, where the server would take it for one.
+    println!("cargo::rustc-env=CHATORA_RUSTDOC_BUILD_TARGET={target}");
 }

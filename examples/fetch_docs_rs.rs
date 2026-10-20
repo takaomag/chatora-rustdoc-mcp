@@ -34,11 +34,14 @@ use sha2::{Digest as _, Sha256};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    if let Err(error) = chatora_rustdoc_mcp::logging::init() {
+    let settings = chatora_rustdoc_mcp::config::Settings::load();
+    if let Err(error) = chatora_rustdoc_mcp::logging::init(&settings) {
         eprintln!("failed to set up logging: {error}");
         return ExitCode::FAILURE;
     }
-    let (cache, docs_rs) = match (Cache::open_default(), DocsRs::new()) {
+    let opened = Cache::open(&settings);
+    settings.report();
+    let (cache, docs_rs) = match (opened, DocsRs::new()) {
         (Ok(cache), Ok(docs_rs)) => (cache, docs_rs),
         (Err(error), _) => {
             eprintln!("failed to open the cache: {error}");

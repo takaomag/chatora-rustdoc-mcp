@@ -42,17 +42,20 @@ use tokio::{
 };
 use tracing::Instrument as _;
 
-use crate::data::{
-    cache::Cache,
-    crate_file::StaticCrates,
-    dist::Dist,
-    docs_rs::DocsRs,
-    fetches::Fetches,
-    sparse_index::SparseIndex,
-    target::{self, HostTarget},
-};
 #[cfg(feature = "local")]
 use crate::data::{metadata::Resolver, project::DefaultProject};
+use crate::{
+    config::Settings,
+    data::{
+        cache::Cache,
+        crate_file::StaticCrates,
+        dist::Dist,
+        docs_rs::DocsRs,
+        fetches::Fetches,
+        sparse_index::SparseIndex,
+        target::{self, HostTarget},
+    },
+};
 
 /// What the tools share for the life of the server.
 #[derive(Debug)]
@@ -101,27 +104,18 @@ pub(super) struct CallLimit {
 impl CallLimit {
     /// `limits.concurrent_calls` unless set (requirement R-SEC-7, initial value).
     const DEFAULT: usize = 16;
-    /// Environment variable of `limits.concurrent_calls` (requirement R-DIST-3).
-    const ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_LIMITS__CONCURRENT_CALLS";
 
-    /// The limit that [`Self::ENV_VAR`] sets, or the default. A value that is not a whole number
-    /// from 1 is logged and replaced by the default.
-    pub(super) fn from_env() -> Self {
-        let max = std::env::var_os(Self::ENV_VAR).map_or(Self::DEFAULT, |value| {
-            value
-                .to_str()
-                .and_then(|value| value.trim().parse().ok())
-                .filter(|max| *max > 0)
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        "{} is not valid ({}), so the default {} is used",
-                        Self::ENV_VAR,
-                        value.to_string_lossy(),
-                        Self::DEFAULT
-                    );
-                    Self::DEFAULT
-                })
-        });
+    /// The limit of the setting `limits.concurrent_calls` (requirement R-DIST-3), or the default.
+    pub(super) fn from_settings(settings: &Settings) -> Self {
+        let max = settings
+            .get("limits.concurrent_calls", |value| {
+                value
+                    .whole_number()
+                    .and_then(|max| usize::try_from(max).ok())
+                    .filter(|max| *max > 0)
+                    .ok_or("a whole number from 1")
+            })
+            .unwrap_or(Self::DEFAULT);
         Self::new(max)
     }
 

@@ -8,7 +8,6 @@ mod file;
 mod layer;
 
 use std::{
-    ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
     time::Duration,
@@ -24,6 +23,7 @@ use tracing_subscriber::{
 };
 
 use self::file::{Limits, LogFile};
+use crate::config::Settings;
 
 /// The name of the span of a tool call. Its `request_id` goes on the warnings in the log file.
 pub const CALL_SPAN: &str = "call";
@@ -32,21 +32,8 @@ pub const CALL_SPAN: &str = "call";
 /// R-ERR-2).
 pub const REQUEST_ID_FIELD: &str = "request_id";
 
-/// Environment variable that filters the stderr log, in the `EnvFilter` syntax (setting
-/// `log.filter`, requirement R-DIST-3).
-const FILTER_ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_LOG__FILTER";
-
-/// Environment variable of the directory of the log files (setting `log.dir`).
-pub const DIR_ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_LOG__DIR";
-
-/// Environment variable of the size of a log file before the next one (`log.file_max_size`).
-const FILE_MAX_SIZE_ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_LOG__FILE_MAX_SIZE";
-
-/// Environment variable of the days that logs are kept (`log.retention_days`).
-const RETENTION_DAYS_ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_LOG__RETENTION_DAYS";
-
-/// Environment variable of the size of all logs together (`log.total_max_size`).
-const TOTAL_MAX_SIZE_ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_LOG__TOTAL_MAX_SIZE";
+/// What a size setting must be.
+const SIZE: &str = "a size such as \"20MB\"";
 
 /// The stderr log's filter when none is set, or when the one set is not valid.
 const DEFAULT_FILTER: LevelFilter = LevelFilter::INFO;
@@ -64,19 +51,20 @@ const DEFAULT_TOTAL_MAX_SIZE: u64 = 50_000_000;
 static FILE: OnceLock<Arc<LogFile>> = OnceLock::new();
 
 /// Installs the global subscriber that writes the log to stderr and warnings and errors to the log
-/// file, and opens the file for [`write_record`].
+/// file, and opens the file for [`write_record`]. The settings are `log.*` (requirements R-OBS-2
+/// and R-DIST-3).
 ///
-/// Settings that are not valid are replaced by their defaults, and a log file that cannot be
-/// opened is done without; both are logged, and the server still starts.
+/// Settings that are not valid are replaced by their defaults, kept as problems of `settings`
+/// for [`Settings::report`], and a log file that cannot be opened is done without, which is
+/// logged; the server still starts.
 ///
 /// # Errors
 ///
 /// Returns an error when a global subscriber is already installed.
-pub fn init() -> Result<(), TryInitError> {
-    let mut problems = Vec::new();
-    let filter = stderr_filter(std::env::var_os(FILTER_ENV_VAR), &mut problems);
-    let limits = limits(&mut problems);
-    let file = match log_dir(std::env::var_os(DIR_ENV_VAR)) {
+pub fn init(settings: &Settings) -> Result<(), TryInitError> {
+    let filter = stderr_filter(settings);
+    let limits = limits(settings);
+    let file = match log_dir(settings) {
         Ok(dir) => LogFile::open(&dir, limits).map(Arc::new).map_err(|error| {
             format!(
                 "the log file in {} cannot be written: {error}",
@@ -99,9 +87,6 @@ pub fn init() -> Result<(), TryInitError> {
         .with(stderr)
         .with(file_layer)
         .try_init()?;
-    for problem in problems {
-        tracing::warn!("{problem}");
-    }
     match file {
         Ok(file) => {
             tracing::info!(path = %file.path().display(), "logging tool calls");
@@ -130,44 +115,35 @@ pub fn now() -> String {
 /// The filter of the stderr log from the value of `log.filter`. When any of its directives is not
 /// valid, the whole value is replaced by the default, with a problem to log (requirement
 /// R-DIST-3): a filter that is partly applied would hide what was meant to be seen.
-fn stderr_filter(value: Option<OsString>, problems: &mut Vec<String>) -> EnvFilter {
-    let builder = EnvFilter::builder().with_default_directive(DEFAULT_FILTER.into());
-    let Some(value) = value else {
-        return builder.parse_lossy("");
-    };
-    let parsed = value
-        .to_str()
-        .ok_or_else(|| "it is not UTF-8".to_owned())
-        .and_then(|value| builder.parse(value).map_err(|error| error.to_string()));
-    parsed.unwrap_or_else(|why| {
-        problems.push(format!(
-            "{FILTER_ENV_VAR} is not a valid filter ({why}), so the default `{DEFAULT_FILTER}` is \
-             used"
-        ));
-        builder.parse_lossy("")
-    })
+fn stderr_filter(settings: &Settings) -> EnvFilter {
+    let builder = || EnvFilter::builder().with_default_directive(DEFAULT_FILTER.into());
+    settings
+        .get("log.filter", |value| {
+            value
+                .text()
+                .and_then(|text| builder().parse(text).ok())
+                .ok_or("a filter of tracing's EnvFilter syntax, such as \"debug\"")
+        })
+        .unwrap_or_else(|| builder().parse_lossy(""))
 }
 
 /// The limits of the log files, from their settings or their defaults.
-fn limits(problems: &mut Vec<String>) -> Limits {
-    let file_max_size = setting(
-        FILE_MAX_SIZE_ENV_VAR,
-        DEFAULT_FILE_MAX_SIZE,
-        parse_size,
-        problems,
-    );
-    let days = setting(
-        RETENTION_DAYS_ENV_VAR,
-        DEFAULT_RETENTION_DAYS,
-        |value| value.parse::<u64>().ok().filter(|days| *days > 0),
-        problems,
-    );
-    let total_max_size = setting(
-        TOTAL_MAX_SIZE_ENV_VAR,
-        DEFAULT_TOTAL_MAX_SIZE,
-        parse_size,
-        problems,
-    );
+fn limits(settings: &Settings) -> Limits {
+    let size = |value: crate::config::Value<'_>| value.size().ok_or(SIZE);
+    let file_max_size = settings
+        .get("log.file_max_size", size)
+        .unwrap_or(DEFAULT_FILE_MAX_SIZE);
+    let days = settings
+        .get("log.retention_days", |value| {
+            value
+                .whole_number()
+                .filter(|days| *days > 0)
+                .ok_or("a whole number from 1")
+        })
+        .unwrap_or(DEFAULT_RETENTION_DAYS);
+    let total_max_size = settings
+        .get("log.total_max_size", size)
+        .unwrap_or(DEFAULT_TOTAL_MAX_SIZE);
     Limits {
         file_max_size,
         retention: Duration::from_secs(days.saturating_mul(24 * 60 * 60)),
@@ -175,65 +151,18 @@ fn limits(problems: &mut Vec<String>) -> Limits {
     }
 }
 
-/// The value of the setting in `env_var` that `parse` reads, or `default` when it is not set or
-/// not valid (with a problem to log).
-fn setting(
-    env_var: &str,
-    default: u64,
-    parse: impl FnOnce(&str) -> Option<u64>,
-    problems: &mut Vec<String>,
-) -> u64 {
-    let Some(value) = std::env::var_os(env_var) else {
-        return default;
-    };
-    value
-        .to_str()
-        .map(str::trim)
-        .and_then(parse)
-        .unwrap_or_else(|| {
-            problems.push(format!(
-                "{env_var} is not valid ({}), so the default {default} is used",
-                value.to_string_lossy()
-            ));
-            default
-        })
-}
-
-/// A size such as `20MB`: a whole number, and a unit of `B`, `KB`, `MB`, `GB` (powers of 1000) or
-/// `KiB`, `MiB`, `GiB` (powers of 1024), in any case. A number alone is bytes.
-fn parse_size(text: &str) -> Option<u64> {
-    let digits = text
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(text.len());
-    let (number, unit) = text.split_at(digits);
-    let number: u64 = number.parse().ok()?;
-    let unit: u64 = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1,
-        "kb" => 1000,
-        "mb" => 1000 * 1000,
-        "gb" => 1000 * 1000 * 1000,
-        "kib" => 1024,
-        "mib" => 1024 * 1024,
-        "gib" => 1024 * 1024 * 1024,
-        _ => return None,
-    };
-    number.checked_mul(unit).filter(|size| *size > 0)
-}
-
-/// The directory of the logs: `log.dir`, or `logs` in the state directory (requirements R-OBS-2
+/// The directory of the logs: `log.dir`, which is absolute, or `logs` in the state directory (requirements R-OBS-2
 /// and R-DIST-3): `$XDG_STATE_HOME/chatora-rustdoc-mcp/logs` (`~/.local/state/…` when unset) on
 /// Linux and macOS, and `%LOCALAPPDATA%\chatora-rustdoc-mcp\state\logs` on Windows.
-fn log_dir(value: Option<OsString>) -> Result<PathBuf, String> {
-    if let Some(value) = value.filter(|value| !value.is_empty()) {
-        let dir = PathBuf::from(value);
-        return if dir.is_absolute() {
-            Ok(dir)
-        } else {
-            Err(format!(
-                "{DIR_ENV_VAR} must be an absolute path, but it is {}",
-                dir.display()
-            ))
-        };
+fn log_dir(settings: &Settings) -> Result<PathBuf, String> {
+    let dir = settings.get("log.dir", |value| {
+        value
+            .path()
+            .filter(|dir| dir.is_absolute())
+            .ok_or("an absolute path")
+    });
+    if let Some(dir) = dir {
+        return Ok(dir);
     }
     let strategy = etcetera::choose_base_strategy()
         .map_err(|error| format!("the home directory could not be found: {error}"))?;
@@ -251,39 +180,35 @@ fn log_dir(value: Option<OsString>) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn sizes() {
-        assert_eq!(parse_size("20MB"), Some(20_000_000));
-        assert_eq!(parse_size("20 mb"), Some(20_000_000));
-        assert_eq!(parse_size("1KiB"), Some(1024));
-        assert_eq!(parse_size("512"), Some(512));
-        assert_eq!(parse_size("0MB"), None);
-        assert_eq!(parse_size("MB"), None);
-        assert_eq!(parse_size("1.5MB"), None);
-        assert_eq!(parse_size("20TB"), None);
-        assert_eq!(parse_size("99999999999999GB"), None);
+    fn settings(variables: &[(&str, &str)]) -> Settings {
+        Settings::from_sources(
+            None,
+            variables
+                .iter()
+                .map(|(name, value)| ((*name).into(), (*value).into())),
+        )
     }
 
     #[test]
     fn a_filter_with_any_invalid_directive_is_replaced_by_the_default() {
-        let mut problems = Vec::new();
-        let filter = stderr_filter(Some("debug".into()), &mut problems);
+        let filter = stderr_filter(&settings(&[("CHATORA_RUSTDOC_MCP_LOG__FILTER", "debug")]));
         assert_eq!(filter.max_level_hint(), Some(LevelFilter::DEBUG));
-        assert_eq!(problems, Vec::<String>::new());
-        let filter = stderr_filter(Some("debug,a=nonsense".into()), &mut problems);
+        let invalid = settings(&[("CHATORA_RUSTDOC_MCP_LOG__FILTER", "debug,a=nonsense")]);
+        let filter = stderr_filter(&invalid);
         assert_eq!(filter.max_level_hint(), Some(DEFAULT_FILTER));
+        let problems = invalid.problems();
         assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains(FILTER_ENV_VAR), "{problems:?}");
-        let filter = stderr_filter(None, &mut problems);
+        assert!(
+            problems[0].contains("CHATORA_RUSTDOC_MCP_LOG__FILTER"),
+            "{problems:?}"
+        );
+        let filter = stderr_filter(&settings(&[]));
         assert_eq!(filter.max_level_hint(), Some(DEFAULT_FILTER));
     }
 
     #[test]
     fn the_log_directory_must_be_absolute() {
-        log_dir(Some("logs".into())).expect_err("relative");
-        let absolute = std::env::temp_dir().join("logs");
-        assert_eq!(log_dir(Some(absolute.clone().into())), Ok(absolute));
-        let default = log_dir(None).expect("a home directory");
+        let default = log_dir(&settings(&[])).expect("a home directory");
         assert!(
             default.ends_with(Path::new(env!("CARGO_PKG_NAME")).join(if cfg!(windows) {
                 "state/logs"
@@ -291,5 +216,14 @@ mod tests {
                 "logs"
             }))
         );
+        let relative = settings(&[("CHATORA_RUSTDOC_MCP_LOG__DIR", "logs")]);
+        assert_eq!(log_dir(&relative), Ok(default));
+        assert_eq!(relative.problems().len(), 1);
+        let absolute = std::env::temp_dir().join("logs");
+        let set = settings(&[(
+            "CHATORA_RUSTDOC_MCP_LOG__DIR",
+            absolute.to_str().expect("UTF-8"),
+        )]);
+        assert_eq!(log_dir(&set), Ok(absolute));
     }
 }

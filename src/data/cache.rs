@@ -29,9 +29,7 @@ use super::{
     rustdoc_json::SUPPORTED,
     target::TargetTriple,
 };
-
-/// Environment variable that sets where the cache is (setting `cache.dir`, requirement R-CA-1).
-pub const DIR_ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_CACHE__DIR";
+use crate::config::Settings;
 
 /// Directory of this server under the OS cache directory.
 const APP_DIR: &str = "chatora-rustdoc-mcp";
@@ -116,21 +114,33 @@ pub enum CacheError {
 }
 
 impl Cache {
-    /// The cache at the directory that [`DIR_ENV_VAR`] sets, or at the OS default:
+    /// The cache at the directory that the setting `cache.dir` names, or at the OS default:
     /// `$XDG_CACHE_HOME/chatora-rustdoc-mcp` (`~/.cache/…` when unset) on Linux and macOS, and
     /// `%LOCALAPPDATA%\chatora-rustdoc-mcp\cache` on Windows (requirement R-CA-1). A relative path
-    /// in the variable is logged and replaced by the default, as other settings that are not
-    /// valid are: the server's working directory depends on how it was started, so it would
-    /// point somewhere unpredictable.
+    /// is a value that is not valid, which is replaced by the default: the server's working
+    /// directory depends on how it was started, so it would point somewhere unpredictable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the home directory, under which the default is, cannot be found.
+    pub fn open(settings: &Settings) -> Result<Self, CacheError> {
+        let root = root_dir(settings, || {
+            etcetera::choose_base_strategy().map(|strategy| strategy.cache_dir())
+        })?;
+        Ok(Self::at(&root))
+    }
+
+    /// [`Self::open`] with the settings of the config file and the environment, for the tests and
+    /// the examples. Their problems are logged.
     ///
     /// # Errors
     ///
     /// Returns an error when the home directory, under which the default is, cannot be found.
     pub fn open_default() -> Result<Self, CacheError> {
-        let root = root_dir(std::env::var_os(DIR_ENV_VAR), || {
-            etcetera::choose_base_strategy().map(|strategy| strategy.cache_dir())
-        })?;
-        Ok(Self::at(&root))
+        let settings = Settings::load();
+        let cache = Self::open(&settings);
+        settings.report();
+        cache
     }
 
     /// The cache at `root`.
@@ -478,21 +488,20 @@ const fn is_same_file(_: &Metadata, _: &Metadata) -> bool {
     true
 }
 
-/// Decides the cache directory from the value of [`DIR_ENV_VAR`] and, when it is unset or empty,
+/// Decides the cache directory from the setting `cache.dir` and, when it is unset or not valid,
 /// from the OS cache directory.
 fn root_dir(
-    env_value: Option<OsString>,
+    settings: &Settings,
     os_cache_dir: impl FnOnce() -> Result<PathBuf, etcetera::HomeDirError>,
 ) -> Result<PathBuf, CacheError> {
-    if let Some(value) = env_value.filter(|value| !value.is_empty()) {
-        let dir = PathBuf::from(value);
-        if dir.is_absolute() {
-            return Ok(dir);
-        }
-        tracing::warn!(
-            "{DIR_ENV_VAR} must be an absolute path, but it is {}, so the default is used",
-            dir.display()
-        );
+    let dir = settings.get("cache.dir", |value| {
+        value
+            .path()
+            .filter(|dir| dir.is_absolute())
+            .ok_or("an absolute path")
+    });
+    if let Some(dir) = dir {
+        return Ok(dir);
     }
     let dir = os_cache_dir().map_err(CacheError::NoHome)?.join(APP_DIR);
     // On Windows, the state directory is under %LOCALAPPDATA%\chatora-rustdoc-mcp too
@@ -828,36 +837,47 @@ mod tests {
         );
     }
 
+    /// The settings with `cache.dir` set to `dir` in the environment, or without it.
+    fn cache_dir(dir: Option<&OsStr>) -> Settings {
+        Settings::from_sources(
+            None,
+            dir.map(|dir| ("CHATORA_RUSTDOC_MCP_CACHE__DIR".into(), dir.to_owned())),
+        )
+    }
+
     #[test]
-    fn the_environment_variable_wins_when_it_is_absolute() {
+    fn the_setting_wins_when_it_is_absolute() {
         let absolute = std::env::temp_dir().join("cache");
         let no_home = || Err(etcetera::HomeDirError);
         assert_eq!(
-            root_dir(Some(absolute.clone().into()), no_home).expect("absolute"),
+            root_dir(&cache_dir(Some(absolute.as_os_str())), no_home).expect("absolute"),
             absolute
         );
         // A relative path is replaced by the default.
         let os = std::env::temp_dir().join("os-cache");
-        let relative = root_dir(Some("relative/cache".into()), || Ok(os.clone())).expect("default");
-        assert!(relative.starts_with(&os), "{}", relative.display());
+        let relative = cache_dir(Some(OsStr::new("relative/cache")));
+        let root = root_dir(&relative, || Ok(os.clone())).expect("default");
+        assert!(root.starts_with(&os), "{}", root.display());
+        assert_eq!(relative.problems().len(), 1);
     }
 
     #[test]
-    fn an_unset_or_empty_environment_variable_means_the_os_default() {
+    fn an_unset_or_empty_setting_means_the_os_default() {
         let os = std::env::temp_dir().join("os-cache");
         let expected = if cfg!(windows) {
             os.join("chatora-rustdoc-mcp").join("cache")
         } else {
             os.join("chatora-rustdoc-mcp")
         };
-        for env_value in [None, Some(OsString::new())] {
+        for settings in [cache_dir(None), cache_dir(Some(OsStr::new("")))] {
             assert_eq!(
-                root_dir(env_value, || Ok(os.clone())).expect("the default"),
+                root_dir(&settings, || Ok(os.clone())).expect("the default"),
                 expected
             );
+            assert_eq!(settings.problems(), Vec::<String>::new());
         }
         assert!(matches!(
-            root_dir(None, || Err(etcetera::HomeDirError)),
+            root_dir(&cache_dir(None), || Err(etcetera::HomeDirError)),
             Err(CacheError::NoHome(_))
         ));
     }

@@ -62,6 +62,11 @@ impl Client {
     /// of the environment (`CHATORA_RUSTDOC_MCP_CACHE__DIR`).
     pub(crate) fn start(project: Option<&Path>, logs: &Path) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"));
+        // Not the config file of the user who runs the tests (requirement R-DIST-3). The cache
+        // is still the one of the environment.
+        let config = logs.join("config.toml");
+        std::fs::write(&config, "").expect("written");
+        command.env("CHATORA_RUSTDOC_MCP_CONFIG", config);
         match project {
             Some(project) => command.env("CLAUDE_PROJECT_DIR", project),
             None => command.env_remove("CLAUDE_PROJECT_DIR"),

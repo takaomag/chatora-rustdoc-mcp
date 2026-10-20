@@ -281,6 +281,17 @@ Claude Code 2.1.304、Linux で測った。
   - worktree の中で cargo を起動すると、worktree のルートの workspace が使われる (メインのリポジトリの workspace は拾わない)。既定のプロジェクトは `.claude` が Cargo.toml を持たないので、そこを含めない
 - README: プロジェクトの決め方の段落と Security の節 (cargo を起動する範囲) に、worktree とサブディレクトリでの起動を書いた
 
+**A3a (設定ファイルの仕組み。2026-10-20)**: A3 は、仕組みと M1 の設定を移す A3a と、M2 の新しい項目を足す A3b に分けた。
+
+- 置き場所: `src/config.rs` (`Settings`)。`logging`・`task` と同じく、どの層からも使う。起動時に 1 回読み (`Settings::load`)、`logging::init`・`Cache::open`・`CallLimit::from_settings` がそこから読む
+- 設定ファイル: 既定は `etcetera` の `config_dir` の下の `chatora-rustdoc-mcp/config.toml` (Linux・macOS は `$XDG_CONFIG_HOME`、Windows は `%APPDATA%`)。既定のファイルが無いのは問題にしない。`CHATORA_RUSTDOC_MCP_CONFIG` で指したファイルが読めなければ問題としてログに出す。相対パスなら問題として、既定のファイルを読む (`cache.dir` と同じ考え方)。TOML として読めなければ、ファイル全体を無視して問題にする
+- 環境変数で受けられる値の制約 (R-DIST-3 が実装時に決めるとしたもの): 数は 10 進の数字 (前後の空白は許す)、真偽は `true`・`false` (大文字小文字を問わない)、容量は設定ファイルと同じ文字列、パスは文字列そのもの (UTF-8 でなくてよい)。空の環境変数は設定していないものとする (`CLAUDE_PROJECT_DIR` と同じ)。設定ファイルでは TOML の型で書く (数を文字列で書くと誤った値)
+- 問題 (読めないファイル、知らないキー、誤った値) は `Settings` にためて、ログのファイルの最初の行 (`start` の記録。R-OBS-1) の後に出す。誤った値の文言は「<キーか環境変数> is <値>, but it must be <期待>, so the default is used」
+- このバージョンが読むキーは `KEYS` の一覧で、それ以外は「このバージョンの設定ではない」として無視する (要件の表にあっても、まだ使っていないキーは知らないキーとして知らせる。効かない設定が黙って無視されないため)
+- ビルド時の変数 `CHATORA_RUSTDOC_MCP_BUILD_TARGET` を `CHATORA_RUSTDOC_BUILD_TARGET` に改めた。cargo は `rustc-env` の変数を `cargo run`・`cargo test` で起動したプロセスにも渡すので、設定の接頭辞と重なると、テストで知らない設定として報告された
+- テストのサーバーは、空の設定ファイルを `CHATORA_RUSTDOC_MCP_CONFIG` で指して起動し、テストを回す人の設定ファイルを読まない
+- 途中で、build.rs を書き換えた直後に rust-analyzer の検査と cargo が競合したらしく、build script の古いバイナリが残り、新しい変数が見えなかった。`cargo clean -p chatora-rustdoc-mcp` で直した (このパッケージの生成物 57.7 GiB が消え、作り直した)
+
 ### 6.3 M2b
 
 (まだ無い)
