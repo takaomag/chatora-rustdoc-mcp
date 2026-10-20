@@ -1848,6 +1848,8 @@ pub(super) fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
             ("docs_unavailable", Some("corrupt"), true)
         },
         DistError::Cache(_) => ("internal_error", None, false),
+        // With the dist turned off, the nightly here is the only source (requirement R-STD-4).
+        DistError::Disabled { .. } => ("toolchain_missing", None, false),
     };
     let mut body = json!({
         "code": code,

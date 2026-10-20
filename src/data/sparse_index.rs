@@ -26,7 +26,7 @@ use super::{
     blocking,
     cache::{self, Cache},
     crate_name::CrateName,
-    http::{self, BodyError},
+    http::{self, BodyError, Network},
     system_time,
     unix_seconds,
     with_suffix,
@@ -183,8 +183,8 @@ impl SparseIndex {
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be set up (for example, TLS).
-    pub fn new(cache: Cache) -> Result<Self, reqwest::Error> {
-        Self::with_base_url(cache, DEFAULT_BASE_URL)
+    pub fn new(cache: Cache, network: &Network) -> Result<Self, reqwest::Error> {
+        Self::with_base_url(cache, DEFAULT_BASE_URL, network)
     }
 
     /// A client for a server at `base_url` that serves the sparse index, such as a mirror.
@@ -193,9 +193,13 @@ impl SparseIndex {
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be set up (for example, TLS).
-    pub fn with_base_url(cache: Cache, base_url: &str) -> Result<Self, reqwest::Error> {
+    pub fn with_base_url(
+        cache: Cache,
+        base_url: &str,
+        network: &Network,
+    ) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            client: http::client_builder().build()?,
+            client: http::client_builder(network).build()?,
             base_url: base_url.into(),
             cache,
             ttl: TTL,
@@ -207,7 +211,7 @@ impl SparseIndex {
     #[cfg(test)]
     fn for_local_test(cache: Cache, base_url: &str, ttl: Duration) -> Self {
         Self {
-            client: http::client_builder()
+            client: http::client_builder(&Network::default())
                 .no_proxy()
                 .build()
                 .expect("the client builds"),

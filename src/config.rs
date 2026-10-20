@@ -24,11 +24,15 @@ pub const CONFIG_ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_CONFIG";
 const KEYS: &[&str] = &[
     "cache.dir",
     "limits.concurrent_calls",
+    "limits.extract_max_size",
     "log.dir",
     "log.file_max_size",
     "log.filter",
     "log.retention_days",
     "log.total_max_size",
+    "network.connect_timeout_secs",
+    "network.read_timeout_secs",
+    "std.fetch_from_dist",
 ];
 
 /// The settings, from the config file and the environment.

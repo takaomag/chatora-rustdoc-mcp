@@ -84,11 +84,15 @@ and in the environment as `CHATORA_RUSTDOC_MCP_LOG__DIR`: the key in capitals, w
 | --- | --- | --- |
 | `cache.dir` | see [Cache](#cache) | The directory of the cache (an absolute path) |
 | `limits.concurrent_calls` | `16` | How many tool calls are handled at once; more get `busy` |
+| `limits.extract_max_size` | `"4GiB"` | The most bytes unpacked from one archive of the standard library |
 | `log.dir` | see [Logs](#logs) | The directory of the log files (an absolute path) |
 | `log.file_max_size` | `"20MB"` | The size of a file before the next one (`KB`, `MB`, `GB`, `KiB`, `MiB`, `GiB`) |
 | `log.retention_days` | `14` | How many days files are kept |
 | `log.total_max_size` | `"50MB"` | The size of all files together |
 | `log.filter` | `"info"` | Which lines stderr gets, in [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax; if any part is not valid, the default is used. The log file is not filtered |
+| `network.connect_timeout_secs` | `10` | How long a connection to docs.rs and the other sources may take |
+| `network.read_timeout_secs` | `120` | How long a response may stay silent while it is received (not a limit on the whole transfer) |
+| `std.fetch_from_dist` | `true` | Whether the standard library may be downloaded from static.rust-lang.org; with `false`, only a nightly toolchain with `rust-docs-json` installed here gives it, even one older than the project's toolchain |
 
 The server always starts: a file that cannot be read or is not TOML is ignored, a value that is not valid is replaced by its default, and a key that this version does not read, in the file or as a `CHATORA_RUSTDOC_MCP_` variable, is ignored. The log says each of them, so that a misspelled setting does not go unnoticed.
 

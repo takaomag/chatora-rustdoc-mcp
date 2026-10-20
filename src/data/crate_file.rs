@@ -15,7 +15,7 @@ use semver::Version;
 use super::{
     cache::{Cache, Verified},
     crate_name::CrateName,
-    http::{self, BodyError},
+    http::{self, BodyError, Network},
 };
 
 /// static.crates.io itself.
@@ -97,8 +97,8 @@ impl StaticCrates {
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be set up (for example, TLS).
-    pub fn new() -> Result<Self, reqwest::Error> {
-        Self::with_base_url(DEFAULT_BASE_URL)
+    pub fn new(network: &Network) -> Result<Self, reqwest::Error> {
+        Self::with_base_url(DEFAULT_BASE_URL, network)
     }
 
     /// A client for a server at `base_url` that serves the URLs of static.crates.io, such as a
@@ -107,9 +107,9 @@ impl StaticCrates {
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be set up (for example, TLS).
-    pub fn with_base_url(base_url: &str) -> Result<Self, reqwest::Error> {
+    pub fn with_base_url(base_url: &str, network: &Network) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            client: http::client_builder().build()?,
+            client: http::client_builder(network).build()?,
             base_url: base_url.into(),
         })
     }

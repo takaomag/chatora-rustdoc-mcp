@@ -33,9 +33,10 @@ use crate::data::{metadata::Resolver, project::DefaultProject};
 use crate::{
     config::Settings,
     data::{
+        Network,
         cache::{Cache, CacheError},
         crate_file::StaticCrates,
-        dist::Dist,
+        dist::{Dist, DistSettings},
         docs_rs::DocsRs,
         sparse_index::SparseIndex,
     },
@@ -238,12 +239,13 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
     // After the first line of the log file, which starts what this run logs.
     settings.report();
     let cache = cache?;
+    let network = Network::from_settings(settings);
     let server = Server {
         tools: Arc::new(tool::ToolState {
-            docs_rs: DocsRs::new()?,
-            dist: Dist::new()?,
-            index: SparseIndex::new(cache.clone())?,
-            static_crates: StaticCrates::new()?,
+            docs_rs: DocsRs::new(&network)?,
+            dist: Dist::new(&network, DistSettings::from_settings(settings))?,
+            index: SparseIndex::new(cache.clone(), &network)?,
+            static_crates: StaticCrates::new(&network)?,
             // Found in the background below: rustc may be slow to start (requirement R-MCP-11).
             host: tokio::sync::OnceCell::new(),
             cache,

@@ -21,11 +21,12 @@ use super::{
     blocking,
     cache::{self, Cache, Verified},
     docs_rs::MAX_BYTES,
-    http::{self, BodyError},
+    http::{self, BodyError, Network},
     system_time,
     target::TargetTriple,
     unix_seconds,
 };
+use crate::config::Settings;
 
 /// Where the Rust distribution server is. Kept in one place so that a mirror can replace it later
 /// (requirement R-CA-8).
@@ -41,9 +42,9 @@ const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 /// Largest archive held in memory. The one for Linux on x86-64 is about 4 MB.
 const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Most bytes unpacked from one archive (requirement R-NW-3). The JSON for Linux on x86-64 comes to
-/// about 125 MB, 96 MB of it core.
-const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// `limits.extract_max_size` unless set: the most bytes unpacked from one archive (requirement
+/// R-NW-3, initial value). The JSON for Linux on x86-64 comes to about 125 MB, 96 MB of it core.
+const EXTRACT_MAX_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
 /// The package of the manifest that holds the archives.
 const PACKAGE: &str = "rust-docs-json-preview";
@@ -102,6 +103,47 @@ pub struct Dist {
     client: reqwest::Client,
     // `Arc` so that cloning the client does not copy the URL.
     base_url: Arc<str>,
+    settings: DistSettings,
+}
+
+/// What the settings say about the JSON of std from the distribution server: `std.fetch_from_dist`
+/// and `limits.extract_max_size` (requirements R-STD-1, R-NW-3 and R-DIST-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistSettings {
+    /// Whether the JSON may be fetched from the server. Without it, only a nightly toolchain
+    /// installed here gives the JSON of std.
+    pub fetch: bool,
+    /// The most bytes unpacked from one archive.
+    pub extract_max_size: u64,
+}
+
+impl Default for DistSettings {
+    fn default() -> Self {
+        Self {
+            fetch: true,
+            extract_max_size: EXTRACT_MAX_SIZE,
+        }
+    }
+}
+
+impl DistSettings {
+    /// The settings that `settings` give, or the defaults.
+    #[must_use]
+    pub fn from_settings(settings: &Settings) -> Self {
+        let default = Self::default();
+        Self {
+            fetch: settings
+                .get("std.fetch_from_dist", |value| {
+                    value.boolean().ok_or("true or false")
+                })
+                .unwrap_or(default.fetch),
+            extract_max_size: settings
+                .get("limits.extract_max_size", |value| {
+                    value.size().ok_or("a size such as \"4GiB\"")
+                })
+                .unwrap_or(default.extract_max_size),
+        }
+    }
 }
 
 /// Why the JSON of std could not be had from the distribution server.
@@ -143,6 +185,13 @@ pub enum DistError {
     /// The cache could not be read or written.
     #[error("the cache of the JSON of std could not be used")]
     Cache(#[source] io::Error),
+    /// The JSON may not be fetched from the server (`std.fetch_from_dist`), and the nightly
+    /// toolchain here does not give it.
+    #[error("std.fetch_from_dist is false, and the nightly toolchain here cannot be used: {why}")]
+    Disabled {
+        /// Why the nightly here cannot be used.
+        why: Box<str>,
+    },
 }
 
 /// The JSON of std of one nightly, unpacked in the cache.
@@ -251,8 +300,17 @@ impl Dist {
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be set up (for example, TLS).
-    pub fn new() -> Result<Self, reqwest::Error> {
-        Self::with_base_url(DEFAULT_BASE_URL)
+    pub fn new(network: &Network, settings: DistSettings) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            settings,
+            ..Self::with_base_url(DEFAULT_BASE_URL, network)?
+        })
+    }
+
+    /// Whether the JSON of std may be fetched from the server (`std.fetch_from_dist`).
+    #[must_use]
+    pub const fn fetches(&self) -> bool {
+        self.settings.fetch
     }
 
     /// A client for a server at `base_url` that serves the same paths, such as a mirror or a test
@@ -261,10 +319,11 @@ impl Dist {
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be set up (for example, TLS).
-    pub fn with_base_url(base_url: &str) -> Result<Self, reqwest::Error> {
+    pub fn with_base_url(base_url: &str, network: &Network) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            client: http::client_builder().build()?,
+            client: http::client_builder(network).build()?,
             base_url: base_url.into(),
+            settings: DistSettings::default(),
         })
     }
 
@@ -272,12 +331,20 @@ impl Dist {
     #[cfg(test)]
     pub(super) fn for_local_test(base_url: &str) -> Self {
         Self {
-            client: http::client_builder()
+            client: http::client_builder(&Network::default())
                 .no_proxy()
                 .build()
                 .expect("the client builds"),
             base_url: base_url.into(),
+            settings: DistSettings::default(),
         }
+    }
+
+    /// The client with `settings` instead.
+    #[cfg(test)]
+    pub(super) const fn with_settings(mut self, settings: DistSettings) -> Self {
+        self.settings = settings;
+        self
     }
 
     /// Fetches the body at `url`, at most `limit` bytes.
@@ -364,7 +431,8 @@ pub async fn std_docs(
     let unpacked = {
         let (cache, dir) = (cache.clone(), dir.clone());
         let (date, version) = (summary.date.clone(), summary.version.clone());
-        blocking(move || Ok(unpack(&cache, &body, &dir, date, version, triple)))
+        let max = dist.settings.extract_max_size;
+        blocking(move || Ok(unpack(&cache, &body, &dir, date, version, triple, max)))
             .await
             .map_err(DistError::Cache)?
     };
@@ -546,6 +614,7 @@ async fn read_complete(cache: &Cache, dir: &Path) -> Result<Option<Nightly>, Dis
 /// Unpacks the JSON files of the xz archive `body` into `dir`, each with its digest, and then the
 /// mark that it is complete (requirement R-CA-4). Only the JSON of [`StdCrate`] and the commit
 /// hash are read; the names of the files written are made here, never taken from the archive.
+/// More than `max_unpacked` bytes in all is an error.
 fn unpack(
     cache: &Cache,
     body: &[u8],
@@ -553,6 +622,7 @@ fn unpack(
     date: Box<str>,
     version: Box<str>,
     triple: TargetTriple,
+    max_unpacked: u64,
 ) -> Result<Nightly, DistError> {
     let mut archive = tar::Archive::new(lzma_rust2::XzReader::new(body, false));
     let mut unpacked: u64 = 0;
@@ -569,9 +639,12 @@ fn unpack(
         };
         let size = entry.size();
         unpacked = unpacked.saturating_add(size);
-        if size > MAX_BYTES || unpacked > MAX_UNPACKED_BYTES {
+        if size > MAX_BYTES {
+            return Err(DistError::TooLarge { limit: MAX_BYTES });
+        }
+        if unpacked > max_unpacked {
             return Err(DistError::TooLarge {
-                limit: MAX_UNPACKED_BYTES.min(MAX_BYTES),
+                limit: max_unpacked,
             });
         }
         let mut contents = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
@@ -854,6 +927,40 @@ available = false
             std_docs(&cache, &dist, &wasm, None).await,
             Err(DistError::NotAvailable { target }) if target == wasm
         ));
+    }
+
+    #[tokio::test]
+    async fn an_archive_that_unpacks_to_more_than_the_limit_is_not_unpacked() {
+        let archive = archive(&json_files());
+        let (cache, dist, _requests, _dir) = setup(&archive, None);
+        let dist = dist.with_settings(DistSettings {
+            extract_max_size: 10,
+            ..DistSettings::default()
+        });
+        assert!(matches!(
+            std_docs(&cache, &dist, &linux(), None).await,
+            Err(DistError::TooLarge { limit: 10 })
+        ));
+    }
+
+    #[test]
+    fn the_settings_of_the_dist_are_read() {
+        let settings = Settings::from_sources(
+            None,
+            [
+                ("CHATORA_RUSTDOC_MCP_STD__FETCH_FROM_DIST", "false"),
+                ("CHATORA_RUSTDOC_MCP_LIMITS__EXTRACT_MAX_SIZE", "1GiB"),
+            ]
+            .map(|(name, value)| (name.into(), value.into())),
+        );
+        assert_eq!(DistSettings::from_settings(&settings), DistSettings {
+            fetch: false,
+            extract_max_size: 1024 * 1024 * 1024,
+        });
+        assert_eq!(
+            DistSettings::from_settings(&Settings::default()),
+            DistSettings::default()
+        );
     }
 
     #[tokio::test]

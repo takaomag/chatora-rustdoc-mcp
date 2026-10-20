@@ -15,9 +15,10 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use chatora_rustdoc_mcp::{
     data::{
+        Network,
         archive::Mapped,
         cache::Cache,
-        dist::{self, Dist, NightlyDate, StdCrate, StdDocs},
+        dist::{self, Dist, DistSettings, NightlyDate, StdCrate, StdDocs},
         rustdoc_json,
         target::TargetTriple,
     },
@@ -36,7 +37,7 @@ fn linux() -> TargetTriple {
 /// The JSON of std of the nightly of `date`, or the latest.
 async fn std_docs(date: Option<&str>) -> (Cache, StdDocs) {
     let cache = Cache::open_default().expect("the cache directory is known");
-    let dist = Dist::new().expect("an HTTP client");
+    let dist = Dist::new(&Network::default(), DistSettings::default()).expect("an HTTP client");
     let date: Option<NightlyDate> = date.map(|date| date.parse().expect("a date"));
     let started = Instant::now();
     let docs = dist::std_docs(&cache, &dist, &linux(), date.as_ref())

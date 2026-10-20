@@ -152,9 +152,13 @@ impl StdJson {
 /// latest nightly from the distribution server. If the server has none for `target`, that for
 /// `host` stands in, with a warning. rustup runs in `neutral_dir`, where no project settings apply.
 ///
+/// When `dist` may not fetch (`std.fetch_from_dist`), the nightly here is taken even if it is
+/// older, with a warning (requirement R-STD-1).
+///
 /// # Errors
 ///
-/// Returns an error when the JSON must come from the distribution server and cannot.
+/// Returns an error when the JSON must come from the distribution server and cannot, or when it
+/// may not and there is no nightly here to take it from.
 pub async fn choose(
     cache: &Cache,
     dist: &Dist,
@@ -163,7 +167,12 @@ pub async fn choose(
     host: &TargetTriple,
     at_least: Option<&Version>,
 ) -> Result<Chosen, DistError> {
-    let why = match local(neutral_dir, target, at_least).await {
+    if !dist.fetches() {
+        return local(neutral_dir, target, at_least, false)
+            .await
+            .map_err(|why| DistError::Disabled { why: why.into() });
+    }
+    let why = match local(neutral_dir, target, at_least, true).await {
         Ok(chosen) => {
             // The archives of the local nightly are kept in the cache too.
             if let Ok((dir, _)) = chosen.json.archive_key(cache, StdCrate::Std) {
@@ -208,14 +217,16 @@ pub async fn choose(
     })
 }
 
-/// The JSON of the nightly toolchain installed here, or why it is not used.
+/// The JSON of the nightly toolchain installed here, or why it is not used. One older than
+/// `at_least` is not used if `refuse_older`, and is used with a warning otherwise.
 #[cfg(feature = "local")]
 async fn local(
     neutral_dir: &Path,
     target: &TargetTriple,
     at_least: Option<&Version>,
+    refuse_older: bool,
 ) -> Result<Chosen, Cow<'static, str>> {
-    let local = local_std::local_std(neutral_dir, at_least)
+    let local = local_std::local_std(neutral_dir, at_least.filter(|_| refuse_older))
         .await
         .map_err(|why| Cow::Owned(why.to_string()))?;
     if local.rustc.host != *target {
@@ -229,6 +240,28 @@ async fn local(
             "the nightly toolchain here writes rustdoc JSON format {format}, which this server \
              does not read"
         )));
+    }
+    if !refuse_older {
+        let mut warnings = Vec::new();
+        if let Some(at_least) = at_least
+            && !local_std::is_at_least(&local.rustc.release, at_least)
+        {
+            warnings.push(
+                format!(
+                    "the nightly toolchain here ({}) is older than the project's ({at_least}), so \
+                     std may lack what the project can use",
+                    local.rustc.release
+                )
+                .into(),
+            );
+        }
+        return Ok(Chosen {
+            json: StdJson::Local(local),
+            why: Cow::Borrowed(
+                "std.fetch_from_dist is false, so the nightly toolchain here is used",
+            ),
+            warnings,
+        });
     }
     Ok(Chosen {
         json: StdJson::Local(local),
@@ -249,6 +282,7 @@ async fn local(
     _neutral_dir: &Path,
     _target: &TargetTriple,
     _at_least: Option<&Version>,
+    _refuse_older: bool,
 ) -> Result<Chosen, Cow<'static, str>> {
     Err(Cow::Borrowed(
         "this server is built without local features, so it does not look for a nightly toolchain",
@@ -513,7 +547,10 @@ mod tests {
     use super::*;
     use crate::data::{
         cache,
-        dist::tests::{archive, json_files, linux, setup},
+        dist::{
+            DistSettings,
+            tests::{archive, json_files, linux, setup},
+        },
         test_http,
     };
 
@@ -642,6 +679,37 @@ xz_hash = "{}"
         let kept = fs::read_to_string(dir.path().join("std/readable-x86_64-unknown-linux-gnu"))
             .expect("kept");
         assert_eq!(kept, "2026-10-17");
+    }
+
+    /// With `std.fetch_from_dist` false, the server is not asked: the nightly here gives the JSON,
+    /// even an older one, or there is none (requirements R-STD-1 and R-STD-4).
+    #[tokio::test]
+    async fn without_the_dist_nothing_is_fetched() {
+        let archive = archive(&json_files());
+        let (cache, dist, requests, dir) = setup(&archive, None);
+        let dist = dist.with_settings(DistSettings {
+            fetch: false,
+            ..DistSettings::default()
+        });
+        // A release that no nightly here is as new as.
+        let future = Version::new(999, 0, 0);
+        match choose(&cache, &dist, dir.path(), &linux(), &linux(), Some(&future)).await {
+            Ok(chosen) => {
+                assert!(
+                    !matches!(chosen.json, StdJson::Dist(_)),
+                    "from here: {chosen:?}"
+                );
+                assert!(
+                    chosen
+                        .warnings
+                        .iter()
+                        .any(|warning| warning.contains("older than the project's")),
+                    "{chosen:?}"
+                );
+            },
+            Err(error) => assert!(matches!(error, DistError::Disabled { .. }), "{error:?}"),
+        }
+        assert!(requests.try_recv().is_err(), "nothing is fetched");
     }
 
     #[tokio::test]

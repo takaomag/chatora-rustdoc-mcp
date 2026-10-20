@@ -42,6 +42,7 @@ use std::{
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
+pub use self::http::Network;
 use self::{
     cache::{Cache, CachedJson, with_suffix},
     crate_name::CrateName,

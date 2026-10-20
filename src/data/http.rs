@@ -5,6 +5,8 @@ use std::{error::Error, time::Duration};
 
 use reqwest::{StatusCode, header};
 
+use crate::config::Settings;
+
 /// Identifies this server and how to reach its maintainers (requirement R-NW-1).
 pub(super) const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_NAME"),
@@ -15,12 +17,54 @@ pub(super) const USER_AGENT: &str = concat!(
     ")"
 );
 
-/// Longest wait for a connection (requirement R-NW-2, initial value).
+/// `network.connect_timeout_secs` unless set: the longest wait for a connection (requirement
+/// R-NW-2, initial value).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Longest silence while the body is received (requirement R-NW-2, initial value). It is not a
-/// limit on the whole transfer, so that a large body over a slow line is not cut off.
+/// `network.read_timeout_secs` unless set: the longest silence while the body is received
+/// (requirement R-NW-2, initial value). It is not a limit on the whole transfer, so that a large
+/// body over a slow line is not cut off.
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The settings of the requests to the sources, `network.*` (requirements R-NW-2 and R-DIST-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Network {
+    /// The longest wait for a connection.
+    pub connect_timeout: Duration,
+    /// The longest silence while a body is received.
+    pub read_timeout: Duration,
+}
+
+impl Default for Network {
+    fn default() -> Self {
+        Self {
+            connect_timeout: CONNECT_TIMEOUT,
+            read_timeout: READ_TIMEOUT,
+        }
+    }
+}
+
+impl Network {
+    /// The settings that `settings` give, or the defaults.
+    #[must_use]
+    pub fn from_settings(settings: &Settings) -> Self {
+        let seconds = |key| {
+            settings.get(key, |value| {
+                value
+                    .whole_number()
+                    .filter(|seconds| *seconds > 0)
+                    .map(Duration::from_secs)
+                    .ok_or("a whole number of seconds from 1")
+            })
+        };
+        let default = Self::default();
+        Self {
+            connect_timeout: seconds("network.connect_timeout_secs")
+                .unwrap_or(default.connect_timeout),
+            read_timeout: seconds("network.read_timeout_secs").unwrap_or(default.read_timeout),
+        }
+    }
+}
 
 /// Most memory reserved for a body before it arrives, whatever its `content-length` says. A
 /// larger body grows the buffer as it comes, so a server cannot make the client reserve the whole
@@ -53,11 +97,11 @@ pub(super) enum BodyError {
 }
 
 /// The settings of the HTTP clients.
-pub(super) fn client_builder() -> reqwest::ClientBuilder {
+pub(super) fn client_builder(network: &Network) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_TIMEOUT)
+        .connect_timeout(network.connect_timeout)
+        .read_timeout(network.read_timeout)
         .redirect(reqwest::redirect::Policy::custom(redirect))
 }
 
@@ -213,6 +257,23 @@ pub(super) fn exceeds(len: usize, limit: u64) -> bool {
 mod tests {
     use super::{super::test_http::serve_sequence_with, *};
 
+    #[test]
+    fn the_timeouts_are_read_from_the_settings() {
+        let settings = Settings::from_sources(
+            None,
+            [
+                ("CHATORA_RUSTDOC_MCP_NETWORK__CONNECT_TIMEOUT_SECS", "3"),
+                ("CHATORA_RUSTDOC_MCP_NETWORK__READ_TIMEOUT_SECS", "0"),
+            ]
+            .map(|(name, value)| (name.into(), value.into())),
+        );
+        assert_eq!(Network::from_settings(&settings), Network {
+            connect_timeout: Duration::from_secs(3),
+            read_timeout: READ_TIMEOUT,
+        });
+        assert_eq!(settings.problems().len(), 1, "0 is not valid");
+    }
+
     #[tokio::test]
     async fn redirects_are_followed_only_within_the_host() {
         let (base_url, _requests) = serve_sequence_with(|base_url| {
@@ -230,7 +291,9 @@ mod tests {
                 ),
             ]
         });
-        let client = client_builder().build().expect("a client");
+        let client = client_builder(&Network::default())
+            .build()
+            .expect("a client");
         let response = send(client.get(format!("{base_url}/first")))
             .await
             .expect("followed");

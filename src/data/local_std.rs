@@ -154,7 +154,7 @@ fn parse_rustc_version(output: &str) -> Option<RustcVersion> {
 
 /// Whether the release `release` (as `1.101.0-nightly`) is at least `at_least`, comparing only
 /// the numbers: a nightly of 1.101 has what 1.100 stable has.
-fn is_at_least(release: &str, at_least: &Version) -> bool {
+pub(super) fn is_at_least(release: &str, at_least: &Version) -> bool {
     Version::parse(release).is_ok_and(|release| {
         (release.major, release.minor, release.patch)
             >= (at_least.major, at_least.minor, at_least.patch)

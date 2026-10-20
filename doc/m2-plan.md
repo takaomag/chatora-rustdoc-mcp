@@ -292,6 +292,12 @@ Claude Code 2.1.304、Linux で測った。
 - テストのサーバーは、空の設定ファイルを `CHATORA_RUSTDOC_MCP_CONFIG` で指して起動し、テストを回す人の設定ファイルを読まない
 - 途中で、build.rs を書き換えた直後に rust-analyzer の検査と cargo が競合したらしく、build script の古いバイナリが残り、新しい変数が見えなかった。`cargo clean -p chatora-rustdoc-mcp` で直した (このパッケージの生成物 57.7 GiB が消え、作り直した)
 
+**A3b-1 (通信のタイムアウト・展開の上限・dist の無効化。2026-10-20)**: A3b を、すでに動きのある設定をつなぐ A3b-1 と、オフラインモードの A3b-2 に分けた。`build.*`・`cache.*`・`limits.concurrent_builds`・`limits.request_timeout_secs` は、それを使う段 (C3・D・F) で足す (使わないキーを読む一覧に入れると、効かない設定が黙って受け付けられるため)
+
+- `network.connect_timeout_secs`・`network.read_timeout_secs`: `data::Network` に持ち、各取得元 (docs.rs・sparse index・static.crates.io・dist) の `new` に渡す。1 以上の整数の秒
+- `limits.extract_max_size` (既定 4GiB): 今ディスクに展開するのは std の dist のアーカイブだけなので、その合計の上限 (M1 の固定の 2GiB) を置き換えた。1 ファイルの上限 (512MiB。メモリで解析する上限) はそのまま。`.crate` の展開 (R-SC-2) は M3
+- `std.fetch_from_dist` (既定 true): false なら dist に要求を出さない。手元の nightly は、プロジェクトの toolchain より古くても warnings を付けて使う (R-STD-1)。手元に無ければ (または使えなければ) `toolchain_missing` に導入コマンドを添えて返す (R-STD-4。`DistError::Disabled`)。dist から前に取ってキャッシュにある std も使わない (設定の意味を「dist のものを使わない」と読んだ)
+
 ### 6.3 M2b
 
 (まだ無い)

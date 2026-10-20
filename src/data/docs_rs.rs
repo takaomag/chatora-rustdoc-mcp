@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 
 use super::{
     crate_name::CrateName,
-    http::{self, BodyError},
+    http::{self, BodyError, Network},
     target::TargetTriple,
 };
 
@@ -93,8 +93,8 @@ impl DocsRs {
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be set up (for example, TLS).
-    pub fn new() -> Result<Self, reqwest::Error> {
-        Self::with_base_url(DEFAULT_BASE_URL)
+    pub fn new(network: &Network) -> Result<Self, reqwest::Error> {
+        Self::with_base_url(DEFAULT_BASE_URL, network)
     }
 
     /// A client for a server at `base_url` that serves the docs.rs URLs, such as a mirror or a
@@ -103,9 +103,9 @@ impl DocsRs {
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be set up (for example, TLS).
-    pub fn with_base_url(base_url: &str) -> Result<Self, reqwest::Error> {
+    pub fn with_base_url(base_url: &str, network: &Network) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            client: http::client_builder().build()?,
+            client: http::client_builder(network).build()?,
             base_url: base_url.into(),
             fetches: Arc::new(Semaphore::new(MAX_FETCHES)),
         })
@@ -116,7 +116,7 @@ impl DocsRs {
     #[cfg(test)]
     pub(super) fn for_local_test(base_url: &str) -> Self {
         Self {
-            client: http::client_builder()
+            client: http::client_builder(&Network::default())
                 .no_proxy()
                 .build()
                 .expect("the client builds"),

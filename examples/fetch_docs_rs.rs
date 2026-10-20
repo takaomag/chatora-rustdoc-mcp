@@ -41,7 +41,8 @@ async fn main() -> ExitCode {
     }
     let opened = Cache::open(&settings);
     settings.report();
-    let (cache, docs_rs) = match (opened, DocsRs::new()) {
+    let network = data::Network::from_settings(&settings);
+    let (cache, docs_rs) = match (opened, DocsRs::new(&network)) {
         (Ok(cache), Ok(docs_rs)) => (cache, docs_rs),
         (Err(error), _) => {
             eprintln!("failed to open the cache: {error}");
