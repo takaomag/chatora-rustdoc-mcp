@@ -3,12 +3,14 @@
 //! M2's D2).
 
 use std::{
+    collections::HashSet,
     fs,
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
+use parking_lot::Mutex;
 use tokio::time::Instant;
 
 use super::load::{self, Archived, LoadError};
@@ -41,6 +43,8 @@ pub struct LocalWanted {
 pub struct LocalBuilt {
     /// The archive, and what the response warns about.
     pub archived: Archived,
+    /// The JSON in the cache.
+    pub json: PathBuf,
     /// The record of the build, for the provenance (requirement R-OUT-9).
     pub record: BuildRecord,
 }
@@ -153,6 +157,8 @@ async fn build_and_archive(
         },
         Err(error) => return Err(LocalError::Choose(error)),
     }
+    // As asked, for the build with the nightly too, whatever the first build did.
+    let cfg_docsrs = plan.cfg_docsrs;
     let built = build_with(
         cache,
         &mut plan,
@@ -176,6 +182,7 @@ async fn build_and_archive(
         match choose().await {
             Ok(Chosen::Nightly { toolchain, .. }) => {
                 plan.toolchain = Some(toolchain);
+                plan.cfg_docsrs = cfg_docsrs;
                 built = build_with(
                     cache,
                     &mut plan,
@@ -251,12 +258,43 @@ async fn build_with(
     let host = checked.as_ref().and_then(|checked| checked.host.as_ref());
     plan.target = build::passes_target(target, host, project_sets_target).then(|| target.clone());
     let toolchain = checked.and_then(|checked| checked.toolchain);
-    build::build(cache, plan, work, toolchain.as_deref(), |doing| {
-        stage.set(doing);
-    })
-    .await
-    .map_err(LocalError::Build)
+    // A member whose build `--cfg docsrs` broke is built without it from then on (decided in M2's
+    // D3), with the toolchain that built it: the one that rustc tells, if it did.
+    let broke = (
+        plan.package.0.clone(),
+        toolchain.clone().or_else(|| plan.toolchain.clone()),
+    );
+    if plan.cfg_docsrs && DOCSRS_BROKE.lock().contains(&broke) {
+        plan.cfg_docsrs = false;
+    }
+    let mut tell = |doing| stage.set(doing);
+    match build::build(cache, plan, work, toolchain.as_deref(), &mut tell).await {
+        // Only the documented crate's rustdoc has it, so only its errors may be of it.
+        Err(BuildError::Failed {
+            in_documented: true,
+            ..
+        }) if plan.cfg_docsrs => {
+            tracing::info!(package = %plan.package.0, "the build failed with --cfg docsrs, so it is tried without");
+            plan.cfg_docsrs = false;
+            let retried = build::build(cache, plan, work, toolchain.as_deref(), &mut tell).await;
+            // It broke the build only if the build works without it: an error of the crate's own
+            // fails both, and is not remembered, so that the build has it again once fixed.
+            if retried.is_ok() {
+                DOCSRS_BROKE.lock().insert(broke);
+            }
+            retried.map_err(LocalError::Build)
+        },
+        built => built.map_err(LocalError::Build),
+    }
 }
+
+/// The members whose build `--cfg docsrs` broke, by package id and toolchain, for the life of the
+/// process (decided in M2's D3).
+static DOCSRS_BROKE: LazyLock<Mutex<HashSet<BuildKey>>> = LazyLock::new(Mutex::default);
+
+/// A member's build, by its package id and its toolchain: as `rustc -vV` tells it, or else the one
+/// that the server chose instead of the project's.
+type BuildKey = (Box<str>, Option<String>);
 
 /// The archive of the JSON that `built` published, keyed by its SHA-256, which it must still have.
 async fn archive(cache: &Cache, built: Built) -> Result<LocalBuilt, LocalError> {
@@ -266,6 +304,13 @@ async fn archive(cache: &Cache, built: Built) -> Result<LocalBuilt, LocalError> 
         warnings.push(
             "the names of the project's crates were too many for RUSTC_BOOTSTRAP, so it was 1: \
              build scripts that look for nightly features may have found them"
+                .into(),
+        );
+    }
+    if !record.cfg_docsrs && build::cfg_docsrs() {
+        warnings.push(
+            "built without --cfg docsrs, as its build failed with it: what the crate documents \
+             only for docs.rs is not shown"
                 .into(),
         );
     }
@@ -285,9 +330,10 @@ async fn archive(cache: &Cache, built: Built) -> Result<LocalBuilt, LocalError> 
         record.sha256.clone(),
         record.format_version.to_string(),
     );
+    let path = json.clone();
     let mapped = crate::task::spawn_blocking(move || {
-        let dir = json.parent().unwrap_or(&json);
-        load::archive_of(&cache, dir, &stem, &sha256, || read_checked(&json, &sha256))
+        let dir = path.parent().unwrap_or(&path);
+        load::archive_of(&cache, dir, &stem, &sha256, || read_checked(&path, &sha256))
     })
     .await
     .map_err(|error| {
@@ -298,6 +344,7 @@ async fn archive(cache: &Cache, built: Built) -> Result<LocalBuilt, LocalError> 
     .map_err(LocalError::Load)?;
     Ok(LocalBuilt {
         archived: Archived { mapped, warnings },
+        json,
         record,
     })
 }

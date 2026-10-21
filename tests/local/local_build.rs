@@ -53,8 +53,13 @@ fn workspace(dir: &Path) -> PathBuf {
 
 /// The names of the items of the published JSON.
 fn items(built: &Built) -> BTreeSet<String> {
+    items_at(&built.json)
+}
+
+/// The names of the items of the JSON at `path`.
+fn items_at(path: &Path) -> BTreeSet<String> {
     let json: serde_json::Value =
-        serde_json::from_slice(&fs::read(&built.json).expect("published")).expect("JSON");
+        serde_json::from_slice(&fs::read(path).expect("published")).expect("JSON");
     json["index"]
         .as_object()
         .expect("an index")
@@ -83,6 +88,7 @@ fn plan(
         crate_name: name.into(),
         version: package.version.clone(),
         target,
+        cfg_docsrs: true,
     }
 }
 
@@ -256,4 +262,86 @@ async fn a_member_is_built_and_archived_for_the_calls_that_want_it() {
         "{:?}",
         first.archived.warnings
     );
+}
+
+#[tokio::test]
+async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
+    use chatora_rustdoc_mcp::{
+        data::{
+            flight::{Flights, Joined},
+            owner::Owner,
+        },
+        query::local::{LocalBuilt, LocalWanted, local_archive},
+    };
+
+    let Some(dir) =
+        in_isolated_child("local_build::a_member_that_breaks_with_docsrs_is_built_without_it")
+    else {
+        return;
+    };
+    let root = workspace(&dir);
+    let workspace = project::workspace_of(&root).expect("a workspace");
+    let resolver = Resolver::new(true);
+    let resolution = resolver.resolve(&workspace).await.expect("resolved");
+    let Resolution::Metadata { metadata, .. } = &*resolution else {
+        panic!("cargo metadata works offline here: {resolution:?}");
+    };
+    let host = host_target(&dir).await.triple;
+    let cache = Cache::at(&dir.join("cache"));
+    // The work directories are this process's.
+    Owner::start_this(&cache);
+    let flights = Flights::handing_over();
+    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    // A member whose build `--cfg docsrs` breaks is built without it, with a warning (decided in
+    // M2's D3).
+    let wanted = |name: &str| LocalWanted {
+        plan: plan(metadata, &workspace.root, &cache, name, None),
+        target: host.clone(),
+        project_sets_target: false,
+        cargo_home: resolver.cargo_home().map(Path::to_path_buf),
+    };
+    let without = |built: &LocalBuilt| {
+        !built.record.cfg_docsrs
+            && built
+                .archived
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("without --cfg docsrs"))
+    };
+    let Joined::Done(Ok(broken)) = local_archive(&flights, &cache, wanted("broken"), until).await
+    else {
+        panic!("built without --cfg docsrs");
+    };
+    assert!(without(&broken), "{:?}", broken.archived.warnings);
+    // And so from then on: with sources that build with it, what is only for docs.rs is not there.
+    fs::write(
+        workspace.root.join("broken/src/lib.rs"),
+        "/// A function.\npub fn works() {}\n\n/// Only for docs.rs.\n#[cfg(docsrs)]\npub fn docsrs_only() {}\n",
+    )
+    .expect("written");
+    let Joined::Done(Ok(again)) = local_archive(&flights, &cache, wanted("broken"), until).await
+    else {
+        panic!("built");
+    };
+    assert!(without(&again), "{:?}", again.archived.warnings);
+    assert!(!items_at(&again.json).contains("docsrs_only"));
+    // An error of the crate's own is not taken for one of `--cfg docsrs`: once it is fixed, the
+    // build has it again.
+    let source = workspace.root.join("typo/src/lib.rs");
+    let fine = fs::read_to_string(&source).expect("readable");
+    fs::write(&source, "pub fn broken() -> Missing {}\n").expect("written");
+    let failed = local_archive(&flights, &cache, wanted("typo"), until).await;
+    assert!(matches!(failed, Joined::Done(Err(_))), "{failed:?}");
+    fs::write(&source, fine).expect("written");
+    let Joined::Done(Ok(fixed)) = local_archive(&flights, &cache, wanted("typo"), until).await
+    else {
+        panic!("built once fixed");
+    };
+    assert!(fixed.record.cfg_docsrs);
+    assert!(
+        fixed.archived.warnings.is_empty(),
+        "{:?}",
+        fixed.archived.warnings
+    );
+    assert!(items_at(&fixed.json).contains("docsrs_only"));
 }

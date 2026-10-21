@@ -739,6 +739,28 @@ Claude Code 2.1.304、Linux で測った。
 2. `--cfg docsrs` で壊れた member は、package id と toolchain を鍵にプロセスの間だけ覚え、次からは外してビルドして warning。ディスクに残して `refresh` で消すのは D4・D5
 3. member の `[package.metadata.docs.rs]` の `rustdoc-args` は、`--cfg <名前>` と `--cfg=<名前>` だけを、名前が cfg の文法に合うときに最後の rustdoc に渡す (要件の案)。入れるのは member の Cargo.toml を読む D3e。その cfg で壊れたら docsrs と一緒に外して再試行する
 
+**D3b (`--cfg docsrs` を外しての再試行。2026-10-21)**:
+
+- 実測 (stable 1.99.1): `#![cfg_attr(docsrs, feature(doc_auto_cfg))]` の crate は、`--cfg docsrs` を付けると文書化する crate 自身に `E0557` (feature has been removed) と `Compilation failed, aborting rustdoc` が出て失敗し、外すと成功する。compiler のメッセージには `package_id` と `target` がある
+- 設定 `build.cfg_docsrs` (既定 true。README)。`Plan::cfg_docsrs` で `--cfg docsrs` を付けるかを決める。`BuildRecord::cfg_docsrs`
+- `Messages` が、文書化する crate (package id と target で照らす) の `error` を見分け、`BuildError::Failed::in_documented` に
+- `query::local::build_with`: `--cfg docsrs` 付きで文書化する crate のエラーで失敗したら、(package id, サーバーが選んだ toolchain) をプロセスの間覚えて、外してもう 1 回ビルドする。覚えてあれば最初から外す (決定 1・2)。記録が `--cfg docsrs` なしで設定がオンなら warning
+- テスト: 文書化する crate の error だけを見分ける (依存の error・warning では見分けない)。fixture に `broken` (`doc_auto_cfg`) と `typo` (`#[cfg(docsrs)]` の item を持つ) を足した。`broken` は `--cfg docsrs` なしで作り直して warning が付き、`--cfg docsrs` 付きでも通るソースに直しても覚えているので外したまま (`docsrs_only` が出ないことで、1 回目の試行を飛ばしたとわかる)。`typo` に普通のコンパイルエラーを入れて失敗させ、直すと `--cfg docsrs` 付きに戻る (コードを「失敗しても覚える」に変えるとこのテストが落ちることを確かめた)
+- 前提を渡さないレビュー (サブエージェント) の指摘と対応: 普通のコンパイルエラーでも再試行の前に「`--cfg docsrs` で壊れた」と覚えていた (直した後も外れたままで、誤った warning が付き続ける) ので、外した再試行が成功したときだけ覚える。両方失敗したら 2 回目 (外したほう) のエラーを返す。nightly で作り直すとき、前のビルドで外した状態を引き継いでいたので、元の値に戻す。記録の鍵の toolchain は、分かれば `rustc -vV` の要約 (途中で `rust-toolchain.toml` を変えても古い記録が効かない)。`LocalBuilt` に JSON のパスを持たせた (テストと D4 のため)。再試行して両方失敗したとき、外して試したことは応答に出ない (D5 で検討)
+
+**D3c (Q-31 の実測。2026-10-21、cargo 1.99.1、resolver 2)**: scratchpad に、member `a`・`b`・proc-macro の `pm`、members に書いていないワークスペースの中の path 依存 `inner`、`default-members = ["a"]`、外の依存 `x` を作った。`a` は `x` (fa)・`inner` (既定)・`pm` に、`b` は `x` (fb)・`inner` (e)・`a` (feature `ae`) に、`pm` は `x` (fp) に依存する。`cargo metadata` の `workspace_members` には `inner` も入る (暗黙の member)。features は次のとおり:
+
+| パッケージ | `cargo tree --workspace -e normal` | `cargo rustdoc -p a` | `cargo build` (default-members) | `cargo build --workspace` | `cargo rustdoc -p b` |
+| --- | --- | --- | --- | --- | --- |
+| `a` | ad, ae, default | ad, default | ad, default | ad, ae, default | ad, ae, default |
+| `inner` | d, default, e | d, default | d, default | d, default, e | d, default, e |
+| `x` (target) | fa, fb, fp | fa | fa | fa, fb, fp | fa, fb |
+| `x` (host) | fp | fp | fp | fp | fp |
+
+- `-p a` は引数なしの `cargo build` (default-members) と同じ組、`cargo tree --workspace` は `cargo build --workspace` と同じ組で、`enabled_in_project` (`cargo tree --workspace` から) と D2 のビルド (`-p`) が食い違う: `a` の `ae` は workspace では有効 (`b` が有効にする) だが、`-p a` のドキュメントには `ae` の item が無い
+- rust-analyzer は既定で `--workspace` を check するので、エディタで見えるのは統合された組
+- `-p a` に features を明示しても、依存 (`x`) の組は `a` の分しか統合されない。`a` のドキュメントに出るのは `a` 自身の item なので、依存の組の違いは re-export の行き先 (D6) の話
+
 ### 6.6 M2e
 
 (まだ無い)

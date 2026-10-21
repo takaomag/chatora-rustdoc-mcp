@@ -51,6 +51,17 @@ const LIB_KINDS: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib", "pro
 /// The jobs of a build, as the setting `build.jobs` gives them.
 static JOBS: OnceLock<NonZeroUsize> = OnceLock::new();
 
+/// Whether the documented crate's rustdoc gets `--cfg docsrs`, as the setting `build.cfg_docsrs`
+/// says (requirement R-WS-1).
+static CFG_DOCSRS: OnceLock<bool> = OnceLock::new();
+
+/// Whether a build passes `--cfg docsrs` first: `build.cfg_docsrs`, which is on unless set off
+/// (requirement R-WS-1).
+#[must_use]
+pub fn cfg_docsrs() -> bool {
+    CFG_DOCSRS.get().copied().unwrap_or(true)
+}
+
 /// The builds that run at once in this process, unless `limits.concurrent_builds` sets it
 /// (requirement R-SEC-7, initial value).
 const DEFAULT_CONCURRENT_BUILDS: usize = 2;
@@ -121,9 +132,13 @@ pub fn set_this(settings: &Settings) {
     if let Some(secs) = run_time {
         super::cargo::set_run_time(Duration::from_secs(secs));
     }
+    let docsrs = settings.get("build.cfg_docsrs", |value| {
+        value.boolean().ok_or("true or false")
+    });
+    let docsrs_set = docsrs.is_none_or(|docsrs| CFG_DOCSRS.set(docsrs).is_ok());
     let jobs_set = jobs.is_none_or(|jobs| JOBS.set(jobs).is_ok());
     let slots_set = slots.is_none_or(|count| SLOTS.set(Slots::new(count)).is_ok());
-    if !(jobs_set && slots_set) {
+    if !(docsrs_set && jobs_set && slots_set) {
         tracing::debug!("the settings of the builds were read before");
     }
     if let Some(value) = std::env::var_os("RUSTC_BOOTSTRAP") {
@@ -446,12 +461,14 @@ pub struct Plan {
     pub version: Version,
     /// The target passed as `--target`, if any.
     pub target: Option<TargetTriple>,
+    /// Whether the documented crate's rustdoc gets `--cfg docsrs` (requirement R-WS-1).
+    pub cfg_docsrs: bool,
 }
 
 impl Plan {
     /// The command (requirement R-WS-1): `cargo [+<toolchain>] --locked [--offline] rustdoc -j
     /// <jobs> -p <package id> (--lib | --bin <name>) [--target <target>] --message-format=json --
-    /// -Z unstable-options --output-format json --cfg docsrs --document-private-items`, with the
+    /// -Z unstable-options --output-format json [--cfg docsrs] --document-private-items`, with the
     /// value of `RUSTC_BOOTSTRAP` in place of the user's, and the target directory.
     #[must_use]
     pub fn command(&self) -> tokio::process::Command {
@@ -470,20 +487,21 @@ impl Plan {
         if let Some(target) = &self.target {
             command.arg("--target").arg(target.as_str());
         }
+        command.args([
+            "--message-format=json",
+            "--",
+            "-Z",
+            "unstable-options",
+            "--output-format",
+            "json",
+        ]);
+        // Only the documented crate's rustdoc has it (requirement R-WS-1).
+        if self.cfg_docsrs {
+            command.args(["--cfg", "docsrs"]);
+        }
         command
-            .args([
-                "--message-format=json",
-                "--",
-                "-Z",
-                "unstable-options",
-                "--output-format",
-                "json",
-                // Only the documented crate's rustdoc has it (requirement R-WS-1).
-                "--cfg",
-                "docsrs",
-                // A member's private items too (requirement R-WS-3).
-                "--document-private-items",
-            ])
+            // A member's private items too (requirement R-WS-3).
+            .arg("--document-private-items")
             .env("RUSTC_BOOTSTRAP", self.bootstrap.value())
             .env("CARGO_TARGET_DIR", self.target_dir.target())
             .env("CARGO_BUILD_BUILD_DIR", self.target_dir.build());
@@ -573,6 +591,8 @@ pub struct BuildRecord {
     pub features_effective: Option<Vec<Box<str>>>,
     /// Whether `RUSTC_BOOTSTRAP` was `1`, as the names were too long (decided in M2's D2).
     pub bootstrap_all: bool,
+    /// Whether the documented crate's rustdoc had `--cfg docsrs` (requirement R-WS-1).
+    pub cfg_docsrs: bool,
     /// The SHA-256 of the JSON.
     pub sha256: Box<str>,
 }
@@ -588,6 +608,9 @@ pub enum BuildError {
     Failed {
         /// How, as its messages tell (requirement R-WS-7).
         failure: Failure,
+        /// Whether the documented crate's rustdoc had an error, which `--cfg docsrs` may cause
+        /// (decided in M2's D3).
+        in_documented: bool,
         /// The first errors of the compiler.
         errors: Vec<Box<str>>,
         /// The end of its stderr.
@@ -666,6 +689,7 @@ pub async fn build(
     if !output.status.success() {
         return Err(BuildError::Failed {
             failure: classify(&output, plan.offline),
+            in_documented: messages.documented_failed,
             errors: messages.errors,
             stderr: stderr_tail(&output),
         });
@@ -708,6 +732,7 @@ pub async fn build(
         built_at: super::rfc3339(SystemTime::now()).into(),
         features_effective: messages.features,
         bootstrap_all: plan.bootstrap == Bootstrap::All,
+        cfg_docsrs: plan.cfg_docsrs,
         sha256: sha256.into(),
     };
     let dir = plan.published_dir(cache.dir(), target.as_ref());
@@ -811,6 +836,8 @@ struct Messages<'a> {
     features: Option<Vec<Box<str>>>,
     /// Whether cargo found the documented crate fresh, from the same message.
     documented_fresh: Option<bool>,
+    /// Whether the compiler had an error in the documented crate.
+    documented_failed: bool,
     /// The units that were built rather than fresh.
     rebuilt: Vec<Box<str>>,
     /// The first errors of the compiler, rendered.
@@ -854,6 +881,7 @@ impl<'a> Messages<'a> {
             plan,
             features: None,
             documented_fresh: None,
+            documented_failed: false,
             rebuilt: Vec::new(),
             errors: Vec::new(),
         }
@@ -883,11 +911,24 @@ impl<'a> Messages<'a> {
                 }
             },
             "compiler-message" => {
-                if let Some(Diagnostic {
-                    level,
-                    rendered: Some(rendered),
-                }) = message.diagnostic
-                    && &*level == "error"
+                let Some(Diagnostic { level, rendered }) = message.diagnostic else {
+                    return;
+                };
+                if &*level != "error" {
+                    return;
+                }
+                if message
+                    .package_id
+                    .as_deref()
+                    .is_some_and(|id| self.plan.package.is(id))
+                    && message
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| self.is_documented(target))
+                {
+                    self.documented_failed = true;
+                }
+                if let Some(rendered) = rendered
                     && self.errors.len() < MAX_ERRORS
                 {
                     self.errors.push(rendered);
@@ -1161,6 +1202,7 @@ mod tests {
             crate_name: "app".into(),
             version: Version::new(0, 1, 0),
             target: target.map(|target| target.parse().expect("a triple")),
+            cfg_docsrs: true,
         }
     }
 
@@ -1258,6 +1300,32 @@ mod tests {
     }
 
     #[test]
+    fn only_an_error_of_the_documented_crate_is_told_apart() {
+        let plan = app_plan(None, false);
+        let message = |package: &str, target: &str, level: &str| {
+            serde_json::json!({
+                "reason": "compiler-message",
+                "package_id": package,
+                "target": {"name": target, "kind": ["lib"]},
+                "message": {"level": level, "rendered": "error[E0557]: feature has been removed"},
+            })
+            .to_string()
+        };
+        let app = "path+file:///ws/app#0.1.0";
+        let mut messages = Messages::new(&plan);
+        messages.read(&message(
+            "registry+https://github.com/rust-lang/crates.io-index#dep@1.0.0",
+            "dep",
+            "error",
+        ));
+        messages.read(&message(app, "app", "warning"));
+        assert!(!messages.documented_failed);
+        assert_eq!(messages.errors.len(), 1);
+        messages.read(&message(app, "app", "error"));
+        assert!(messages.documented_failed);
+    }
+
+    #[test]
     fn the_keys_of_the_locks_do_not_change() {
         assert_eq!(target_key("0123456789ab.1"), "target:0123456789ab.1");
         assert_eq!(doc_key("0123456789ab.1"), "doc:0123456789ab.1");
@@ -1292,6 +1360,7 @@ mod tests {
             crate_name: "my_app".into(),
             version: Version::new(0, 1, 0),
             target: Some(other),
+            cfg_docsrs: true,
         };
         let command = plan.command();
         let command = command.as_std();
@@ -1359,6 +1428,7 @@ mod tests {
             crate_name: "macros".into(),
             version: Version::new(0, 1, 0),
             target: None,
+            cfg_docsrs: false,
         };
         let command = plan.command();
         let args: Vec<_> = command

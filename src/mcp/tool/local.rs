@@ -124,6 +124,7 @@ pub(super) async fn member(
         documented,
         version: package.version.clone(),
         target: None,
+        cfg_docsrs: build::cfg_docsrs(),
     };
     Ok(Member::Is {
         wanted: Box::new(LocalWanted {
@@ -313,6 +314,7 @@ fn build_error(what: &str, error: &BuildError) -> CallToolResult {
             failure,
             errors,
             stderr,
+            ..
         } => {
             let mut body = json!({
                 "code": project::failure_name(*failure),
