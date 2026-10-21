@@ -177,6 +177,7 @@ async fn build_and_archive(
         stage,
         docs_rs: docs_rs_features.as_deref(),
     };
+    let planned = warnings.len();
     let built = builder.build(&mut plan, installs, &mut warnings).await;
     let mut built = if installs {
         after_install(&rustc, &root, &target, built).await?
@@ -191,6 +192,8 @@ async fn build_and_archive(
             Ok(Chosen::Nightly { toolchain, .. }) => {
                 plan.toolchain = Some(toolchain);
                 (plan.cfg_docsrs, plan.features) = (cfg_docsrs, features);
+                // What the build that is not kept told.
+                warnings.truncate(planned);
                 built = builder.build(&mut plan, false, &mut warnings).await?;
             },
             Ok(Chosen::Project { format }) => {
@@ -283,7 +286,7 @@ impl Builder<'_> {
         if plan.cfg_docsrs && DOCSRS_BROKE.lock().contains(&key) {
             plan.cfg_docsrs = false;
         }
-        let projects = plan.features.clone();
+        let (projects, cfg_docsrs) = (plan.features.clone(), plan.cfg_docsrs);
         let docs_rs = self
             .docs_rs
             .filter(|_| !DOCS_RS_FEATURES_BROKE.lock().contains(&key));
@@ -313,18 +316,19 @@ impl Builder<'_> {
             }
         }
         // The features of `[package.metadata.docs.rs]` may break it, the documented crate or a
-        // dependency, as an error of the code tells; not what fetching or the lock tells.
-        if docs_rs.is_some()
-            && matches!(
-                built,
-                Err(BuildError::Failed {
-                    failure: Failure::Other,
-                    ..
-                })
-            )
-        {
+        // dependency, as the compiler's errors tell; not what fetching or the lock tells.
+        let compiler_failed = matches!(
+            &built,
+            Err(BuildError::Failed {
+                failure: Failure::Other,
+                errors,
+                ..
+            }) if !errors.is_empty()
+        );
+        if docs_rs.is_some() && compiler_failed {
             tracing::info!(package = %plan.package.0, "the build failed with the features of [package.metadata.docs.rs], so it is tried with the project's");
-            plan.features = projects;
+            // With `--cfg docsrs` as it began, which did not break it: it failed without it too.
+            (plan.features, plan.cfg_docsrs) = (projects, cfg_docsrs);
             built =
                 build::build(self.cache, plan, self.work, toolchain.as_deref(), &mut tell).await;
             if built.is_ok() {
@@ -376,7 +380,8 @@ async fn archive(
     }
     if !record.cfg_docsrs && build::cfg_docsrs() {
         warnings.push(
-            "built without --cfg docsrs, as its build failed with it: what the crate documents \
+            "built without --cfg docsrs, nor the --cfg of the rustdoc-args of its \
+             [package.metadata.docs.rs], as its build failed with them: what the crate documents \
              only for docs.rs is not shown"
                 .into(),
         );

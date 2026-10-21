@@ -204,11 +204,16 @@ async fn docs_rs_of(
             return DocsRsAsks::default();
         },
     };
-    let features = build::declared_features(package, &docs.features);
     let mut asks = DocsRsAsks {
         cfgs: docs.rustdoc_cfg,
         ..DocsRsAsks::default()
     };
+    // Only `features`, `all-features` and `no-default-features` ask for features (requirement
+    // R-FT-3); the project's are the same otherwise.
+    let features = build::declared_features(package, &docs.features);
+    if !docs.asks_features || projects == Some(&*features) {
+        return asks;
+    }
     if projects.is_some_and(|projects| features.iter().all(|feature| projects.contains(feature))) {
         asks.features = Some(features);
         return asks;

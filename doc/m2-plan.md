@@ -789,6 +789,18 @@ Claude Code 2.1.304、Linux で測った。
 - `query::local::Builder::build`: docs.rs の組 + `--cfg docsrs` (+ `cfgs`) で始め、文書化する crate のエラーなら `--cfg docsrs` を外し、それでも、または依存の、コードのエラー (`Failure::Other`) で失敗したら通常の組に戻す (最大 3 回)。それぞれ、外して通ったときだけ (package id, toolchain) をプロセスの間覚える (`DOCSRS_BROKE`・`DOCS_RS_FEATURES_BROKE`)。docs.rs の組でビルドしたら「`enabled_in_project` は通常の組」と warning、通常の組に戻したら warning。nightly で作り直すときは `cfg_docsrs` と組を最初の値に戻す
 - テスト: `rustdoc-args` の `--cfg` (値付き・`docsrs`・`rustc-args`・名前でないものを除く)、`asked`。stdio で 1 つのワークスペースの 3 つの member: 範囲の中の docs.rs の組 (`extra` の item が出て `features_requested: ["extra"]`、`rustdoc-args` の `--cfg my_cfg` の item も出る)、`all-features` がコンパイルエラーになる組 (通常の組で作り直して warning)、外の optional な依存を引き込む組 (通常の組で「would build opt 0.1.0」の warning)
 
+**D3e の後の直し (2026-10-21、D3e のコミットの後に届いたレビュー)**:
+
+- `[package.metadata.docs.rs]` の表があるだけで docs.rs の組を使っていた (`rustdoc-args` しか書いていない member が `--no-default-features --features default` になり、D3d で入れた組の一部が消え、毎回 warning)。R-FT-3 のとおり `features`・`all-features`・`no-default-features` のどれかがあるとき (`DocsRsBuild::asks_features`) だけ使い、組が通常の組と同じなら使わない
+- nightly で作り直すとき、捨てたビルドの warning が残って重なっていた。作り直す前に戻す
+- features が原因で 3 回目 (通常の組) まで行くと、`--cfg docsrs` を外したままビルドし、「`--cfg docsrs` で壊れた」と誤った warning が付き、次の呼び出しでは付いて中身が変わっていた。3 回目は `--cfg docsrs` を最初の値に戻す (features と `--cfg docsrs` の両方で壊れる member は毎回失敗する。まれ)
+- 通常の組に戻すのは、`Failure::Other` で compiler の `error` があるときだけ (ネットの一時的な失敗やインストールの失敗で戻して「壊れた」と覚えない)
+- 範囲の確かめの `cargo tree` を呼び出しのたびに走らせていたので、`Resolver` が (ワークスペース、target、package id、features) ごとに、解決が変わるまで覚える
+- `cargo metadata` に無いパッケージを、名前と版が同じ別の取得元のパッケージと取り違えうるので、範囲の確かめでは取得元も常に照らす (`Ids::exact`)
+- `--cfg docsrs` を外したときの warning に、`rustdoc-args` の `--cfg` も外したことを書いた
+- テスト: `rustdoc-args` しか書いていない member (`argsonly`) は通常の組で、warning が無く、`--cfg` は効く。`clash` は「`--cfg docsrs` なしで」の warning が無い。`wide` の `features_requested` は通常の組
+- 残したもの: 記憶の鍵に docs.rs の組と `cfgs` を入れること (`[package.metadata.docs.rs]` を書き換えても、プロセスの間は前の記憶が効く)。鍵は決めたとおり package id と toolchain のままで、内容のダイジェストを鍵にディスクへ残すのは D4 で決める
+
 ### 6.6 M2e
 
 (まだ無い)

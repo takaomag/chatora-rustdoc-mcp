@@ -1232,12 +1232,12 @@ fn built_item(server: &mut Server, first: u64, arguments: &Value) -> Value {
     found
 }
 
-/// A member's `[package.metadata.docs.rs]` is built with, with the `--cfg` of its `rustdoc-args`,
-/// unless its features break the build or build packages that the project's build does not:
-/// then the project's features are (requirements R-FT-3 and R-MCP-3, decided in M2's D3).
+/// A workspace in `ws/` of a new temporary directory, whose members' `[package.metadata.docs.rs]`
+/// asks for: features within the project's build, with `--cfg my_cfg` (`asked`); only `--cfg
+/// my_cfg` (`argsonly`); all its features, which clash (`clash`); all its features, which build an
+/// optional dependency outside (`wide`).
 #[cfg(feature = "local")]
-#[test]
-fn a_member_is_built_as_its_docs_rs_metadata_asks_when_it_may() {
+fn docs_rs_workspace() -> TempDir {
     let dir = TempDir::new().expect("a temporary directory");
     let write = |path: &str, text: &str| {
         let path = dir.path().join(path);
@@ -1249,7 +1249,7 @@ fn a_member_is_built_as_its_docs_rs_metadata_asks_when_it_may() {
     };
     write(
         "ws/Cargo.toml",
-        "[workspace]\nmembers = [\"asked\", \"clash\", \"wide\"]\nresolver = \"3\"\n",
+        "[workspace]\nmembers = [\"asked\", \"argsonly\", \"clash\", \"wide\"]\nresolver = \"3\"\n",
     );
     write(
         "ws/asked/Cargo.toml",
@@ -1285,6 +1285,20 @@ fn a_member_is_built_as_its_docs_rs_metadata_asks_when_it_may() {
         ),
     );
     write("ws/wide/src/lib.rs", "/// Always.\npub fn always() {}\n");
+    // Only `rustdoc-args`: no features are asked for, and the project's are built with.
+    write(
+        "ws/argsonly/Cargo.toml",
+        &package(
+            "argsonly",
+            "[features]\ndefault = [\"on\"]\non = []\n\n[package.metadata.docs.rs]\n\
+             rustdoc-args = [\"--cfg\", \"my_cfg\"]\n",
+        ),
+    );
+    write(
+        "ws/argsonly/src/lib.rs",
+        "#![allow(unexpected_cfgs)]\n/// With `on`.\n#[cfg(feature = \"on\")]\npub fn on() {}\n\
+         /// With `my_cfg`.\n#[cfg(my_cfg)]\npub fn cfged() {}\n",
+    );
     write("opt/Cargo.toml", &package("opt", ""));
     write("opt/src/lib.rs", "");
     let status = Command::new("cargo")
@@ -1297,6 +1311,16 @@ fn a_member_is_built_as_its_docs_rs_metadata_asks_when_it_may() {
         .status()
         .expect("cargo runs");
     assert!(status.success(), "cargo generate-lockfile");
+    dir
+}
+
+/// A member's `[package.metadata.docs.rs]` is built with, with the `--cfg` of its `rustdoc-args`,
+/// unless its features break the build or build packages that the project's build does not:
+/// then the project's features are (requirements R-FT-3 and R-MCP-3, decided in M2's D3).
+#[cfg(feature = "local")]
+#[test]
+fn a_member_is_built_as_its_docs_rs_metadata_asks_when_it_may() {
+    let dir = docs_rs_workspace();
     let mut server = Server::start_in(Some(&dir.path().join("ws")));
     let asked = built_item(
         &mut server,
@@ -1330,6 +1354,8 @@ fn a_member_is_built_as_its_docs_rs_metadata_asks_when_it_may() {
         "{clash}"
     );
     assert!(warns(clash, "broke the build"), "{clash}");
+    // `--cfg docsrs`, which did not break it, is back for the build with the project's features.
+    assert!(!warns(clash, "without --cfg docsrs"), "{clash}");
     let wide = built_item(
         &mut server,
         90,
@@ -1338,6 +1364,30 @@ fn a_member_is_built_as_its_docs_rs_metadata_asks_when_it_may() {
     assert_ne!(wide["isError"], true, "{wide}");
     let wide = &wide["structuredContent"];
     assert!(warns(wide, "would build opt 0.1.0"), "{wide}");
+    assert_eq!(
+        wide["provenance"]["features_requested"],
+        json!([]),
+        "{wide}"
+    );
+    let on = built_item(
+        &mut server,
+        120,
+        &json!({ "crate": "argsonly", "path": "on" }),
+    );
+    assert_ne!(on["isError"], true, "{on}");
+    let on = &on["structuredContent"];
+    assert_eq!(
+        on["provenance"]["features_requested"],
+        json!(["default", "on"]),
+        "{on}"
+    );
+    assert!(!warns(on, "as docs.rs builds it"), "{on}");
+    let cfged = built_item(
+        &mut server,
+        150,
+        &json!({ "crate": "argsonly", "path": "cfged" }),
+    );
+    assert_ne!(cfged["isError"], true, "{cfged}");
     assert!(server.finish().success());
 }
 

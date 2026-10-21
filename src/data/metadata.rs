@@ -266,7 +266,17 @@ pub struct Resolver {
     inner: Arc<Inner>,
     /// The resolutions being made, by workspace root.
     resolving: Flights<Resolved>,
+    /// What [`Self::outside_scope`] found, with the resolution that it is of.
+    outside: parking_lot::Mutex<Outside>,
 }
+
+/// What [`Resolver::outside_scope`] found, by the build it looked at, with the resolution that it
+/// is of.
+type Outside = HashMap<OutsideKey, (Arc<Resolution>, Vec<Box<str>>)>;
+
+/// A build that [`Resolver::outside_scope`] looked at: the workspace's root, the target, the
+/// member's package id and the features.
+type OutsideKey = (PathBuf, Box<str>, Box<str>, Vec<Box<str>>);
 
 /// What the work of a [`Resolver`] shares.
 #[derive(Debug)]
@@ -335,6 +345,7 @@ impl Resolver {
                 kept: Mutex::new(HashMap::new()),
             }),
             resolving: Flights::default(),
+            outside: parking_lot::Mutex::default(),
         }
     }
 
@@ -467,8 +478,24 @@ impl Resolver {
         let Resolution::Metadata { metadata, .. } = &*resolution else {
             return Err(Arc::new(ScopeError::NoMetadata));
         };
+        // Kept while the resolution is, as the scope is: `cargo tree` runs once for them.
+        let key = (
+            workspace.root.clone(),
+            target.as_str().into(),
+            package.id.0.clone(),
+            features.to_vec(),
+        );
+        let found = self
+            .outside
+            .lock()
+            .get(&key)
+            .filter(|(of, _)| Arc::ptr_eq(of, &resolution))
+            .map(|(_, outside)| outside.clone());
+        if let Some(outside) = found {
+            return Ok(outside);
+        }
         let offline = self.inner.offline_in(&workspace.root).await;
-        build_scope::outside(
+        let outside = build_scope::outside(
             (&workspace.root, offline, target),
             metadata,
             &scope,
@@ -476,7 +503,13 @@ impl Resolver {
             features,
         )
         .await
-        .map_err(Arc::new)
+        .map_err(Arc::new)?;
+        let mut kept = self.outside.lock();
+        // What is of a resolution that nothing else holds is of one that changed.
+        kept.retain(|_, (of, _)| Arc::strong_count(of) > 1);
+        kept.insert(key, (Arc::clone(&resolution), outside.clone()));
+        drop(kept);
+        Ok(outside)
     }
 
     /// Which packages the query tools may build locally for `target`, an actual build target of

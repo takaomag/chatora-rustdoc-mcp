@@ -205,8 +205,8 @@ pub(super) async fn outside(
         // `cargo metadata` has no package that its features do not enable, as an optional
         // dependency: not in the project's build either.
         let in_scope = ids
-            .of(&line.package)
-            .is_ok_and(|id| scope.get(id).is_some());
+            .exact(&line.package)
+            .is_some_and(|id| scope.get(id).is_some());
         if !in_scope {
             let name: Box<str> = format!("{} {}", line.package.name, line.package.version).into();
             if !outside.contains(&name) {
@@ -397,6 +397,24 @@ impl<'m> Ids<'m> {
             by_name.entry(&package.name).or_default().push(package);
         }
         Self { by_name }
+    }
+
+    /// The package that `shown` is, of the same source even when it is the only one of its name
+    /// and version: a package that `cargo metadata` does not have may be shown, as an optional
+    /// dependency that its features do not enable.
+    fn exact(&self, shown: &TreePackage) -> Option<&'m PackageId> {
+        let mut found = self
+            .by_name
+            .get(&*shown.name)
+            .into_iter()
+            .flatten()
+            .filter(|package| {
+                package.version == shown.version && same_source(&shown.source, package)
+            });
+        match (found.next(), found.next()) {
+            (Some(package), None) => Some(&package.id),
+            _ => None,
+        }
     }
 
     fn of(&self, shown: &TreePackage) -> Result<&'m PackageId, ScopeError> {

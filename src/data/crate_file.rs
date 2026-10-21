@@ -285,6 +285,9 @@ pub struct DocsRsBuild {
     pub default: Box<[Box<str>]>,
     /// Whether the manifest has `[package.metadata.docs.rs]`.
     pub asked: bool,
+    /// Whether it asks for features: `features`, `all-features` or `no-default-features`
+    /// (requirement R-FT-3).
+    pub asks_features: bool,
     /// The names of the `--cfg` that `rustdoc-args` passes without a value (`--cfg
     /// tokio_unstable`, `--cfg=tokio_unstable`), but `docsrs`: what a local build passes to the
     /// documented crate's rustdoc (decided in M2's D3). One with a value is not passed.
@@ -442,6 +445,9 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
             .collect(),
         default,
         asked: metadata.is_some(),
+        asks_features: ["features", "all-features", "no-default-features"]
+            .into_iter()
+            .any(|key| metadata.is_some_and(|metadata| metadata.get(key).is_some())),
         rustdoc_cfg: rustdoc_cfg.into_iter().map(Into::into).collect(),
     }
 }
@@ -650,7 +656,11 @@ pub(crate) mod tests {
              \"tokio_unstable\", \"--cfg=loom\", \"--cfg\", \"docsrs\", \"--cfg\", \
              'kind=\"x\"', \"--cfg\", \"not a name\"]\nrustc-args = [\"--cfg\", \"from_rustc\"]\n",
         );
-        assert!(docs.asked);
+        assert!(docs.asked && !docs.asks_features);
+        assert!(
+            build("[package]\nname = \"m\"\n\n[package.metadata.docs.rs]\nall-features = true\n")
+                .asks_features
+        );
         assert_eq!(&*docs.rustdoc_cfg, [
             Box::from("loom"),
             "tokio_unstable".into()
