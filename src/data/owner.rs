@@ -651,9 +651,13 @@ mod tests {
         assert_eq!(swept.records, 1);
         assert!(!old.exists());
         // That of this version is a child's, which is settled by whether it runs: nothing holds
-        // its lock, so it has ended.
-        assert_eq!(swept.child_records, 1);
-        assert!(!this_version.exists());
+        // its lock, so it has ended. Windows records no child, and leaves it.
+        if cfg!(unix) {
+            assert_eq!(swept.child_records, 1);
+            assert!(!this_version.exists());
+        } else {
+            assert!(this_version.exists());
+        }
         assert!(
             !process_lock::lock_path(dir.path(), &owner_key(&stopped)).exists(),
             "the lock file that the check made is removed"
