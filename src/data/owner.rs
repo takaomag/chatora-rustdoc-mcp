@@ -146,7 +146,7 @@ impl Owner {
 
     /// Lets this server's lock go without removing anything, as when the server is killed: for the
     /// tests of what a later server does.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn killed_for_test(&self) {
         drop(self.alive.lock().take());
     }
