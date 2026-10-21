@@ -289,6 +289,28 @@ impl SparseIndex {
         Err(IndexError::NotFound)
     }
 
+    /// Forgets that `name` was not in the index, and that fetching its entry failed a moment ago,
+    /// as the argument `refresh` asks (§6.4, decided in M2's D5).
+    pub fn forget(&self, name: &CrateName) {
+        if self
+            .missing
+            .lock()
+            .remove(&name.as_str().to_ascii_lowercase())
+            .is_some()
+        {
+            tracing::info!(%name, "that the crate is not in the index is forgotten, as asked");
+        }
+        // A file or two, removed here.
+        for spelling in spellings(name) {
+            let failure =
+                super::failure_file(&self.cache.sparse_index_path(&index_path(&spelling)));
+            if failure.is_file() {
+                tracing::info!(path = %failure.display(), "a failure is forgotten, as asked");
+                super::remove_if_there(&failure);
+            }
+        }
+    }
+
     /// The index entry at the lowercase `name`: the cached one while it is fresh, and else one
     /// fetched or confirmed with a conditional request.
     async fn entry_at(&self, name: &str) -> Result<IndexEntry, IndexError> {
@@ -674,6 +696,26 @@ mod tests {
             index.entry(&name("nope")).await,
             Err(IndexError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_crate_missing_from_the_index_is_asked_for_again_once_forgotten() {
+        let (index, _requests, _dir) = index(
+            vec![status("404 Not Found"), ok(SERDE_INDEX, "\"v1\"")],
+            TTL,
+        );
+        let serde = name("serde");
+        assert!(matches!(
+            index.entry(&serde).await,
+            Err(IndexError::NotFound)
+        ));
+        assert!(matches!(
+            index.entry(&serde).await,
+            Err(IndexError::NotFound)
+        ));
+        // As `refresh` asks: the index is asked again, and has it now.
+        index.forget(&serde);
+        index.entry(&serde).await.expect("found once asked again");
     }
 
     #[tokio::test]

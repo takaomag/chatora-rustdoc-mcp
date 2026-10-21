@@ -48,6 +48,10 @@ pub struct LocalWanted {
     pub docs_rs_features: Option<Vec<Box<str>>>,
     /// What the response warns about how the build was planned.
     pub warnings: Vec<Box<str>>,
+    /// Whether the call asks for `refresh`, which the call sets: what failed or fell back for the
+    /// member is forgotten by the work that it starts. One that joins a work does not change it
+    /// (§6.4, decided in M2's D5).
+    pub refresh: bool,
     /// The files that the build is made from, which may not exist: the workspace's manifests,
     /// Cargo.lock and the cargo settings (requirement R-WS-4, decided in M2's D4).
     pub input_files: Vec<PathBuf>,
@@ -89,8 +93,8 @@ pub enum LocalError {
     #[error(transparent)]
     Missing(Missing),
     /// The build failed, or failed before, made from the same (requirement R-WS-7, decided in
-    /// M2's D5): its record, with the error to return, and whether it is kept, so that it is not
-    /// made again meanwhile.
+    /// M2's D5): its record, with the error to return, whether it is kept, so that it is not made
+    /// again meanwhile, and whether it was made as `refresh` asked.
     #[error("the build failed")]
     Failed {
         /// The record.
@@ -267,6 +271,7 @@ async fn build_and_archive(
         mut warnings,
         input_files,
         input_packages,
+        refresh,
     } = wanted;
     let root = plan.root.clone();
     let programs = Programs::this();
@@ -304,6 +309,7 @@ async fn build_and_archive(
         work: &work,
         stage,
         docs_rs: docs_rs_features.as_deref(),
+        refresh,
     };
     let planned = warnings.len();
     let built = builder.build(&mut plan, installs, &mut warnings).await;
@@ -377,6 +383,8 @@ struct Builder<'a> {
     stage: &'a Stage,
     /// The features of the member's `[package.metadata.docs.rs]`, to build with first.
     docs_rs: Option<&'a [Box<str>]>,
+    /// Whether a call asked for `refresh`.
+    refresh: bool,
 }
 
 impl Builder<'_> {
@@ -393,6 +401,9 @@ impl Builder<'_> {
     ///
     /// A failure is remembered with the key, and told again without a build while it holds
     /// ([`build::Failed`]), unless the server stopped the build as it ends (decided in M2's D5).
+    /// When a call asked for `refresh`, the failure is not told, the build before does not tell
+    /// how this one begins, and a build that is fresh is not made again, but forgets that it fell
+    /// back ([`forget_fallback`]).
     async fn build(
         &self,
         plan: &mut Plan,
@@ -417,9 +428,16 @@ impl Builder<'_> {
         plan.target = build::passes_target(self.target, host.as_ref(), self.project_sets_target)
             .then(|| self.target.clone());
         let toolchain = checked.and_then(|checked| checked.toolchain);
+        let refresh = self.refresh;
         // A build that is fresh is not made again (requirement R-WS-4, decided in M2's D4).
-        let (fresh, earlier) = match self.fresh(plan, host.as_ref(), toolchain.as_deref()).await {
-            Freshness::Fresh(built, fresh) => {
+        let freshness = self
+            .fresh(plan, host.as_ref(), toolchain.as_deref(), refresh)
+            .await;
+        let (fresh, earlier) = match freshness {
+            Freshness::Fresh(mut built, fresh) => {
+                if refresh {
+                    forget_fallback(self.cache, &mut built).await;
+                }
                 warnings.extend(built.record.warnings.iter().cloned());
                 // A server ended before it had the dep-info: with the plan as it was built.
                 if !built.record.dep_info {
@@ -440,7 +458,11 @@ impl Builder<'_> {
                 return Err(LocalError::Failed { failed, kept: true });
             },
             Freshness::Stale(fresh, before) => {
-                let earlier = before.as_ref().map(|before| before.record.clone());
+                // How the build before ended is not how this one begins, when asked so.
+                let earlier = before
+                    .as_ref()
+                    .filter(|_| !refresh)
+                    .map(|before| before.record.clone());
                 if let (Some(before), Some(_)) = (before, &fresh) {
                     self.rebuilding.give(before);
                 }
@@ -589,6 +611,7 @@ impl Builder<'_> {
         plan: &Plan,
         host: Option<&TargetTriple>,
         toolchain: Option<&str>,
+        refresh: bool,
     ) -> Freshness {
         let Some(host) = host else {
             return Freshness::Stale(None, None);
@@ -655,6 +678,7 @@ impl Builder<'_> {
             &inputs,
             &(facts.clone() + &freshness::environment(&deps.env)),
         );
+        let failed = holding(failed, &key, refresh);
         match before {
             // With the inputs as they were before the build, for its dep-info.
             Some(before) if before.record.key.as_deref() == Some(key.as_str()) => {
@@ -674,9 +698,7 @@ impl Builder<'_> {
                 };
                 Freshness::Fresh(Box::new(before), Box::new(fresh))
             },
-            _ if let Some(failed) = failed.filter(|failed| failed.holds(&key)) => {
-                Freshness::Failed(Box::new(failed))
-            },
+            _ if let Some(failed) = failed => Freshness::Failed(Box::new(failed)),
             before => Freshness::Stale(
                 Some(Box::new(build::Fresh {
                     key: key.into(),
@@ -740,8 +762,11 @@ async fn follow(
     fresh: build::Fresh,
     packages: Vec<(PackageId, PathBuf)>,
 ) -> bool {
-    let key = fresh.key.clone();
-    let still = move |now: &BuildRecord| now.key.as_deref() == Some(&*key) && !now.dep_info;
+    let (key, planned) = (fresh.key.clone(), built.record.planned.clone());
+    // Nor what `refresh` took out meanwhile (decided in M2's D5).
+    let still = move |now: &BuildRecord| {
+        now.key.as_deref() == Some(&*key) && !now.dep_info && now.planned == planned
+    };
     // Not had meanwhile, by this server or another.
     let dir = built
         .json
@@ -1156,6 +1181,43 @@ const fn escaped_char_len(c: char) -> usize {
         '\0'..='\u{1f}' => 6,
         _ => 1,
     }
+}
+
+/// Forgets that the build `built`, which is fresh, fell back without `--cfg docsrs` or the
+/// features of `[package.metadata.docs.rs]`, and that its dep-info could not be had, as the
+/// argument `refresh` asks (decided in M2's D5): the next build of the member tries them again.
+/// It is not made again.
+async fn forget_fallback(cache: &Cache, built: &mut Built) {
+    if DEP_INFO_FAILED
+        .lock()
+        .extract_if(|(json, _)| *json == built.json)
+        .count()
+        > 0
+    {
+        tracing::info!(json = %built.json.display(), "that the dep-info of a build could not be had is forgotten, as asked");
+    }
+    if built.record.planned.is_none() {
+        return;
+    }
+    match built.forget_planned(cache).await {
+        Ok(true) => {
+            built.record.planned = None;
+            tracing::info!(json = %built.json.display(), "how the build fell back is forgotten, as asked");
+        },
+        Ok(false) => {},
+        Err(error) => tracing::warn!(%error, "the record of a build could not be written again"),
+    }
+}
+
+/// `failed`, if it holds for a build of the key `key`, and `refresh` does not forget it (decided in
+/// M2's D5).
+fn holding(failed: Option<build::Failed>, key: &str, refresh: bool) -> Option<build::Failed> {
+    let failed = failed.filter(|failed| failed.holds(key));
+    if refresh && failed.is_some() {
+        tracing::info!("the failure of a build is forgotten, as asked");
+        return None;
+    }
+    failed
 }
 
 /// The build published in `dir`, and the failure remembered there, if any.

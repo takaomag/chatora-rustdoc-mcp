@@ -47,6 +47,8 @@ pub(super) struct Arguments {
     offset: usize,
     request_digest: Box<str>,
     cursor_data: Option<Box<str>>,
+    /// Whether what failed is to be tried again (§6.4, decided in M2's D5).
+    refresh: bool,
 }
 
 /// Definition of the tool for `tools/list`.
@@ -239,6 +241,7 @@ pub(super) fn parse_arguments(
         offset,
         request_digest: format!("{CURSOR_FORM}.{request_digest}").into(),
         cursor_data,
+        refresh: super::get_item::parse_refresh(arguments)?,
     })
 }
 
@@ -297,8 +300,22 @@ fn resolving_provenance(
 }
 
 /// Lists the project's crates.
-pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
+pub(super) async fn execute(mut arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
+    // Acted on once for the project, until a call for it ends (decided in M2's D5).
+    let scope = format!("project {:?}", arguments.project);
+    arguments.refresh = arguments.refresh && super::local::refresh_acts(&scope);
+    let result = list(arguments, state).await;
+    super::local::refresh_told(&scope, &result);
+    result
+}
+
+/// [`execute`], forgetting what failed for the project first when it asks for `refresh`.
+async fn list(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
     let until = state.until();
+    // Of the workspace only, not of each crate (decided in M2's D5).
+    if arguments.refresh {
+        super::local::refresh_project(&state, arguments.project.as_deref()).await;
+    }
     let (workspace, project_from) =
         match super::project::workspace(state.project.as_ref(), arguments.project.as_deref()) {
             Ok(Some(found)) => found,

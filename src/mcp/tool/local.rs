@@ -2,7 +2,12 @@
 //! which member a crate name is, the shared work that builds it, and how its progress and its
 //! failures are told (requirements R-WS-6, R-WS-7 and R-OUT-9).
 
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use rmcp::model::CallToolResult;
 use semver::Version;
@@ -119,34 +124,11 @@ pub(super) async fn member(
     let root = &workspace.root;
     // The member's features in the build of the whole workspace, as rust-analyzer checks it and
     // `enabled_in_project` tells (requirement R-FT-3, decided in M2's D3), or else cargo's default.
-    let mut warnings: Vec<Box<str>> = Vec::new();
-    let features = match state
-        .resolver
-        .features_until(workspace, target, until)
-        .await
+    let (features, mut warnings) = match features_of(state, workspace, target, package, until).await
     {
-        Joined::Done(Ok(sets)) => sets
-            .normal(&package.name, &package.version)
-            .map(|features| build::declared_features(package, features)),
-        Joined::Done(Err(error)) => {
-            tracing::debug!(%error, "the features of the workspace could not be read");
-            None
-        },
-        // The work ended without them, as when it panicked: as if they could not be read.
-        Joined::Ended => None,
-        // cargo may wait for its package cache, which rust-analyzer holds (requirement R-ARCH-6).
-        Joined::Going(doing) => return Ok(Member::Planning(doing)),
+        Ok(found) => found,
+        Err(doing) => return Ok(Member::Planning(doing)),
     };
-    if features.is_none() {
-        warnings.push(
-            format!(
-                "the features of {} in the build of the workspace could not be read, so it is \
-                 built with cargo's default for it alone",
-                package.name
-            )
-            .into(),
-        );
-    }
     let docs_rs = match docs_rs_of(
         state,
         workspace,
@@ -187,9 +169,51 @@ pub(super) async fn member(
             warnings,
             input_files: state.resolver.input_files(root, metadata).await,
             input_packages: build::source_packages(metadata, package),
+            refresh: false,
         }),
         package: package.name.clone(),
     })
+}
+
+/// The features of the member `package` in the build of `workspace` for `target`, with a warning
+/// when they cannot be read, or what cargo does past `until`.
+async fn features_of(
+    state: &ToolState,
+    workspace: &Workspace,
+    target: &TargetTriple,
+    package: &Package,
+    until: Instant,
+) -> Result<(Option<Vec<Box<str>>>, Vec<Box<str>>), Doing> {
+    let features = match state
+        .resolver
+        .features_until(workspace, target, until)
+        .await
+    {
+        Joined::Done(Ok(sets)) => sets
+            .normal(&package.name, &package.version)
+            .map(|features| build::declared_features(package, features)),
+        Joined::Done(Err(error)) => {
+            tracing::debug!(%error, "the features of the workspace could not be read");
+            None
+        },
+        // The work ended without them, as when it panicked: as if they could not be read.
+        Joined::Ended => None,
+        // cargo may wait for its package cache, which rust-analyzer holds (requirement R-ARCH-6).
+        Joined::Going(doing) => return Err(doing),
+    };
+    let warnings = if features.is_none() {
+        vec![
+            format!(
+                "the features of {} in the build of the workspace could not be read, so it is \
+                 built with cargo's default for it alone",
+                package.name
+            )
+            .into(),
+        ]
+    } else {
+        Vec::new()
+    };
+    Ok((features, warnings))
 }
 
 /// What a member's `[package.metadata.docs.rs]` asks of its build here.
@@ -339,6 +363,70 @@ pub(super) async fn built(
     }
 }
 
+/// Forgets the failures kept for the project that `project` names, or the default one, as the
+/// argument `refresh` asks (§6.4, decided in M2's D5): of `cargo metadata` and `cargo tree` for
+/// its workspace, and of `rustc -vV` and rustup. Returns whether `refresh` is taken: not for a
+/// project outside the default one, which is not built.
+pub(super) async fn refresh_project(state: &ToolState, project: Option<&Path>) -> bool {
+    match project::workspace(state.project.as_ref(), project) {
+        Ok(workspace) => {
+            if let Some((workspace, _)) = workspace {
+                state.resolver.forget_failures(&workspace.root).await;
+            }
+            crate::data::toolchain::forget_failures();
+            true
+        },
+        // Outside the default project, nothing is built.
+        Err(_) if project.is_some() => false,
+        // The default project has several workspaces: what is not of one is still forgotten.
+        Err(_) => {
+            crate::data::toolchain::forget_failures();
+            true
+        },
+    }
+}
+
+/// The calls' `refresh` that was acted on, by what it is of, and when: until a call for it ends
+/// with what is not to be asked for again, a call that asks for `refresh` again, as one that waits
+/// for the build does, does not forget what the first one made, which would be made again and
+/// again (decided in M2's D5). One is let go after [`REFRESH_HELD`] in any case.
+static REFRESHING: LazyLock<parking_lot::Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(parking_lot::Mutex::default);
+
+/// How long a `refresh` that was acted on keeps another for the same from being acted on, at
+/// most: past it, a client that stopped asking does not keep `refresh` from working.
+const REFRESH_HELD: Duration = Duration::from_mins(10);
+
+/// Whether the `refresh` that a call asks for `scope` is acted on: not while one is, until a call
+/// for it ends ([`refresh_told`]).
+pub(super) fn refresh_acts(scope: &str) -> bool {
+    let mut refreshing = REFRESHING.lock();
+    refreshing.retain(|_, at| at.elapsed() < REFRESH_HELD);
+    if refreshing.contains_key(scope) {
+        tracing::debug!(
+            scope,
+            "refresh is not acted on again while the one before is"
+        );
+        return false;
+    }
+    refreshing.insert(scope.to_owned(), std::time::Instant::now());
+    true
+}
+
+/// Lets go of the `refresh` that was acted on for `scope`, if any, as a call for it ends with
+/// `result`, unless it says to call again (`retry_after_secs`: `status: building`, or the build
+/// before while it is built again).
+pub(super) fn refresh_told(scope: &str, result: &CallToolResult) {
+    let again = result.is_error != Some(true)
+        && result
+            .structured_content
+            .as_ref()
+            .is_some_and(|content| content.get("retry_after_secs").is_some());
+    if !again {
+        REFRESHING.lock().remove(scope);
+    }
+}
+
 /// The tool error of a member's build that failed (requirement R-WS-7, decided in M2's D2).
 fn local_error(what: &str, error: &LocalError) -> CallToolResult {
     let failed = |message: String, retryable: bool, suggestions: &[&str]| {
@@ -389,7 +477,7 @@ fn local_error(what: &str, error: &LocalError) -> CallToolResult {
             false,
             &[],
         ),
-        LocalError::Failed { failed, .. } => failed_body(failed),
+        LocalError::Failed { failed, kept } => failed_body(failed, *kept),
         LocalError::Load(LoadError::Parse(ParseError::UnsupportedFormat { found, .. })) => {
             unsupported(what, *found)
         },
@@ -454,11 +542,24 @@ fn unsupported(what: &str, found: u32) -> Value {
     })
 }
 
+/// How a failure that lasts is tried again, once its cause is fixed (requirement R-WS-7).
+const REFRESH_ONCE_FIXED: &str = "the failure is kept while the sources and the settings are the \
+                                  same: once its cause is fixed elsewhere, as a missing system \
+                                  library or the credentials, call again with \"refresh\": true";
+
 /// The error of a build that failed, as its record tells (requirement R-WS-7, decided in M2's D5):
-/// when, and how long until trying again may work, if it may.
-fn failed_body(failed: &build::Failed) -> Value {
+/// when, and how long until trying again may work, if it may; or, for one that is `kept`, that
+/// `refresh` tries it again.
+fn failed_body(failed: &build::Failed, kept: bool) -> Value {
     let mut body = failed.body.clone();
     if let Some(fields) = body.as_object_mut() {
+        // It lasts while what the build is made from is the same (requirement R-WS-7).
+        if kept
+            && !failed.transient
+            && let Some(Value::Array(suggestions)) = fields.get_mut("suggestions")
+        {
+            suggestions.push(json!(REFRESH_ONCE_FIXED));
+        }
         fields.insert("failed_at".to_owned(), json!(failed.time));
         if let Some(left) = failed.retry_after() {
             fields.insert(
@@ -478,10 +579,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn refresh_is_acted_on_once_until_a_call_ends() {
+        let scope = "crate None refresh_is_acted_on_once";
+        let building =
+            CallToolResult::structured(json!({"status": "building", "retry_after_secs": 3}));
+        assert!(refresh_acts(scope));
+        // A call that waits, asking for it again.
+        assert!(!refresh_acts(scope));
+        refresh_told(scope, &building);
+        assert!(!refresh_acts(scope));
+        // Once a call for it ends, with a result or an error, it is acted on again.
+        refresh_told(scope, &CallToolResult::structured(json!({"item": {}})));
+        assert!(refresh_acts(scope));
+        refresh_told(scope, &error_result(&json!({"code": "build_failed"})));
+        assert!(refresh_acts(scope));
+        // Another scope is apart.
+        assert!(refresh_acts("crate None another"));
+    }
+
+    #[test]
     fn a_failure_tells_when_and_how_long_until_trying_again() {
         let body = json!({"code": "build_failed", "retryable": true});
-        let transient = build::Failed::now(Some("k".into()), None, true, body.clone());
-        let told = failed_body(&transient);
+        let transient = build::Failed::now(Some("k".into()), None, true, body);
+        let told = failed_body(&transient, true);
         assert_eq!(told["failed_at"], *transient.time);
         // Rounded up, as it is less than 30 seconds now.
         assert!(
@@ -490,9 +610,17 @@ mod tests {
                 .is_some_and(|left| (1..=30).contains(&left)),
             "{told}"
         );
-        let lasting = build::Failed::now(Some("k".into()), None, false, body);
-        let told = failed_body(&lasting);
+        assert_eq!(told.get("suggestions"), None, "{told}");
+        let lasting = build::Failed::now(
+            Some("k".into()),
+            None,
+            false,
+            json!({"code": "build_failed", "retryable": false, "suggestions": ["fix it"]}),
+        );
+        let told = failed_body(&lasting, true);
         assert_eq!(told["failed_at"], *lasting.time);
         assert!(told.get("retry_after_secs").is_none(), "{told}");
+        // How it is tried again once fixed.
+        assert_eq!(told["suggestions"], json!(["fix it", REFRESH_ONCE_FIXED]));
     }
 }

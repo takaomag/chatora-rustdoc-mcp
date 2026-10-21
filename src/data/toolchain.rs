@@ -803,6 +803,12 @@ pub fn forget_project(root: &Path) {
     tool::forget_project(root);
 }
 
+/// Forgets what was kept of toolchains that failed, as rustup's saying that one is not installed,
+/// as the argument `refresh` asks (§6.4, decided in M2's D5).
+pub fn forget_failures() {
+    tool::forget_failures();
+}
+
 /// The toolchain that rustup says is not installed, in why a command failed:
 /// `error: toolchain '1.80.0-x86_64-unknown-linux-gnu' is not installed` (rustup 1.29.1). One of
 /// the few messages that are matched (requirement R-WS-7).

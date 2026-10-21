@@ -1363,6 +1363,35 @@ impl Built {
         .await
     }
 
+    /// Takes `planned` out of the record published now, if it is of this build, so that the next
+    /// build of the member does not begin as this one ended, as the argument `refresh` asks
+    /// (decided in M2's D5). The record is read again under the lock, so that what was written
+    /// meanwhile, as the dep-info, is kept. Returns whether it was taken out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be written.
+    pub async fn forget_planned(&self, cache: &Cache) -> io::Result<bool> {
+        let dir = self.json.parent().unwrap_or(&self.json).to_path_buf();
+        let publishing = cache.lock(&dir).await;
+        let built = self.clone();
+        super::blocking(move || {
+            let written = match published(&dir) {
+                Some(mut now)
+                    if now.record.sha256 == built.record.sha256 && now.record.planned.is_some() =>
+                {
+                    now.record.planned = None;
+                    let json = serde_json::to_vec_pretty(&now.record).map_err(io::Error::from)?;
+                    cache::write_atomically(&now.record_path(), &json).map(|()| true)
+                },
+                _ => Ok(false),
+            };
+            drop(publishing);
+            written
+        })
+        .await
+    }
+
     /// Removes the JSON and the record, as for a format that is not read, so that nothing takes
     /// them for a build to use.
     pub fn unpublish(&self) {

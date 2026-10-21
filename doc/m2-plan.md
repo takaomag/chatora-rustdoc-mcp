@@ -957,7 +957,7 @@ Claude Code 2.1.304、Linux で測った。
   2. 短い失敗の記憶もすべて解く (`cargo metadata`・`cargo tree`、`rustc -vV`・rustup、std の配布物)。そのワークスペース (std ならその配布物) の分だけ
   3. 何を解いたかは応答で伝えない (ログに書く)
   4. 1 つの crate を指さない呼び出し (`crate` なしの `search_items`、`list_crates`) では、ワークスペースの分 (`cargo metadata`・`cargo tree`、`rustc -vV`・rustup) だけを解く。横断する crate の否定キャッシュや失敗の記録は解かない
-  5. 同じ member のビルドが進行中なら、記録を解いてから合流する (進行中の仕事が解く前の記録を読んでいたときだけ、古い失敗が 1 度返りうる)
+  5. 同じ member のビルドが進行中なら合流する。`refresh` が効くのは仕事を始めた呼び出しの分だけで、合流した呼び出しは進行中の仕事を変えない (進行中の仕事が記録を読んだ後に合流したときは、古い失敗や後退が残りうるが、もう一度 `refresh` すれば解ける)。最初は「記録を解いてから合流する」と決めたが、実装で印が後の仕事に残る問題が出て、利用者がこの形に改めた (2026-10-21)
 
 **D5a (失敗の分類と記録・診断の上限・`cargo fetch`・`toolchain_too_old`。2026-10-21)**:
 
@@ -979,6 +979,29 @@ Claude Code 2.1.304、Linux で測った。
 - 残したもの (レビューの指摘のうち): ビルドの時間切れが、ほとんど cargo のロック待ちだった場合も決定的になる (要件の「ロック待ちの打ち切りは一時的」とずれる)。`toolchain_too_old` は rustup の無い環境でも `rustup update` を案内する。記録は置き場に 1 つなので、計画やサーバーの版の違うビルドが交互に動くと公開のたびに消える。一時的な失敗が 30 秒で切れて作り直す結合テスト、サーバーの終了で止めたビルドを記録しないことのテストは無い。D5a だけでは鍵が変わらないまま原因を直したとき (システムライブラリ・git の認証・環境変数) に抜ける手段が無いので、D5b と一緒に push する
 - 残したもの: 出力のサニタイズ (R-SEC-7) はまだどこにも無いので、診断は切ってからサニタイズすることになる (除く文字は長さを減らすだけなので、上限は超えない)。`refresh` は D5b。README には失敗を覚えることを D5b で書く
 - README: `build.max_diagnostics` を設定の表に足した
+
+**D5b (引数 `refresh`。2026-10-21)**:
+
+- 引数: ローカル機能のある構成で、すべての照会のツール (9 本) の入力スキーマに `refresh` (真偽値) を足す (`mcp::tool::with_refresh`。`sleep` を除く)。ローカル機能の無い構成では宣言しない。真偽値でなければ `invalid_argument`。カーソルの照合 (`request_digest`) には入れない (`refresh` 付きの呼び出しの次のページを、付けずに頼める)
+- 解くもの (決定 2 と D5b の決定 2・4):
+  - ワークスペース (`mcp::tool::local::refresh_project`): `Resolver::forget_failures` (`cargo metadata` の失敗と、target ごとの `cargo tree` の features・範囲の失敗。成功は残す)、`toolchain::forget_failures` (`rustc -vV`・rustup の出力のうち失敗だけ)。既定のプロジェクトの外を指したら何もしない。`list_crates` と `crate` なしの `search_items` はこれだけ
+  - crate を指す照会 (`get_item::execute`): ワークスペースの分、index に名前が無かった記憶と index の取得の失敗 (`SparseIndex::forget`)。版を決めた後、docs.rs の crate なら、その版の置き場 (頼んだ target と既定の target) の `miss.json`・`*.miss.json` と `.crate` の取得の失敗 (`data::forget_failures`・`forget_failure_of`)。std なら配布物の取得の失敗 (キャッシュの `std/` の下)。`resolve_version` はワークスペースの分と index の記憶
+  - member: `LocalWanted.refresh` を立て、ビルドの仕事が、`failed.json` を読まない、前回の記録の終わり方 (`planned`) で始め方を決めない、新しいビルドなら `planned` を消して記録を書き直し dep-info の失敗の記憶 (`DEP_INFO_FAILED`) を消す (作り直さない。決定 1)
+  - 何を解いたかは応答に書かず、info のログに書く (決定 3)
+- 決定 5 の実装と、試して見つけて変えたこと:
+  - member の `refresh` は、仕事を始めた呼び出しの分だけ効く (`Flights::join` の `start` が受け取る `wanted` の印)。進行中の仕事に合流した呼び出しは、その仕事を変えない (決定 5 を改めた。利用者の決定)。最初はプロセスの中の集合に鍵を入れて仕事が読む形にしたが、合流した呼び出しの印が残り、後の仕事が忘れてしまうので、やめた
+  - stdio のテストで、待ちの上限 (`build.wait_secs`) より長くかかって失敗する member を、`refresh: true` を付けたまま呼び直すと、呼ぶたびに記録した失敗を忘れて作り直し、`status: building` を返し続けた (モデルは `retry_after_secs` に従って同じ引数で呼び直すので、終わらない)。最初は `refresh` で作った失敗を次の呼び出しに渡して直したが、レビューで、(1) 同じことが `cargo metadata`・`cargo tree`・docs.rs・std・`.crate` の遅い失敗でも起きる、(2) 渡した失敗が、ソースを直した後の `refresh` なしの呼び出しにも 1 度返る (stale の応答で呼び直しをやめた後など) と指摘された
+  - そこで、`refresh` は同じもの (プロジェクトと crate、プロジェクトだけ、std) について 1 度だけ効かせ、そのものの呼び出しが「呼び直せ」でない応答 (エラーか、`retry_after_secs` の無い結果。`status: building` と作り直しの間の stale は呼び直せ) で終わるまで、続く `refresh` は効かせない (`mcp::tool::local::refresh_acts`・`refresh_told`。印は最長 10 分で外す)。待つ間に付け続けても、作り直した結果か失敗が返る。受け渡しの変更はやめた
+- 決定的な失敗の応答の suggestions に、原因を直したら `"refresh": true` で呼び直すことを足した (R-WS-7。一時的な失敗には付けない)
+- R-QA-5 の「引数ごとに結果が変わる」検査: `refresh` は成功した結果を変えないので、ほかのテストで確かめる印 (`Change::CheckedElsewhere`) を足した (宣言された引数に場合があることの検査は通る)
+- テスト: 引数の読み取りとカーソル、ツールの宣言、`miss.json` を忘れること、index の記憶を忘れること、`hands_over`、suggestions。結合テスト (local): 記録した失敗が `refresh` で作り直されて記録が書き直されること、docsrs なしに後退した新しいビルドが `refresh` で作り直されずに `planned` を消し、次の編集で docsrs ありで作られること (どちらも `refresh` を無効にすると落ちることを確かめた)。stdio: 記録した失敗をすぐ返し suggestions に `refresh` があること、`refresh: true` で呼び直し続けると作り直した失敗 (時刻が新しい) が返ること (3 回続けて通った、約 10 秒)
+- レビューで直したこと (ほかに):
+  - 既定のディレクトリの直下に workspace が複数あると (`project` なし)、`refresh` をまるごと無視していた: プロジェクトの外を `project` で指したときだけ無視し、ほかは workspace に関係しない分 (toolchain・index・docs.rs・std) を解く
+  - 後退を忘れること (`planned` を消す) が、裏の dep-info の書き込みと競合していた: `Built::forget_planned` が公開のロックの下で記録を読み直して `planned` だけを消し、dep-info の `follow` は `planned` が変わっていれば書かない (次の呼び出しが dep-info を取り直す)
+  - 記録しなかった失敗 (`kept: false`) にも `refresh` の案内を付けていた: 記録したものだけに付ける
+  - 解いたもののログ: member の失敗の記録を読まなかったこと、`cargo tree` の失敗、`rustc -vV`・rustup の失敗、index の名前の記憶、dep-info の失敗の記憶も info に書く
+  - テストを足した: `refresh` を 1 回だけ効かせること、`Resolver::forget_failures` (失敗は `cargo metadata` を走らせ直し、成功は残す)、toolchain の失敗だけを忘れること
+- 残したもの: README は F6 でまとめて書く (照会のツールのビルドとあわせて)。`toolchain::forget_failures` はすべてのディレクトリの `rustc -vV`・rustup の失敗を、std は全日付の配布物の失敗を解く (決定 2 の「その分だけ」より広いが、失敗だけで害は小さい)。起動時の host の `rustc -vV` の失敗 (`state.host`) は解けない。`cargo metadata` の git の決定的な失敗 (`fetch_failed`) は `Resolver` で 30 秒しか覚えず、`metadata_failed` に `refresh` の案内も無い (前からある。R-WS-7 の「`refresh` までキャッシュ」とずれる)。docs.rs・std・`list_crates`・`search_items`・`resolve_version` の `refresh` を通しで確かめる結合テストは無い (`CheckedElsewhere` が指すのは member のテスト)
 
 **止まる危険の監査と直し 1 (2026-10-21)**:
 

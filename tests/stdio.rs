@@ -1390,6 +1390,33 @@ fn a_member_whose_build_fails_again_is_told_failed() {
     }
     let text = failed["content"][0]["text"].as_str().unwrap_or_default();
     assert!(text.contains("build_failed"), "{failed}");
+    // Kept: told again at once, with how to try again once fixed (requirement R-WS-7).
+    let body = |result: &Value| -> Value {
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap_or_default())
+            .unwrap_or_default()
+    };
+    let told = body(&failed);
+    server.send(&call_tool(300, "get_item", first.clone()));
+    let again = body(&server.response(300)["result"]);
+    assert_eq!(again["failed_at"], told["failed_at"], "{again}");
+    assert!(
+        again["suggestions"].to_string().contains("refresh"),
+        "{again}"
+    );
+    // Asked to refresh, it is built again (§6.4, decided in M2's D5).
+    let mut refreshed = Value::Null;
+    let refreshing = json!({ "crate": "failing", "path": "first", "refresh": true });
+    for id in 400..500 {
+        server.send(&call_tool(id, "get_item", refreshing.clone()));
+        let result = server.response(id)["result"].clone();
+        if result["isError"] == true {
+            refreshed = body(&result);
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(refreshed["code"], "build_failed", "{refreshed}");
+    assert_ne!(refreshed["failed_at"], told["failed_at"], "{refreshed}");
     assert!(server.finish().success());
 }
 

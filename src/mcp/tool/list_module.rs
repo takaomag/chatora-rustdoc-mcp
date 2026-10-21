@@ -278,7 +278,8 @@ pub(super) fn request_digest(tool: &str, arguments: Option<&JsonObject>) -> Stri
     let kept: BTreeMap<&str, &Value> = arguments
         .into_iter()
         .flatten()
-        .filter(|(name, _)| !matches!(name.as_str(), "cursor" | "limit"))
+        // `refresh` does not change what is listed, so a page after one with it may be without.
+        .filter(|(name, _)| !matches!(name.as_str(), "cursor" | "limit" | "refresh"))
         .map(|(name, value)| (name.as_str(), value))
         .collect();
     let canonical = format!(

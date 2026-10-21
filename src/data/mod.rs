@@ -607,6 +607,46 @@ async fn remember_failure(path: &Path) {
     remember_miss_file(&failure_file(path), MissKind::Transient).await;
 }
 
+/// Forgets the failures remembered in `dir`, and with `below`, in the directories below it too.
+///
+/// They are `miss.json` and the files next to what failed to be fetched. The argument `refresh`
+/// asks for it (§6.4, decided in M2's D5).
+pub async fn forget_failures(dir: PathBuf, below: bool) {
+    let forgotten = blocking(move || {
+        let mut dirs = vec![dir];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    if below {
+                        dirs.push(path);
+                    }
+                } else if name == MISS_FILE || name.ends_with(".miss.json") {
+                    tracing::info!(path = %path.display(), "a failure is forgotten, as asked");
+                    remove_if_there(&path);
+                }
+            }
+        }
+        Ok(())
+    })
+    .await;
+    if let Err(error) = forgotten {
+        tracing::debug!(%error, "the failures could not be forgotten");
+    }
+}
+
+/// Forgets that fetching what goes at `path` failed a moment ago, as the argument `refresh` asks
+/// (§6.4, decided in M2's D5).
+pub fn forget_failure_of(path: &Path) {
+    let failure = failure_file(path);
+    if failure.is_file() {
+        tracing::info!(path = %failure.display(), "a failure is forgotten, as asked");
+        remove_if_there(&failure);
+    }
+}
+
 /// Removes the file at `path`, if there is one. A failure is logged.
 fn remove_if_there(path: &Path) {
     match std::fs::remove_file(path) {
@@ -691,6 +731,33 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+
+    #[tokio::test]
+    async fn the_failures_in_a_directory_are_forgotten_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let below = dir.path().join("below");
+        std::fs::create_dir_all(&below).expect("made");
+        for path in [
+            dir.path().join(MISS_FILE),
+            dir.path().join("61.json.miss.json"),
+            dir.path().join("61.json"),
+            below.join(MISS_FILE),
+        ] {
+            std::fs::write(path, "{}").expect("written");
+        }
+        forget_failures(dir.path().to_path_buf(), false).await;
+        assert!(!dir.path().join(MISS_FILE).exists());
+        assert!(!dir.path().join("61.json.miss.json").exists());
+        assert!(dir.path().join("61.json").exists());
+        assert!(below.join(MISS_FILE).exists(), "not below");
+        forget_failures(dir.path().to_path_buf(), true).await;
+        assert!(!below.join(MISS_FILE).exists());
+        // And one next to a file.
+        let file = dir.path().join("a.crate");
+        std::fs::write(failure_file(&file), "{}").expect("written");
+        forget_failure_of(&file);
+        assert!(!failure_file(&file).exists());
+    }
 
     fn serde() -> (CrateName, Version) {
         (

@@ -154,6 +154,22 @@ struct Decided {
 /// Decides the version as `get_item` does (requirements R-VR-1 to R-VR-3), and tells what
 /// crates.io and docs.rs have of it.
 pub(super) async fn execute(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallToolResult {
+    // Acted on once for the crate in the project, as `get_item` does (decided in M2's D5).
+    #[cfg(feature = "local")]
+    {
+        let mut arguments = arguments;
+        let scope = format!("crate {:?} {}", arguments.project, arguments.name);
+        arguments.refresh = arguments.refresh && super::local::refresh_acts(&scope);
+        let result = resolve(arguments, state).await;
+        super::local::refresh_told(&scope, &result);
+        result
+    }
+    #[cfg(not(feature = "local"))]
+    resolve(arguments, state).await
+}
+
+/// [`execute`], forgetting what failed first when it asks for `refresh`.
+async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallToolResult {
     let until = state.until();
     if get_item::std_crate(&arguments.name).is_some() {
         return super::tool_error(
@@ -165,6 +181,13 @@ pub(super) async fn execute(arguments: ReleaseArguments, state: Arc<ToolState>) 
             false,
             &["call get_item for its items, which come from a nightly toolchain's documentation"],
         );
+    }
+    // What failed is forgotten before it is read again (§6.4, decided in M2's D5).
+    #[cfg(feature = "local")]
+    if arguments.refresh
+        && super::local::refresh_project(&state, arguments.project.as_deref()).await
+    {
+        state.index.forget(&arguments.name);
     }
     let (target, mut warnings) = match &arguments.target {
         Some(target) => (target.clone(), Vec::new()),

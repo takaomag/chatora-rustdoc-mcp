@@ -286,11 +286,7 @@ pub(super) fn docs_rs(network: &Network) -> Result<DocsRs, reqwest::Error> {
 
 /// Definitions of every tool, in the order `tools/list` returns them.
 pub(super) fn definitions() -> Vec<Tool> {
-    #[cfg_attr(
-        not(debug_assertions),
-        expect(unused_mut, reason = "only a debug build adds the tool for testing")
-    )]
-    let mut tools = vec![
+    let tools = vec![
         crate_overview::definition(),
         get_item::definition(),
         // A project is needed, which only local features read (requirement R-ARCH-4).
@@ -303,16 +299,41 @@ pub(super) fn definitions() -> Vec<Tool> {
         resolve_version::definition(),
         search_items::definition(),
     ];
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(unused_mut, reason = "only a debug build adds the tool for testing")
+    )]
+    let mut tools: Vec<Tool> = if cfg!(feature = "local") {
+        tools.into_iter().map(with_refresh).collect()
+    } else {
+        tools.into_iter().map(without_project).collect()
+    };
     // A tool for testing progress and cancellation.
     #[cfg(debug_assertions)]
     if test_tools() {
         tools.push(sleep::definition());
     }
-    if cfg!(feature = "local") {
-        tools
-    } else {
-        tools.into_iter().map(without_project).collect()
+    tools
+}
+
+/// `tool` with the argument `refresh` (§6.4), which every tool takes with local features, as each
+/// may run cargo (requirement R-MCP-4).
+fn with_refresh(mut tool: Tool) -> Tool {
+    let mut schema = (*tool.input_schema).clone();
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        properties.insert(
+            "refresh".to_owned(),
+            json!({
+                "type": "boolean",
+                "description": "Set true to try again what failed before, instead of the failure \
+                                that is kept: a build of a workspace member (kept while its \
+                                sources are the same), cargo metadata, or fetching from docs.rs. \
+                                What worked is not redone.",
+            }),
+        );
     }
+    tool.input_schema = Arc::new(schema);
+    tool
 }
 
 /// The end of every tool's description of `project` (doc/m2-plan.md §5, P5): the server sees only
@@ -772,6 +793,25 @@ mod tests {
         assert_eq!(busy["retry_after_secs"], BUSY_RETRY_AFTER_SECS);
         drop(first);
         assert!(limit.enter().is_some());
+    }
+
+    /// With local features, every tool takes `refresh`, as each may run cargo (§6.4); without
+    /// them, none does (requirement R-ARCH-3).
+    #[test]
+    fn every_tool_takes_refresh_with_local_features() {
+        for tool in definitions() {
+            let takes = tool
+                .input_schema
+                .get("properties")
+                .and_then(|properties| properties.get("refresh"))
+                .is_some();
+            assert_eq!(
+                takes,
+                cfg!(feature = "local") && tool.name != "sleep",
+                "{}",
+                tool.name
+            );
+        }
     }
 
     #[test]

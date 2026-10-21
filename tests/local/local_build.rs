@@ -240,6 +240,7 @@ async fn a_member_is_built_and_archived_for_the_calls_that_want_it() {
         cargo_home: resolver.cargo_home().map(Path::to_path_buf),
         docs_rs_features: None,
         warnings: Vec::new(),
+        refresh: false,
         input_files: Vec::new(),
         input_packages: Vec::new(),
     };
@@ -310,6 +311,7 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
         cargo_home: resolver.cargo_home().map(Path::to_path_buf),
         docs_rs_features: None,
         warnings: Vec::new(),
+        refresh: false,
         input_files: Vec::new(),
         input_packages: build::source_packages(
             metadata,
@@ -353,6 +355,16 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
     assert_ne!(again.record.sha256, broken.record.sha256, "built again");
     assert!(without(&again), "{:?}", again.archived.warnings);
     assert!(!items_at(&again.json).contains("docsrs_only"));
+    // Asked to refresh, it forgets that it fell back (decided in M2's D5).
+    let mut refreshing = wanted("broken");
+    refreshing.refresh = true;
+    forgets_the_fall_back(
+        (&flights, &cache, until),
+        (refreshing, wanted("broken")),
+        &again,
+        &workspace.root.join("broken/src/lib.rs"),
+    )
+    .await;
     // An error of the crate's own is not taken for one of `--cfg docsrs`: once it is fixed, the
     // build has it again.
     let source = workspace.root.join("typo/src/lib.rs");
@@ -372,6 +384,40 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
         fixed.archived.warnings
     );
     assert!(items_at(&fixed.json).contains("docsrs_only"));
+}
+
+/// That the member which `refreshing` asks to refresh, built as `again` after it fell back without
+/// `--cfg docsrs`, is not built again, but forgets it: once its sources at `source` change, it is
+/// built with it, as `retried` asks (decided in M2's D5).
+async fn forgets_the_fall_back(
+    (flights, cache, until): (
+        &chatora_rustdoc_mcp::data::flight::Flights<chatora_rustdoc_mcp::query::local::SharedLocal>,
+        &Cache,
+        tokio::time::Instant,
+    ),
+    (refreshing, retried): (
+        chatora_rustdoc_mcp::query::local::LocalWanted,
+        chatora_rustdoc_mcp::query::local::LocalWanted,
+    ),
+    again: &chatora_rustdoc_mcp::query::local::LocalBuilt,
+    source: &Path,
+) {
+    use chatora_rustdoc_mcp::{data::flight::Joined, query::local::local_archive};
+
+    let Joined::Done(Ok(same)) = local_archive(flights, cache, refreshing, until).await else {
+        panic!("built");
+    };
+    assert_eq!(same.record.sha256, again.record.sha256, "not built again");
+    let published = build::published(again.json.parent().expect("a directory")).expect("there");
+    assert_eq!(published.record.planned, None);
+    let mut text = fs::read_to_string(source).expect("readable");
+    text.push_str("\n/// Added.\npub fn added() {}\n");
+    fs::write(source, text).expect("written");
+    let Joined::Done(Ok(tried)) = local_archive(flights, cache, retried, until).await else {
+        panic!("built");
+    };
+    assert!(tried.record.cfg_docsrs, "{:?}", tried.archived.warnings);
+    assert!(items_at(&tried.json).contains("docsrs_only"));
 }
 
 /// Builds the members of the fixture's workspace as the server does, planned again for each call:
@@ -423,6 +469,16 @@ impl Members {
         name: &str,
     ) -> chatora_rustdoc_mcp::data::flight::Joined<chatora_rustdoc_mcp::query::local::SharedLocal>
     {
+        self.joined_with(name, false).await
+    }
+
+    /// [`Self::joined`], asking for `refresh` if `refresh`.
+    async fn joined_with(
+        &self,
+        name: &str,
+        refresh: bool,
+    ) -> chatora_rustdoc_mcp::data::flight::Joined<chatora_rustdoc_mcp::query::local::SharedLocal>
+    {
         use chatora_rustdoc_mcp::query::local::{LocalWanted, local_archive};
 
         let resolution = self
@@ -441,6 +497,7 @@ impl Members {
             cargo_home: self.resolver.cargo_home().map(Path::to_path_buf),
             docs_rs_features: None,
             warnings: Vec::new(),
+            refresh,
             input_files: self
                 .resolver
                 .input_files(&self.workspace.root, metadata)
@@ -569,7 +626,7 @@ async fn a_member_that_failed_is_not_built_again_until_what_it_is_made_from_chan
         let Joined::Done(Err(error)) = joined else {
             return None;
         };
-        let LocalError::Failed { failed, kept } = &**error else {
+        let LocalError::Failed { failed, kept, .. } = &**error else {
             return None;
         };
         Some(((**failed).clone(), *kept))
@@ -594,12 +651,19 @@ async fn a_member_that_failed_is_not_built_again_until_what_it_is_made_from_chan
     let Some((again, true)) = failed(&joined) else {
         panic!("the failure again: {joined:?}");
     };
-    assert_eq!((again.time, again.body), (told.time, told.body));
+    assert_eq!((&again.time, &again.body), (&told.time, &told.body));
     assert_eq!(
         failures(members.cache.dir()),
         remembered,
         "not written again"
     );
+    // Asked to refresh, it is built again, and fails again (§6.4, decided in M2's D5).
+    let joined = members.joined_with("one", true).await;
+    let Some((refreshed, true)) = failed(&joined) else {
+        panic!("the failure, built again: {joined:?}");
+    };
+    assert_eq!(refreshed.body, told.body);
+    assert_ne!(failures(members.cache.dir()), remembered, "written again");
     // Fixed, it is built, and the failure is forgotten.
     fs::write(&source, format!("{fine}\npub fn mended() {{}}\n")).expect("written");
     let fixed = members.built("one").await;

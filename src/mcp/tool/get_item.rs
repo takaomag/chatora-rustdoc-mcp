@@ -115,6 +115,12 @@ pub(super) struct Arguments {
     path: Box<str>,
     /// The target asked for.
     target: Option<TargetTriple>,
+    /// Whether what failed is to be tried again (§6.4).
+    #[cfg_attr(
+        all(not(feature = "local"), not(test)),
+        expect(dead_code, reason = "only local features declare and take it")
+    )]
+    refresh: bool,
     /// How much to show, and for `list_module`, of what.
     shape: Shape,
 }
@@ -220,6 +226,7 @@ impl Arguments {
             project: release.project,
             path,
             target: release.target,
+            refresh: release.refresh,
             shape: Shape {
                 detail,
                 what: What::List(Box::new(listing)),
@@ -239,6 +246,7 @@ impl Arguments {
             version: release.version,
             project: release.project,
             target: release.target,
+            refresh: release.refresh,
             shape: Shape {
                 detail,
                 what: What::Search(Box::new(searching)),
@@ -264,6 +272,7 @@ impl Arguments {
             version: release.version,
             project: release.project,
             target: release.target,
+            refresh: release.refresh,
             shape: Shape {
                 detail: Detail::Normal,
                 what: What::Impls(Box::new(paging)),
@@ -285,6 +294,7 @@ impl Arguments {
             version: release.version,
             project: release.project,
             target: release.target,
+            refresh: release.refresh,
             shape: Shape {
                 detail,
                 what: What::Methods(Box::new(filter)),
@@ -300,6 +310,7 @@ impl Arguments {
             version: release.version,
             project: release.project,
             target: release.target,
+            refresh: release.refresh,
             shape: Shape {
                 detail,
                 what: What::Overview,
@@ -724,7 +735,19 @@ pub(super) fn parse_release(
         version,
         project,
         target,
+        refresh: parse_refresh(arguments)?,
     })
+}
+
+/// Checks `refresh` (§6.4): `false` when it is not given.
+pub(super) fn parse_refresh(arguments: Option<&JsonObject>) -> Result<bool, InvalidArgument> {
+    match arguments.and_then(|arguments| arguments.get("refresh")) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(refresh)) => Ok(*refresh),
+        Some(_) => Err(InvalidArgument::new("`refresh` must be true or false", &[
+            r#"pass true to try again what failed, for example {"refresh": true}"#,
+        ])),
+    }
 }
 
 /// The arguments that name a release, checked.
@@ -737,6 +760,8 @@ pub(super) struct ReleaseArguments {
     pub(super) project: Option<PathBuf>,
     /// The target asked for.
     pub(super) target: Option<TargetTriple>,
+    /// Whether what failed is to be tried again (§6.4, decided in M2's D5).
+    pub(super) refresh: bool,
 }
 
 /// Checks the arguments (requirement R-ARG-1).
@@ -748,6 +773,7 @@ pub(super) fn parse_arguments(
         version,
         project,
         target,
+        refresh,
     } = parse_release(arguments)?;
     let argument = |name| arguments.and_then(|arguments| arguments.get(name));
     let string = |name: &'static str, example| match argument(name) {
@@ -786,6 +812,7 @@ pub(super) fn parse_arguments(
         project,
         path,
         target,
+        refresh,
         shape: Shape {
             detail,
             what: What::Item,
@@ -1500,19 +1527,79 @@ fn same_crate_name(a: &str, b: &str) -> bool {
 /// Looks the item up in the archive of the crate, or else loads the JSON of the crate and archives
 /// it first, on a blocking thread, since parsing a large crate takes a large part of a second.
 pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
+    // `refresh` is acted on once for the crate in the project, until a call for it ends (decided
+    // in M2's D5).
+    #[cfg(feature = "local")]
+    {
+        let scope = format!("crate {:?} {}", arguments.project, arguments.name);
+        let refresh = arguments.refresh && local::refresh_acts(&scope);
+        let result = look_up(arguments, state, refresh).await;
+        local::refresh_told(&scope, &result);
+        result
+    }
+    #[cfg(not(feature = "local"))]
+    look_up(arguments, state).await
+}
+
+/// [`execute`], forgetting what failed first when `refresh`.
+async fn look_up(
+    arguments: Arguments,
+    state: Arc<ToolState>,
+    #[cfg(feature = "local")] refresh: bool,
+) -> CallToolResult {
     let until = state.until();
+    // What failed is forgotten before it is read again (§6.4, decided in M2's D5).
+    #[cfg(feature = "local")]
+    let refresh = refresh && local::refresh_project(&state, arguments.project.as_deref()).await;
     if let Some(krate) = std_crate(&arguments.name) {
+        #[cfg(feature = "local")]
+        if refresh {
+            data::forget_failures(state.cache.dir().join("std"), true).await;
+        }
         return execute_std(arguments, krate, state, Vec::new(), until).await;
+    }
+    #[cfg(feature = "local")]
+    if refresh {
+        state.index.forget(&arguments.name);
     }
     let (target, warnings) = match &arguments.target {
         Some(target) => (target.clone(), Vec::new()),
         None => project::default_target(&state, arguments.project.as_deref()).await,
     };
-    let (arguments, warnings) = match resolve(&state, arguments, target, warnings, until).await {
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(unused_mut, reason = "only local features refresh the release")
+    )]
+    let (mut arguments, warnings) = match resolve(&state, arguments, target, warnings, until).await
+    {
         Ok(resolved) => resolved,
         Err(error) => return *error,
     };
+    #[cfg(feature = "local")]
+    if refresh {
+        refresh_release(&state, &mut arguments).await;
+    }
     look_up_release(&state, arguments, warnings).await
+}
+
+/// Forgets what failed of the release that `request` names, as the argument `refresh` asks (§6.4,
+/// decided in M2's D5): a member's build forgets it as it begins, and for docs.rs, its JSON and its
+/// `.crate` are fetched again.
+#[cfg(feature = "local")]
+async fn refresh_release(state: &ToolState, request: &mut Request) {
+    match &mut request.local {
+        Some(LocalSource::Wanted(wanted)) => wanted.refresh = true,
+        Some(LocalSource::Built(_)) => {},
+        None => {
+            for target in [Some(&request.target), None] {
+                let dir = state
+                    .cache
+                    .docs_rs_dir(&request.name, &request.version, target);
+                data::forget_failures(dir, false).await;
+            }
+            data::forget_failure_of(&state.cache.crate_file_path(&request.name, &request.version));
+        },
+    }
 }
 
 /// Looks the item up in the release that `arguments` names, from its archive or its JSON on
@@ -1934,6 +2021,7 @@ async fn follow(
                 project: None,
                 path: destination.path.clone(),
                 target: Some(origin.target.clone()),
+                refresh: false,
                 shape: origin.shape.clone(),
             };
             Box::pin(execute_std(
@@ -3186,6 +3274,31 @@ mod tests {
         assert_eq!(
             parsed.version,
             Some(VersionSpec::Exact(Version::new(0, 5, 6)))
+        );
+    }
+
+    #[test]
+    fn refresh_is_true_or_false() {
+        let parsed = |refresh: Value| {
+            arguments(json!({ "crate": "serde", "path": "Serialize", "refresh": refresh }))
+                .map(|parsed| parsed.refresh)
+        };
+        assert_eq!(parsed(json!(true)).ok(), Some(true));
+        assert_eq!(parsed(json!(false)).ok(), Some(false));
+        assert_eq!(parsed(Value::Null).ok(), Some(false));
+        parsed(json!("yes")).expect_err("not true or false");
+        let without = arguments(json!({ "crate": "serde", "path": "Serialize" })).expect("valid");
+        assert!(!without.refresh);
+        // A page after one asked with `refresh` may be asked without it.
+        let digest = |value: Value| {
+            let Value::Object(arguments) = value else {
+                panic!("an object");
+            };
+            super::super::list_module::request_digest("list_module", Some(&arguments))
+        };
+        assert_eq!(
+            digest(json!({ "crate": "serde", "refresh": true })),
+            digest(json!({ "crate": "serde" }))
         );
     }
 

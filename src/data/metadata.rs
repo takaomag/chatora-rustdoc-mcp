@@ -400,6 +400,40 @@ impl Resolver {
         self.shared.inner.offline_in(root).await
     }
 
+    /// Forgets the failures kept for the workspace at `root`: of `cargo metadata`, and of `cargo
+    /// tree` for each target, as the argument `refresh` asks (§6.4, decided in M2's D5). What
+    /// worked is kept.
+    pub async fn forget_failures(&self, root: &Path) {
+        let kept = self.shared.inner.kept.lock().await.get(root).cloned();
+        let Some(kept) = kept else {
+            return;
+        };
+        if !matches!(&*kept.resolution, Resolution::Metadata { .. }) {
+            tracing::info!(root = %root.display(), "the failure of cargo metadata is forgotten, as asked");
+            let mut all = self.shared.inner.kept.lock().await;
+            if all.get(root).is_some_and(|now| Arc::ptr_eq(now, &kept)) {
+                all.remove(root);
+            }
+            drop(all);
+            return;
+        }
+        let features = kept
+            .features
+            .lock()
+            .await
+            .extract_if(|_, (_, result)| result.is_err())
+            .count();
+        let scopes = kept
+            .scopes
+            .lock()
+            .await
+            .extract_if(|_, (_, result)| result.is_err())
+            .count();
+        if features > 0 || scopes > 0 {
+            tracing::info!(root = %root.display(), features, scopes, "the failures of cargo tree are forgotten, as asked");
+        }
+    }
+
     /// The packages of `workspace`, as [`Self::resolve_until`] gives them, waiting for them as
     /// long as it takes.
     ///
@@ -1040,6 +1074,10 @@ mod tests {
         assert_eq!(&*lock.packages[0].name, "a");
         let again = resolver.resolve(&workspace).await.expect("resolved");
         assert!(Arc::ptr_eq(&first, &again), "kept");
+        // `refresh` keeps what worked (decided in M2's D5).
+        resolver.forget_failures(&workspace.root).await;
+        let refreshed = resolver.resolve(&workspace).await.expect("resolved");
+        assert!(Arc::ptr_eq(&first, &refreshed), "still kept");
 
         let manifest = dir.path().join("crates/a/Cargo.toml");
         fs::write(&manifest, format!("{MEMBER}description = \"changed\"\n")).expect("written");
@@ -1089,6 +1127,11 @@ mod tests {
         // The failure is given again for a while, without running cargo.
         let again = resolver.resolve(&workspace).await.expect("resolved");
         assert!(Arc::ptr_eq(&resolution, &again), "the failure is kept");
+        // Until `refresh` forgets it (decided in M2's D5): cargo runs again.
+        resolver.forget_failures(&workspace.root).await;
+        let refreshed = resolver.resolve(&workspace).await.expect("resolved");
+        assert!(!Arc::ptr_eq(&resolution, &refreshed), "run again");
+        assert!(matches!(&*refreshed, Resolution::CargoLockRaw { .. }));
     }
 
     #[tokio::test]

@@ -26,6 +26,8 @@ enum Change {
     Set(Value),
     /// Passes the `next_cursor` of the base call's result.
     NextCursor,
+    /// Changes what the server does but not a result that worked, as another test checks.
+    CheckedElsewhere,
 }
 
 struct Case {
@@ -228,11 +230,35 @@ fn project_cases() -> Vec<Case> {
     cases
 }
 
+/// `refresh` tries again what failed, and redoes nothing that worked (§6.4, decided in M2's D5).
+fn refresh_cases() -> Vec<Case> {
+    if !cfg!(feature = "local") {
+        return Vec::new();
+    }
+    // As the local test a_member_that_failed_is_not_built_again_until_what_it_is_made_from_changes
+    // and the stdio test a_member_whose_build_fails_again_is_told_failed check.
+    [
+        "crate_overview",
+        "get_item",
+        "list_crates",
+        "list_implementors",
+        "list_impls",
+        "list_methods",
+        "list_module",
+        "resolve_version",
+        "search_items",
+    ]
+    .into_iter()
+    .map(|tool| case(tool, "refresh", json!({}), Change::CheckedElsewhere))
+    .collect()
+}
+
 fn cases() -> Vec<Case> {
     let mut cases = item_cases();
     cases.extend(list_cases());
     cases.extend(type_cases());
     cases.extend(project_cases());
+    cases.extend(refresh_cases());
     cases
 }
 
@@ -279,6 +305,9 @@ fn changing_an_argument_changes_the_result() {
     let mut client = Client::start(Some(Path::new(env!("CARGO_MANIFEST_DIR"))), logs.path());
     let mut unchanged = Vec::new();
     for case in cases() {
+        if matches!(case.change, Change::CheckedElsewhere) {
+            continue;
+        }
         let base = client.call(case.tool, &case.base);
         // The base call works, so that a change is not just another error.
         assert!(
@@ -291,6 +320,7 @@ fn changing_an_argument_changes_the_result() {
         changed[case.argument] = match case.change {
             Change::Set(value) => value,
             Change::NextCursor => base.ok()["page"]["next_cursor"].clone(),
+            Change::CheckedElsewhere => continue,
         };
         let after = client.call(case.tool, &changed);
         if after.text() == base.text() {

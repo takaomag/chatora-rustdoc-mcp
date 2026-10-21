@@ -40,6 +40,8 @@ pub(super) enum SearchArguments {
         target: Option<TargetTriple>,
         detail: Detail,
         searching: Searching,
+        /// Whether what failed is to be tried again (§6.4).
+        refresh: bool,
     },
     /// The project's direct dependencies (requirement R-SR-2).
     Dependencies {
@@ -47,6 +49,8 @@ pub(super) enum SearchArguments {
         target: Option<TargetTriple>,
         detail: Detail,
         searching: Searching,
+        /// Whether what failed for the project is to be tried again (§6.4).
+        refresh: bool,
     },
 }
 
@@ -251,6 +255,7 @@ pub(super) fn parse_arguments(
             target,
             detail,
             searching,
+            refresh: get_item::parse_refresh(arguments)?,
         });
     }
     let release = get_item::parse_release(arguments)?;
@@ -259,6 +264,7 @@ pub(super) fn parse_arguments(
             target: release.target,
             detail,
             searching,
+            refresh: release.refresh,
         });
     }
     Ok(SearchArguments::One(Arguments::for_search(
@@ -364,26 +370,56 @@ pub(super) async fn execute(arguments: SearchArguments, state: Arc<ToolState>) -
             target,
             detail,
             searching,
+            refresh,
         } => {
+            // Acted on once, until a call for it ends (decided in M2's D5).
+            #[cfg(feature = "local")]
+            let scope = "std";
+            #[cfg(feature = "local")]
+            if refresh
+                && super::local::refresh_acts(scope)
+                && super::local::refresh_project(&state, None).await
+            {
+                crate::data::forget_failures(state.cache.dir().join("std"), true).await;
+            }
+            #[cfg(not(feature = "local"))]
+            let _ = refresh;
             // The default project's target (requirement R-TG-1); its warnings go with the
             // search's own.
             let (target, warnings) = match target {
                 Some(target) => (target, Vec::new()),
                 None => super::project::default_target(&state, None).await,
             };
-            search_across::std(state, target, detail, searching, warnings).await
+            let result = search_across::std(state, target, detail, searching, warnings).await;
+            #[cfg(feature = "local")]
+            super::local::refresh_told(scope, &result);
+            result
         },
         SearchArguments::Dependencies {
             project,
             target,
             detail,
             searching,
+            refresh,
         } => {
+            // Of the workspace only, not of each crate searched, and once until a call for it ends
+            // (decided in M2's D5).
+            #[cfg(feature = "local")]
+            let scope = format!("project {project:?}");
+            #[cfg(feature = "local")]
+            if refresh && super::local::refresh_acts(&scope) {
+                super::local::refresh_project(&state, project.as_deref()).await;
+            }
+            #[cfg(not(feature = "local"))]
+            let _ = refresh;
             let (target, warnings) = match target {
                 Some(target) => (target, Vec::new()),
                 None => super::project::default_target(&state, project.as_deref()).await,
             };
-            dependencies(state, project, target, detail, searching, warnings).await
+            let result = dependencies(state, project, target, detail, searching, warnings).await;
+            #[cfg(feature = "local")]
+            super::local::refresh_told(&scope, &result);
+            result
         },
     }
 }

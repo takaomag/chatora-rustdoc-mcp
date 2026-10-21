@@ -73,6 +73,18 @@ pub(super) fn forget_project(dir: &Path) {
         .retain(|(kept_dir, place, ..), _| !(kept_dir == dir && *place == Place::Project));
 }
 
+/// Forgets the failures kept, as rustup's saying that a toolchain is not installed, as the
+/// argument `refresh` asks (§6.4, decided in M2's D5).
+pub(super) fn forget_failures() {
+    let forgotten = KEPT.lock().extract_if(|_, (_, kept)| kept.is_err()).count();
+    if forgotten > 0 {
+        tracing::info!(
+            forgotten,
+            "the failures of rustc and rustup are forgotten, as asked"
+        );
+    }
+}
+
 /// Runs `program` with `args` in `dir` and returns what it printed. rustup may not install a
 /// toolchain on the way (requirement R-WS-7), and the server's stdin and stdout are never shared
 /// (requirement R-SEC-1).
@@ -137,4 +149,37 @@ pub(super) async fn output_with(
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_failures_kept_are_forgotten() {
+        let key = |arg: &str| {
+            (
+                PathBuf::from("/only_the_failures_kept_are_forgotten"),
+                Place::Neutral,
+                PathBuf::from("rustc"),
+                vec![arg.to_owned()],
+            )
+        };
+        KEPT.lock().extend([
+            (
+                key("worked"),
+                (Instant::now(), Ok("rustc 1.99.1".to_owned())),
+            ),
+            (key("failed"), (Instant::now(), Err("not installed".into()))),
+        ]);
+        forget_failures();
+        let (worked, failed) = {
+            let kept = KEPT.lock();
+            (
+                kept.contains_key(&key("worked")),
+                kept.contains_key(&key("failed")),
+            )
+        };
+        assert!(worked && !failed);
+    }
 }
