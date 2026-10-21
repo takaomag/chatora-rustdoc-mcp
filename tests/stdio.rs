@@ -1216,6 +1216,158 @@ fn a_member_under_a_root_package_of_resolver_1_gets_its_features() {
     assert!(server.finish().success());
 }
 
+/// While a member is built again past `build.wait_secs`, the call gets the build before, marked
+/// stale, with when to call again and the LSP for the code edited since; the new build comes after
+/// (requirements R-WS-4, R-WS-9 and R-OUT-9, decided in M2's D4).
+#[cfg(feature = "local")]
+#[test]
+fn a_member_being_built_again_is_given_as_it_was_built() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let write = |path: &str, text: &str| {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        std::fs::write(path, text).expect("written");
+    };
+    write(
+        "Cargo.toml",
+        "[package]\nname = \"slow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    // A build of some seconds, longer than the call waits for it.
+    write(
+        "build.rs",
+        "fn main() { std::thread::sleep(std::time::Duration::from_secs(6)); }\n",
+    );
+    write("src/lib.rs", "/// First.\npub fn first() {}\n");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = Server::start_with(Some(dir.path()), &[(
+        "CHATORA_RUSTDOC_MCP_BUILD__WAIT_SECS",
+        "1",
+    )]);
+    let first = json!({ "crate": "slow", "path": "first" });
+    let found = built_item(&mut server, 1, &first);
+    assert_eq!(
+        found["structuredContent"]["provenance"]["source"], "local",
+        "{found}"
+    );
+    write(
+        "src/lib.rs",
+        "/// First.\npub fn first() {}\n/// Second.\npub fn second() {}\n",
+    );
+    let mut stale = Value::Null;
+    for id in 100..160 {
+        server.send(&call_tool(id, "get_item", first.clone()));
+        let result = server.response(id)["result"].clone();
+        if result["structuredContent"]["provenance"]["stale"] == true {
+            stale = result["structuredContent"].clone();
+            break;
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+    assert_eq!(stale["provenance"]["stale_reason"], "rebuilding", "{stale}");
+    assert!(stale["provenance"]["built_at"].is_string(), "{stale}");
+    assert!(stale["retry_after_secs"].is_u64(), "{stale}");
+    assert!(stale.get("status").is_none(), "{stale}");
+    let text = stale.to_string();
+    assert!(text.contains("LSP"), "{stale}");
+    assert!(text.contains("the build of slow made at"), "{stale}");
+    assert!(text.contains("`span` may have moved"), "{stale}");
+    // The item just added, which the build before has not: not an error, but the build to wait
+    // for.
+    server.send(&call_tool(
+        180,
+        "get_item",
+        json!({ "crate": "slow", "path": "second" }),
+    ));
+    let added = server.response(180)["result"].clone();
+    assert_ne!(added["isError"], true, "{added}");
+    assert_eq!(added["structuredContent"]["status"], "building", "{added}");
+    // The new build, once it is made: until then, the build before has no `second`.
+    let mut second = Value::Null;
+    for id in 200..300 {
+        server.send(&call_tool(
+            id,
+            "get_item",
+            json!({ "crate": "slow", "path": "second" }),
+        ));
+        second = server.response(id)["result"].clone();
+        if second["structuredContent"]["data"]["path"] == "slow::second" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+    let second = &second["structuredContent"];
+    assert_ne!(second["provenance"]["stale"], true, "{second}");
+    assert_eq!(second["data"]["path"], "slow::second", "{second}");
+    assert!(server.finish().success());
+}
+
+/// When a member's build fails past `build.wait_secs`, a call gets `build_failed`, though it got the
+/// build before while it was made (requirement R-WS-7, decided in M2's D4).
+#[cfg(feature = "local")]
+#[test]
+fn a_member_whose_build_fails_again_is_told_failed() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let write = |path: &str, text: &str| {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        std::fs::write(path, text).expect("written");
+    };
+    write(
+        "Cargo.toml",
+        "[package]\nname = \"failing\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write("build.rs", "fn main() {}\n");
+    write("src/lib.rs", "/// First.\npub fn first() {}\n");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = Server::start_with(Some(dir.path()), &[(
+        "CHATORA_RUSTDOC_MCP_BUILD__WAIT_SECS",
+        "1",
+    )]);
+    let first = json!({ "crate": "failing", "path": "first" });
+    let found = built_item(&mut server, 1, &first);
+    assert_eq!(
+        found["structuredContent"]["provenance"]["source"], "local",
+        "{found}"
+    );
+    // A build script that fails after longer than a call waits.
+    write(
+        "build.rs",
+        "fn main() {\n    std::thread::sleep(std::time::Duration::from_secs(4));\n    \
+         panic!(\"broken\");\n}\n",
+    );
+    let mut failed = Value::Null;
+    for id in 100..200 {
+        server.send(&call_tool(id, "get_item", first.clone()));
+        let result = server.response(id)["result"].clone();
+        if result["isError"] == true {
+            failed = result;
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let text = failed["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("build_failed"), "{failed}");
+    assert!(server.finish().success());
+}
+
 /// The result of `get_item` with `arguments`, called again while it answers `status: building`,
 /// with the ids from `first` on.
 #[cfg(feature = "local")]

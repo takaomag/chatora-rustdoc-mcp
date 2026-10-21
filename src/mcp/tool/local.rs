@@ -317,18 +317,25 @@ pub(super) async fn built(
     let what = format!("{} {}", wanted.plan.crate_name, wanted.plan.version);
     let mut joined = local_archive(&state.locals, &state.cache, wanted.clone(), until_built).await;
     if matches!(joined, Joined::Going(Doing::Indexing)) && until_built < until {
-        joined = local_archive(&state.locals, &state.cache, wanted, until).await;
+        joined = local_archive(&state.locals, &state.cache, wanted.clone(), until).await;
     }
     match joined {
         Joined::Done(Ok(built)) => Ok(built),
         Joined::Done(Err(error)) => Err(Box::new(local_error(&what, &error))),
         Joined::Ended => Err(Box::new(get_item::stopped())),
-        Joined::Going(doing) => Err(Box::new(get_item::building_response(
-            provenance,
-            doing,
-            &get_item::being(&what, doing, "the registry"),
-            warnings,
-        ))),
+        // While it is built again, the build before, if its archive is there (requirement
+        // R-WS-4, decided in M2's D4).
+        Joined::Going(doing) => crate::query::local::rebuilding(&state.cache, &wanted)
+            .await
+            .map(Arc::new)
+            .ok_or_else(|| {
+                Box::new(get_item::building_response(
+                    provenance,
+                    doing,
+                    &get_item::being(&what, doing, "the registry"),
+                    warnings,
+                ))
+            }),
     }
 }
 

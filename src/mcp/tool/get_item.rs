@@ -488,6 +488,16 @@ pub(super) fn provenance_schema() -> Value {
                 "description": "When the documentation of a workspace member was built here (RFC \
                                 3339): edits made since are not in it.",
             },
+            "stale": {
+                "type": "boolean",
+                "description": "The documentation is older than the code: stale_reason tells why.",
+            },
+            "stale_reason": {
+                "type": "string",
+                "enum": ["rebuilding"],
+                "description": "rebuilding: a workspace member is being built again, as what it \
+                                is made from changed; this is the build before, of built_at.",
+            },
             "features_requested": {
                 "type": "array",
                 "items": { "type": "string" },
@@ -1570,6 +1580,18 @@ async fn look_up_member(
             }
         },
     };
+    // The build before, while the member is built again (decided in M2's D4).
+    let built_before = built.stale.then(|| built.record.built_at.clone());
+    let rebuilt = built.stale.then(|| built.record.crate_name.clone());
+    if let (Some(built_at), Some(krate)) = (&built_before, &rebuilt) {
+        warnings.push(
+            format!(
+                "this is the build of {krate} made at {built_at}, given while it is built again, \
+                 as what it is made from changed: the lines of `span` may have moved"
+            )
+            .into(),
+        );
+    }
     arguments.in_build.sets = feature_sets(state, &arguments, &mut warnings).await;
     // Kept for the lookup again when a re-export is not followed.
     arguments.local = Some(LocalSource::Built(Arc::clone(&built)));
@@ -1583,10 +1605,29 @@ async fn look_up_member(
             features_requested: record.features_requested.as_deref(),
             features_effective: record.features_effective.as_deref(),
         };
-        let looked_up = look_up_in(&built.archived.mapped, &arguments, origin);
+        let mut looked_up = look_up_in(&built.archived.mapped, &arguments, origin);
+        if let (Some(built_at), Ok(response)) = (&built_before, &mut looked_up) {
+            mark_rebuilding(response, built_at);
+        }
         (looked_up, arguments)
     });
     match task.await {
+        // Not in the build before: maybe in the one being made, as an item just added.
+        Ok((Err(Failure::Item(error)), arguments))
+            if !matches!(error, GetItemError::Elsewhere(_)) && rebuilt.is_some() =>
+        {
+            let being = format!(
+                "{} is built again, and the build before has no such item, which the new build \
+                 may have",
+                rebuilt.unwrap_or_default()
+            );
+            building_response(
+                local_provenance(&arguments),
+                Doing::Building,
+                &being,
+                &warnings,
+            )
+        },
         Ok((looked_up, arguments)) => conclude(state, looked_up, arguments, warnings).await,
         Err(error) => {
             let error = crate::task::resume_if_panic(error);
@@ -1594,6 +1635,44 @@ async fn look_up_member(
             shutting_down()
         },
     }
+}
+
+/// Marks `response` as of the build of a member made at `built_at`, given while the member is built
+/// again (requirements R-WS-9 and R-OUT-9, decided in M2's D4): `stale` and `stale_reason` in its
+/// provenance, `retry_after_secs` after it, and a hint to see the code changed since with the LSP.
+#[cfg(feature = "local")]
+fn mark_rebuilding(response: &mut Value, built_at: &str) {
+    let Some(fields) = response.as_object_mut() else {
+        return;
+    };
+    if let Some(Value::Object(provenance)) = fields.get_mut("provenance") {
+        provenance.insert("stale".to_owned(), json!(true));
+        provenance.insert("stale_reason".to_owned(), json!("rebuilding"));
+    }
+    let hint = json!(format!(
+        "for the code changed since {built_at}, use the LSP tool (rust-analyzer); call again in \
+         about {RETRY_AFTER_SECS} seconds for the new build"
+    ));
+    // The fields are in order: `retry_after_secs` after `provenance`, the hint last (§7.3).
+    let old = std::mem::take(fields);
+    let mut hints = None;
+    for (key, value) in old {
+        let after = key == "provenance";
+        if key == "hints" {
+            hints = Some(value);
+            continue;
+        }
+        fields.insert(key, value);
+        if after {
+            fields.insert("retry_after_secs".to_owned(), json!(RETRY_AFTER_SECS));
+        }
+    }
+    let mut hints = match hints {
+        Some(Value::Array(hints)) => hints,
+        _ => Vec::new(),
+    };
+    hints.push(hint);
+    fields.insert("hints".to_owned(), Value::Array(hints));
 }
 
 /// The provenance of the workspace member's crate that `arguments` names, as far as it is known
@@ -2669,7 +2748,7 @@ fn finish(
 }
 
 /// Puts `warnings` first among the `warnings` of `response`, which come right after `provenance`
-/// (§7.3).
+/// and the fields of its state, as `retry_after_secs` (§7.3).
 fn add_warnings(response: &mut Value, warnings: &[Box<str>]) {
     if warnings.is_empty() {
         return;
@@ -2690,13 +2769,24 @@ fn add_warnings(response: &mut Value, warnings: &[Box<str>]) {
         fields.insert("warnings".to_owned(), Value::Array(all));
         return;
     }
-    // The fields are in order: rebuild them with `warnings` after `provenance`.
-    let old = std::mem::take(fields);
+    // The fields are in order: rebuild them with `warnings` after `provenance` and the state.
+    let old: Vec<(String, Value)> = std::mem::take(fields).into_iter().collect();
+    let state = [
+        "provenance",
+        "status",
+        "building_reason",
+        "retry_after_secs",
+        "partial",
+    ];
+    let last = old
+        .iter()
+        .rposition(|(key, _)| state.contains(&key.as_str()));
     let mut all = Some(Value::Array(all));
-    for (key, value) in old {
-        let after = key == "provenance";
+    for (at, (key, value)) in old.into_iter().enumerate() {
         fields.insert(key, value);
-        if after && let Some(all) = all.take() {
+        if Some(at) == last
+            && let Some(all) = all.take()
+        {
             fields.insert("warnings".to_owned(), all);
         }
     }

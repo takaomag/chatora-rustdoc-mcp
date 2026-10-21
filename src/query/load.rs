@@ -585,6 +585,25 @@ pub fn archive_of(
     make_at(cache, &path, source, json, Parsing::enter())
 }
 
+/// The archive of the JSON of the crate `stem` in `dir`, keyed by `source`, if it was made: opened,
+/// and not made (decided in M2's D4).
+pub async fn archived(
+    cache: &Cache,
+    dir: &Path,
+    stem: &str,
+    source: &str,
+) -> Option<Arc<Mapped<Indexed>>> {
+    let path = archive_path_of(dir, stem, source);
+    if let Some(mapped) = opened(&path) {
+        return Some(mapped);
+    }
+    let (cache, source) = (cache.clone(), Box::<str>::from(source));
+    crate::task::spawn_blocking(move || archived_at(&cache, &path, &source))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// [`archive_of`] for async code: it waits for the lock and for a place among the crates being
 /// parsed as a task, and parses on a blocking thread. `None` when the work was stopped, as when
 /// the server ends.

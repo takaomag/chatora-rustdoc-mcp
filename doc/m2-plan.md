@@ -893,6 +893,32 @@ Claude Code 2.1.304、Linux で測った。
   - 依存 (registry・git) の build script の `rerun-if-env-changed` (`OPENSSL_DIR` など) は鍵に入らない (D4 は member と path 依存だけ)
   - Unix の外 (Windows) では ctime を見ないので、古い mtime のまま置き換えた外のファイルを拾わないことがある
 
+**D4c・D4d の決定 (2026-10-21)**:
+
+- 下調べ: 要件は、作り直しが `build.wait_secs` に間に合わなければ前回成功した JSON を返し、provenance に `stale: true`・`stale_reason: "rebuilding"`、最上位に `retry_after_secs` を付け、最上位の `status` は付けない (R-WS-6・R-OUT-9)。前回が無ければ `status: building`。作り直しに失敗したら前回があっても `build_failed` (stale は返さない)。`built_at` を付け、ソースがその後に変わっていれば LSP を hints で案内する (R-WS-9・§9.9)。stale の JSON の span でソースを読むときは行がずれうる旨を warnings に (R-OUT-9 の近く)
+- 利用者が 1 件ずつ決めたこと (D4c):
+  1. 前回のビルドは、flight の仕事が鮮度の判定で読んだものを共有の場所に置き、待ちをやめた呼び出しが使う (置き場の決め方を二重に持たない)。判定より前 (toolchain の確認や枠の待ち) で時間切れになったら `status: building`
+  2. 計画 (features・toolchain・docsrs) が違っても、置き場の直近の成功を返す。provenance にはそのビルドの `features_requested`・`toolchain`・`built_at` をそのまま載せる
+  3. 前回の JSON のアーカイブ (索引) が手元に無ければ `status: building` (索引を作る時間を待たせない)
+  4. stale の応答すべてに、LSP を案内する hint と、span の行がずれうる warning を付ける
+- 利用者が決めたこと (D4d): D4 の決定 6 を改め、`--cfg docsrs` や docs.rs の組で壊れた記録は新しく作らず、置き場の前回の成功の記録で判断する。前回が docsrs なし・通常の組に落ちていて、toolchain・`rustdoc-args` の cfg・docs.rs の組が同じなら、最初からそちらでビルドする。それらが変わるか `refresh` (D5) で試し直す。理由: 内容の鍵だと、編集のたびに docsrs を試し直して rustdoc 1 回分 (このリポジトリで約 5 秒) 余計にかかる
+
+**D4c (作り直しの間の stale の応答。2026-10-21)**:
+
+- `query::local`: flight の仕事が鮮度の判定で、置き場に前回のビルドを見つけて作り直すときは、それを flight の鍵ごとの表 (`REBUILDING`) に置き、仕事が終われば消す (`Rebuilding` の drop。成功でも失敗でも)。`rebuilding(cache, wanted)` は、その前回のビルドのアーカイブがあれば開いて返す (作らない。`load::archived`)。決定 1・2・3 のとおり、計画が違っても置き場の直近の成功を返し、判定より前やアーカイブが無ければ返さない
+- `mcp::tool::local::built`: 待ちが期限を過ぎて `Joined::Going` なら、前回のビルドを返し、無ければ今までどおり `status: building`。作り直しに失敗すれば `build_failed` (stale は返さない)
+- 応答 (`get_item` の member): provenance に `stale: true`・`stale_reason: "rebuilding"`、`provenance` の後に `retry_after_secs`、warnings に「前回のビルド (built_at) で、作り直しの間は `span` の行がずれうる」、hints に「built_at の後に編集したコードは LSP で、呼び直せば新しいビルド」(決定 4)。最上位の `status` は付けない。provenance の `features_requested`・`toolchain`・`built_at` は前回のビルドのもの。outputSchema の provenance に `stale`・`stale_reason` (今は `rebuilding` だけ) を足した
+- テスト (stdio): build script が 6 秒眠る member を `build.wait_secs = 1` で作り、ソースを編集した後の呼び出しが、前回のビルドを stale の印・`retry_after_secs`・LSP の案内・span の warning 付きで返し、`status` を付けず、作り直しの後は新しいビルド (足した関数がある) を返すこと。3 回続けて通った (1 回 約 13 秒)
+- レビューで直したこと:
+  - 前回のビルドに無い item (編集で足した関数など) を引くと、stale と知らせずに `item_not_found` (`retryable: false`) を返していた: 前回のビルドでの item のエラー (re-export の行き先を除く) は `status: building` を返す (新しいビルドにあるかもしれない)
+  - 作り直しが待ちの上限より長くかかって失敗すると、`build_failed` が届かず stale が返り続けていた (再現): 失敗した入力の鍵を (キャッシュ, flight の鍵) ごとに覚え、同じ鍵の間は前回のビルドを出さない (`REBUILD_FAILED`。D5 の失敗の記憶までのつなぎ)。失敗の結果も次の呼び出しに 1 度渡す (`hands_over` に失敗を足した)
+  - stale の応答に、前回のビルドの記録にある warnings (docs.rs の組で作った旨など) も載せる
+  - 前回のビルドの表は (キャッシュ, flight の鍵) で引き、項目は仕事の番号と組にして、後の仕事の項目を消さない
+  - warning に crate 名を入れ、文面を「編集」前提から「作るもとが変わった」に改めた (toolchain や features が変わっただけの作り直しでも出るため)。warnings は `retry_after_secs` などの状態の項目の後に置く (`status: building` の応答と同じ順)
+  - 決定 1 の「判定より前」は、実装では toolchain の確認まで: 枠や cargo のロックの待ちは判定の後なので、その間は前回のビルドを返す
+  - テスト: 作り直しの間に足した item は `status: building`。作り直しが上限より長くかかって失敗すると `build_failed` が届く (2 回続けて通った)
+- 残したもの: stale の member から re-export を追って別の crate に移った応答には、stale の印が付かない (warning に元の crate 名と built_at が出る)。stale の `LocalBuilt.json` は、作り直しで上書きされたファイルを指しうる (今はテストでしか読まない)
+
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
 - 利用者の指示で、デッドロックと止まって戻らない危険を、コード全体で監査した (サブエージェント、読むだけ。D4b のハングの後)。ロックの循環、ガードを持ったままの `.await` (clippy の `await_holding_lock` も `suspicious` の deny で効いている)、自分の結果を待つ形の循環は無かった。止まって長く戻らない箇所は次のとおり

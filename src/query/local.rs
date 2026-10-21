@@ -3,7 +3,7 @@
 //! M2's D2).
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io,
     path::{Path, PathBuf},
@@ -64,6 +64,9 @@ pub struct LocalBuilt {
     pub json: PathBuf,
     /// The record of the build, for the provenance (requirement R-OUT-9).
     pub record: BuildRecord,
+    /// The build before, given while the member is built again, past the deadline of the call
+    /// (requirements R-WS-4 and R-OUT-9, decided in M2's D4).
+    pub stale: bool,
 }
 
 /// Why a member's crate could not be built and archived.
@@ -98,12 +101,16 @@ pub enum LocalError {
 /// The build of a member for the calls that wanted it at once, or why there is none.
 pub type SharedLocal = Result<Arc<LocalBuilt>, Arc<LocalError>>;
 
-/// Whether a member's build that went on past a deadline is handed to the next call for it: only
-/// a build without a key, which the next call cannot find fresh, and would make again (decided in
-/// M2's D4).
+/// Whether a member's build that went on past a deadline is handed to the next call for it
+/// (decided in M2's D4).
+///
+/// It is when it has no key, so that the next call cannot find it fresh, and would make it again,
+/// or when it failed, which the calls that stopped waiting did not see: they had the build before.
 #[must_use]
 pub fn hands_over(built: &SharedLocal) -> bool {
-    built.as_ref().is_ok_and(|built| built.record.key.is_none())
+    built
+        .as_ref()
+        .map_or(true, |built| built.record.key.is_none())
 }
 
 /// The archive of the member's crate that `wanted` names, built and archived by work that the
@@ -119,21 +126,18 @@ pub async fn local_archive(
     wanted: LocalWanted,
     until: Instant,
 ) -> Joined<SharedLocal> {
-    let documented = match &wanted.plan.documented {
-        Documented::Lib { .. } => "lib".to_owned(),
-        Documented::Bin { name } => format!("bin {name}"),
-    };
-    let key = format!(
-        "local:{}:{}:{}:{documented}",
-        wanted.plan.root.display(),
-        wanted.plan.package.0,
-        wanted.target
-    );
+    let key = flight_key(&wanted);
     let what = format!("{} {}", wanted.plan.crate_name, wanted.plan.version);
     let cache = cache.clone();
+    let table = table_key(&cache, &wanted);
     flights
         .join(&key, &what, until, async move |stage| {
-            build_and_archive(&cache, wanted, &stage)
+            // What the work found was built before is there while it works.
+            let rebuilding = Rebuilding {
+                key: table,
+                work: NEXT_REBUILD.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            };
+            build_and_archive(&cache, wanted, &stage, &rebuilding)
                 .await
                 .map(Arc::new)
                 .map_err(Arc::new)
@@ -141,11 +145,118 @@ pub async fn local_archive(
         .await
 }
 
+/// The key of what `wanted` names in [`REBUILDING`] and [`REBUILD_FAILED`]: of the work, in the
+/// cache, as one process may have more than one.
+fn table_key(cache: &Cache, wanted: &LocalWanted) -> String {
+    format!("{}|{}", cache.dir().display(), flight_key(wanted))
+}
+
+/// The key of the work that builds what `wanted` names.
+fn flight_key(wanted: &LocalWanted) -> String {
+    let documented = match &wanted.plan.documented {
+        Documented::Lib { .. } => "lib".to_owned(),
+        Documented::Bin { name } => format!("bin {name}"),
+    };
+    format!(
+        "local:{}:{}:{}:{documented}",
+        wanted.plan.root.display(),
+        wanted.plan.package.0,
+        wanted.target
+    )
+}
+
+/// The builds published before, by [`table_key`], with the number of the work that builds them
+/// again, which found them so: given while it works (decided in M2's D4).
+static REBUILDING: LazyLock<Mutex<HashMap<String, Given>>> = LazyLock::new(Mutex::default);
+
+/// A build given while the work numbered so builds it again.
+type Given = (u64, Arc<Built>);
+
+/// The key of the inputs of the last build that failed, by [`table_key`]: while they are the same,
+/// the build before is not given while the member is built again, so that the failure is told
+/// rather than the build before again and again (until M2's D5 remembers failures).
+static REBUILD_FAILED: LazyLock<Mutex<HashMap<String, Box<str>>>> = LazyLock::new(Mutex::default);
+
+/// Numbers the works that build members.
+static NEXT_REBUILD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The entry in [`REBUILDING`] under `key` of the work numbered `work`, taken away when it is
+/// dropped, as the work ends, however it ends: not that of a later work under the same key.
+struct Rebuilding {
+    key: String,
+    work: u64,
+}
+
+impl Rebuilding {
+    /// Gives `before` while the work builds it again, unless the build of the same inputs, of
+    /// the key `inputs`, failed last.
+    fn give(&self, before: Box<Built>, inputs: &str) {
+        if REBUILD_FAILED.lock().get(&self.key).map(AsRef::as_ref) == Some(inputs) {
+            return;
+        }
+        REBUILDING
+            .lock()
+            .insert(self.key.clone(), (self.work, Arc::from(before)));
+    }
+
+    /// Notes how the build of the inputs of the key `inputs` ended.
+    fn ended(&self, inputs: &str, failed: bool) {
+        let mut failures = REBUILD_FAILED.lock();
+        if failed {
+            failures.insert(self.key.clone(), inputs.into());
+        } else {
+            failures.remove(&self.key);
+        }
+    }
+}
+
+impl Drop for Rebuilding {
+    fn drop(&mut self) {
+        let mut rebuilding = REBUILDING.lock();
+        if rebuilding
+            .get(&self.key)
+            .is_some_and(|(work, _)| *work == self.work)
+        {
+            rebuilding.remove(&self.key);
+        }
+    }
+}
+
+/// The archive of the build of what `wanted` names that was published before, while the work
+/// builds it again (decided in M2's D4).
+///
+/// It is given past the deadline of the call, whatever it was built with. `None` when the work did
+/// not find one, or its archive was not made, which is not made here.
+pub async fn rebuilding(cache: &Cache, wanted: &LocalWanted) -> Option<LocalBuilt> {
+    let before = REBUILDING
+        .lock()
+        .get(&table_key(cache, wanted))
+        .map(|(_, before)| Arc::clone(before))?;
+    let Built { json, record, .. } = Built::clone(&before);
+    let dir = json.parent().unwrap_or(&json).to_path_buf();
+    let mapped = load::archived(
+        cache,
+        &dir,
+        &record.format_version.to_string(),
+        &record.sha256,
+    )
+    .await?;
+    // What it warned of when it was built, as when it is found fresh.
+    let warnings = warnings_of(&record, record.warnings.clone());
+    Some(LocalBuilt {
+        archived: Archived { mapped, warnings },
+        json,
+        record,
+        stale: true,
+    })
+}
+
 /// Checks the toolchain, builds, and archives the JSON, telling `stage` what it does.
 async fn build_and_archive(
     cache: &Cache,
     wanted: LocalWanted,
     stage: &Stage,
+    rebuilding: &Rebuilding,
 ) -> Result<LocalBuilt, LocalError> {
     stage.set(Doing::Building);
     if let Some(problem) = Programs::problem() {
@@ -192,6 +303,7 @@ async fn build_and_archive(
     let (cfg_docsrs, features) = (plan.cfg_docsrs, plan.features.clone());
     let builder = Builder {
         cache,
+        rebuilding,
         input_files: &input_files,
         input_packages: &input_packages,
         rustc: &rustc,
@@ -259,6 +371,8 @@ async fn after_install(
 /// What the builds of a member are made with.
 struct Builder<'a> {
     cache: &'a Cache,
+    /// Where the work that builds it tells the build before (decided in M2's D4).
+    rebuilding: &'a Rebuilding,
     /// The files that the member's build is made from, and the directories of them (decided in
     /// M2's D4).
     input_files: &'a [PathBuf],
@@ -324,10 +438,21 @@ impl Builder<'_> {
                 }
                 return Ok(*built);
             },
-            Freshness::Stale(fresh) => fresh,
+            Freshness::Stale(fresh, before) => {
+                if let (Some(before), Some(fresh)) = (before, &fresh) {
+                    self.rebuilding.give(before, &fresh.key);
+                }
+                fresh
+            },
         };
-        self.tries(plan, toolchain.as_deref(), fresh.as_deref(), warnings)
-            .await
+        let built = self
+            .tries(plan, toolchain.as_deref(), fresh.as_deref(), warnings)
+            .await;
+        if let Some(fresh) = &fresh {
+            self.rebuilding
+                .ended(&fresh.key, matches!(built, Err(LocalError::Build(_))));
+        }
+        built
     }
 
     /// The build of `plan`, as [`Self::build`] tries it, with the toolchain that `rustc -vV`
@@ -427,7 +552,7 @@ impl Builder<'_> {
         toolchain: Option<&str>,
     ) -> Freshness {
         let Some(host) = host else {
-            return Freshness::Stale(None);
+            return Freshness::Stale(None, None);
         };
         // Where the JSON tells it is for: the host's for a proc-macro.
         let target = if plan.is_proc_macro() {
@@ -442,7 +567,7 @@ impl Builder<'_> {
             Err(error) => {
                 let error = crate::task::resume_if_panic(error);
                 tracing::debug!(%error, "the check of a build was stopped");
-                return Freshness::Stale(None);
+                return Freshness::Stale(None, None);
             },
         };
         // What the dep-info of the build before and its build scripts told: its key has them.
@@ -478,12 +603,12 @@ impl Builder<'_> {
             Ok((before, Ok(inputs))) => (before, inputs),
             Ok((_, Err(error))) => {
                 tracing::warn!(%error, "what a build is made from could not be read, so it is made again each time");
-                return Freshness::Stale(None);
+                return Freshness::Stale(None, None);
             },
             Err(error) => {
                 let error = crate::task::resume_if_panic(error);
                 tracing::debug!(%error, "the check of a build was stopped");
-                return Freshness::Stale(None);
+                return Freshness::Stale(None, None);
             },
         };
         let key = freshness::key(
@@ -508,15 +633,18 @@ impl Builder<'_> {
                 };
                 Freshness::Fresh(Box::new(before), Box::new(fresh))
             },
-            _ => Freshness::Stale(Some(Box::new(build::Fresh {
-                key: key.into(),
-                seen: inputs.clone(),
-                inputs,
-                facts,
-                deps,
-                scanned,
-                walked,
-            }))),
+            before => Freshness::Stale(
+                Some(Box::new(build::Fresh {
+                    key: key.into(),
+                    seen: inputs.clone(),
+                    inputs,
+                    facts,
+                    deps,
+                    scanned,
+                    walked,
+                })),
+                before.map(Box::new),
+            ),
         }
     }
 
@@ -752,8 +880,9 @@ impl Drop for Following {
 enum Freshness {
     /// It is, as published, with its key and the inputs that it was made from.
     Fresh(Box<Built>, Box<build::Fresh>),
-    /// It is to be made, with this key and these inputs, if they could be taken.
-    Stale(Option<Box<build::Fresh>>),
+    /// It is to be made, with this key and these inputs, if they could be taken, and was built
+    /// before so, if it was.
+    Stale(Option<Box<build::Fresh>>, Option<Box<Built>>),
 }
 
 /// What the response warns about a member built with the project's features, as the features
@@ -778,9 +907,33 @@ type BuildKey = (Box<str>, Option<String>);
 async fn archive(
     cache: &Cache,
     built: Built,
-    mut warnings: Vec<Box<str>>,
+    warnings: Vec<Box<str>>,
 ) -> Result<LocalBuilt, LocalError> {
     let Built { json, record, .. } = built;
+    let warnings = warnings_of(&record, warnings);
+    let (cache, sha256, stem) = (
+        cache.clone(),
+        record.sha256.clone(),
+        record.format_version.to_string(),
+    );
+    let (path, dir) = (json.clone(), json.parent().unwrap_or(&json).to_path_buf());
+    let checked = sha256.clone();
+    let mapped = load::archive_from(&cache, &dir, &stem, &sha256, move || {
+        read_checked(&path, &checked)
+    })
+    .await
+    .ok_or(LocalError::Stopped)?
+    .map_err(LocalError::Load)?;
+    Ok(LocalBuilt {
+        archived: Archived { mapped, warnings },
+        json,
+        record,
+        stale: false,
+    })
+}
+
+/// `warnings`, with what the response warns about how the build of `record` was made.
+fn warnings_of(record: &BuildRecord, mut warnings: Vec<Box<str>>) -> Vec<Box<str>> {
     if record.bootstrap_all {
         warnings.push(
             "the names of the project's crates were too many for RUSTC_BOOTSTRAP, so it was 1: \
@@ -807,24 +960,7 @@ async fn archive(
             .into(),
         );
     }
-    let (cache, sha256, stem) = (
-        cache.clone(),
-        record.sha256.clone(),
-        record.format_version.to_string(),
-    );
-    let (path, dir) = (json.clone(), json.parent().unwrap_or(&json).to_path_buf());
-    let checked = sha256.clone();
-    let mapped = load::archive_from(&cache, &dir, &stem, &sha256, move || {
-        read_checked(&path, &checked)
-    })
-    .await
-    .ok_or(LocalError::Stopped)?
-    .map_err(LocalError::Load)?;
-    Ok(LocalBuilt {
-        archived: Archived { mapped, warnings },
-        json,
-        record,
-    })
+    warnings
 }
 
 /// The JSON at `path`, which must have `sha256`: another server may have published another build
