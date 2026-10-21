@@ -6,7 +6,9 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output, Stdio},
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
 /// A temporary directory with a home, a cargo home and an empty git config of its own, and room
@@ -99,13 +101,13 @@ pub(crate) fn in_isolated_child(name: &str) -> Option<PathBuf> {
     }
     let isolated = Isolated::new();
     let binary = std::env::current_exe().expect("the test binary");
-    let output = isolated
-        .apply(&mut Command::new(binary))
-        .args([name, "--exact", "--nocapture", "--test-threads=1"])
-        .env(ISOLATED_DIR, isolated.path())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .expect("the test binary runs");
+    let output = output_within(
+        isolated
+            .apply(&mut Command::new(binary))
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(ISOLATED_DIR, isolated.path()),
+        Duration::from_secs(600),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     // A name that matches no test passes, too.
@@ -114,6 +116,79 @@ pub(crate) fn in_isolated_child(name: &str) -> Option<PathBuf> {
         "{name} in an isolated child:\n{stdout}\n{stderr}"
     );
     None
+}
+
+/// The output of `command`, run with no stdin, which must end within `limit`: else it is
+/// stopped, with what it started on Unix (its process group), and the test fails with what it
+/// wrote. What it leaves running may hold its output open after it ends, which is read a few
+/// seconds more, and then not waited for.
+pub(crate) fn output_within(command: &mut Command, limit: Duration) -> Output {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut *command, 0);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the command runs");
+    let stdout = read_all(child.stdout.take());
+    let stderr = read_all(child.stderr.take());
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the command is waited for") {
+            break status;
+        }
+        if started.elapsed() > limit {
+            #[cfg(unix)]
+            drop(
+                Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{}", child.id())])
+                    .status(),
+            );
+            drop(child.kill());
+            drop(child.wait());
+            panic!(
+                "{command:?} did not end in {limit:?}:\n{}\n{}",
+                String::from_utf8_lossy(&rest(&stdout)),
+                String::from_utf8_lossy(&rest(&stderr))
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Output {
+        status,
+        stdout: rest(&stdout),
+        stderr: rest(&stderr),
+    }
+}
+
+/// What `pipe` gives, read on a thread of its own and sent as it comes, so that what was read is
+/// there even when the pipe does not end.
+fn read_all(pipe: Option<impl std::io::Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    if let Some(mut pipe) = pipe {
+        std::thread::spawn(move || {
+            let mut piece = vec![0; 8 * 1024];
+            while let Ok(read) = pipe.read(&mut piece) {
+                if read == 0 || sender.send(piece[..read].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    receiver
+}
+
+/// What `receiver` has from [`read_all`]: until its pipe ends, or for five seconds.
+fn rest(receiver: &mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    let started = Instant::now();
+    let mut read = Vec::new();
+    while let Ok(piece) =
+        receiver.recv_timeout(Duration::from_secs(5).saturating_sub(started.elapsed()))
+    {
+        read.extend(piece);
+    }
+    read
 }
 
 /// Whether the variable `name` of the test's environment is kept from the children.

@@ -41,10 +41,7 @@ impl Child {
     ///
     /// Returns an error when the child cannot be waited for.
     pub(super) async fn output(self) -> io::Result<Output> {
-        let Self { child, group } = self;
-        let output = child.wait_with_output().await;
-        drop(group);
-        output
+        self.read_lines(true, |_| {}, |_| {}).await
     }
 
     /// [`Self::output`], handing each line of stderr to `on_line` as it comes, as cargo's
@@ -76,6 +73,10 @@ impl Child {
     }
 
     /// Reads stdout and stderr line by line as they come, keeping stdout if `keep_stdout`.
+    ///
+    /// What the child leaves running may hold its stdout and stderr open after it ends, as a
+    /// process that a build script starts. They are read a moment more ([`DRAIN`]), and then the
+    /// group is stopped, and they are read a moment more again: what is left is not waited for.
     async fn read_lines(
         self,
         keep_stdout: bool,
@@ -85,43 +86,72 @@ impl Child {
         use tokio::io::AsyncBufReadExt as _;
         let Self { mut child, group } = self;
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        let read_stdout = async {
-            let mut read = Vec::new();
-            if let Some(stdout) = stdout {
-                let mut stdout = tokio::io::BufReader::new(stdout);
-                let mut line = Vec::new();
-                while stdout.read_until(b'\n', &mut line).await? > 0 {
-                    on_stdout(&String::from_utf8_lossy(&line));
-                    if keep_stdout {
-                        read.append(&mut line);
-                    } else {
-                        line.clear();
+        // Out of the reading, which may be given up: what was read is kept.
+        let (mut stdout_read, mut stderr_read) = (Vec::new(), Vec::new());
+        let status = {
+            let read_stdout = async {
+                if let Some(stdout) = stdout {
+                    let mut stdout = tokio::io::BufReader::new(stdout);
+                    let mut line = Vec::new();
+                    while stdout.read_until(b'\n', &mut line).await? > 0 {
+                        on_stdout(&String::from_utf8_lossy(&line));
+                        if keep_stdout {
+                            stdout_read.append(&mut line);
+                        } else {
+                            line.clear();
+                        }
                     }
                 }
-            }
-            Ok::<_, io::Error>(read)
-        };
-        let read_stderr = async {
-            let mut read = Vec::new();
-            if let Some(stderr) = stderr {
-                let mut stderr = tokio::io::BufReader::new(stderr);
-                let mut line = Vec::new();
-                while stderr.read_until(b'\n', &mut line).await? > 0 {
-                    on_stderr(&String::from_utf8_lossy(&line));
-                    read.append(&mut line);
+                Ok::<_, io::Error>(())
+            };
+            let read_stderr = async {
+                if let Some(stderr) = stderr {
+                    let mut stderr = tokio::io::BufReader::new(stderr);
+                    let mut line = Vec::new();
+                    while stderr.read_until(b'\n', &mut line).await? > 0 {
+                        on_stderr(&String::from_utf8_lossy(&line));
+                        stderr_read.append(&mut line);
+                    }
                 }
+                Ok::<_, io::Error>(())
+            };
+            let reading = async { tokio::try_join!(read_stdout, read_stderr).map(drop) };
+            let mut reading = std::pin::pin!(reading);
+            let (read, status) = tokio::select! {
+                read = &mut reading => (Some(read), child.wait().await?),
+                status = child.wait() => (None, status?),
+            };
+            match read {
+                Some(read) => read?,
+                None => {
+                    if let Ok(read) = tokio::time::timeout(DRAIN, &mut reading).await {
+                        read?;
+                    } else {
+                        stop(group.0);
+                        if let Ok(read) = tokio::time::timeout(DRAIN, &mut reading).await {
+                            read?;
+                        } else {
+                            tracing::warn!(
+                                "a child ended, and something that it left holds its output open: the rest is not read"
+                            );
+                        }
+                    }
+                },
             }
-            Ok::<_, io::Error>(read)
+            status
         };
-        let (stdout, stderr, status) = tokio::try_join!(read_stdout, read_stderr, child.wait())?;
         drop(group);
         Ok(Output {
             status,
-            stdout,
-            stderr,
+            stdout: stdout_read,
+            stderr: stderr_read,
         })
     }
 }
+
+/// How long the output of a child that ended is read for before the rest of its group is stopped,
+/// and again after.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Stops the group under its number in [`GROUPS`] when dropped.
 #[derive(Debug)]
@@ -614,6 +644,67 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         done()
+    }
+
+    /// The output of `sh -c script`, which must end within ten seconds, and how long it took.
+    #[cfg(unix)]
+    async fn timed_output(script: &str) -> (Output, Duration) {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        prepare(&mut command);
+        let started = Instant::now();
+        let child = spawn(command).await.expect("started");
+        let output = tokio::time::timeout(Duration::from_secs(30), child.output())
+            .await
+            .expect("not waited for the grandchild")
+            .expect("its output");
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        (output, took)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_whose_grandchild_holds_its_output_ends_all_the_same() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let pid_file = dir.path().join("grandchild");
+        // The grandchild keeps stdout and stderr open after the child ends: it is stopped.
+        let (output, _) = timed_output(&format!(
+            "echo told; echo said >&2; sleep 300 & echo $! > '{}'; exit 0",
+            pid_file.display()
+        ))
+        .await;
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "told\n");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "said\n");
+        let pid = std::fs::read_to_string(&pid_file).expect("its ID");
+        let pid = pid.trim();
+        assert!(
+            wait_for(Duration::from_secs(10), || !running(pid)).await,
+            "the grandchild {pid} was stopped"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_grandchild_out_of_the_group_is_not_waited_for() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let pid_file = dir.path().join("grandchild");
+        // Out of the child's session, it is not stopped with it: what was read is kept.
+        let (output, took) = timed_output(&format!(
+            "echo told; setsid sh -c 'echo $$ > \"{}\"; exec sleep 300' & sleep 1; exit 0",
+            pid_file.display()
+        ))
+        .await;
+        let pid = std::fs::read_to_string(&pid_file).expect("its ID");
+        drop(std::process::Command::new("kill").arg(pid.trim()).status());
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "told\n");
+        assert!(took >= DRAIN, "{took:?}");
     }
 
     #[cfg(any(unix, windows))]

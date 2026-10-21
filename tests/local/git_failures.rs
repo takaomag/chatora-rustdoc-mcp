@@ -17,7 +17,7 @@ use chatora_rustdoc_mcp::data::cargo::{Failure, GitFetchFailure, classify};
 
 use crate::{
     git::{commit_all, git},
-    isolated::Isolated,
+    isolated::{Isolated, output_within},
 };
 
 /// A bare repository with the package `dep`, a branch `main` and a tag `v1`.
@@ -90,16 +90,16 @@ fn run(isolated: &Isolated, dir: &Path, dependency: &str, command: &str) -> Outp
         "metadata" => &["metadata", "--format-version", "1"],
         other => &[other],
     };
-    isolated
-        .apply(&mut Command::new("cargo"))
-        .args(args)
-        .current_dir(dir)
-        // As the server runs cargo (`data::cargo::project_command`).
-        .env("LC_ALL", "C")
-        .env("CARGO_TERM_COLOR", "never")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .expect("cargo runs")
+    output_within(
+        isolated
+            .apply(&mut Command::new("cargo"))
+            .args(args)
+            .current_dir(dir)
+            // As the server runs cargo (`data::cargo::project_command`).
+            .env("LC_ALL", "C")
+            .env("CARGO_TERM_COLOR", "never"),
+        std::time::Duration::from_secs(300),
+    )
 }
 
 #[test]

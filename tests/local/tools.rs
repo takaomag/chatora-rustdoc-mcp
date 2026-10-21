@@ -5,20 +5,20 @@ use std::{fs, path::Path, process::Command};
 
 use crate::{
     git::{add_worktree, commit_all, git},
-    isolated::Isolated,
+    isolated::{Isolated, output_within},
     registry::{FakeCrate, FakeRegistry},
 };
 
 /// Runs cargo with `args` in `dir` in the isolated environment, and returns its stderr. It fails
 /// the test if cargo fails.
 fn cargo(isolated: &Isolated, dir: &Path, args: &[&str]) -> String {
-    let output = isolated
-        .apply(&mut Command::new("cargo"))
-        .args(args)
-        .current_dir(dir)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .expect("cargo runs");
+    let output = output_within(
+        isolated
+            .apply(&mut Command::new("cargo"))
+            .args(args)
+            .current_dir(dir),
+        std::time::Duration::from_secs(600),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(output.status.success(), "cargo {args:?} failed:\n{stderr}");
     stderr

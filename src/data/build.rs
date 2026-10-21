@@ -1198,10 +1198,14 @@ async fn hold(
         },
     }
     on_doing(Doing::WaitingForLock);
-    let held = process_lock::lock(root, key, mode)
+    // As long as it takes: a build holds it while it waits for a build slot too, and going on
+    // without it would let another build write the same JSON (Q-29). A process that holds it and
+    // stopped is told by `waiting_for_lock`.
+    let held = process_lock::lock(root, key, mode, Duration::MAX)
         .await
         .inspect_err(failed)
-        .ok();
+        .ok()
+        .flatten();
     on_doing(Doing::Building);
     held
 }

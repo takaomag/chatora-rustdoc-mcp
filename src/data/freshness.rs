@@ -242,11 +242,11 @@ pub fn collect_after(files: &[PathBuf], dirs: &[PathBuf], taken_at: u128) -> io:
     let mut inputs = collect(files, dirs, None)?;
     let since = taken_at.saturating_sub(CLOSE.as_nanos());
     for file in &mut inputs.files {
-        if file
-            .modified
-            .max(changed_at(&file.path))
-            .is_some_and(|at| at >= since)
-        {
+        let changed = file.modified;
+        // Its status too, on Unix.
+        #[cfg(unix)]
+        let changed = changed.max(changed_at(&file.path));
+        if changed.is_some_and(|at| at >= since) {
             file.sha256 = None;
         }
     }
@@ -270,28 +270,21 @@ pub fn unchanged(inputs: &Inputs) -> bool {
 }
 
 /// When the file at `path` last changed as the OS keeps it apart from its time of change, which
-/// `cp -p` and `mv` keep: its status (ctime), on Unix.
+/// `cp -p` and `mv` keep: its status (ctime).
+#[cfg(unix)]
 fn changed_at(path: &Path) -> Option<u128> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::MetadataExt as _;
 
-        // Of a symlink, and of where it leads.
-        [fs::symlink_metadata(path), fs::metadata(path)]
-            .into_iter()
-            .filter_map(|metadata| {
-                let metadata = metadata.ok()?;
-                let seconds = u128::try_from(metadata.ctime()).ok()?;
-                let nanos = u128::try_from(metadata.ctime_nsec()).ok()?;
-                seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
-            })
-            .max()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
+    // Of a symlink, and of where it leads.
+    [fs::symlink_metadata(path), fs::metadata(path)]
+        .into_iter()
+        .filter_map(|metadata| {
+            let metadata = metadata.ok()?;
+            let seconds = u128::try_from(metadata.ctime()).ok()?;
+            let nanos = u128::try_from(metadata.ctime_nsec()).ok()?;
+            seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+        })
+        .max()
 }
 
 /// What the dep-info of a build and its build scripts told that it read, besides the files of

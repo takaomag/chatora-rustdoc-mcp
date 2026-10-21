@@ -87,8 +87,37 @@ impl DirLocks {
     }
 }
 
-/// How long [`Cache::lock_blocking`] waits for another process.
+/// How long [`Cache::lock`] waits for another process: more than it takes to fetch and archive
+/// the largest JSON, which the holder does meanwhile, so that it is seldom done twice at once.
+const LOCK_LIMIT: Duration = Duration::from_secs(600);
+
+/// How long [`Cache::lock_blocking`] waits for another process, on a thread that cannot be called
+/// off.
 const BLOCKING_LOCK_LIMIT: Duration = Duration::from_secs(60);
+
+/// The OS lock of `path` in the cache, if it was taken within `limit`, with a log line when it
+/// was not.
+fn held(
+    path: &Path,
+    limit: Duration,
+    taken: io::Result<Option<ProcessLock>>,
+) -> Option<ProcessLock> {
+    match taken {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            tracing::warn!(
+                path = %path.display(),
+                limit_secs = limit.as_secs(),
+                "another process held the cache that long; going on without waiting for it"
+            );
+            None
+        },
+        Err(error) => {
+            lock_failed(path, &error);
+            None
+        },
+    }
+}
 
 /// Logs that the OS could not lock `path` in the cache: as a warning the first time, as on a cache
 /// where no lock file can be made it would come with every call.
@@ -187,16 +216,20 @@ impl Cache {
     /// The tasks of this process take turns first, so that one of them at a time waits for the
     /// OS lock (`process_lock`). When the OS cannot lock, as on a cache that refuses the lock
     /// files, the processes do not exclude each other, which costs only fetching twice, and a log
-    /// line tells it.
+    /// line tells it. Another process is waited for at most ten minutes, and then the work goes
+    /// on without it, as with [`Self::lock_blocking`]: it may have stopped.
     pub async fn lock(&self, path: &Path) -> PathGuard {
         let within = self.locks.of(path).lock_owned().await;
-        let across = process_lock::lock(&self.root, &self.lock_key(path), LockMode::Exclusive)
-            .await
-            .inspect_err(|error| lock_failed(path, error))
-            .ok();
+        let across = process_lock::lock(
+            &self.root,
+            &self.lock_key(path),
+            LockMode::Exclusive,
+            LOCK_LIMIT,
+        )
+        .await;
         PathGuard {
             _within: within,
-            _across: across,
+            _across: held(path, LOCK_LIMIT, across),
         }
     }
 
@@ -207,29 +240,15 @@ impl Cache {
     /// stopped. Doing the work twice costs time and memory, and what is written stays whole.
     pub fn lock_blocking(&self, path: &Path) -> PathGuard {
         let within = self.locks.of(path).blocking_lock_owned();
-        let across = match process_lock::lock_blocking(
+        let across = process_lock::lock_blocking(
             &self.root,
             &self.lock_key(path),
             LockMode::Exclusive,
             BLOCKING_LOCK_LIMIT,
-        ) {
-            Ok(Some(lock)) => Some(lock),
-            Ok(None) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    limit_secs = BLOCKING_LOCK_LIMIT.as_secs(),
-                    "another process held the cache that long; going on without waiting for it"
-                );
-                None
-            },
-            Err(error) => {
-                lock_failed(path, &error);
-                None
-            },
-        };
+        );
         PathGuard {
             _within: within,
-            _across: across,
+            _across: held(path, BLOCKING_LOCK_LIMIT, across),
         }
     }
 

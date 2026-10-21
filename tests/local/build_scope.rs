@@ -18,7 +18,7 @@ use chatora_rustdoc_mcp::data::{
     target::{TargetTriple, host_target},
 };
 
-use crate::isolated::in_isolated_child;
+use crate::isolated::{in_isolated_child, output_within};
 
 /// Copies the directory `from` into `to`.
 fn copy_dir(from: &Path, to: &Path) {
@@ -36,13 +36,14 @@ fn copy_dir(from: &Path, to: &Path) {
 
 /// Runs cargo with `args` in `dir`, offline.
 fn cargo(dir: &Path, args: &[&str]) -> Output {
-    Command::new("cargo")
-        .args(args)
-        .arg("--offline")
-        .current_dir(dir)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .expect("cargo runs")
+    output_within(
+        Command::new("cargo")
+            .args(args)
+            .arg("--offline")
+            .current_dir(dir),
+        // Within the isolated child's limit, so that its failure is told.
+        std::time::Duration::from_secs(300),
+    )
 }
 
 /// The fixture's workspace in `dir`, with the feature resolver `resolver` and a Cargo.lock.

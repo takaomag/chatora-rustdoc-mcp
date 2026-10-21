@@ -20,7 +20,7 @@ use chatora_rustdoc_mcp::data::{
     target::{TargetTriple, host_target},
 };
 
-use crate::isolated::in_isolated_child;
+use crate::isolated::{in_isolated_child, output_within};
 
 /// Copies the directory `from` into `to`.
 fn copy_dir(from: &Path, to: &Path) {
@@ -42,12 +42,12 @@ fn workspace(dir: &Path) -> PathBuf {
     let copy = dir.join("local-build");
     copy_dir(&fixture, &copy);
     let root = copy.join("ws");
-    let output = Command::new("cargo")
-        .args(["generate-lockfile", "--offline"])
-        .current_dir(&root)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .expect("cargo runs");
+    let output = output_within(
+        Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(&root),
+        std::time::Duration::from_secs(120),
+    );
     assert!(output.status.success(), "{output:?}");
     root
 }

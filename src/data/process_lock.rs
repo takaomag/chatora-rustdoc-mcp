@@ -87,23 +87,35 @@ pub fn try_lock_at(path: &Path, mode: LockMode) -> io::Result<Option<ProcessLock
     try_lock_file(open(path)?, mode)
 }
 
-/// Waits for the lock of `key` in the cache at `root` in `mode`, and takes it.
+/// Waits at most `limit` for the lock of `key` in the cache at `root` in `mode`, and takes it.
 ///
-/// Dropping the future stops the wait: the lock is tried again and again, with longer pauses up to a quarter second,
-/// instead of a blocking call that could not be called off.
+/// It returns `None` after `limit`: another process that holds it may have stopped (a stopped
+/// session, a debugger), and work that waits for it would wait as long.
+///
+/// Dropping the future stops the wait: the lock is tried again and again, with longer pauses up to
+/// a quarter second, instead of a blocking call that could not be called off.
 ///
 /// # Errors
 ///
 /// Returns an error when the lock file cannot be made or opened, or the OS fails to lock it.
-pub async fn lock(root: &Path, key: &str, mode: LockMode) -> io::Result<ProcessLock> {
+pub async fn lock(
+    root: &Path,
+    key: &str,
+    mode: LockMode,
+    limit: Duration,
+) -> io::Result<Option<ProcessLock>> {
     let path = lock_path(root, key);
     let mut file = super::blocking(move || open(&path)).await?;
+    let start = tokio::time::Instant::now();
     let mut pause = MIN_PAUSE;
     loop {
         // The same open file each time: a lock is the open file's, and trying does not block.
         let again = file.try_clone()?;
         if let Some(lock) = try_lock_file(file, mode)? {
-            return Ok(lock);
+            return Ok(Some(lock));
+        }
+        if start.elapsed() >= limit {
+            return Ok(None);
         }
         file = again;
         tokio::time::sleep(pause).await;
@@ -267,12 +279,26 @@ mod tests {
         let held = try_lock(&root, "key", LockMode::Exclusive)
             .expect("locked")
             .expect("free");
-        let waiter = tokio::spawn(async move { lock(&root, "key", LockMode::Exclusive).await });
+        let waiter = tokio::spawn({
+            let root = root.clone();
+            async move { lock(&root, "key", LockMode::Exclusive, Duration::from_secs(60)).await }
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!waiter.is_finished(), "it waits");
         drop(held);
         let taken = tokio::time::timeout(Duration::from_secs(5), waiter).await;
-        assert!(matches!(taken, Ok(Ok(Ok(_)))), "{taken:?}");
+        assert!(matches!(taken, Ok(Ok(Ok(Some(_))))), "{taken:?}");
+        // Held by another, which `taken` holds, for longer than the wait: given up.
+        let start = Instant::now();
+        let given_up = lock(
+            &root,
+            "key",
+            LockMode::Exclusive,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(given_up, Ok(None)), "{given_up:?}");
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
