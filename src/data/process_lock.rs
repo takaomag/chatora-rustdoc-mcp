@@ -3,8 +3,10 @@
 //! They are OS locks, as `File::lock` takes them (`flock` on Linux and macOS, `LockFileEx` on
 //! Windows), on empty files in `locks/` in the cache directory. The locks are where what they guard is, so that the processes that share a cache exclude each
 //! other even when their state directories differ (decided by the user, M2's C1). A lock file is
-//! never removed, by GC or by `cache clear`: a process may have opened it to wait, and another
-//! would then lock a new file of the same name. The name has no format version, so that servers of
+//! not removed, by GC or by `cache clear`: a process may have opened it to wait, and another
+//! would then lock a new file of the same name. The exception is the lock `owner:<id>` of a server
+//! (`super::owner`): nobody waits for it, and once its server has stopped, only a sweep that holds
+//! it removes it (decided in M2's C4). The name has no format version, so that servers of
 //! different versions exclude each other, too. The OS lets a lock go when its process ends,
 //! however it ends; the files are opened close-on-exec, so cargo and what it starts do not hold
 //! them. A process being started holds a copy of every open file until it runs its program, so a

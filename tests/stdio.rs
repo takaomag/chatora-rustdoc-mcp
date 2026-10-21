@@ -244,7 +244,11 @@ impl Server {
 
     /// [`Self::start_in`], with more environment variables.
     fn start_with(project: Option<&Path>, env: &[(&str, &str)]) -> Self {
-        let cache = test_cache();
+        Self::start_with_cache(test_cache(), project, env)
+    }
+
+    /// [`Self::start_with`], with the cache `cache`, which [`test_cache`] made.
+    fn start_with_cache(cache: TempDir, project: Option<&Path>, env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"));
         // Not the config file of the user who runs the tests (requirement R-DIST-3).
         let config = cache.path().join("config.toml");
@@ -1809,4 +1813,36 @@ fn a_search_that_finds_nothing_while_crates_are_fetched_is_building() {
     assert!(found.get("partial").is_none(), "{found}");
     assert_eq!(found["data"]["items"][0]["path"], "demo::hello", "{found}");
     assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+/// At startup, the server removes the work directories that a server that has stopped left in
+/// the cache, in the background, and when it stops it leaves none of its own, nor its lock
+/// (requirements R-WS-6 and R-CA-4, decided in C4).
+#[cfg(feature = "local")]
+#[test]
+fn a_server_removes_what_stopped_servers_left_and_leaves_nothing() {
+    let cache = test_cache();
+    let left = cache.path().join("work/0123456789abcdef");
+    std::fs::create_dir_all(left.join("build")).expect("made");
+    std::fs::write(left.join("build/out"), "left").expect("written");
+    let mut server = Server::start_with_cache(cache, None, &[]);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .expect("in range");
+    while left.exists() {
+        assert!(Instant::now() < deadline, "not removed");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Kept past `finish`, which drops the server's own.
+    let cache = std::mem::replace(
+        &mut server.cache,
+        TempDir::new().expect("a temporary directory"),
+    );
+    assert!(server.finish().success());
+    let left_locks: Vec<_> = std::fs::read_dir(cache.path().join("locks"))
+        .expect("the server made its lock")
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(left_locks.is_empty(), "{left_locks:?}");
 }

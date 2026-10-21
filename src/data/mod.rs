@@ -29,6 +29,8 @@ pub mod local_std;
 #[cfg(feature = "local")]
 pub mod metadata;
 #[cfg(feature = "local")]
+pub mod owner;
+#[cfg(feature = "local")]
 pub mod packages;
 pub mod process_lock;
 #[cfg(feature = "local")]

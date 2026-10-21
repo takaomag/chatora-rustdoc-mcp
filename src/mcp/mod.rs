@@ -239,6 +239,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
     // After the first line of the log file, which starts what this run logs.
     settings.report();
     let cache = cache?;
+    #[cfg(feature = "local")]
+    sweep_in_background(&cache);
     let network = Network::from_settings(settings);
     let server = Server {
         tools: Arc::new(tool::ToolState {
@@ -280,7 +282,7 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
     };
     #[cfg(not(feature = "local"))]
     let transport = stdio();
-    match Box::pin(server.serve(transport)).await {
+    let outcome = match Box::pin(server.serve(transport)).await {
         Ok(running) => {
             #[cfg(feature = "local")]
             let on_signal = {
@@ -309,7 +311,36 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
         Err(ServerInitializeError::ConnectionClosed(_)) => Ok(()),
 
         Err(error) => Err(ServeError::Initialize(Box::new(error))),
+    };
+    // What this server leaves in the cache goes with it, however it ends (requirement R-CA-4).
+    #[cfg(feature = "local")]
+    if let Some(owner) = crate::data::owner::Owner::this() {
+        owner.leave();
     }
+    outcome
+}
+
+/// How long the sweep at startup may take (decided in C4).
+#[cfg(feature = "local")]
+const SWEEP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Starts this server as the owner of what it leaves in the cache, and removes, in the background
+/// for at most [`SWEEP_LIMIT`], what the servers that have stopped left: the server answers at
+/// once (requirement R-MCP-11), and the next one goes on where this one stops (requirements R-WS-6
+/// and R-CA-4).
+#[cfg(feature = "local")]
+fn sweep_in_background(cache: &Cache) {
+    let owner = crate::data::owner::Owner::start_this(cache);
+    drop(crate::task::spawn_blocking(move || {
+        let now = std::time::Instant::now();
+        let swept = crate::data::owner::sweep(owner, now.checked_add(SWEEP_LIMIT).unwrap_or(now));
+        if swept != crate::data::owner::Swept::default() {
+            tracing::info!(
+                ?swept,
+                "removed what servers that have stopped left in the cache"
+            );
+        }
+    }));
 }
 
 /// The server's stdin, which stops every child and what it started when it ends or fails: the
