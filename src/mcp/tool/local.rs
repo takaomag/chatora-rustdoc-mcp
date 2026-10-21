@@ -14,9 +14,10 @@ use crate::{
     data::{
         build::{self, Bootstrap, BuildError, Plan, TargetDir},
         cargo::{Failure, RunError},
+        crate_file,
         crate_name::CrateName,
         flight::{Doing, Joined},
-        metadata::{CargoError, Resolution},
+        metadata::{CargoError, Package, Resolution},
         project::Workspace,
         rustdoc_json::ParseError,
         target::TargetTriple,
@@ -135,6 +136,8 @@ pub(super) async fn member(
             .into(),
         );
     }
+    let docs_rs = docs_rs_of(state, workspace, target, package, features.as_deref()).await;
+    warnings.extend(docs_rs.warnings);
     let plan = Plan {
         root: root.clone(),
         offline: state.resolver.offline_in(root).await,
@@ -148,6 +151,7 @@ pub(super) async fn member(
         version: package.version.clone(),
         target: None,
         cfg_docsrs: build::cfg_docsrs(),
+        cfgs: docs_rs.cfgs,
         features,
     };
     Ok(Member::Is {
@@ -156,10 +160,83 @@ pub(super) async fn member(
             target: target.clone(),
             project_sets_target: project::sets_build_target(state, root).await,
             cargo_home: state.resolver.cargo_home().map(Path::to_path_buf),
+            docs_rs_features: docs_rs.features,
             warnings,
         }),
         package: package.name.clone(),
     })
+}
+
+/// What a member's `[package.metadata.docs.rs]` asks of its build here.
+#[derive(Debug, Default)]
+struct DocsRsAsks {
+    /// Its features, when they build nothing outside the project's build.
+    features: Option<Vec<Box<str>>>,
+    /// The names of the `--cfg` of its `rustdoc-args`.
+    cfgs: Box<[Box<str>]>,
+    /// What the response warns about.
+    warnings: Vec<Box<str>>,
+}
+
+/// What the `[package.metadata.docs.rs]` of the member `package` of `workspace` asks of its build
+/// for `target`, whose features in the project's build are `projects` (requirements R-FT-3 and
+/// R-MCP-3, decided in M2's D3). Its features are taken when the project's build has them all,
+/// or when a build with them builds no package that the project's build does not; else the
+/// project's are, with a warning.
+async fn docs_rs_of(
+    state: &ToolState,
+    workspace: &Workspace,
+    target: &TargetTriple,
+    package: &Package,
+    projects: Option<&[Box<str>]>,
+) -> DocsRsAsks {
+    let manifest = package.manifest_path.clone();
+    let read = crate::task::spawn_blocking(move || crate_file::member_docs_rs(&manifest)).await;
+    let docs = match read {
+        Ok(Ok(docs)) if docs.asked => docs,
+        Ok(Ok(_)) => return DocsRsAsks::default(),
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "the manifest of a member could not be read");
+            return DocsRsAsks::default();
+        },
+        Err(error) => {
+            tracing::debug!(error = %crate::task::resume_if_panic(error), "the manifest of a member was not read");
+            return DocsRsAsks::default();
+        },
+    };
+    let features = build::declared_features(package, &docs.features);
+    let mut asks = DocsRsAsks {
+        cfgs: docs.rustdoc_cfg,
+        ..DocsRsAsks::default()
+    };
+    if projects.is_some_and(|projects| features.iter().all(|feature| projects.contains(feature))) {
+        asks.features = Some(features);
+        return asks;
+    }
+    match state
+        .resolver
+        .outside_scope(workspace, target, package, &features)
+        .await
+    {
+        Ok(outside) if outside.is_empty() => asks.features = Some(features),
+        Ok(outside) => asks.warnings.push(
+            format!(
+                "built with the features of the project's build: those of \
+                 [package.metadata.docs.rs] would build {}, which the project's build does not; \
+                 build_external_docs builds with them",
+                outside.join(", ")
+            )
+            .into(),
+        ),
+        Err(error) => asks.warnings.push(
+            format!(
+                "built with the features of the project's build: whether those of \
+                 [package.metadata.docs.rs] build more could not be told ({error})"
+            )
+            .into(),
+        ),
+    }
+    asks
 }
 
 /// The error when the project's package `name`, not from crates.io, cannot be built, as `cargo

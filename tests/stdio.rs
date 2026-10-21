@@ -1216,6 +1216,131 @@ fn a_member_under_a_root_package_of_resolver_1_gets_its_features() {
     assert!(server.finish().success());
 }
 
+/// The result of `get_item` with `arguments`, called again while it answers `status: building`,
+/// with the ids from `first` on.
+#[cfg(feature = "local")]
+fn built_item(server: &mut Server, first: u64, arguments: &Value) -> Value {
+    let mut found = Value::Null;
+    for id in first..first.saturating_add(20) {
+        server.send(&call_tool(id, "get_item", arguments.clone()));
+        found = server.response(id)["result"].clone();
+        if found["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    found
+}
+
+/// A member's `[package.metadata.docs.rs]` is built with, with the `--cfg` of its `rustdoc-args`,
+/// unless its features break the build or build packages that the project's build does not:
+/// then the project's features are (requirements R-FT-3 and R-MCP-3, decided in M2's D3).
+#[cfg(feature = "local")]
+#[test]
+fn a_member_is_built_as_its_docs_rs_metadata_asks_when_it_may() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let write = |path: &str, text: &str| {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        std::fs::write(path, text).expect("written");
+    };
+    let package = |name: &str, rest: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n{rest}")
+    };
+    write(
+        "ws/Cargo.toml",
+        "[workspace]\nmembers = [\"asked\", \"clash\", \"wide\"]\nresolver = \"3\"\n",
+    );
+    write(
+        "ws/asked/Cargo.toml",
+        &package(
+            "asked",
+            "[features]\nextra = []\n\n[package.metadata.docs.rs]\nfeatures = [\"extra\"]\n\
+             rustdoc-args = [\"--cfg\", \"my_cfg\"]\n",
+        ),
+    );
+    write(
+        "ws/asked/src/lib.rs",
+        "#![allow(unexpected_cfgs)]\n/// With `extra`.\n#[cfg(feature = \"extra\")]\npub fn extra() {}\n\
+         /// With `my_cfg`.\n#[cfg(my_cfg)]\npub fn cfged() {}\n",
+    );
+    write(
+        "ws/clash/Cargo.toml",
+        &package(
+            "clash",
+            "[features]\na = []\nb = []\n\n[package.metadata.docs.rs]\nall-features = true\n",
+        ),
+    );
+    write(
+        "ws/clash/src/lib.rs",
+        "#[cfg(all(feature = \"a\", feature = \"b\"))]\ncompile_error!(\"a and b\");\n\
+         /// Always.\npub fn always() {}\n",
+    );
+    write(
+        "ws/wide/Cargo.toml",
+        &package(
+            "wide",
+            "[dependencies]\nopt = { path = \"../../opt\", optional = true }\n\n\
+             [package.metadata.docs.rs]\nall-features = true\n",
+        ),
+    );
+    write("ws/wide/src/lib.rs", "/// Always.\npub fn always() {}\n");
+    write("opt/Cargo.toml", &package("opt", ""));
+    write("opt/src/lib.rs", "");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path().join("ws"))
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = Server::start_in(Some(&dir.path().join("ws")));
+    let asked = built_item(
+        &mut server,
+        1,
+        &json!({ "crate": "asked", "path": "extra" }),
+    );
+    assert_ne!(asked["isError"], true, "{asked}");
+    let asked = &asked["structuredContent"];
+    assert_eq!(
+        asked["provenance"]["features_requested"],
+        json!(["extra"]),
+        "{asked}"
+    );
+    assert!(warns(asked, "as docs.rs builds it"), "{asked}");
+    let cfged = built_item(
+        &mut server,
+        30,
+        &json!({ "crate": "asked", "path": "cfged" }),
+    );
+    assert_ne!(cfged["isError"], true, "{cfged}");
+    let clash = built_item(
+        &mut server,
+        60,
+        &json!({ "crate": "clash", "path": "always" }),
+    );
+    assert_ne!(clash["isError"], true, "{clash}");
+    let clash = &clash["structuredContent"];
+    assert_eq!(
+        clash["provenance"]["features_requested"],
+        json!([]),
+        "{clash}"
+    );
+    assert!(warns(clash, "broke the build"), "{clash}");
+    let wide = built_item(
+        &mut server,
+        90,
+        &json!({ "crate": "wide", "path": "always" }),
+    );
+    assert_ne!(wide["isError"], true, "{wide}");
+    let wide = &wide["structuredContent"];
+    assert!(warns(wide, "would build opt 0.1.0"), "{wide}");
+    assert!(server.finish().success());
+}
+
 /// A member's re-export of another member's item is not followed into it (decided in M2's D2,
 /// until D6): the re-export is shown, with why.
 #[cfg(feature = "local")]

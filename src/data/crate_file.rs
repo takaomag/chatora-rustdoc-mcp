@@ -283,6 +283,28 @@ pub struct DocsRsBuild {
     pub declared: Box<[Box<str>]>,
     /// The features that `default` enables, through others too, sorted.
     pub default: Box<[Box<str>]>,
+    /// Whether the manifest has `[package.metadata.docs.rs]`.
+    pub asked: bool,
+    /// The names of the `--cfg` that `rustdoc-args` passes without a value (`--cfg
+    /// tokio_unstable`, `--cfg=tokio_unstable`), but `docsrs`: what a local build passes to the
+    /// documented crate's rustdoc (decided in M2's D3). One with a value is not passed.
+    pub rustdoc_cfg: Box<[Box<str>]>,
+}
+
+/// How the workspace member whose `Cargo.toml` is at `manifest` asks docs.rs to build it, from
+/// its `[package.metadata.docs.rs]` (requirement R-FT-3, decided in M2's D3).
+///
+/// # Errors
+///
+/// Returns an error when the manifest cannot be read or is not TOML.
+pub fn member_docs_rs(manifest: &Path) -> io::Result<DocsRsBuild> {
+    let mut text = String::new();
+    fs::File::open(manifest)?
+        .take(MAX_MANIFEST_BYTES)
+        .read_to_string(&mut text)?;
+    let table: toml::Table =
+        toml::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(build_of(&table))
 }
 
 /// How docs.rs built `name` at `version`, from the `Cargo.toml` in its `.crate` `contents`.
@@ -381,6 +403,7 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
         .map(|feature| feature.as_str().into())
         .collect();
     let mut cfg = BTreeSet::new();
+    let mut rustdoc_cfg = BTreeSet::new();
     for key in ["rustdoc-args", "rustc-args"] {
         let args = strings(key);
         let mut args = args.iter();
@@ -390,10 +413,13 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
                 Some(rest) => rest.strip_prefix('='),
                 None => None,
             };
-            let Some(name) = value.map(|value| value.split('=').next().unwrap_or_default().trim())
-            else {
+            let Some(value) = value else {
                 continue;
             };
+            let name = value.split('=').next().unwrap_or_default().trim();
+            if key == "rustdoc-args" && name == value && name != "docsrs" && is_cfg_name(name) {
+                rustdoc_cfg.insert(name);
+            }
             // `--cfg 'feature="x"'` enables a feature, which `features` tells better.
             if !matches!(name, "docsrs" | "feature") && is_cfg_name(name) {
                 cfg.insert(name);
@@ -415,6 +441,8 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
             .map(|feature| feature.as_str().into())
             .collect(),
         default,
+        asked: metadata.is_some(),
+        rustdoc_cfg: rustdoc_cfg.into_iter().map(Into::into).collect(),
     }
 }
 
@@ -613,6 +641,21 @@ pub(crate) mod tests {
             crates.crate_file(&other, &name, &version, Some("00")).await,
             Err(CrateError::Offline)
         ));
+    }
+
+    #[test]
+    fn the_cfg_of_rustdoc_args_without_a_value_is_passed_to_a_local_build() {
+        let docs = build(
+            "[package]\nname = \"m\"\n\n[package.metadata.docs.rs]\nrustdoc-args = [\"--cfg\", \
+             \"tokio_unstable\", \"--cfg=loom\", \"--cfg\", \"docsrs\", \"--cfg\", \
+             'kind=\"x\"', \"--cfg\", \"not a name\"]\nrustc-args = [\"--cfg\", \"from_rustc\"]\n",
+        );
+        assert!(docs.asked);
+        assert_eq!(&*docs.rustdoc_cfg, [
+            Box::from("loom"),
+            "tokio_unstable".into()
+        ]);
+        assert!(!build("[package]\nname = \"m\"\n").asked);
     }
 
     fn build(manifest: &str) -> DocsRsBuild {

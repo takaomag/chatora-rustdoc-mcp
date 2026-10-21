@@ -781,6 +781,14 @@ Claude Code 2.1.304、Linux で測った。
 2. docs.rs の組で壊れ、通常の組で通った member は、`--cfg docsrs` と同じく、再試行が成功したときだけ package id と toolchain を鍵にプロセスの間覚え、次からは最初から通常の組で warning
 3. 再試行の順: 文書化する crate のエラーなら先に `--cfg docsrs` (と `rustdoc-args` の `--cfg`) を外す。それでも失敗するか、依存のエラーなら通常の組に戻す。ビルドは最大 3 回。それぞれの壊れは別々に覚える
 
+**D3e (member の `[package.metadata.docs.rs]`。2026-10-21)**:
+
+- `crate_file::member_docs_rs`: member の Cargo.toml を `build_of` で読む (R-SEC-4 の名前の検証が入っている)。`DocsRsBuild` に、`[package.metadata.docs.rs]` があるか (`asked`) と、`rustdoc-args` の値の無い `--cfg` の名前 (`rustdoc_cfg`。`docsrs` と、値付きの `--cfg k="v"` と `rustc-args` の分は除く) を足した
+- `Resolver::outside_scope` (`build_scope::outside`): docs.rs の組で `cargo tree --manifest-path <member> -p <member> --no-default-features --features … -e normal,build` を走らせ、通常のビルドの範囲 (`BuildScope`) に無いパッケージを返す。`cargo metadata` に無いパッケージ (有効になっていない optional な依存は `cargo metadata` に出ない) も範囲の外
+- `mcp::tool::local::docs_rs_of`: docs.rs の組 (宣言された features に絞る) が通常の組に含まれればそのまま、そうでなければ範囲の外が増えないときだけ使う。増えるなら通常の組で warning (`build_external_docs` で)、確かめられなければ通常の組で warning。`rustdoc-args` の `--cfg` は `Plan::cfgs` に入れ、`--cfg docsrs` と一緒に付け外しする (D3b の決定 3)
+- `query::local::Builder::build`: docs.rs の組 + `--cfg docsrs` (+ `cfgs`) で始め、文書化する crate のエラーなら `--cfg docsrs` を外し、それでも、または依存の、コードのエラー (`Failure::Other`) で失敗したら通常の組に戻す (最大 3 回)。それぞれ、外して通ったときだけ (package id, toolchain) をプロセスの間覚える (`DOCSRS_BROKE`・`DOCS_RS_FEATURES_BROKE`)。docs.rs の組でビルドしたら「`enabled_in_project` は通常の組」と warning、通常の組に戻したら warning。nightly で作り直すときは `cfg_docsrs` と組を最初の値に戻す
+- テスト: `rustdoc-args` の `--cfg` (値付き・`docsrs`・`rustc-args`・名前でないものを除く)、`asked`。stdio で 1 つのワークスペースの 3 つの member: 範囲の中の docs.rs の組 (`extra` の item が出て `features_requested: ["extra"]`、`rustdoc-args` の `--cfg my_cfg` の item も出る)、`all-features` がコンパイルエラーになる組 (通常の組で作り直して warning)、外の optional な依存を引き込む組 (通常の組で「would build opt 0.1.0」の warning)
+
 ### 6.6 M2e
 
 (まだ無い)

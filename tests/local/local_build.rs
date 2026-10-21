@@ -90,6 +90,7 @@ fn plan(
         version: package.version.clone(),
         target,
         cfg_docsrs: true,
+        cfgs: Box::default(),
         features: None,
     }
 }
@@ -236,6 +237,7 @@ async fn a_member_is_built_and_archived_for_the_calls_that_want_it() {
         target: host.clone(),
         project_sets_target: false,
         cargo_home: resolver.cargo_home().map(Path::to_path_buf),
+        docs_rs_features: None,
         warnings: Vec::new(),
     };
     let flights = Flights::handing_over();
@@ -302,6 +304,7 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
         target: host.clone(),
         project_sets_target: false,
         cargo_home: resolver.cargo_home().map(Path::to_path_buf),
+        docs_rs_features: None,
         warnings: Vec::new(),
     };
     let without = |built: &LocalBuilt| {

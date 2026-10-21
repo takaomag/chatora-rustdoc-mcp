@@ -17,6 +17,7 @@ use super::load::{self, Archived, LoadError};
 use crate::data::{
     build::{self, BuildError, BuildRecord, Built, Documented, Plan},
     cache::{self, Cache},
+    cargo::Failure,
     flight::{Doing, Flights, Joined, Stage},
     owner::Owner,
     rustdoc_json,
@@ -36,6 +37,10 @@ pub struct LocalWanted {
     pub project_sets_target: bool,
     /// `$CARGO_HOME`, whose settings apply to the project.
     pub cargo_home: Option<PathBuf>,
+    /// The features of the member's `[package.metadata.docs.rs]`, built with first, when they
+    /// build nothing outside the project's build; the plan's are the project's, to go back to
+    /// when they break the build (requirements R-FT-3 and R-MCP-3, decided in M2's D3).
+    pub docs_rs_features: Option<Vec<Box<str>>>,
     /// What the response warns about how the build was planned.
     pub warnings: Vec<Box<str>>,
 }
@@ -139,7 +144,8 @@ async fn build_and_archive(
         target,
         project_sets_target,
         cargo_home,
-        warnings,
+        docs_rs_features,
+        mut warnings,
     } = wanted;
     let root = plan.root.clone();
     let programs = Programs::this();
@@ -161,18 +167,17 @@ async fn build_and_archive(
         Err(error) => return Err(LocalError::Choose(error)),
     }
     // As asked, for the build with the nightly too, whatever the first build did.
-    let cfg_docsrs = plan.cfg_docsrs;
-    let built = build_with(
+    let (cfg_docsrs, features) = (plan.cfg_docsrs, plan.features.clone());
+    let builder = Builder {
         cache,
-        &mut plan,
-        &rustc,
-        &target,
+        rustc: &rustc,
+        target: &target,
         project_sets_target,
-        installs,
-        &work,
+        work: &work,
         stage,
-    )
-    .await;
+        docs_rs: docs_rs_features.as_deref(),
+    };
+    let built = builder.build(&mut plan, installs, &mut warnings).await;
     let mut built = if installs {
         after_install(&rustc, &root, &target, built).await?
     } else {
@@ -185,18 +190,8 @@ async fn build_and_archive(
         match choose().await {
             Ok(Chosen::Nightly { toolchain, .. }) => {
                 plan.toolchain = Some(toolchain);
-                plan.cfg_docsrs = cfg_docsrs;
-                built = build_with(
-                    cache,
-                    &mut plan,
-                    &rustc,
-                    &target,
-                    project_sets_target,
-                    false,
-                    &work,
-                    stage,
-                )
-                .await?;
+                (plan.cfg_docsrs, plan.features) = (cfg_docsrs, features);
+                built = builder.build(&mut plan, false, &mut warnings).await?;
             },
             Ok(Chosen::Project { format }) => {
                 return Err(LocalError::Choose(ChooseError::TooOld { found: format }));
@@ -233,63 +228,128 @@ async fn after_install(
     }
 }
 
-/// Builds `plan` for `target`, deciding whether it passes `--target` by the host of its toolchain,
-/// which is checked first unless cargo is to install it.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "what one build is made from, passed twice"
-)]
-async fn build_with(
-    cache: &Cache,
-    plan: &mut Plan,
-    rustc: &Path,
-    target: &TargetTriple,
+/// What the builds of a member are made with.
+struct Builder<'a> {
+    cache: &'a Cache,
+    rustc: &'a Path,
+    /// The target asked for.
+    target: &'a TargetTriple,
     project_sets_target: bool,
-    installs: bool,
-    work: &Path,
-    stage: &Stage,
-) -> Result<Built, LocalError> {
-    let checked = if installs {
-        None
-    } else {
-        Some(
-            toolchain::check_target(rustc, plan.toolchain.as_deref(), &plan.root, target)
+    work: &'a Path,
+    stage: &'a Stage,
+    /// The features of the member's `[package.metadata.docs.rs]`, to build with first.
+    docs_rs: Option<&'a [Box<str>]>,
+}
+
+impl Builder<'_> {
+    /// Builds `plan`, deciding whether it passes `--target` by the host of its toolchain, which
+    /// is checked first unless cargo is to install it.
+    ///
+    /// It builds with the features of `[package.metadata.docs.rs]` first, if any, and `--cfg
+    /// docsrs`, unless they broke the build before. When the documented crate fails, it builds
+    /// without `--cfg docsrs`; when that fails too, or a dependency fails, with the project's
+    /// features: three builds at most (decided in M2's D3). What broke the build is remembered
+    /// only once a build works without it, so that an error of the crate's own, which fails
+    /// them all, is not taken for it. `warnings` gets what the response tells of it.
+    async fn build(
+        &self,
+        plan: &mut Plan,
+        installs: bool,
+        warnings: &mut Vec<Box<str>>,
+    ) -> Result<Built, LocalError> {
+        let checked = if installs {
+            None
+        } else {
+            Some(
+                toolchain::check_target(
+                    self.rustc,
+                    plan.toolchain.as_deref(),
+                    &plan.root,
+                    self.target,
+                )
                 .await
                 .map_err(LocalError::Missing)?,
-        )
-    };
-    let host = checked.as_ref().and_then(|checked| checked.host.as_ref());
-    plan.target = build::passes_target(target, host, project_sets_target).then(|| target.clone());
-    let toolchain = checked.and_then(|checked| checked.toolchain);
-    // A member whose build `--cfg docsrs` broke is built without it from then on (decided in M2's
-    // D3), with the toolchain that built it: the one that rustc tells, if it did.
-    let broke = (
-        plan.package.0.clone(),
-        toolchain.clone().or_else(|| plan.toolchain.clone()),
-    );
-    if plan.cfg_docsrs && DOCSRS_BROKE.lock().contains(&broke) {
-        plan.cfg_docsrs = false;
-    }
-    let mut tell = |doing| stage.set(doing);
-    match build::build(cache, plan, work, toolchain.as_deref(), &mut tell).await {
+            )
+        };
+        let host = checked.as_ref().and_then(|checked| checked.host.as_ref());
+        plan.target = build::passes_target(self.target, host, self.project_sets_target)
+            .then(|| self.target.clone());
+        let toolchain = checked.and_then(|checked| checked.toolchain);
+        // With the toolchain that built it: the one that rustc tells, if it did.
+        let key = (
+            plan.package.0.clone(),
+            toolchain.clone().or_else(|| plan.toolchain.clone()),
+        );
+        if plan.cfg_docsrs && DOCSRS_BROKE.lock().contains(&key) {
+            plan.cfg_docsrs = false;
+        }
+        let projects = plan.features.clone();
+        let docs_rs = self
+            .docs_rs
+            .filter(|_| !DOCS_RS_FEATURES_BROKE.lock().contains(&key));
+        if let Some(features) = docs_rs {
+            plan.features = Some(features.to_vec());
+        } else if self.docs_rs.is_some() {
+            warnings.push(DOCS_RS_FEATURES_BROKE_IT.into());
+        }
+        let mut tell = |doing| self.stage.set(doing);
+        let mut built =
+            build::build(self.cache, plan, self.work, toolchain.as_deref(), &mut tell).await;
         // Only the documented crate's rustdoc has it, so only its errors may be of it.
-        Err(BuildError::Failed {
-            in_documented: true,
-            ..
-        }) if plan.cfg_docsrs => {
+        if matches!(
+            built,
+            Err(BuildError::Failed {
+                in_documented: true,
+                ..
+            })
+        ) && plan.cfg_docsrs
+        {
             tracing::info!(package = %plan.package.0, "the build failed with --cfg docsrs, so it is tried without");
             plan.cfg_docsrs = false;
-            let retried = build::build(cache, plan, work, toolchain.as_deref(), &mut tell).await;
-            // It broke the build only if the build works without it: an error of the crate's own
-            // fails both, and is not remembered, so that the build has it again once fixed.
-            if retried.is_ok() {
-                DOCSRS_BROKE.lock().insert(broke);
+            built =
+                build::build(self.cache, plan, self.work, toolchain.as_deref(), &mut tell).await;
+            if built.is_ok() {
+                DOCSRS_BROKE.lock().insert(key.clone());
             }
-            retried.map_err(LocalError::Build)
-        },
-        built => built.map_err(LocalError::Build),
+        }
+        // The features of `[package.metadata.docs.rs]` may break it, the documented crate or a
+        // dependency, as an error of the code tells; not what fetching or the lock tells.
+        if docs_rs.is_some()
+            && matches!(
+                built,
+                Err(BuildError::Failed {
+                    failure: Failure::Other,
+                    ..
+                })
+            )
+        {
+            tracing::info!(package = %plan.package.0, "the build failed with the features of [package.metadata.docs.rs], so it is tried with the project's");
+            plan.features = projects;
+            built =
+                build::build(self.cache, plan, self.work, toolchain.as_deref(), &mut tell).await;
+            if built.is_ok() {
+                DOCS_RS_FEATURES_BROKE.lock().insert(key);
+                warnings.push(DOCS_RS_FEATURES_BROKE_IT.into());
+            }
+        } else if docs_rs.is_some() && built.is_ok() {
+            warnings.push(
+                "built with the features of [package.metadata.docs.rs], as docs.rs builds it; \
+                 enabled_in_project tells those of the project's build"
+                    .into(),
+            );
+        }
+        built.map_err(LocalError::Build)
     }
 }
+
+/// What the response warns about a member built with the project's features, as the features
+/// of its `[package.metadata.docs.rs]` broke its build.
+const DOCS_RS_FEATURES_BROKE_IT: &str = "built with the features of the project's build, as those \
+                                         of [package.metadata.docs.rs] broke the build";
+
+/// The members whose build the features of their `[package.metadata.docs.rs]` broke, by package
+/// id and toolchain, for the life of the process (decided in M2's D3).
+static DOCS_RS_FEATURES_BROKE: LazyLock<Mutex<HashSet<BuildKey>>> = LazyLock::new(Mutex::default);
 
 /// The members whose build `--cfg docsrs` broke, by package id and toolchain, for the life of the
 /// process (decided in M2's D3).

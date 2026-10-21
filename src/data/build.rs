@@ -485,6 +485,9 @@ pub struct Plan {
     pub target: Option<TargetTriple>,
     /// Whether the documented crate's rustdoc gets `--cfg docsrs` (requirement R-WS-1).
     pub cfg_docsrs: bool,
+    /// The names of the `--cfg` of the member's `rustdoc-args`, which the documented crate's
+    /// rustdoc gets with `--cfg docsrs` (decided in M2's D3).
+    pub cfgs: Box<[Box<str>]>,
     /// The features of the member, as in the build of the whole workspace, passed with
     /// `--no-default-features --features` (requirement R-FT-3, decided in M2's D3), or `None` for
     /// cargo's default of `-p`.
@@ -533,6 +536,9 @@ impl Plan {
         // Only the documented crate's rustdoc has it (requirement R-WS-1).
         if self.cfg_docsrs {
             command.args(["--cfg", "docsrs"]);
+            for cfg in &self.cfgs {
+                command.arg("--cfg").arg(&**cfg);
+            }
         }
         command
             // A member's private items too (requirement R-WS-3).
@@ -1243,6 +1249,7 @@ mod tests {
             version: Version::new(0, 1, 0),
             target: target.map(|target| target.parse().expect("a triple")),
             cfg_docsrs: true,
+            cfgs: Box::default(),
             features: None,
         }
     }
@@ -1422,6 +1429,7 @@ mod tests {
             version: Version::new(0, 1, 0),
             target: Some(other),
             cfg_docsrs: true,
+            cfgs: Box::from([Box::from("tokio_unstable")]),
             features: Some(vec!["default".into(), "extra".into()]),
         };
         let command = plan.command();
@@ -1457,6 +1465,8 @@ mod tests {
             "json",
             "--cfg",
             "docsrs",
+            "--cfg",
+            "tokio_unstable",
             "--document-private-items",
         ]);
         let env = |name: &str| {
@@ -1497,6 +1507,7 @@ mod tests {
             version: Version::new(0, 1, 0),
             target: None,
             cfg_docsrs: false,
+            cfgs: Box::from([Box::from("tokio_unstable")]),
             features: None,
         };
         let command = plan.command();
@@ -1507,12 +1518,14 @@ mod tests {
             .collect();
         assert_eq!(args.first().map(String::as_str), Some("--locked"));
         assert!(args.iter().any(|arg| arg == "--lib"));
+        // Without `--cfg docsrs`, nor the cfg of `rustdoc-args`.
         assert!(!args.iter().any(|arg| {
             [
                 "--target",
                 "--offline",
                 "--no-default-features",
                 "--features",
+                "--cfg",
             ]
             .contains(&arg.as_str())
         }));

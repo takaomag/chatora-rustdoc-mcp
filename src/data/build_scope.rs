@@ -165,10 +165,70 @@ async fn tree(
     edges: &str,
     extra: &[&str],
 ) -> Result<Vec<Line>, ScopeError> {
+    let mut args = vec!["--workspace"];
+    args.extend_from_slice(extra);
+    tree_of(root, offline, target, edges, &args).await
+}
+
+/// The packages that a build of the member `package` with `--no-default-features --features
+/// <features>` would build and that `scope`, the workspace's for `target`, does not have, as
+/// `name version` (requirement R-MCP-3, decided in M2's D3): with the features of its
+/// `[package.metadata.docs.rs]`, it is not built when some.
+///
+/// # Errors
+///
+/// Returns an error when `cargo tree` fails, or its output does not tell its packages.
+pub(super) async fn outside(
+    (root, offline, target): (&Path, bool, &TargetTriple),
+    metadata: &Metadata,
+    scope: &BuildScope,
+    package: &Package,
+    features: &[Box<str>],
+) -> Result<Vec<Box<str>>, ScopeError> {
+    let spec = package.id.spec();
+    let manifest = package.manifest_path.to_string_lossy();
+    let features = features.join(",");
+    let mut args = vec![
+        "--manifest-path",
+        &manifest,
+        "-p",
+        &spec,
+        "--no-default-features",
+    ];
+    if !features.is_empty() {
+        args.extend(["--features", &features]);
+    }
+    let lines = tree_of(root, offline, target, "normal,build", &args).await?;
+    let ids = Ids::new(metadata);
+    let mut outside = Vec::new();
+    for line in &lines {
+        // `cargo metadata` has no package that its features do not enable, as an optional
+        // dependency: not in the project's build either.
+        let in_scope = ids
+            .of(&line.package)
+            .is_ok_and(|id| scope.get(id).is_some());
+        if !in_scope {
+            let name: Box<str> = format!("{} {}", line.package.name, line.package.version).into();
+            if !outside.contains(&name) {
+                outside.push(name);
+            }
+        }
+    }
+    Ok(outside)
+}
+
+/// Runs `cargo tree` for `target` with the dependency kinds `edges` and the arguments `extra`,
+/// and reads it.
+async fn tree_of(
+    root: &Path,
+    offline: bool,
+    target: &TargetTriple,
+    edges: &str,
+    extra: &[&str],
+) -> Result<Vec<Line>, ScopeError> {
     let mut command = cargo::project_command(root, offline, None);
     command.args([
         "tree",
-        "--workspace",
         "--target",
         target.as_str(),
         "-e",

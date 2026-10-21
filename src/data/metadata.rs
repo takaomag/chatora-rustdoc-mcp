@@ -445,6 +445,40 @@ impl Resolver {
         }
     }
 
+    /// The packages that a build of the member `package` of `workspace` for `target` with
+    /// `--no-default-features --features <features>` would build outside the scope of the
+    /// workspace, as `name version` (requirement R-MCP-3, decided in M2's D3).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scope or the build's packages cannot be read.
+    pub async fn outside_scope(
+        &self,
+        workspace: &Workspace,
+        target: &TargetTriple,
+        package: &Package,
+        features: &[Box<str>],
+    ) -> Result<Vec<Box<str>>, Arc<ScopeError>> {
+        let scope = self.scope(workspace, target).await?;
+        let resolution = self
+            .resolve(workspace)
+            .await
+            .map_err(|error| Arc::new(error.into()))?;
+        let Resolution::Metadata { metadata, .. } = &*resolution else {
+            return Err(Arc::new(ScopeError::NoMetadata));
+        };
+        let offline = self.inner.offline_in(&workspace.root).await;
+        build_scope::outside(
+            (&workspace.root, offline, target),
+            metadata,
+            &scope,
+            package,
+            features,
+        )
+        .await
+        .map_err(Arc::new)
+    }
+
     /// Which packages the query tools may build locally for `target`, an actual build target of
     /// `workspace`, the default project (requirement R-MCP-3). It is kept as the feature sets
     /// are.
