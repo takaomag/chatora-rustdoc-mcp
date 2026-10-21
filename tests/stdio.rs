@@ -1420,6 +1420,136 @@ fn a_member_whose_build_fails_again_is_told_failed() {
     assert!(server.finish().success());
 }
 
+/// The lib of a member with items of each visibility, for
+/// [`a_members_items_tell_their_visibility_and_their_path_in_the_crate`].
+#[cfg(feature = "local")]
+const VISIBILITIES: &str = r"//! Demo.
+pub mod open {
+    /// Shared.
+    pub mod inner {
+        /// Up.
+        pub(super) fn up() {}
+        /// Alone.
+        fn alone() {}
+    }
+}
+mod hidden {
+    /// Hidden.
+    pub struct Hidden {
+        /// Open.
+        pub open: u8,
+        count: u8,
+        pub(crate) shared: u8,
+    }
+    /// Wide.
+    pub(crate) fn wide() {}
+    /// Act.
+    pub(crate) trait Act {
+        /// Acts.
+        fn act(&self);
+    }
+    /// Kind.
+    pub(crate) enum Kind {
+        /// One.
+        One,
+    }
+    impl Hidden {
+        /// Secret.
+        fn secret(&self) {}
+    }
+    impl Act for Hidden {
+        fn act(&self) {}
+    }
+}
+/// At the root.
+fn rooted() {}
+";
+
+/// A workspace member's items have their visibility as Rust writes it, and one without a public
+/// path its path in the crate, which is taken as it is shown (requirements R-WS-3 and R-PR-2,
+/// decided in M2's D6).
+#[cfg(feature = "local")]
+#[test]
+fn a_members_items_tell_their_visibility_and_their_path_in_the_crate() {
+    let project = demo_workspace();
+    std::fs::write(project.path().join("src/lib.rs"), VISIBILITIES).expect("written");
+    let mut server = Server::start_in(Some(project.path()));
+    let mut ids = 1..;
+    let mut item = |path: &str| -> Value {
+        let id = ids.next().expect("an id");
+        let found = built_item(
+            &mut server,
+            id * 100,
+            &json!({ "crate": "demo", "path": path, "detail": "brief" }),
+        );
+        found["structuredContent"].clone()
+    };
+    // Without a public path: in the crate, as given, and without a warning of it.
+    let hidden = item("crate::hidden::Hidden");
+    assert_eq!(hidden["data"]["path"], "crate::hidden::Hidden", "{hidden}");
+    assert_eq!(hidden["data"]["visibility"], "pub", "{hidden}");
+    assert!(!warns(&hidden, "no public path"), "{hidden}");
+    let alone = item("open::inner::alone");
+    assert_eq!(alone["data"]["visibility"], "private", "{alone}");
+    assert_eq!(alone["data"]["signature"], "fn alone()", "{alone}");
+    let up = item("open::inner::up");
+    assert_eq!(up["data"]["visibility"], "pub(in crate::open)", "{up}");
+    assert_eq!(
+        up["data"]["signature"], "pub(in crate::open) fn up()",
+        "{up}"
+    );
+    assert_eq!(
+        item("crate::hidden::wide")["data"]["visibility"],
+        "pub(crate)"
+    );
+    // As its parent: the trait's and the enum's.
+    assert_eq!(
+        item("crate::hidden::Act::act")["data"]["visibility"],
+        "pub(crate)"
+    );
+    assert_eq!(
+        item("crate::hidden::Kind::One")["data"]["visibility"],
+        "pub(crate)"
+    );
+    // A method of an inherent `impl`, which no module lists, and one of an `impl` of a trait of
+    // the crate, which has the trait's.
+    let secret = item("crate::hidden::Hidden::secret");
+    assert_eq!(secret["data"]["visibility"], "private", "{secret}");
+    assert_eq!(secret["data"]["signature"], "fn secret(&self)", "{secret}");
+    let act = item("crate::hidden::Hidden::act");
+    assert_eq!(act["data"]["visibility"], "pub(crate)", "{act}");
+    // At the root, rustdoc tells it as the crate's.
+    assert_eq!(item("crate::rooted")["data"]["visibility"], "pub(crate)");
+    // The fields, as written.
+    let normal = built_item(
+        &mut server,
+        5_000,
+        &json!({ "crate": "demo", "path": "crate::hidden::Hidden" }),
+    );
+    assert_eq!(
+        normal["structuredContent"]["data"]["fields"],
+        json!(["pub open: u8", "count: u8", "pub(crate) shared: u8"]),
+        "{normal}"
+    );
+    server.send(&call_tool(
+        6_000,
+        "list_impls",
+        json!({ "crate": "demo", "path": "crate::hidden::Hidden" }),
+    ));
+    let impls = server.response(6_000)["result"]["structuredContent"].clone();
+    assert_eq!(impls["data"]["has_private_fields"], true, "{impls}");
+    // A module without a public path, of which only the items with one are listed until M2's
+    // D6b, with a warning of it.
+    server.send(&call_tool(
+        7_000,
+        "list_module",
+        json!({ "crate": "demo", "path": "crate::hidden" }),
+    ));
+    let listed = server.response(7_000)["result"]["structuredContent"].clone();
+    assert!(warns(&listed, "has no public path"), "{listed}");
+    assert!(server.finish().success());
+}
+
 /// The result of `get_item` with `arguments`, called again while it answers `status: building`,
 /// with the ids from `first` on.
 #[cfg(feature = "local")]

@@ -24,6 +24,7 @@ use rustdoc_types::{
     StabilityLevel,
     Struct,
     StructKind,
+    Visibility,
 };
 use semver::Version;
 use serde::Serialize;
@@ -32,7 +33,7 @@ use super::{
     cfg::{Cfg, CfgAttribute, CfgSource},
     docs,
     path_index::{self, ArchivedPathIndex, ExternalReexport, PublicPath, Resolution},
-    render::Renderer,
+    render::{Renderer, in_crate},
     view::CrateView,
 };
 use crate::data::{crate_file::DocsRsBuild, crate_name::CrateName};
@@ -362,6 +363,12 @@ pub struct ItemData<'a> {
     /// What the item is, in the words of rustdoc's `ItemKind`, except that a function in an
     /// `impl` or a trait is a `method`.
     pub kind: &'static str,
+    /// In a workspace member, which has its private items, who can use the item, as Rust writes
+    /// it: `pub`, `pub(crate)`, `pub(in crate::a)`, or `private` (requirement R-WS-3, decided in
+    /// M2's D6). An item of a trait, a variant and an item of an `impl` of a trait have their
+    /// parent's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<Box<str>>,
     /// The type, trait or enum that the item belongs to (requirement R-SH-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<Box<str>>,
@@ -764,6 +771,11 @@ impl<'a> Query<'a> {
         }
     }
 
+    /// Adds a warning.
+    pub(super) fn warn(&mut self, warning: String) {
+        self.warnings.push(Cow::Owned(warning));
+    }
+
     /// Adds a hint of what to call next.
     pub(super) fn hint(&mut self, hint: String) {
         self.hints.push(hint.into());
@@ -887,6 +899,7 @@ impl<'a> Query<'a> {
         let signature = self.renderer.signature(item);
         let mut data = ItemData {
             kind: kind_of(item, parent.is_some()),
+            visibility: self.visibility_of(item, parent),
             ..ItemData::default()
         };
         if let Some(parent) = parent {
@@ -1208,11 +1221,56 @@ impl<'a> Query<'a> {
         known
     }
 
-    /// The canonical path of `id`, or its definition path with a warning if it has no public
-    /// path.
+    /// Who can use `item`, which belongs to `parent` if it is a member, in a workspace member's
+    /// build (requirement R-WS-3, decided in M2's D6): `None` elsewhere, where only public items
+    /// are shown, and for a member whose parent is not known.
+    fn visibility_of(&self, item: &Item, parent: Option<Id>) -> Option<Box<str>> {
+        if !self.is_member() {
+            return None;
+        }
+        Some(match &item.visibility {
+            Visibility::Public => "pub".into(),
+            Visibility::Crate => "pub(crate)".into(),
+            Visibility::Restricted { .. } if self.index.is_module_private(item.id) => {
+                "private".into()
+            },
+            Visibility::Restricted { path, .. } => format!("pub(in {})", in_crate(path)).into(),
+            // Its parent's: a trait or an enum; for an item of an `impl` of a trait, the trait's if
+            // it is of this crate, else the type's. Unknown without its parent.
+            Visibility::Default => {
+                let parent = parent?;
+                let of_trait = path_index::own_impls(self.view, parent)
+                    .find(|(_, contents)| contents.items.contains(&item.id))
+                    .and_then(|(_, contents)| contents.trait_.as_ref())
+                    .and_then(|path| self.view.item(path.id));
+                return self.visibility_of(of_trait.or_else(|| self.view.item(parent))?, None);
+            },
+        })
+    }
+
+    /// Whether the crate is a workspace member's, built here with its private items (decided in
+    /// M2's D2).
+    pub(super) const fn is_member(&self) -> bool {
+        matches!(self.request.origin, Origin::Local { .. })
+    }
+
+    /// The canonical path of `id`; in a workspace member, its path in the crate,
+    /// `crate::a::Item`, if it has no public path (requirement R-PR-2, decided in M2's D6); or its
+    /// definition path with a warning.
     pub(super) fn path_of(&mut self, id: Id) -> Box<str> {
         if let Some(path) = self.index.canonical_path(id) {
             return path.joined();
+        }
+        if self.is_member()
+            && let Some(summary) = self.view.summary(id)
+            && summary.crate_id == 0
+        {
+            let mut path = String::from("crate");
+            for segment in summary.path.iter().skip(1) {
+                path.push_str("::");
+                path.push_str(segment);
+            }
+            return path.into();
         }
         let path: Box<str> = self.view.summary(id).map_or_else(
             || {
@@ -1686,7 +1744,6 @@ pub(super) mod tests {
         Use,
         Variant,
         VariantKind,
-        Visibility,
     };
     use serde_json::json;
 

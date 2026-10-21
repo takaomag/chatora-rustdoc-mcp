@@ -90,7 +90,9 @@ pub struct ModuleResponse<'a> {
 /// A module and its items.
 #[derive(Debug, Serialize)]
 pub struct ModuleData<'a> {
-    /// The path of the module as asked for (its canonical one if it has no public path).
+    /// The path of the module as asked for, or its canonical one if it has no items there; for a
+    /// module without a public path, its path in the crate of a workspace member, or its
+    /// definition path.
     pub path: Box<str>,
     /// The first paragraph of the module's documentation, with `detail` normal or full.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,6 +171,12 @@ pub fn list_module<'a>(
     } else {
         path.into()
     };
+    // Until the items without a public path are listed (M2's D6b).
+    if query.is_member() && index.canonical_path(module).is_none() {
+        query.warn(format!(
+            "{listed_at} has no public path, and only the items with one are listed"
+        ));
+    }
     let mut entries = Vec::new();
     let depth = if options.recursive { options.depth } else { 1 };
     let mut visited = HashSet::from([module]);

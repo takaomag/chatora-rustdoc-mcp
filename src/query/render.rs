@@ -61,6 +61,12 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// Whether the item `id` is restricted to the module that has it: private, as written without
+    /// `pub` (decided in M2's D6).
+    fn own_module(&self, id: Id) -> bool {
+        self.view.index().is_module_private(id)
+    }
+
     /// What could not be rendered faithfully so far.
     #[must_use]
     pub fn warnings(&self) -> &[Cow<'static, str>] {
@@ -84,12 +90,12 @@ impl<'a> Renderer<'a> {
         let visibility = &item.visibility;
         match &item.inner {
             ItemEnum::Module(_) => {
-                push_visibility(&mut out, visibility);
+                push_visibility(&mut out, visibility, self.own_module(item.id));
                 out.push_str("mod ");
                 out.push_str(name);
             },
             ItemEnum::ExternCrate { name, rename } => {
-                push_visibility(&mut out, visibility);
+                push_visibility(&mut out, visibility, self.own_module(item.id));
                 out.push_str("extern crate ");
                 out.push_str(name);
                 if let Some(rename) = rename {
@@ -98,7 +104,9 @@ impl<'a> Renderer<'a> {
                 }
                 out.push(';');
             },
-            ItemEnum::Use(reexport) => push_use(&mut out, visibility, reexport),
+            ItemEnum::Use(reexport) => {
+                push_use(&mut out, visibility, self.own_module(item.id), reexport);
+            },
             ItemEnum::Union(contents) => {
                 self.push_type_header(&mut out, item, "union", &contents.generics);
             },
@@ -114,7 +122,7 @@ impl<'a> Renderer<'a> {
                 }
             },
             ItemEnum::StructField(ty) => {
-                push_visibility(&mut out, visibility);
+                push_visibility(&mut out, visibility, self.own_module(item.id));
                 out.push_str(name);
                 out.push_str(": ");
                 self.push_type(&mut out, ty);
@@ -124,7 +132,7 @@ impl<'a> Renderer<'a> {
             },
             ItemEnum::Variant(variant) => self.push_variant(&mut out, name, variant),
             ItemEnum::Function(function) => {
-                push_visibility(&mut out, visibility);
+                push_visibility(&mut out, visibility, self.own_module(item.id));
                 push_header(&mut out, &function.header);
                 out.push_str("fn ");
                 out.push_str(name);
@@ -133,7 +141,7 @@ impl<'a> Renderer<'a> {
             },
             ItemEnum::Trait(contents) => self.push_trait(&mut out, item, contents),
             ItemEnum::TraitAlias(alias) => {
-                push_visibility(&mut out, visibility);
+                push_visibility(&mut out, visibility, self.own_module(item.id));
                 out.push_str("trait ");
                 out.push_str(name);
                 self.push_generic_params(&mut out, &alias.generics.params);
@@ -226,7 +234,7 @@ impl<'a> Renderer<'a> {
         keyword: &str,
         generics: &Generics,
     ) {
-        push_visibility(out, &item.visibility);
+        push_visibility(out, &item.visibility, self.own_module(item.id));
         out.push_str(keyword);
         out.push(' ');
         out.push_str(item.name.as_deref().unwrap_or("_"));
@@ -252,7 +260,7 @@ impl<'a> Renderer<'a> {
 
     /// `pub unsafe trait Name<T>: Bound`.
     fn push_trait(&mut self, out: &mut String, item: &Item, contents: &Trait) {
-        push_visibility(out, &item.visibility);
+        push_visibility(out, &item.visibility, self.own_module(item.id));
         if contents.is_unsafe {
             out.push_str("unsafe ");
         }
@@ -295,7 +303,7 @@ impl<'a> Renderer<'a> {
         bounds: &[GenericBound],
         ty: Option<&Type>,
     ) {
-        push_visibility(out, &item.visibility);
+        push_visibility(out, &item.visibility, self.own_module(item.id));
         out.push_str("type ");
         out.push_str(item.name.as_deref().unwrap_or("_"));
         if let Some(generics) = generics {
@@ -314,7 +322,7 @@ impl<'a> Renderer<'a> {
 
     /// `pub const NAME: T = value;`, or without the value when there is none.
     fn push_const(&mut self, out: &mut String, item: &Item, ty: &Type, value: Option<&str>) {
-        push_visibility(out, &item.visibility);
+        push_visibility(out, &item.visibility, self.own_module(item.id));
         out.push_str("const ");
         out.push_str(item.name.as_deref().unwrap_or("_"));
         out.push_str(": ");
@@ -328,7 +336,7 @@ impl<'a> Renderer<'a> {
 
     /// `pub static mut NAME: T = value;`.
     fn push_static(&mut self, out: &mut String, item: &Item, contents: &Static) {
-        push_visibility(out, &item.visibility);
+        push_visibility(out, &item.visibility, self.own_module(item.id));
         if contents.is_unsafe {
             out.push_str("unsafe ");
         }
@@ -355,11 +363,12 @@ impl<'a> Renderer<'a> {
             }
             match field.and_then(|id| self.view.item(id)) {
                 Some(Item {
+                    id,
                     visibility,
                     inner: ItemEnum::StructField(ty),
                     ..
                 }) => {
-                    push_visibility(out, visibility);
+                    push_visibility(out, visibility, self.own_module(*id));
                     self.push_type(out, ty);
                 },
                 // A private field.
@@ -843,9 +852,10 @@ const fn generics_of(item: &Item) -> Option<&Generics> {
     }
 }
 
-/// `pub use source;`, `pub use source as name;` or `pub use source::*;`.
-fn push_use(out: &mut String, visibility: &Visibility, reexport: &Use) {
-    push_visibility(out, visibility);
+/// `pub use source;`, `pub use source as name;` or `pub use source::*;`. `own_module` as for
+/// [`push_visibility`].
+fn push_use(out: &mut String, visibility: &Visibility, own_module: bool, reexport: &Use) {
+    push_visibility(out, visibility, own_module);
     out.push_str("use ");
     out.push_str(&reexport.source);
     if reexport.is_glob {
@@ -869,17 +879,32 @@ fn push_proc_macro(out: &mut String, name: &str, kind: MacroKind) {
     out.push_str(close);
 }
 
-/// `pub `, `pub(crate) `, `pub(in path) `, or nothing (requirement R-OUT-2).
-fn push_visibility(out: &mut String, visibility: &Visibility) {
+/// `pub `, `pub(crate) `, `pub(in crate::path) `, or nothing (requirements R-OUT-2 and R-WS-3):
+/// nothing for an item restricted to the module that has it, `own_module`, as Rust writes a
+/// private item (decided in M2's D6).
+fn push_visibility(out: &mut String, visibility: &Visibility, own_module: bool) {
     match visibility {
         Visibility::Public => out.push_str("pub "),
         Visibility::Default => {},
         Visibility::Crate => out.push_str("pub(crate) "),
+        Visibility::Restricted { .. } if own_module => {},
         Visibility::Restricted { path, .. } => {
             out.push_str("pub(in ");
-            out.push_str(path);
+            out.push_str(&in_crate(path));
             out.push_str(") ");
         },
+    }
+}
+
+/// The path of a module as rustdoc writes it in a visibility, `::query::local`, as Rust writes it
+/// in the crate: `crate::query::local`.
+#[must_use]
+pub fn in_crate(path: &str) -> String {
+    let path = path.trim_start_matches("::");
+    match path.strip_prefix("crate") {
+        Some(rest) if rest.is_empty() || rest.starts_with("::") => format!("crate{rest}"),
+        _ if path.is_empty() => "crate".to_owned(),
+        _ => format!("crate::{path}"),
     }
 }
 
@@ -1080,6 +1105,16 @@ mod tests {
         let mut renderer = Renderer::new(&view);
         let item = view.item(Id(id)).expect("the item");
         (renderer.signature(item), renderer.where_predicates(item))
+    }
+
+    #[test]
+    fn a_module_in_a_visibility_is_written_from_the_crate() {
+        assert_eq!(in_crate("::query::local"), "crate::query::local");
+        assert_eq!(in_crate("::"), "crate");
+        assert_eq!(in_crate(""), "crate");
+        assert_eq!(in_crate("crate::a"), "crate::a");
+        assert_eq!(in_crate("crate"), "crate");
+        assert_eq!(in_crate("crates::a"), "crate::crates::a");
     }
 
     #[test]

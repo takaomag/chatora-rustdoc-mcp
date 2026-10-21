@@ -14,7 +14,7 @@ use std::{
     fmt,
 };
 
-use rustdoc_types::{Crate, Id, Impl, Item, ItemEnum, Type, Use, Visibility};
+use rustdoc_types::{Crate, Id, Impl, Item, ItemEnum, StructKind, Type, Use, Visibility};
 
 use super::view::{self, CrateView};
 
@@ -119,6 +119,9 @@ pub struct PathIndex {
     external_globs: Box<[ExternalGlob]>,
     /// Some paths were not followed because a module was reached too many times.
     incomplete: bool,
+    /// The items restricted to the module that has them, as an item written without `pub` is
+    /// (decided in M2's D6): only in a build with private items.
+    module_private: HashSet<Id>,
 }
 
 /// What a path refers to.
@@ -219,6 +222,7 @@ impl PathIndex {
             })
             .collect();
         let children = children_of(by_public_path.keys().chain(external_reexports.keys()));
+        let module_private = module_private(krate);
         Self {
             paths_of,
             canonical_via,
@@ -228,7 +232,73 @@ impl PathIndex {
             external_reexports,
             external_globs,
             incomplete: walker.incomplete,
+            module_private,
         }
+    }
+}
+
+/// The items of `krate` restricted to the module that has them (`Restricted` to it, as rustdoc
+/// writes an item without `pub` outside the crate root): those of its modules, the fields of its
+/// types, and the items of the inherent `impl`s of its types, which no module lists, taken as in
+/// the module of their type, as they mostly are. Items of traits, variants and the items of
+/// `impl`s of traits are `Default`.
+#[expect(
+    clippy::iter_over_hash_type,
+    reason = "what is found is a set, whose order does not matter"
+)]
+fn module_private(krate: &Crate) -> HashSet<Id> {
+    let restricted_to = |id: &Id, module: Id| {
+        krate.index.get(id).is_some_and(|item| {
+            matches!(item.visibility, Visibility::Restricted { parent, .. } if parent == module)
+        })
+    };
+    let mut private = HashSet::new();
+    let mut module_of_type = HashMap::new();
+    for (&module, item) in &krate.index {
+        let ItemEnum::Module(contents) = &item.inner else {
+            continue;
+        };
+        for id in &contents.items {
+            let owned = std::iter::once(*id).chain(fields_of(krate, *id));
+            private.extend(owned.filter(|id| restricted_to(id, module)));
+            if krate.index.get(id).is_some_and(|item| {
+                matches!(
+                    item.inner,
+                    ItemEnum::Struct(_) | ItemEnum::Enum(_) | ItemEnum::Union(_)
+                )
+            }) {
+                module_of_type.insert(*id, module);
+            }
+        }
+    }
+    for item in krate.index.values() {
+        let ItemEnum::Impl(contents) = &item.inner else {
+            continue;
+        };
+        let Type::ResolvedPath(ty) = &contents.for_ else {
+            continue;
+        };
+        if contents.trait_.is_some() {
+            continue;
+        }
+        if let Some(&module) = module_of_type.get(&ty.id) {
+            private.extend(contents.items.iter().filter(|id| restricted_to(id, module)));
+        }
+    }
+    private
+}
+
+/// The fields of the item `id`, a struct or a union, whose visibility is of the module that has
+/// it.
+fn fields_of(krate: &Crate, id: Id) -> Vec<Id> {
+    match krate.index.get(&id).map(|item| &item.inner) {
+        Some(ItemEnum::Struct(contents)) => match &contents.kind {
+            StructKind::Plain { fields, .. } => fields.clone(),
+            StructKind::Tuple(fields) => fields.iter().flatten().copied().collect(),
+            StructKind::Unit => Vec::new(),
+        },
+        Some(ItemEnum::Union(contents)) => contents.fields.clone(),
+        _ => Vec::new(),
     }
 }
 
@@ -254,6 +324,13 @@ impl PathIndex {
 }
 
 impl ArchivedPathIndex {
+    /// Whether the item `id` is restricted to the module that has it: private, as written
+    /// without `pub` (decided in M2's D6).
+    #[must_use]
+    pub fn is_module_private(&self, id: Id) -> bool {
+        self.module_private.contains(&view::archived_id(id))
+    }
+
     /// The canonical path of `id`: among its public paths, one that does not rename the item,
     /// then the shortest, then the first in lexicographic order (requirement R-PR-2).
     #[must_use]
@@ -897,7 +974,6 @@ mod tests {
         ItemSummary,
         Module,
         Struct,
-        StructKind,
         Target,
         Variant,
         VariantKind,

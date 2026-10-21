@@ -6,7 +6,7 @@
 
 use std::{borrow::Cow, collections::BTreeMap};
 
-use rustdoc_types::{Attribute, Id, Impl, Item, ItemEnum, StructKind, Type};
+use rustdoc_types::{Attribute, Id, Impl, Item, ItemEnum, StructKind, Type, Visibility};
 use serde::Serialize;
 
 use super::{
@@ -209,7 +209,7 @@ pub fn list_impls<'a>(
         .take(options.limit)
         .map(|(_, _, _, entry)| entry)
         .collect();
-    let (non_exhaustive, has_private_fields) = shape_of(item);
+    let (non_exhaustive, has_private_fields) = shape_of(view, item);
     let path = query.path_of(ty);
     let Notes { warnings, hints } = query.finish();
     let page = |shown: usize| {
@@ -509,19 +509,28 @@ pub(super) fn trait_origin(view: &CrateView<'_>, id: Id) -> Option<TraitOrigin> 
     })
 }
 
-/// Whether the type is `#[non_exhaustive]`, and whether it has fields that are not public.
-fn shape_of(item: &Item) -> (bool, bool) {
+/// Whether the type is `#[non_exhaustive]`, and whether it has fields that are not public: that
+/// rustdoc stripped, or, in a build with private items, that are not `pub` (decided in M2's D6).
+fn shape_of(view: &CrateView<'_>, item: &Item) -> (bool, bool) {
     let non_exhaustive = item.attrs.contains(&Attribute::NonExhaustive);
+    let not_public = |field: &Id| {
+        view.item(*field)
+            .is_some_and(|field| field.visibility != Visibility::Public)
+    };
     let private = match &item.inner {
         ItemEnum::Struct(contents) => match &contents.kind {
             StructKind::Plain {
+                fields,
                 has_stripped_fields,
-                ..
-            } => *has_stripped_fields,
-            StructKind::Tuple(fields) => fields.iter().any(Option::is_none),
+            } => *has_stripped_fields || fields.iter().any(not_public),
+            StructKind::Tuple(fields) => fields
+                .iter()
+                .any(|field| field.as_ref().is_none_or(not_public)),
             StructKind::Unit => false,
         },
-        ItemEnum::Union(contents) => contents.has_stripped_fields,
+        ItemEnum::Union(contents) => {
+            contents.has_stripped_fields || contents.fields.iter().any(not_public)
+        },
         ItemEnum::Module(_)
         | ItemEnum::ExternCrate { .. }
         | ItemEnum::Use(_)

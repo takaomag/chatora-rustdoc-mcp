@@ -555,7 +555,20 @@ pub(super) fn defined_at_schema() -> Value {
     })
 }
 
+/// The schema of the visibility of an item, which a workspace member's items have (decided in M2's
+/// D6).
+fn visibility_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "In a workspace member: pub, pub(crate), pub(in crate::path) or private.",
+    })
+}
+
 /// The schema of `data`: `ItemData` in `query::get_item`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the schema of each field of the data, in the order of the data"
+)]
 pub(super) fn data_schema() -> Value {
     let strings = json!({ "type": "array", "items": { "type": "string" } });
     json!({
@@ -571,6 +584,7 @@ pub(super) fn data_schema() -> Value {
                 "description": "In a list, the canonical path of an item listed at another.",
             },
             "kind": { "type": "string" },
+            "visibility": visibility_schema(),
             "parent": { "type": "string" },
             "impl": { "type": "string" },
             "signature": { "type": "string" },
@@ -1480,10 +1494,16 @@ pub(super) fn index_error(cache: &Cache, name: &CrateName, error: &IndexError) -
     }
 }
 
-/// `path`, starting with the crate name: it is added when the first segment is something else.
-/// `-` and `_` in the crate name are the same.
+/// `path`, starting with the crate name: it is added when the first segment is something else,
+/// and takes the place of `crate`. `-` and `_` in the crate name are the same.
 fn with_crate_name(name: &CrateName, path: &str) -> Box<str> {
     let first = path.split("::").next().unwrap_or_default();
+    // `crate::a::Item`, as an item of a workspace member without a public path is shown
+    // (requirement R-PR-2, decided in M2's D6).
+    if first == "crate" {
+        let rest = path.strip_prefix("crate").unwrap_or_default();
+        return format!("{}{rest}", name.as_str().replace('-', "_")).into();
+    }
     if same_crate_name(first, name.as_str()) {
         path.into()
     } else {
@@ -3539,6 +3559,7 @@ mod tests {
                 path: "x".into(),
                 canonical: some(),
                 kind: "struct",
+                visibility: some(),
                 parent: some(),
                 impl_header: some(),
                 signature: some(),

@@ -1003,6 +1003,35 @@ Claude Code 2.1.304、Linux で測った。
   - テストを足した: `refresh` を 1 回だけ効かせること、`Resolver::forget_failures` (失敗は `cargo metadata` を走らせ直し、成功は残す)、toolchain の失敗だけを忘れること
 - 残したもの: README は F6 でまとめて書く (照会のツールのビルドとあわせて)。`toolchain::forget_failures` はすべてのディレクトリの `rustc -vV`・rustup の失敗を、std は全日付の配布物の失敗を解く (決定 2 の「その分だけ」より広いが、失敗だけで害は小さい)。起動時の host の `rustc -vV` の失敗 (`state.host`) は解けない。`cargo metadata` の git の決定的な失敗 (`fetch_failed`) は `Resolver` で 30 秒しか覚えず、`metadata_failed` に `refresh` の案内も無い (前からある。R-WS-7 の「`refresh` までキャッシュ」とずれる)。docs.rs・std・`list_crates`・`search_items`・`resolve_version` の `refresh` を通しで確かめる結合テストは無い (`CheckedElsewhere` が指すのは member のテスト)
 
+**D6 の下調べと決定 (2026-10-21)**:
+
+- 下調べ (サブエージェント、読むだけ): 可視性は `render::push_visibility` が描き、rustdoc の `restricted` のパスをそのまま `pub(in ::query::local)` と出す (rustdoc は何も付けない private を `restricted { parent: 含むモジュール }` で書き、`pub(super)` も同じ形)。trait の item・enum の variant・impl の item は `default` で、親の可視性を継がない。可視性は応答の項目に無い。公開パス索引は `Public` だけをたどり、private な item は定義パスと「公開パスが無い」の warning でなら引ける (`crate::` は受けない)。検索と一覧は公開索引だけを使うが、公開の型の private な固有メソッドは検索と `list_methods` に出る。docs.rs は `rustdoc-args` を尊重するので、`--document-private-items`・`--document-hidden-items` でビルドされた依存の JSON がありうるが、除くのは公開索引だけ (定義パスの引き当て・固有メソッド・フィールド・hidden が漏れる)。member の JSON では private なフィールドが消されないので `has_private_fields` と「/* private fields */」が誤る。member どうしの re-export は追わない (D2c-2)
+- 利用者が決めたこと:
+  1. D6 を 3 つに分ける: D6a (可視性の表示・応答の項目・親から継ぐ、private な item の crate 内のパスと `crate::` の入力、private なフィールドの誤り)、D6b (検索と一覧で member は private を含め、依存と std は非公開と `doc(hidden)` をどの経路でも除く)、D6c (member と path 依存への re-export を追う。行き先をビルドし、版は依存グラフ)
+  2. 応答の可視性は Rust の書き方の文字列 (`pub`・`pub(crate)`・`pub(in crate::query)`・`private`)
+  3. (D6b) member の `list_module`・`crate_overview` は private な item も並べ、private なモジュールも開ける (検索とそろえる。長くなる一覧はページングで受ける)
+  4. (D6b) member の `#[doc(hidden)]` な item も検索と一覧に出し、hidden の印を付ける。依存と std の hidden は除く
+  5. (D6b) 検索と一覧の項目には、`pub` でないものにだけ `visibility` を付ける (`get_item` は member で常に付ける)
+- 聞かずに決めたこと: 含むモジュールと同じ範囲は `private` (シグネチャには何も付けない)、違えば `pub(in crate::…)` (`pub(super)` は JSON から分からないので書かない)。crate のルートの private は rustdoc が `crate` で出すので `pub(crate)` (同じ意味)。trait の item と trait impl の item は trait の、enum の variant は enum の可視性を継ぐ。公開パスの無い member の item は `crate::a::b::Item` で示し、`crate::` で始まるパスを受ける (R-PR-2)
+
+**D6a (可視性・crate 内のパス・private なフィールド。2026-10-21)**:
+
+- 公開パス索引に、含むモジュールに限られた item の集合 (`PathIndex::module_private`) を足した: モジュールの item と型 (struct・union) のフィールドのうち `Restricted { parent }` の `parent` が含むモジュールのもの (Rust で `pub` を付けずに書いたもの)、固有の `impl` の item のうち型のモジュールに限られたもの (rustdoc の JSON はモジュールの item に `impl` を入れないので、`impl` は型と同じモジュールにあるとみなす。別のモジュールや関数の本体にある `impl` の private は `pub(in crate::…)` と出る)。private な item を含むビルドでだけ中身がある。アーカイブの形式 (`ARCHIVE_SCHEMA`) を 6 に上げた
+- シグネチャ (`render::push_visibility`): 含むモジュールに限られたものは何も付けず、ほかの `Restricted` は `pub(in crate::…)` (rustdoc の `::a::b` を `crate::a::b` に。`render::in_crate`)
+- 応答の `data.visibility` (member の JSON のときだけ。docs.rs と std は公開の item しか出さないので付けない): `pub`・`pub(crate)`・`pub(in crate::…)`・`private`。`Default` (trait の item・variant・trait の impl の item) は親のもの: trait の item は trait の、variant は enum の、trait の impl の item は、この crate の trait なら trait の、外の trait なら型の。親が分からなければ付けない。出力スキーマに足した
+- パス: member の公開パスの無い item は `crate::a::b::Item` で示し、「公開パスが無い」の warning を付けない (`Query::path_of`)。引数の `path` は `crate::` で始まってよい (`with_crate_name` が crate 名に置き換える)
+- private なフィールド: `list_impls` の `has_private_fields` を、rustdoc が除いたものに加えて `pub` でないフィールドでも真にする (member の JSON では private なフィールドが除かれないので、偽になっていた)。`get_item` の `fields` は member では可視性付きで並ぶ (`count: u8`、`pub(crate) shared: u8`)
+- `get_item` の説明文: member をビルドすること、`visibility`、`crate::a::Item` を書いた (上限 2,048 文字に収めるため、`std::vec::Vec` の例と「Cargo's」を削った)
+- テスト: stdio で、private なモジュール・`pub(super)`・`pub(crate)`・private なフィールド・`pub(crate)` の trait と enum を持つ member を作り、可視性 (`private`・`pub(in crate::open)`・`pub(crate)`・親から継ぐもの)、シグネチャ、`crate::` のパスの入力と表示、フィールド、`has_private_fields` を確かめた (集合を無効にすると落ちることを確かめた)。`in_crate` の単体テスト
+- 確かめたこと (rustdoc 1.99.1。レビューの実測を含む): 何も付けない private・`pub(in crate::a)`・`pub(self)`・`pub(super)` は `Restricted { parent }`。crate のルートの private と、ルートのすぐ下のモジュールの `pub(super)` は `Crate` (`pub(crate)` と出る。ルートのフィールドも)。trait の item・variant とそのフィールド・trait の impl の item・impl そのものは `Default`。`--document-hidden-items` を付けないので、member の `#[doc(hidden)]` は JSON に入らない
+- レビューで直したこと:
+  - 固有の `impl` の private なメソッドが `pub(in crate::…)` と出ていた (いちばん多い private なのに、`impl` がモジュールの item に入らないことを見落とし、テストも無かった): 型のモジュールで判定する
+  - trait の impl の item が、決定と違い型の可視性を継いでいた: この crate の trait なら trait の可視性
+  - 親が分からない `Default` (曖昧なパスで variant を定義パスで引いたときなど) を `private` としていた: 付けない
+  - private なモジュールの `list_module` が、理由の warning なしに空を返していた (`path_of` が warning を出さなくなったため): member で公開パスの無いモジュールは、公開パスのある item だけを並べる旨を warning に書く (D6b で中身を並べるまで)
+  - テストに、固有の `impl` の private なメソッド・自分の crate の trait の impl の item・ルートの private・private なモジュールの一覧を足した (型のモジュールでの判定を外すと落ちることを確かめた)
+- 残したもの: 型と別のモジュールや関数の本体にある `impl` の private (`pub(in crate::…)` と出る)。`list_implementors` の sealed の文言は、member でも定義パス (`crate::` でない)。`get_item` の説明文の書き出しは docs.rs と std のまま (F4 で見直す)。アーカイブの形式を上げた後の最初の呼び出しは、作り直しの間の前回のビルド (D4c) を開けず `status: building` になる
+
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
 - 利用者の指示で、デッドロックと止まって戻らない危険を、コード全体で監査した (サブエージェント、読むだけ。D4b のハングの後)。ロックの循環、ガードを持ったままの `.await` (clippy の `await_holding_lock` も `suspicious` の deny で効いている)、自分の結果を待つ形の循環は無かった。止まって長く戻らない箇所は次のとおり
