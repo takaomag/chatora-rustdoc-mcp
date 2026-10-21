@@ -386,6 +386,17 @@ pub async fn same_toolchain(rustc: &Path, rustdoc: &Path, dir: &Path) -> Result<
     })
 }
 
+/// What [`check_target`] found of a toolchain that can build for the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked {
+    /// Its host, which tells whether a build passes `--target` (requirement R-WS-1), if rustc
+    /// told it.
+    pub host: Option<TargetTriple>,
+    /// It, as the first line of `rustc -vV` gives it, for the provenance (requirement R-OUT-9),
+    /// if rustc told it.
+    pub toolchain: Option<String>,
+}
+
 /// Why a toolchain cannot build for a target.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Missing {
@@ -413,19 +424,26 @@ pub enum Missing {
 /// the host, its `libcore`), so that cargo is not started to fail (requirement R-TG-1, decided in
 /// M2's D1).
 ///
-/// Returns the host of the toolchain, which tells whether a build passes `--target` (requirement
-/// R-WS-1), if rustc told it.
+/// `toolchain` is one that the server chose instead of the project's, as `nightly`, which rustc
+/// is run with as `+<toolchain>`. Returns what rustc told of its toolchain.
 ///
 /// # Errors
 ///
 /// Returns what is missing.
 pub async fn check_target(
     rustc: &Path,
+    toolchain: Option<&str>,
     root: &Path,
     target: &TargetTriple,
-) -> Result<Option<TargetTriple>, Missing> {
+) -> Result<Checked, Missing> {
+    let plus = toolchain.map(|toolchain| format!("+{toolchain}"));
     let run = async |args: &[&str]| {
-        tool::output_kept(root, tool::Place::Project, rustc, args)
+        let args: Vec<&str> = plus
+            .as_deref()
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        tool::output_kept(root, tool::Place::Project, rustc, &args)
             .await
             .map_err(|why| not_installed(&why).unwrap_or_else(|| Missing::NotRun(why.into_owned())))
     };
@@ -448,7 +466,11 @@ pub async fn check_target(
         lib.is_dir()
     };
     if found {
-        Ok(host.and_then(|host| host.parse().ok()))
+        Ok(Checked {
+            host: host.and_then(|host| host.parse().ok()),
+            toolchain: super::local_std::parse_rustc_version(&version)
+                .map(|version| version.summary()),
+        })
     } else {
         Err(Missing::Target {
             target: target.clone(),
@@ -665,8 +687,9 @@ pub enum ChooseError {
 /// M2's D1).
 ///
 /// It is the project's toolchain, as cargo runs it there, unless that writes too old a format:
-/// then rustup's nightly (`build.nightly_date`), when the rustdoc is rustup's (`rustdoc` in
-/// `PATH`, not one that a setting or the project names) and rustup is here.
+/// then rustup's nightly (`build.nightly_date`), when rustc and rustdoc are rustup's (`rustc` and
+/// `rustdoc` in `PATH`, not ones that a setting, a variable or the project names) and rustup is
+/// here.
 ///
 /// # Errors
 ///
@@ -678,7 +701,10 @@ pub async fn choose(
     work: &Path,
 ) -> Result<Chosen, ChooseError> {
     let rustdoc = Programs::this().used_in(Kind::Rustdoc, root, cargo_home);
+    let rustc = Programs::this().used_in(Kind::Rustc, root, cargo_home);
+    // With rustc or rustdoc of a path, `+nightly` would mix toolchains.
     let switchable = rustdoc == Path::new(Kind::Rustdoc.name())
+        && rustc == Path::new(Kind::Rustc.name())
         && tool::output_kept(cache.dir(), tool::Place::Neutral, Path::new("rustup"), &[
             "--version",
         ])
@@ -742,6 +768,12 @@ async fn choose_with(
         format: nightly_format,
         project_format: format,
     })
+}
+
+/// Forgets what was kept of the toolchain of the project at `root`, as rustup's saying that it is
+/// not installed, once cargo has installed it in a build (decided in M2's D2).
+pub fn forget_project(root: &Path) {
+    tool::forget_project(root);
 }
 
 /// The toolchain that rustup says is not installed, in why a command failed:
@@ -889,10 +921,16 @@ mod tests {
     async fn the_toolchain_here_builds_for_its_host() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let host = crate::data::target::host_target(dir.path()).await;
-        let told = check_target(Path::new("rustc"), dir.path(), &host.triple)
+        let told = check_target(Path::new("rustc"), None, dir.path(), &host.triple)
             .await
             .expect("the host's standard library");
-        assert_eq!(told, Some(host.triple));
+        assert_eq!(told.host, Some(host.triple));
+        assert!(
+            told.toolchain
+                .as_deref()
+                .is_some_and(|toolchain| toolchain.starts_with("rustc 1.")),
+            "{told:?}"
+        );
     }
 
     /// A project whose `rust-toolchain.toml` names a toolchain that is not installed is told so,
@@ -907,7 +945,7 @@ mod tests {
         )
         .expect("written");
         let target: TargetTriple = "x86_64-unknown-linux-gnu".parse().expect("a triple");
-        let missing = check_target(Path::new("rustc"), dir.path(), &target).await;
+        let missing = check_target(Path::new("rustc"), None, dir.path(), &target).await;
         assert!(
             matches!(&missing, Err(Missing::NotInstalled { toolchain }) if toolchain.starts_with("1.0.1-")),
             "{missing:?}"
@@ -941,13 +979,13 @@ mod tests {
         std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755))
             .expect("made runnable");
         let host: TargetTriple = "x86_64-unknown-linux-gnu".parse().expect("a triple");
-        let told = check_target(&rustc, dir.path(), &host)
+        let told = check_target(&rustc, None, dir.path(), &host)
             .await
             .expect("the host's libcore");
-        assert_eq!(told.as_ref(), Some(&host));
+        assert_eq!(told.host.as_ref(), Some(&host));
         let other: TargetTriple = "aarch64-apple-darwin".parse().expect("a triple");
         assert_eq!(
-            check_target(&rustc, dir.path(), &other).await,
+            check_target(&rustc, None, dir.path(), &other).await,
             Err(Missing::Target { target: other })
         );
     }

@@ -397,7 +397,8 @@ pub(super) fn resolving(
         Doing::WaitingForLock => {
             "cargo waits for a lock that another cargo holds, to resolve the project's packages"
         },
-        Doing::Fetching | Doing::Indexing => {
+        // Resolving builds nothing; the other stages are not reported for it.
+        Doing::Fetching | Doing::Indexing | Doing::Building => {
             "cargo is fetching the project's dependencies, to resolve the project's packages"
         },
     };

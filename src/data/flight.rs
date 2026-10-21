@@ -13,7 +13,7 @@ use std::{
     sync::{
         Arc,
         Weak,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -22,16 +22,40 @@ use tracing::Instrument as _;
 
 use super::fetches::Fetches;
 
+/// The results that [`Flights::handing_over`] keeps for the next call, by key, with the number of
+/// their flight.
+type Left<T> = parking_lot::Mutex<HashMap<String, (u64, T)>>;
+
 /// The work in flight, by key.
 #[derive(Debug)]
 pub struct Flights<T> {
     flying: parking_lot::Mutex<HashMap<String, Weak<Flight<T>>>>,
+    /// With [`Self::handing_over`], the results of work that went on past a deadline, by key,
+    /// with the number of their flight, for the next call (decided in M2's D2).
+    left: Option<Arc<Left<T>>>,
+    /// Numbers the flights.
+    next: AtomicU64,
+}
+
+impl<T> Flights<T> {
+    /// Flights that hand the result of work that went on past a deadline to the next call for its
+    /// key, once: what is made anew for each call, as a local build until D4, would else be lost,
+    /// and a call that comes after it would start it again (decided in M2's D2).
+    #[must_use]
+    pub fn handing_over() -> Self {
+        Self {
+            left: Some(Arc::default()),
+            ..Self::default()
+        }
+    }
 }
 
 impl<T> Default for Flights<T> {
     fn default() -> Self {
         Self {
             flying: parking_lot::Mutex::new(HashMap::new()),
+            left: None,
+            next: AtomicU64::new(0),
         }
     }
 }
@@ -47,6 +71,8 @@ pub enum Doing {
     Indexing,
     /// Waiting for a lock that another cargo holds, as that of the package cache.
     WaitingForLock,
+    /// Building the documentation locally (decided in M2's D2).
+    Building,
 }
 
 impl Doing {
@@ -57,6 +83,7 @@ impl Doing {
             Self::Fetching => "fetching",
             Self::Indexing => "indexing",
             Self::WaitingForLock => "waiting_for_lock",
+            Self::Building => "building",
         }
     }
 
@@ -67,6 +94,7 @@ impl Doing {
             Self::Fetching => "fetching",
             Self::Indexing => "indexing",
             Self::WaitingForLock => "waiting for a cargo lock for",
+            Self::Building => "building the documentation of",
         }
     }
 }
@@ -94,6 +122,7 @@ impl Stage {
         match self.0.load(Ordering::Relaxed) {
             doing if doing == Doing::Indexing as u8 => Doing::Indexing,
             doing if doing == Doing::WaitingForLock as u8 => Doing::WaitingForLock,
+            doing if doing == Doing::Building as u8 => Doing::Building,
             _ => Doing::Fetching,
         }
     }
@@ -117,8 +146,11 @@ struct Flight<T> {
     /// The result, once there is one.
     done: watch::Receiver<Option<T>>,
     stage: Arc<Stage>,
-    /// A call stopped waiting for it at its deadline, so that it goes on until it ends.
-    left_going: AtomicBool,
+    /// A call stopped waiting for it at its deadline, so that it goes on until it ends, and its
+    /// result is handed to the next call with [`Flights::handing_over`].
+    left_going: Arc<AtomicBool>,
+    /// Its number among the flights.
+    number: u64,
     task: AbortHandle,
 }
 
@@ -191,6 +223,9 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
     where
         F: Future<Output = T> + Send + 'static,
     {
+        if let Some(result) = self.take_left(key) {
+            return Joined::Done(result);
+        }
         let flight = self.flight(key, start);
         let _waiting = super::waits::waiting(what, &flight.stage);
         let mut done = flight.done.clone();
@@ -201,13 +236,35 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
         }
         .map(|done| done.ok().and_then(|done| done.clone()));
         match waited {
-            Ok(Some(result)) => Joined::Done(result),
+            Ok(Some(result)) => {
+                // This call has it: it is not handed over again.
+                self.forget_left(key, flight.number);
+                Joined::Done(result)
+            },
             Ok(None) => Joined::Ended,
             Err(_) => {
                 let doing = flight.stage.get();
                 flight.leave_going();
                 Joined::Going(doing)
             },
+        }
+    }
+
+    /// The result for `key` that work which went on past a deadline left, once.
+    fn take_left(&self, key: &str) -> Option<T> {
+        self.left
+            .as_ref()
+            .and_then(|left| left.lock().remove(key))
+            .map(|(_, result)| result)
+    }
+
+    /// Forgets the result for `key` that the flight `number` left, which a call has had.
+    fn forget_left(&self, key: &str, number: u64) {
+        if let Some(left) = &self.left {
+            let mut left = left.lock();
+            if left.get(key).is_some_and(|(of, _)| *of == number) {
+                left.remove(key);
+            }
         }
     }
 
@@ -225,12 +282,24 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
         let (sender, done) = watch::channel(None);
         let stage = Arc::new(Stage::default());
         let work = start(Arc::clone(&stage));
+        let left_going = Arc::new(AtomicBool::new(false));
+        let number = self.next.fetch_add(1, Ordering::Relaxed);
+        let handing = self
+            .left
+            .as_ref()
+            .map(|left| (Arc::clone(left), Arc::clone(&left_going), key.to_owned()));
         // The requests that the work sends are noted for the call that started it (requirement
         // R-OBS-1).
         let fetches = Fetches::current().unwrap_or_default();
         let task = tokio::spawn(
             async move {
                 let result = fetches.scope(work).await;
+                // Before it is sent, so that a call that has it forgets it.
+                if let Some((left, left_going, key)) = handing
+                    && left_going.load(Ordering::Relaxed)
+                {
+                    left.lock().insert(key, (number, result.clone()));
+                }
                 // Every call may have stopped waiting meanwhile.
                 drop(sender.send(Some(result)));
             }
@@ -239,7 +308,8 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
         let flight = Arc::new(Flight {
             done,
             stage,
-            left_going: AtomicBool::new(false),
+            left_going,
+            number,
             task: task.abort_handle(),
         });
         flying.insert(key.to_owned(), Arc::downgrade(&flight));
@@ -279,6 +349,89 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// A deadline that a test passes at once.
+    fn soon() -> Instant {
+        Instant::now()
+            .checked_add(Duration::from_millis(20))
+            .expect("in range")
+    }
+
+    /// Joins the work of `key` in a task of its own, with a deadline that it does not reach.
+    fn join_later(
+        flights: &Arc<Flights<u32>>,
+        runs: &Arc<AtomicUsize>,
+        go: &Arc<Notify>,
+    ) -> tokio::task::JoinHandle<Joined<u32>> {
+        let (flights, runs, go) = (Arc::clone(flights), Arc::clone(runs), Arc::clone(go));
+        tokio::spawn(async move {
+            flights
+                .join("key", "work", later(), |_| work(&runs, &go))
+                .await
+        })
+    }
+
+    #[tokio::test]
+    async fn the_result_of_work_that_went_on_goes_to_the_next_call_once() {
+        let flights = Arc::new(Flights::handing_over());
+        let (runs, go) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
+        let first = flights
+            .join("key", "work", soon(), |_| work(&runs, &go))
+            .await;
+        assert!(matches!(first, Joined::Going(_)), "{first:?}");
+        go.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The next call has it, without running the work again.
+        let second = flights
+            .join("key", "work", later(), |_| work(&runs, &go))
+            .await;
+        assert_eq!(second, Joined::Done(7));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        // Once.
+        let third = join_later(&flights, &runs, &go);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        go.notify_waiters();
+        assert_eq!(third.await.expect("joined"), Joined::Done(7));
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_result_that_a_call_waited_for_is_not_handed_over_again() {
+        let flights = Arc::new(Flights::handing_over());
+        let (runs, go) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
+        let first = flights
+            .join("key", "work", soon(), |_| work(&runs, &go))
+            .await;
+        assert!(matches!(first, Joined::Going(_)), "{first:?}");
+        // A call that joins the work that goes on has its result.
+        let second = join_later(&flights, &runs, &go);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        go.notify_waiters();
+        assert_eq!(second.await.expect("joined"), Joined::Done(7));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let third = join_later(&flights, &runs, &go);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        go.notify_waiters();
+        assert_eq!(third.await.expect("joined"), Joined::Done(7));
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn without_handing_over_a_call_after_the_work_runs_it_again() {
+        let flights = Arc::new(Flights::default());
+        let (runs, go) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
+        let first = flights
+            .join("key", "work", soon(), |_| work(&runs, &go))
+            .await;
+        assert!(matches!(first, Joined::Going(_)), "{first:?}");
+        go.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = join_later(&flights, &runs, &go);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        go.notify_waiters();
+        assert_eq!(second.await.expect("joined"), Joined::Done(7));
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

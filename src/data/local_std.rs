@@ -41,6 +41,20 @@ pub struct RustcVersion {
     pub host: TargetTriple,
 }
 
+impl RustcVersion {
+    /// The toolchain, as the first line of `rustc -vV` gives it: `rustc 1.99.1 (0123456789
+    /// 2026-10-17)`, with nine digits of the commit (requirement R-OUT-9).
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "rustc {} ({} {})",
+            self.release,
+            self.commit_hash.get(..9).unwrap_or(&self.commit_hash),
+            self.commit_date
+        )
+    }
+}
+
 /// Why the nightly toolchain installed here is not used for std.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NotUsed {
@@ -136,7 +150,7 @@ pub fn read_local_std_json(local: &LocalStd, krate: StdCrate) -> io::Result<Box<
 }
 
 /// The release, commit and host in the output of `rustc -vV`.
-fn parse_rustc_version(output: &str) -> Option<RustcVersion> {
+pub(super) fn parse_rustc_version(output: &str) -> Option<RustcVersion> {
     let field = |name: &str| {
         output
             .lines()

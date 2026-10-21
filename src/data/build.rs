@@ -327,7 +327,7 @@ impl Plan {
             .arg("-j")
             .arg(jobs().to_string())
             .arg("-p")
-            .arg(&*self.package.0);
+            .arg(&*self.package.spec());
         match &self.documented {
             Documented::Lib { .. } => command.arg("--lib"),
             Documented::Bin { name } => command.arg("--bin").arg(&**name),
@@ -390,6 +390,9 @@ impl Plan {
 
 /// The directory of the published builds, in the cache, until D4 (decided in M2's D2).
 pub const LOCAL_DIR: &str = "local";
+
+/// The record of a published build, next to its JSON.
+const RECORD: &str = "record.json";
 
 /// The most errors of the compiler that a failed build keeps.
 const MAX_ERRORS: usize = 5;
@@ -576,7 +579,7 @@ pub async fn build(
     let (cache, published) = (cache.clone(), path.clone());
     super::blocking(move || {
         cache.write_verified(&published, &contents)?;
-        let written = cache::write_atomically(&dir.join("record.json"), &record_json);
+        let written = cache::write_atomically(&dir.join(RECORD), &record_json);
         drop(publishing);
         written
     })
@@ -587,6 +590,38 @@ pub async fn build(
         record,
         rebuilt: messages.rebuilt,
     })
+}
+
+impl Built {
+    /// Writes the record again, as after more of the toolchain became known.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when it cannot be written.
+    pub fn write_record(&self) -> io::Result<()> {
+        let json = serde_json::to_vec_pretty(&self.record).map_err(io::Error::from)?;
+        cache::write_atomically(&self.record_path(), &json)
+    }
+
+    /// Removes the JSON and the record, as for a format that is not read, so that nothing takes
+    /// them for a build to use.
+    pub fn unpublish(&self) {
+        for path in [
+            self.json.clone(),
+            cache::with_suffix(&self.json, ".sha256"),
+            self.record_path(),
+        ] {
+            if let Err(error) = fs::remove_file(&path)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %path.display(), %error, "a build could not be removed");
+            }
+        }
+    }
+
+    fn record_path(&self) -> PathBuf {
+        self.json.with_file_name(RECORD)
+    }
 }
 
 /// The key of the lock of the target directory `name` in `t/`: shared by the builds, exclusive
@@ -698,7 +733,10 @@ impl<'a> Messages<'a> {
                 if !message.fresh {
                     self.rebuilt.push(target.name.clone());
                 }
-                if message.package_id.as_deref() == Some(&*self.plan.package.0)
+                if message
+                    .package_id
+                    .as_deref()
+                    .is_some_and(|id| self.plan.package.is(id))
                     && self.is_documented(target)
                 {
                     self.features = Some(message.features);

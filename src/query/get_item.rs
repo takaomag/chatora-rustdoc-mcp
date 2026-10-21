@@ -117,6 +117,20 @@ pub enum Origin<'a> {
         /// How docs.rs built it, if its `.crate` could be read (requirement R-FT-1).
         build: Option<&'a DocsRsBuild>,
     },
+    /// A build of a workspace member here (decided in M2's D2).
+    Local {
+        /// How the version was chosen.
+        resolved_from: ResolvedFrom,
+        /// Where the project came from.
+        project_from: Option<&'static str>,
+        /// The toolchain, as `rustc -vV` gives it on its first line, if known.
+        toolchain: Option<&'a str>,
+        /// When it was built, in RFC 3339 (requirement R-WS-9).
+        built_at: &'a str,
+        /// The features that cargo built it with, if its messages told them (requirement
+        /// R-FT-3).
+        features_effective: Option<&'a [Box<str>]>,
+    },
     /// The std of a nightly toolchain (requirement R-STD-1).
     Std {
         /// The toolchain, as `rustc -vV` gives it on its first line.
@@ -183,6 +197,74 @@ pub struct Provenance<'a> {
     /// The `--cfg` that docs.rs built it with, other than `docsrs` (`tokio_unstable`).
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub cfg: &'a [Box<str>],
+    /// When a local build was made (requirement R-WS-9).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub built_at: Option<&'a str>,
+    /// The features that cargo built a local build with (requirement R-FT-3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub features_effective: Option<&'a [Box<str>]>,
+}
+
+/// What the provenance tells of where the data came from, by its origin.
+struct FromWhere<'a> {
+    source: Source,
+    resolved_from: Option<ResolvedFrom>,
+    project_from: Option<&'static str>,
+    toolchain: Option<&'a str>,
+    std_from: Option<StdFrom<'a>>,
+    built_at: Option<&'a str>,
+    features_effective: Option<&'a [Box<str>]>,
+}
+
+/// [`FromWhere`] of `origin`.
+const fn from_where(origin: Origin<'_>) -> FromWhere<'_> {
+    match origin {
+        Origin::DocsRs {
+            resolved_from,
+            project_from,
+            ..
+        } => FromWhere {
+            source: Source::DocsRs,
+            resolved_from: Some(resolved_from),
+            project_from,
+            toolchain: None,
+            std_from: None,
+            built_at: None,
+            features_effective: None,
+        },
+        Origin::Local {
+            resolved_from,
+            project_from,
+            toolchain,
+            built_at,
+            features_effective,
+        } => FromWhere {
+            source: Source::Local,
+            resolved_from: Some(resolved_from),
+            project_from,
+            toolchain,
+            std_from: None,
+            built_at: Some(built_at),
+            features_effective,
+        },
+        Origin::Std {
+            toolchain,
+            std_from,
+            why,
+            ..
+        } => FromWhere {
+            source: Source::Std,
+            resolved_from: None,
+            project_from: None,
+            toolchain: Some(toolchain),
+            std_from: Some(StdFrom {
+                source: std_from,
+                reason: why,
+            }),
+            built_at: None,
+            features_effective: None,
+        },
+    }
 }
 
 /// Where std came from, and why.
@@ -203,6 +285,9 @@ pub enum Source {
     /// The rustdoc JSON of std that a nightly toolchain ships.
     #[serde(rename = "std")]
     Std,
+    /// The rustdoc JSON of a workspace member, built here.
+    #[serde(rename = "local")]
+    Local,
 }
 
 /// How the version was chosen (§7.3).
@@ -695,7 +780,7 @@ impl<'a> Query<'a> {
         let view = self.view;
         let build = match self.request.origin {
             Origin::DocsRs { build, .. } => build,
-            Origin::Std { .. } => None,
+            Origin::Local { .. } | Origin::Std { .. } => None,
         };
         if let Some(build) = build
             && !build.missing.is_empty()
@@ -750,34 +835,15 @@ impl<'a> Query<'a> {
                  were not followed, so a path may not be found",
             ));
         }
-        let (source, resolved_from, project_from, toolchain, std_from) = match self.request.origin {
-            Origin::DocsRs {
-                resolved_from,
-                project_from,
-                ..
-            } => (
-                Source::DocsRs,
-                Some(resolved_from),
-                project_from,
-                None,
-                None,
-            ),
-            Origin::Std {
-                toolchain,
-                std_from,
-                why,
-                ..
-            } => (
-                Source::Std,
-                None,
-                None,
-                Some(toolchain),
-                Some(StdFrom {
-                    source: std_from,
-                    reason: why,
-                }),
-            ),
-        };
+        let FromWhere {
+            source,
+            resolved_from,
+            project_from,
+            toolchain,
+            std_from,
+            built_at,
+            features_effective,
+        } = from_where(self.request.origin);
         Provenance {
             source,
             name: self.request.name.as_str(),
@@ -794,6 +860,8 @@ impl<'a> Query<'a> {
                 .map(|build| &*build.features),
             all_features: build.is_some_and(|build| build.all_features),
             cfg: build.map_or(&[], |build| &build.cfg),
+            built_at,
+            features_effective,
         }
     }
 
@@ -949,7 +1017,7 @@ impl<'a> Query<'a> {
             Origin::Std {
                 project_release, ..
             } => project_release,
-            Origin::DocsRs { .. } => None,
+            Origin::DocsRs { .. } | Origin::Local { .. } => None,
         };
         if let Some(feature) = note.unstable_feature {
             self.warnings.push(Cow::Owned(format!(
@@ -1089,7 +1157,7 @@ impl<'a> Query<'a> {
             Origin::DocsRs {
                 build: Some(build), ..
             } => &build.cfg,
-            Origin::DocsRs { build: None, .. } | Origin::Std { .. } => &[],
+            Origin::DocsRs { build: None, .. } | Origin::Local { .. } | Origin::Std { .. } => &[],
         };
         let same_target = self
             .request
@@ -1254,12 +1322,13 @@ impl<'a> Query<'a> {
                 url,
             });
         }
-        if !in_package {
+        let on_docs_rs = matches!(self.request.origin, Origin::DocsRs { .. });
+        // A local build has no URL anywhere: the file is the user's.
+        if !in_package && on_docs_rs {
             self.warnings.push(Cow::Owned(format!(
                 "{file} is outside the package, so the definition has no docs.rs URL"
             )));
         }
-        let on_docs_rs = matches!(self.request.origin, Origin::DocsRs { .. });
         let url = (in_package && on_docs_rs).then(|| {
             let version: &dyn fmt::Display = match self.view.crate_version() {
                 Some(version) => &version.to_owned(),

@@ -438,7 +438,7 @@ pub(super) fn provenance_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "source": { "type": "string", "enum": ["docs.rs", "std"] },
+            "source": { "type": "string", "enum": ["docs.rs", "std", "local"] },
             "crate": { "type": "string" },
             "version": { "type": "string" },
             "resolved_from": {
@@ -475,6 +475,16 @@ pub(super) fn provenance_schema() -> Value {
             "features": strings,
             "all_features": { "type": "boolean" },
             "cfg": strings,
+            "built_at": {
+                "type": "string",
+                "description": "When the documentation of a workspace member was built here (RFC \
+                                3339): edits made since are not in it.",
+            },
+            "features_effective": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "The features that cargo built a workspace member with.",
+            },
         },
         // Before the version is known, a response while it is fetched has no `version`, and may
         // have no `source` (requirement R-OUT-9).
@@ -1427,6 +1437,7 @@ pub(super) fn being(what: &str, doing: Doing, from: &str) -> String {
         Doing::Fetching => format!("{what} is being fetched from {from}"),
         Doing::Indexing => format!("{what} is being indexed"),
         Doing::WaitingForLock => format!("{what} waits for a lock that another cargo holds"),
+        Doing::Building => format!("the documentation of {what} is being built"),
     }
 }
 
@@ -2901,6 +2912,8 @@ mod tests {
                 features: Some(&features),
                 all_features: true,
                 cfg: &features,
+                built_at: some_str(),
+                features_effective: Some(&features),
             },
             warnings: Box::from(["x".into()]),
             data: ItemData {

@@ -66,6 +66,13 @@ pub(super) async fn output_kept(
     printed
 }
 
+/// Forgets what [`output_kept`] keeps of the commands run in the project at `dir`, as after cargo
+/// installed its toolchain, which rustup said before was not installed.
+pub(super) fn forget_project(dir: &Path) {
+    KEPT.lock()
+        .retain(|(kept_dir, place, ..), _| !(kept_dir == dir && *place == Place::Project));
+}
+
 /// Runs `program` with `args` in `dir` and returns what it printed. rustup may not install a
 /// toolchain on the way (requirement R-WS-7), and the server's stdin and stdout are never shared
 /// (requirement R-SEC-1).

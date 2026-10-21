@@ -667,6 +667,38 @@ Claude Code 2.1.304、Linux で測った。
   - future が落ちても、ロックを rename の後まで持つように、guard をブロッキングのスレッドに渡して手放す (移動と読み込みと削除も 1 つのスレッドで行い、work に残さない)。公開の `Cache::lock` も同じ
   - `Header::check` の単体テスト (根の ID が数値と文字列、版が無い・違う、別の crate、`--target` と proc-macro の例外) を足した。fixture の `one` の関数を crate 名と違う名前にした (根のモジュールの名前でも満たされていた)
 
+**D2c の下調べと決定 (2026-10-21)**:
+
+- 下調べ (サブエージェント、読むだけ): `crate_overview`・`list_module`・`list_impls`・`list_methods`・`list_implementors`・crate を 1 つ指定した `search_items` は、どれも `get_item::execute` を通る。`local_build_required` を返すのは `get_item::resolve` の 2 か所 (crates.io でない、docs.rs の照合が通らない) と `search_across::dependencies` (D7)。member を引くときに黙って別物を返しうる箇所: R-FT-1 のための `.crate` の取得 (`docs_rs_build`)、re-export の行き先を「crates.io の最新」に落とす `destination_request`、版を明示したときの crates.io。足りない部品: `Doing::Building`、ビルドの toolchain の `rustc -vV` を来歴に載せる手段、プロジェクトが `build.target` を設定したか (と独自の target か) を返す `project_target`、利用者の `net.offline` を含むオフラインの判定 (`Resolver::offline_in` は private)、来歴の `source: local`・`built_at`・`features_effective` とスキーマ。`tests/stdio.rs` の member に `local_build_required` を期待するテストは書き換える
+- 利用者が 1 件ずつ決めたこと:
+  1. 範囲: `get_item::execute` を通るツールで、ワークスペースの member だけ。ワークスペースの外の path 依存・git・ほかの registry・checksum の食い違い・横断の検索は今の `local_build_required` のまま (D7)
+  2. member と同じ名前の `crate@version`: 版が member と同じなら member をビルドする (R-VR-1 の member の部分を先に)。違う版なら今どおり crates.io を引き、member ではない旨の warning を付ける
+  3. 期限: 今の期限 (`limits.request_timeout_secs` の 3 分の 2)。`build.wait_secs` は D3
+  4. ビルドの中で入った toolchain の JSON が古すぎたら、同じ共有の仕事の中で `choose` をやり直して nightly で作り直す (D2 の決定 10)。テストは古い形式を出す偽の rustdoc で
+  5. `features_requested` は D3 まで出さない (スキーマでは省きうる項目)
+  6. crates.io でないパッケージへの re-export は追わず、re-export (use の item) を返して warning を付ける。追うのは D6
+  7. プロジェクトの `build.target` が独自の target (target の JSON・build-std) なら、host 向けに `--target <host>` でビルドして warning (B3b と同じ)。build-std で失敗したら `build_failed`
+  8. cargo 1.77 より前の形式の package id (`name ver (source)`): `-p` には `name@version` を渡し、メッセージの照合も両方の形式から取り出した (名前, 版) で行う
+- 聞かずに決めたこと (要件・前の決定から): member を引くときは `.crate` を取りに行かず docs.rs にも落ちない (R-WS-7)。`cargo metadata` が失敗して Cargo.lock だけで解決したときは、分類した失敗を返す (R-VR-2)。アーカイブは作った JSON の SHA-256 を鍵に `archive_of` で作る。エラーの対応づけの初期案: `ChooseError::NotInstalled` はオンラインならビルドに任せ、オフラインなら `toolchain_missing`、`NightlyMissing`・`Missing::Target` は `toolchain_missing` (入れるコマンド付き)、`TooOld` と読めない新しい形式は `unsupported_format`、`BuildError::Failed` は `classify` の名前 (`offline_miss`・`lockfile_outdated`・`fetch_failed`) か `build_failed`、`Programs::problem`・rustc と rustdoc の食い違い・`NoJson`・`Fresh`・`NotTheCrate`・`Unreadable` は `build_failed` (`retryable: false`)、`Io`・`Killed` は `build_failed` (`retryable: true`)。失敗の記憶・`refresh`・`toolchain_too_old`・診断の文字数の上限は D5
+- D2c は 3 つに分ける: D2c-1 (データ側: `Doing::Building`、`Activity` からの写し、`rustc -vV` の要約、オフラインの判定、`project_target` の拡張、ローカルの共有の仕事と事前の確かめとアーカイブ、package id の形式、来歴の型)、D2c-2 (MCP 側: `resolve` での分岐、`.crate` の取得を飛ばす、building の応答、エラーの対応づけ、re-export の止め、スキーマ、stdio のテスト)、D2c-3 (Claude Code での試しと README)
+
+**D2c-1 (データ側。2026-10-21)**:
+
+- `Doing::Building` (`building`、「building the documentation of」) を足し、`Activity::of_build` で cargo の様子を写す (動いていれば `Building`、ロック待ちと取得はそのまま)。`resolving` と `being` の分岐にも足した
+- `toolchain::check_target` が `+<toolchain>` (サーバーが選んだ nightly) を受け、host と一緒に `rustc -vV` の要約 (`rustc 1.99.1 (0123456789 2026-…)`。std の来歴と同じ `RustcVersion::summary`) を返す (`Checked`)
+- `Resolver::offline_in` を公開した (利用者の `net.offline`・`CARGO_NET_OFFLINE` も見る)
+- `PackageId::name_and_version`・`spec`・`is`: cargo 1.77 以降の id (`<source>#<name>@<version>`、名前がパスの最後と同じなら `<source>#<version>`) と、それより前の id (`<name> <version> (<source>)`) の両方から名前と版を取る。`-p` には古い形式なら `name@version` を渡し、メッセージの照合も (名前, 版) で行う (決定 8)
+- `query::local::local_archive`: `Flights` の共有の仕事 (鍵はワークスペースのルート・package id・target・lib か bin)。仕事は、設定のプログラムの問題 → `Owner::work_dirs` → rustc と rustdoc の食い違い → `choose` (オンラインで toolchain が入っていなければ、ビルドの cargo に入れさせる) → `check_target` (host で `--target` を決める) → `build::build` → 入れさせた toolchain の形式が古すぎれば `choose` をやり直して nightly で作り直す (決定 4) → `archive_of` (鍵は JSON の SHA-256。読むときに SHA-256 を照らす)。warnings: `RUSTC_BOOTSTRAP` が `1` だったこと、形式が新しすぎること。失敗は `LocalError` (D2c-2 でエラーの code に写す)
+- 来歴: `Origin::Local` (`resolved_from`・`project_from`・`toolchain`・`built_at`・`features_effective`)、`Source::Local` (`local`)、`Provenance` の `built_at`・`features_effective` とスキーマ。ソースの場所は、ローカルビルドでは URL を付けず、「docs.rs の URL が無い」warning も出さない。`provenance()` が長くなったので、`Origin` から項目を取り出す部分を `from_where` に分けた
+- テスト: package id の両形式、`check_target` の要約、`tests/local/local_build.rs` に `local_archive` (同時の 2 つの呼び出しが 1 つの仕事を共有し、要約が載り、warning が無い)
+- 試していないこと: ビルドの中で toolchain を入れさせる経路 (オンラインで入っていない toolchain) と、その後の nightly での作り直しは、toolchain を入れずには試せないので、テストが無い
+- 前提を渡さないレビュー (サブエージェント) の指摘と対応:
+  - `tool::output_kept` は失敗も 60 秒保持するので、ビルドの中で cargo が toolchain を入れた直後の選び直しが、保持された「not installed」で失敗していた。入れさせたビルドの後は、そのプロジェクトで保持したものを捨て (`toolchain::forget_project`)、`check_target` を 1 度走らせる。ビルドが失敗していて toolchain や target が欠けていれば `Missing` (`toolchain_missing`) を返し、成功していれば toolchain の要約を記録に入れて書き直す
+  - nightly に切り替えてよいのは rustdoc が素の `rustdoc` のときだけを見ていたので、環境やプロジェクトが rustc だけを別のものにすると `+nightly` が toolchain を混ぜていた。rustc も素の `rustc` であることを足した
+  - 古すぎる形式の 1 回目のビルドが公開されたまま残っていた。nightly で作り直す前に消す (`Built::unpublish`)。選び直しでもプロジェクトの toolchain になったら `TooOld`
+  - 呼び出しのたびにビルドするので、文書化する crate の rustdoc だけで呼び出しの期限 (20 秒) より長くかかる member には、いつまでも `building` が返っていた (前のビルドが終わった後に来た呼び出しは、新しいビルドを始める)。利用者の決定で、期限を過ぎて裏で続いたビルドの結果は、次の 1 回の呼び出しに渡す: `Flights::handing_over` (結果を仕事の番号と一緒に残し、次の呼び出しが受け取って消す。走っている仕事に合流して結果を受け取った呼び出しも、同じ番号の残りを消す)。ローカルビルドの `Flights` はこれで作る。docs.rs などのほかの `Flights` は今のまま
+- D2c-2 に残したこと: `project_target` がプロジェクトの `build.target` の有無と独自の target かを返すこと (決定 7)、`resolve` での member の分岐 (決定 1・2)、`.crate` の取得を飛ばすこと、building の応答、エラーの写し、re-export を追わないこと (決定 6)、stdio のテスト
+
 ### 6.6 M2e
 
 (まだ無い)

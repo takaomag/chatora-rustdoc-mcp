@@ -194,3 +194,66 @@ async fn the_members_are_built_and_published() {
         .collect();
     assert!(left.is_empty(), "{left:?}");
 }
+
+#[tokio::test]
+async fn a_member_is_built_and_archived_for_the_calls_that_want_it() {
+    use std::sync::Arc;
+
+    use chatora_rustdoc_mcp::{
+        data::{
+            flight::{Flights, Joined},
+            owner::Owner,
+        },
+        query::local::{LocalWanted, local_archive},
+    };
+
+    let Some(dir) =
+        in_isolated_child("local_build::a_member_is_built_and_archived_for_the_calls_that_want_it")
+    else {
+        return;
+    };
+    let root = workspace(&dir);
+    let workspace = project::workspace_of(&root).expect("a workspace");
+    let resolver = Resolver::new(true);
+    let resolution = resolver.resolve(&workspace).await.expect("resolved");
+    let Resolution::Metadata { metadata, .. } = &*resolution else {
+        panic!("cargo metadata works offline here: {resolution:?}");
+    };
+    let host = host_target(&dir).await.triple;
+    let cache = Cache::at(&dir.join("cache"));
+    // The work directories are this process's.
+    Owner::start_this(&cache);
+    let wanted = LocalWanted {
+        plan: plan(metadata, &workspace.root, &cache, "one", None),
+        target: host.clone(),
+        project_sets_target: false,
+        cargo_home: resolver.cargo_home().map(Path::to_path_buf),
+    };
+    let flights = Flights::handing_over();
+    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    // Two calls at once share one build.
+    let (first, second) = tokio::join!(
+        local_archive(&flights, &cache, wanted.clone(), until),
+        local_archive(&flights, &cache, wanted, until)
+    );
+    let (Joined::Done(Ok(first)), Joined::Done(Ok(second))) = (first, second) else {
+        panic!("built and archived");
+    };
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(first.record.crate_name.as_ref(), "one");
+    assert_eq!(first.record.target.as_deref(), Some(host.as_str()));
+    assert!(
+        first
+            .record
+            .toolchain
+            .as_deref()
+            .is_some_and(|toolchain| toolchain.starts_with("rustc 1.")),
+        "{:?}",
+        first.record.toolchain
+    );
+    assert!(
+        first.archived.warnings.is_empty(),
+        "{:?}",
+        first.archived.warnings
+    );
+}

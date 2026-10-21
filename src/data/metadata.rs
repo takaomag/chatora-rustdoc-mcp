@@ -2,6 +2,7 @@
 //! the files that decide them do not change, with Cargo.lock read directly when cargo fails.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs,
     io,
@@ -45,6 +46,54 @@ pub struct Metadata {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 #[serde(transparent)]
 pub struct PackageId(pub Box<str>);
+
+impl PackageId {
+    /// The name and the version of the package, from the id of cargo 1.77 and later
+    /// (`<source>#<name>@<version>`, or `<source>#<version>` when the name is the last part of
+    /// the source's path) or of cargo before it (`<name> <version> (<source>)`).
+    #[must_use]
+    pub fn name_and_version(&self) -> Option<(&str, &str)> {
+        name_and_version(&self.0)
+    }
+
+    /// What `cargo rustdoc -p` takes for it: the id, or `<name>@<version>` for an id of cargo
+    /// before 1.77, which a newer cargo, as a nightly that the server chose, does not take
+    /// (decided in M2's D2).
+    #[must_use]
+    pub fn spec(&self) -> Cow<'_, str> {
+        match self.0.split_once(' ') {
+            Some(_) => self
+                .name_and_version()
+                .map_or(Cow::Borrowed(&*self.0), |(name, version)| {
+                    Cow::Owned(format!("{name}@{version}"))
+                }),
+            None => Cow::Borrowed(&self.0),
+        }
+    }
+
+    /// Whether `id`, of either format, is the id of the same package, as far as the name and
+    /// the version tell.
+    #[must_use]
+    pub fn is(&self, id: &str) -> bool {
+        *self.0 == *id
+            || name_and_version(id).is_some_and(|other| self.name_and_version() == Some(other))
+    }
+}
+
+/// [`PackageId::name_and_version`] of the text `id`.
+fn name_and_version(id: &str) -> Option<(&str, &str)> {
+    if let Some((name, rest)) = id.split_once(' ') {
+        let version = rest.split_once(' ').map_or(rest, |(version, _)| version);
+        return Some((name, version));
+    }
+    let (source, fragment) = id.rsplit_once('#')?;
+    if let Some((name, version)) = fragment.split_once('@') {
+        return Some((name, version));
+    }
+    let path = source.split_once('?').map_or(source, |(path, _)| path);
+    let name = path.trim_end_matches('/').rsplit('/').next()?;
+    (!name.is_empty()).then_some((name, fragment))
+}
 
 /// A package of the resolve.
 #[derive(Debug, Deserialize)]
@@ -281,6 +330,12 @@ impl Resolver {
     #[must_use]
     pub fn cargo_home(&self) -> Option<&Path> {
         self.inner.cargo_home.as_deref()
+    }
+
+    /// Whether cargo is offline in the project at `root`: run with `--offline`, or with
+    /// `net.offline` in the user's cargo settings (requirement R-WS-7).
+    pub async fn offline_in(&self, root: &Path) -> bool {
+        self.inner.offline_in(root).await
     }
 
     /// The packages of `workspace`, as [`Self::resolve_until`] gives them, waiting for them as
@@ -669,6 +724,27 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn a_package_id_of_either_format_tells_its_name_and_version() {
+        let id = |id: &str| PackageId(id.into());
+        let registry = id("registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228");
+        assert_eq!(registry.name_and_version(), Some(("serde", "1.0.228")));
+        assert_eq!(registry.spec(), registry.0.as_ref());
+        // The name is the last part of the path when it is the same.
+        let path = id("path+file:///ws/one#0.1.0");
+        assert_eq!(path.name_and_version(), Some(("one", "0.1.0")));
+        let git = id("git+https://github.com/o/repo?branch=main#tool@0.2.0");
+        assert_eq!(git.name_and_version(), Some(("tool", "0.2.0")));
+        // That of cargo before 1.77, which `-p` of a newer cargo does not take.
+        let old = id("one 0.1.0 (path+file:///ws/one)");
+        assert_eq!(old.name_and_version(), Some(("one", "0.1.0")));
+        assert_eq!(old.spec(), "one@0.1.0");
+        assert!(old.is("path+file:///ws/one#0.1.0"));
+        assert!(path.is(&path.0));
+        assert!(!path.is("path+file:///ws/one#0.2.0"));
+        assert!(!path.is("registry+https://github.com/rust-lang/crates.io-index#two@0.1.0"));
+    }
 
     const MEMBER: &str = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
 

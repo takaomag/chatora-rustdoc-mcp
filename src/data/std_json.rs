@@ -109,16 +109,7 @@ impl StdJson {
     pub fn toolchain(&self) -> Cow<'_, str> {
         match self {
             #[cfg(feature = "local")]
-            Self::Local(local) => Cow::Owned(format!(
-                "rustc {} ({} {})",
-                local.rustc.release,
-                local
-                    .rustc
-                    .commit_hash
-                    .get(..9)
-                    .unwrap_or(&local.rustc.commit_hash),
-                local.rustc.commit_date
-            )),
+            Self::Local(local) => Cow::Owned(local.rustc.summary()),
             Self::Dist(docs) => Cow::Owned(format!("rustc {}", docs.nightly.version)),
         }
     }

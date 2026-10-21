@@ -139,6 +139,19 @@ pub enum Activity {
     Fetching,
 }
 
+impl Activity {
+    /// What a build is doing when cargo does this (decided in M2's D2): it builds unless it
+    /// waits or fetches.
+    #[must_use]
+    pub const fn of_build(self) -> super::flight::Doing {
+        match self {
+            Self::Running => super::flight::Doing::Building,
+            Self::WaitingForLock => super::flight::Doing::WaitingForLock,
+            Self::Fetching => super::flight::Doing::Fetching,
+        }
+    }
+}
+
 /// What a line of cargo's stderr tells that cargo does: its status word, as cargo 1.99.1 writes
 /// it (`    Updating crates.io index`, `  Downloaded serde v1.0.228`).
 fn activity_of(line: &str) -> Activity {
