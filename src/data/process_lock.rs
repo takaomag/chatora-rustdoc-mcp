@@ -42,6 +42,10 @@ pub enum LockMode {
 #[derive(Debug)]
 pub struct ProcessLock {
     /// The open lock file, whose lock closing it lets go.
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only Unix hands its descriptor to a child")
+    )]
     file: File,
 }
 

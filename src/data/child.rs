@@ -532,6 +532,19 @@ mod tests {
         check.status().expect("the check runs").success()
     }
 
+    /// Whether the process `pid` runs, not as a zombie: one that was killed and waits for this
+    /// process to take its status still answers `kill -0`.
+    #[cfg(unix)]
+    fn running(pid: &str) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .expect("ps runs");
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
     /// Waits up to `limit` for `done`.
     async fn wait_for(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
         let start = Instant::now();
@@ -677,5 +690,162 @@ mod tests {
             "{descendant} ran outside the group"
         );
         assert!(kept, "the record is kept while {descendant} runs");
+    }
+
+    /// Later than any test's deadline.
+    #[cfg(unix)]
+    fn later() -> Instant {
+        Instant::now()
+            .checked_add(Duration::from_secs(60))
+            .expect("in range")
+    }
+
+    /// The environment variable that tells [`start_a_child_for_another_test`] the cache.
+    #[cfg(unix)]
+    const ROOT: &str = "CHATORA_RUSTDOC_TEST_CACHE_ROOT";
+
+    /// Not a test by itself: a server that
+    /// [`a_later_server_stops_what_a_killed_server_left`] starts and kills, which starts a child
+    /// with a grandchild, writes the grandchild's pid in the cache, and waits.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "started by a_later_server_stops_what_a_killed_server_left"]
+    async fn start_a_child_for_another_test() {
+        let Some(root) = std::env::var_os(ROOT) else {
+            return;
+        };
+        let root = Path::new(&root);
+        let owner = super::super::owner::Owner::start(&super::super::cache::Cache::at(root));
+        let _child = spawn_owned(with_grandchild(&root.join("grandchild")), Some(&owner))
+            .await
+            .expect("started");
+        tokio::time::sleep(Duration::from_secs(120)).await;
+    }
+
+    /// The sweep of a later server stops what a child of a killed server left running, which is
+    /// its descendants for sure, and removes the record (decided in C4).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_later_server_stops_what_a_killed_server_left() {
+        use super::super::{cache::Cache, owner};
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let mut killed = crate::test_process::start(
+            "data::child::tests::start_a_child_for_another_test",
+            &[(ROOT, dir.path().as_os_str())],
+        );
+        let pid_file = dir.path().join("grandchild");
+        let read = || {
+            std::fs::read_to_string(&pid_file)
+                .ok()
+                .filter(|pid| pid.ends_with('\n'))
+                .map(|pid| pid.trim().to_owned())
+        };
+        assert!(
+            wait_for(Duration::from_secs(30), || read().is_some()).await,
+            "the grandchild started"
+        );
+        let grandchild = read().expect("its pid");
+        killed.kill().expect("killed");
+        killed.wait().expect("waited");
+        let me = owner::Owner::start(&Cache::at(dir.path()));
+        let swept = owner::sweep(&me, later());
+        assert_eq!(swept.child_records, 1, "{swept:?}");
+        assert!(
+            swept.stopped >= 1,
+            "the grandchild, and on macOS the child: {swept:?}"
+        );
+        assert!(
+            wait_for(Duration::from_secs(10), || !alive(&grandchild)).await,
+            "the grandchild {grandchild} was stopped"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path().join("procs/v1"))
+            .expect("the directory")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// What runs in the recorded session is left alone when it cannot be told for sure to be the
+    /// child's: a record of another boot, or a session whose leader started at another time, as
+    /// when its ID was used again (decided in C4).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn what_cannot_be_told_for_sure_is_left() {
+        use super::super::{
+            cache::Cache,
+            owner::{self, Record},
+            process_id,
+            process_lock::{self, LockMode},
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let gone = owner::Owner::start(&cache);
+        gone.killed_for_test();
+        // Another process in a session of its own, which a record names.
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("60").stdin(Stdio::null());
+        prepare(&mut command);
+        let other = spawn_owned(command, None).await.expect("started");
+        let pid = other.child.id().expect("running");
+        let since = process_id::started(pid).expect("its start");
+        let (machine, boot) = process_id::machine_and_boot()
+            .cloned()
+            .map_or((None, None), |(machine, boot)| (Some(machine), Some(boot)));
+        let records = dir.path().join("procs/v1");
+        std::fs::create_dir_all(&records).expect("made");
+        let mut held = Vec::new();
+        // On Linux, a process that matches the record but has not the inherited lock open is
+        // not the child's.
+        #[cfg(target_os = "linux")]
+        let matching = Some(Record {
+            machine: machine.clone(),
+            boot: boot.clone(),
+            session: pid,
+            started: Some(since),
+        });
+        #[cfg(not(target_os = "linux"))]
+        let matching: Option<Record> = None;
+        for (number, record) in [
+            Record {
+                machine: machine.clone(),
+                boot: Some("another boot".to_owned()),
+                session: pid,
+                started: Some(since),
+            },
+            Record {
+                machine,
+                boot,
+                session: pid,
+                started: Some(since.saturating_sub(1)),
+            },
+        ]
+        .into_iter()
+        .chain(matching)
+        .enumerate()
+        {
+            let stem = format!("{}.{number}", gone.id());
+            std::fs::write(
+                records.join(format!("{stem}.json")),
+                serde_json::to_vec(&record).expect("JSON"),
+            )
+            .expect("written");
+            // A descendant holds the lock.
+            held.push(
+                process_lock::try_lock_at(
+                    &records.join(format!("{stem}.lock")),
+                    LockMode::Exclusive,
+                )
+                .expect("locked")
+                .expect("free"),
+            );
+        }
+        let me = owner::Owner::start(&cache);
+        let swept = owner::sweep(&me, later());
+        assert_eq!(swept.unsure, held.len(), "{swept:?}");
+        assert_eq!(swept.stopped, 0, "{swept:?}");
+        assert!(running(&pid.to_string()), "left alone");
+        drop(held);
+        drop(other);
     }
 }

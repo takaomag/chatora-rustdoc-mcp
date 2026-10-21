@@ -144,6 +144,13 @@ impl Owner {
         Ok(dir)
     }
 
+    /// Lets this server's lock go without removing anything, as when the server is killed: for the
+    /// tests of what a later server does.
+    #[cfg(test)]
+    pub(super) fn killed_for_test(&self) {
+        drop(self.alive.lock().take());
+    }
+
     /// Removes this server's work directories and lock file, as it stops.
     pub fn leave(&self) {
         let dir = self.root.join(WORK_DIR).join(&*self.id);
@@ -304,6 +311,13 @@ fn remove_lock_file(root: &Path, id: &str, held: ProcessLock) {
 /// What a sweep removed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Swept {
+    /// The records of children of servers that have stopped, removed once nothing of the child
+    /// ran or what ran was stopped.
+    pub child_records: usize,
+    /// The processes stopped: descendants of those children that outlived their server.
+    pub stopped: usize,
+    /// The records kept, as what runs could not be told for sure to be the child's.
+    pub unsure: usize,
     /// The work directories of servers that have stopped.
     pub work_dirs: usize,
     /// The records of other versions.
@@ -324,6 +338,11 @@ pub struct Swept {
 pub fn sweep(me: &Owner, until: Instant) -> Swept {
     let mut swept = Swept::default();
     if !me.locked() {
+        return swept;
+    }
+    // Before the work directories, whose sweep removes the lock files of their servers.
+    #[cfg(unix)]
+    if !settle_children(me, until, &mut swept) {
         return swept;
     }
     let root = &me.root;
@@ -379,6 +398,133 @@ pub fn sweep(me: &Owner, until: Instant) -> Swept {
         drop(fs::remove_dir(&version));
     }
     swept
+}
+
+/// Settles the records of the children of servers that have stopped, until `until` (decided in
+/// C4). Returns `false` when it stopped at `until`.
+#[cfg(unix)]
+fn settle_children(me: &Owner, until: Instant, swept: &mut Swept) -> bool {
+    for (id, record) in owned(&me.records()) {
+        if record
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        if Instant::now() >= until {
+            swept.unfinished = true;
+            return false;
+        }
+        // Not those of a server that runs, nor of one that this one cannot tell of.
+        if id == *me.id {
+            continue;
+        }
+        let Some(held) = stopped(&me.root, &id) else {
+            continue;
+        };
+        let settled = settle(&record, until);
+        // The check made its lock file again if an earlier sweep removed it with its work
+        // directories; then nothing else would remove it.
+        if !me.root.join(WORK_DIR).join(&id).exists() {
+            remove_lock_file(&me.root, &id, held);
+        }
+        match settled {
+            Settled::Ended => swept.child_records = swept.child_records.saturating_add(1),
+            Settled::Stopped(count) => {
+                swept.child_records = swept.child_records.saturating_add(1);
+                swept.stopped = swept.stopped.saturating_add(count);
+            },
+            Settled::Unsure => swept.unsure = swept.unsure.saturating_add(1),
+        }
+    }
+    true
+}
+
+/// How the record of a child of a server that has stopped was settled.
+#[cfg(unix)]
+enum Settled {
+    /// Nothing of the child ran: the lock that its descendants inherited was free.
+    Ended,
+    /// So many of its descendants were stopped.
+    Stopped(usize),
+    /// What holds the lock could not be told for sure to be its descendants, and the record is
+    /// kept.
+    Unsure,
+}
+
+/// Settles the record at `record`: removes it, with its lock file, once nothing of the child runs,
+/// after stopping the descendants that are known for sure to be the child's (decided in C4).
+#[cfg(unix)]
+fn settle(record: &Path, until: Instant) -> Settled {
+    let lock_path = record.with_extension("lock");
+    let remove = |held: ProcessLock| {
+        drop(fs::remove_file(record));
+        drop(fs::remove_file(&lock_path));
+        drop(held);
+    };
+    if let Ok(Some(held)) = process_lock::try_lock_at(&lock_path, LockMode::Exclusive) {
+        remove(held);
+        return Settled::Ended;
+    }
+    let read: Option<Record> = fs::read(record)
+        .ok()
+        .and_then(|json| serde_json::from_slice(&json).ok());
+    let Some(descendants) = read.as_ref().and_then(|read| descendants(read, &lock_path)) else {
+        tracing::info!(record = %record.display(), "what still runs of a child of a server that has stopped cannot be told for sure to be its, so it is left");
+        return Settled::Unsure;
+    };
+    for pid in &descendants {
+        super::process_id::kill(*pid);
+    }
+    // They let the lock go as they end.
+    let limit = until
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_secs(1));
+    if let Ok(Some(held)) = process_lock::lock_blocking_at(&lock_path, LockMode::Exclusive, limit) {
+        tracing::info!(record = %record.display(), stopped = descendants.len(), "stopped what a child of a server that has stopped left running");
+        remove(held);
+        Settled::Stopped(descendants.len())
+    } else {
+        tracing::info!(record = %record.display(), "a descendant of a child of a server that has stopped still runs outside its session, so the record is left");
+        Settled::Unsure
+    }
+}
+
+/// The processes that run as descendants of the child of `record`, when that can be told for
+/// sure, or `None`.
+///
+/// They are, on the same machine since the same boot, the processes of the child's session that
+/// started since the child, whose leader, if it runs, is the child itself (else the ID was used
+/// again). On Linux, each must also have the lock `lock` open, which only the child's descendants
+/// inherited: the leader, cargo, dies with the server there, and a session whose members all
+/// ended may have the ID again. On macOS, where that cannot be read, the leader must run: cargo
+/// does not die with the server there.
+#[cfg(unix)]
+fn descendants(record: &Record, lock: &Path) -> Option<Vec<u32>> {
+    let (machine, boot) = super::process_id::machine_and_boot()?;
+    if record.machine.as_ref() != Some(machine) || record.boot.as_ref() != Some(boot) {
+        return None;
+    }
+    let started = record.started?;
+    let members = super::process_id::session_members(record.session)?;
+    let leader = members
+        .iter()
+        .find(|(pid, _)| *pid == record.session)
+        .map(|(_, since)| *since);
+    let used_again = leader.is_some_and(|since| since != Some(started));
+    if used_again || (leader.is_none() && cfg!(target_os = "macos")) {
+        return None;
+    }
+    let own = std::process::id();
+    let found: Vec<u32> = members
+        .into_iter()
+        .filter(|(pid, since)| *pid != own && since.is_some_and(|since| since >= started))
+        .filter(|(pid, _)| {
+            cfg!(not(target_os = "linux")) || super::process_id::has_open(*pid, lock) == Some(true)
+        })
+        .map(|(pid, _)| pid)
+        .collect();
+    (!found.is_empty()).then_some(found)
 }
 
 /// The entries of `dir` named by a server's id, before the first `.`, and their paths.
@@ -473,8 +619,8 @@ mod tests {
     }
 
     /// The records of other versions are removed a week after they were written, once their
-    /// server has stopped; those of this version are left to the check of their children (decided
-    /// in C4).
+    /// server has stopped; those of this version are settled by whether their children run
+    /// (decided in C4).
     #[test]
     fn records_of_other_versions_go_a_week_after_their_server() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -504,11 +650,15 @@ mod tests {
         let swept = sweep(&me, later());
         assert_eq!(swept.records, 1);
         assert!(!old.exists());
+        // That of this version is a child's, which is settled by whether it runs: nothing holds
+        // its lock, so it has ended.
+        assert_eq!(swept.child_records, 1);
+        assert!(!this_version.exists());
         assert!(
             !process_lock::lock_path(dir.path(), &owner_key(&stopped)).exists(),
             "the lock file that the check made is removed"
         );
-        assert!(recent.exists() && alive.exists() && this_version.exists());
+        assert!(recent.exists() && alive.exists());
     }
 
     /// A server makes its directory at once, so that a sweep finds it, and its lock file, even

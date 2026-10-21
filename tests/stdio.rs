@@ -1451,6 +1451,40 @@ fn cargo_dies_with_a_killed_server() {
     }
 }
 
+/// What cargo started outlives a server that is killed outright, but the next server that starts
+/// with the same cache stops it, at once and in the background, as it is known for sure to be the
+/// server's: in the session of a child that the server recorded, started since it (requirement
+/// R-WS-6, decided in M2's C4).
+#[cfg(all(unix, feature = "local"))]
+#[test]
+fn the_next_server_stops_what_a_killed_server_left() {
+    let pids = TempDir::new().expect("a temporary directory");
+    let project = demo_workspace();
+    set_hanging_rustc(project.path(), pids.path());
+    let mut server = Server::start_in(Some(project.path()));
+    let [_, rustc, grandchild] = hang(&mut server, pids.path());
+    server.child.kill().expect("killed");
+    server.child.wait().expect("waited");
+    let cache = std::mem::replace(
+        &mut server.cache,
+        TempDir::new().expect("a temporary directory"),
+    );
+    assert!(alive(&grandchild), "the grandchild outlived the server");
+    let next = Server::start_with_cache(cache, None, &[]);
+    let stopped = eventually(Duration::from_secs(10), || {
+        !alive(&rustc) && !alive(&grandchild)
+    });
+    // Not left behind by this test either way.
+    for pid in [&rustc, &grandchild] {
+        drop(Command::new("kill").args(["-KILL", pid]).status());
+    }
+    assert!(
+        stopped,
+        "rustc {rustc} or the grandchild {grandchild} still runs"
+    );
+    assert!(next.finish().success());
+}
+
 /// Writes `settings` as the `.cargo/config.toml` of `project`.
 #[cfg(feature = "local")]
 fn set_cargo_settings(project: &Path, settings: &str) {
