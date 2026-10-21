@@ -65,8 +65,26 @@ pub enum Failure {
     GitFetch(GitFetchFailure),
     /// cargo or one of its children was killed, as by the OOM killer. Trying again may work.
     Killed,
-    /// Anything else. Without a message to tell it apart, it is taken as transient.
+    /// The toolchain is older than what the code needs: a feature that it does not have
+    /// (`E0658`), or a package's `rust-version` (`toolchain_too_old`, requirement R-WS-7).
+    TooOld,
+    /// Anything else: a build that failed so fails again until what it is made from changes,
+    /// while `cargo metadata` or `cargo fetch` may pass when tried again (requirement R-WS-7).
     Other,
+}
+
+impl Failure {
+    /// The `code` of the error, as the response writes it.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::LockfileOutdated => "lockfile_outdated",
+            Self::OfflineMiss => "offline_miss",
+            Self::GitFetch(_) => "fetch_failed",
+            Self::TooOld => "toolchain_too_old",
+            Self::Killed | Self::Other => "build_failed",
+        }
+    }
 }
 
 /// Why a git dependency cannot be fetched: the `reason` of `fetch_failed` (requirement R-WS-7).
@@ -312,6 +330,9 @@ pub fn classify(output: &Output, offline: bool) -> Failure {
         Failure::GitFetch(reason)
     } else if has("(signal: 9, SIGKILL") || output.status.code().is_none() {
         Failure::Killed
+    } else if has("requires rustc") {
+        // `package `x` cannot be built because it requires rustc 1.99 or newer`.
+        Failure::TooOld
     } else {
         Failure::Other
     }
@@ -434,6 +455,21 @@ mod tests {
         assert_eq!(
             classify("error: failed to parse manifest", false),
             Failure::Other
+        );
+        // cargo 1.99.1, of a package's `rust-version`, and the wording of older cargo.
+        assert_eq!(
+            classify(
+                "error: rustc 1.99.1 is not supported by the following package:\n  a@0.1.0 requires rustc 1.999",
+                false
+            ),
+            Failure::TooOld
+        );
+        assert_eq!(
+            classify(
+                "error: package `a v0.1.0` cannot be built because it requires rustc 1.999 or newer, while the currently active rustc version is 1.70.0",
+                false
+            ),
+            Failure::TooOld
         );
     }
 

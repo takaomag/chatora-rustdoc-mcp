@@ -138,6 +138,18 @@ pub fn set_this(settings: &Settings) {
     let docsrs = settings.get("build.cfg_docsrs", |value| {
         value.boolean().ok_or("true or false")
     });
+    let diagnostics = settings.get("build.max_diagnostics", |value| {
+        value
+            .whole_number()
+            .and_then(|count| usize::try_from(count).ok())
+            .filter(|count| *count > 0)
+            .ok_or("a whole number from 1")
+    });
+    if let Some(count) = diagnostics
+        && MAX_DIAGNOSTICS.set(count).is_err()
+    {
+        tracing::debug!("build.max_diagnostics was read before");
+    }
     let docsrs_set = docsrs.is_none_or(|docsrs| CFG_DOCSRS.set(docsrs).is_ok());
     let jobs_set = jobs.is_none_or(|jobs| JOBS.set(jobs).is_ok());
     let slots_set = slots.is_none_or(|count| SLOTS.set(Slots::new(count)).is_ok());
@@ -151,6 +163,16 @@ pub fn set_this(settings: &Settings) {
         );
     }
 }
+
+/// How many errors of the compiler the response to a failed build tells: `build.max_diagnostics`,
+/// or 2 (requirement R-WS-7, until F5 measures it).
+#[must_use]
+pub fn max_diagnostics() -> usize {
+    MAX_DIAGNOSTICS.get().copied().unwrap_or(2)
+}
+
+/// `build.max_diagnostics`, once read.
+static MAX_DIAGNOSTICS: OnceLock<usize> = OnceLock::new();
 
 /// The jobs of a build (`-j`): `build.jobs`, or half the CPUs (requirement R-WS-1, decided in
 /// M2's D2 until F5 measures it).
@@ -733,6 +755,8 @@ pub struct Fresh {
     pub scanned: Vec<PathBuf>,
     /// The directories of the packages that were walked for the rest.
     pub walked: Vec<PathBuf>,
+    /// Where the build is published ([`Plan::published_dir`]), and its failure remembered.
+    pub dir: PathBuf,
 }
 
 /// The build published in `dir`, if its record and its JSON are there, and the digest next to the
@@ -757,8 +781,107 @@ fn is_of(json: &Path, record: &BuildRecord) -> bool {
 /// The record of a published build, next to its JSON.
 const RECORD: &str = "record.json";
 
-/// The most errors of the compiler that a failed build keeps.
-const MAX_ERRORS: usize = 5;
+/// The record of the last build that failed, where its JSON would be published.
+const FAILED: &str = "failed.json";
+
+/// A build that failed, remembered where its JSON would be published (`failed.json`).
+///
+/// It is not made again while what it is made from is the same, by this server or another: for
+/// good, or for a moment when trying again may work (requirement R-WS-7, decided in M2's D5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Failed {
+    /// The key of what it was made from ([`Fresh::key`]), which has the toolchain, if it was
+    /// taken.
+    pub key: Option<Box<str>>,
+    /// The toolchain, as `rustc -vV` told it.
+    pub toolchain: Option<Box<str>>,
+    /// Whether trying again may work ([`BuildError::is_transient`]).
+    pub transient: bool,
+    /// When it failed, in RFC 3339.
+    pub time: Box<str>,
+    /// When it failed, in seconds since the Unix epoch.
+    pub at: u64,
+    /// The body of the error that was returned.
+    pub body: serde_json::Value,
+}
+
+impl Failed {
+    /// A failure of the build of the key `key` with `toolchain`, now, whose error has `body`.
+    #[must_use]
+    pub fn now(
+        key: Option<Box<str>>,
+        toolchain: Option<&str>,
+        transient: bool,
+        body: serde_json::Value,
+    ) -> Self {
+        let now = SystemTime::now();
+        Self {
+            key,
+            toolchain: toolchain.map(Into::into),
+            transient,
+            time: super::rfc3339(now).into(),
+            at: super::unix_seconds(now),
+            body,
+        }
+    }
+
+    /// Whether it holds for a build of the key `key`: one that failed so for good, or for a
+    /// moment ([`Self::retry_after`]).
+    #[must_use]
+    pub fn holds(&self, key: &str) -> bool {
+        self.key.as_deref() == Some(key) && (!self.transient || self.retry_after().is_some())
+    }
+
+    /// How long it still holds, when trying again may work: about 30 seconds after it failed
+    /// (requirements R-WS-7 and R-ERR-3). Not after a clock set back before it.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        let since = SystemTime::now()
+            .duration_since(super::system_time(self.at))
+            .ok()?;
+        super::TRANSIENT_TTL
+            .checked_sub(since)
+            .filter(|_| self.transient)
+            .filter(|left| !left.is_zero())
+    }
+
+    /// Remembers it in `dir`, where the build would be published, unless a build was published
+    /// there meanwhile with its key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when it cannot be written.
+    pub async fn remember(self, cache: &Cache, dir: PathBuf) -> io::Result<()> {
+        let publishing = cache.lock(&dir).await;
+        let cache = cache.clone();
+        super::blocking(move || {
+            let built = published(&dir)
+                .is_some_and(|built| built.record.key.is_some() && built.record.key == self.key);
+            let written = if built {
+                Ok(())
+            } else {
+                let json = serde_json::to_vec_pretty(&self).map_err(io::Error::from)?;
+                let path = dir.join(FAILED);
+                cache
+                    .check_inside(&path)
+                    .and_then(|()| cache::write_atomically(&path, &json))
+            };
+            drop(publishing);
+            written
+        })
+        .await
+    }
+}
+
+/// The failure remembered in `dir`, if any ([`Failed`]).
+#[must_use]
+pub fn failed(dir: &Path) -> Option<Failed> {
+    serde_json::from_slice(&fs::read(dir.join(FAILED)).ok()?).ok()
+}
+
+/// The most errors of the compiler that a failed build keeps, of which the response tells the first
+/// [`max_diagnostics`].
+const MAX_ERRORS: usize = 20;
 
 /// Numbers the JSON files moved into the work directory.
 static NEXT_WORK: AtomicU64 = AtomicU64::new(0);
@@ -863,6 +986,8 @@ pub enum BuildError {
         in_documented: bool,
         /// The first errors of the compiler.
         errors: Vec<Box<str>>,
+        /// How many more errors there were.
+        more_errors: usize,
         /// The end of its stderr.
         stderr: Box<str>,
     },
@@ -888,6 +1013,82 @@ pub enum BuildError {
     /// The JSON could not be moved or published.
     #[error("the rustdoc JSON could not be published")]
     Io(#[source] io::Error),
+    /// `cargo fetch` failed before the build (requirement R-WS-7).
+    #[error("cargo could not fetch the dependencies")]
+    Fetch {
+        /// How, as its messages tell.
+        failure: Failure,
+        /// The end of its stderr.
+        stderr: Box<str>,
+    },
+}
+
+impl BuildError {
+    /// Whether trying again may work, so that the failure is not kept but for a moment
+    /// (requirement R-WS-7).
+    ///
+    /// It may when cargo or its children were killed, as by the OOM killer, cargo could not be
+    /// started, the JSON could not be published, or what cargo left was not the build's, as
+    /// another may have written it; and when fetching failed, but for a git dependency that
+    /// cannot be had, Cargo.lock that does not match, or what is not cached offline. The rest
+    /// lasts while what the build is made from does not change, a build that ran too long too.
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        match self {
+            Self::Failed { failure, .. } => matches!(failure, Failure::Killed),
+            Self::Fetch { failure, .. } => !matches!(
+                failure,
+                Failure::GitFetch(_) | Failure::LockfileOutdated | Failure::OfflineMiss
+            ),
+            Self::Run(RunError::NotStarted(_))
+            | Self::Io(_)
+            | Self::Fresh(_)
+            | Self::Unreadable(_)
+            | Self::NotTheCrate { .. } => true,
+            Self::Run(RunError::TimedOut(_)) | Self::NoJson(_) => false,
+        }
+    }
+}
+
+/// Fetches the dependencies of the workspace of `plan`, with `--locked`, before it is built.
+///
+/// A failure to fetch them, which trying again may mend, is so told apart from one of the build
+/// (requirement R-WS-7). It fetches for the target of the build, if it passes one. `on_doing` is
+/// told when cargo waits for a lock.
+///
+/// # Errors
+///
+/// Returns why cargo failed, or could not run.
+pub async fn fetch(plan: &Plan, on_doing: impl FnMut(Doing) + Send) -> Result<(), BuildError> {
+    let mut command =
+        super::cargo::project_command(&plan.root, plan.offline, plan.toolchain.as_deref());
+    command
+        .arg("fetch")
+        .arg("--manifest-path")
+        .arg(&plan.manifest);
+    // As the build, over the project's `build.target`, which may be a target JSON that cargo
+    // does not take on stable.
+    if let Some(target) = &plan.target {
+        command.arg("--target").arg(target.as_str());
+    }
+    let mut on_doing = on_doing;
+    // Fetching that runs too long, or cannot be started, is no more lasting than its failure.
+    let output = super::cargo::run_reporting(command, |activity| {
+        on_doing(super::cargo::doing_of(activity));
+    })
+    .await
+    .map_err(|error| BuildError::Fetch {
+        failure: Failure::Other,
+        stderr: error.to_string().into(),
+    })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(BuildError::Fetch {
+            failure: classify(&output, plan.offline),
+            stderr: stderr_tail(&output),
+        })
+    }
 }
 
 /// Runs the build of `plan`, and publishes its JSON in `cache` (requirements R-WS-1 and R-WS-6,
@@ -924,8 +1125,13 @@ pub async fn build(
     let output = output?;
     if !output.status.success() {
         return Err(BuildError::Failed {
-            failure: classify(&output, plan.offline),
+            failure: if messages.too_old {
+                Failure::TooOld
+            } else {
+                classify(&output, plan.offline)
+            },
             in_documented: messages.documented_failed,
+            more_errors: messages.more_errors,
             errors: messages.errors,
             stderr: stderr_tail(&output),
         });
@@ -991,6 +1197,10 @@ pub async fn build(
         let record_json = serde_json::to_vec_pretty(&recorded).map_err(io::Error::from)?;
         cache.write_verified(&published, &contents)?;
         let written = cache::write_atomically(&dir.join(RECORD), &record_json);
+        // The failure before is not of this build (requirement R-WS-7).
+        if written.is_ok() {
+            super::remove_if_there(&dir.join(FAILED));
+        }
         drop(publishing);
         written
     })
@@ -1097,6 +1307,7 @@ pub async fn dep_info(
             failure: classify(&output, plan.offline),
             in_documented: false,
             errors: Vec::new(),
+            more_errors: 0,
             stderr: stderr_tail(&output),
         });
     }
@@ -1248,6 +1459,10 @@ struct Messages<'a> {
     rebuilt: Vec<Box<str>>,
     /// The first errors of the compiler, rendered.
     errors: Vec<Box<str>>,
+    /// How many errors there were past [`MAX_ERRORS`].
+    more_errors: usize,
+    /// Whether an error was of a feature that the toolchain does not have (`E0658`).
+    too_old: bool,
 }
 
 /// A JSON message of cargo, as far as it is read.
@@ -1278,7 +1493,27 @@ struct MessageTarget {
 struct Diagnostic {
     level: Box<str>,
     #[serde(default)]
+    message: Box<str>,
+    #[serde(default)]
     rendered: Option<Box<str>>,
+    #[serde(default)]
+    code: Option<DiagnosticCode>,
+    #[serde(default)]
+    spans: Vec<serde::de::IgnoredAny>,
+}
+
+impl Diagnostic {
+    /// Whether it is the compiler's count of the errors before it, `aborting due to 2 previous
+    /// errors`, which tells nothing of its own.
+    fn is_the_count(&self) -> bool {
+        self.code.is_none() && self.spans.is_empty() && self.message.starts_with("aborting due to")
+    }
+}
+
+/// The code of a diagnostic, as `E0658`.
+#[derive(Deserialize)]
+struct DiagnosticCode {
+    code: Box<str>,
 }
 
 impl<'a> Messages<'a> {
@@ -1290,6 +1525,8 @@ impl<'a> Messages<'a> {
             documented_failed: false,
             rebuilt: Vec::new(),
             errors: Vec::new(),
+            more_errors: 0,
+            too_old: false,
         }
     }
 
@@ -1317,11 +1554,19 @@ impl<'a> Messages<'a> {
                 }
             },
             "compiler-message" => {
-                let Some(Diagnostic { level, rendered }) = message.diagnostic else {
+                let Some(diagnostic) = message.diagnostic else {
                     return;
                 };
-                if &*level != "error" {
+                if &*diagnostic.level != "error" {
                     return;
+                }
+                // A feature that the toolchain does not have, or not stably (requirement R-WS-7).
+                if diagnostic
+                    .code
+                    .as_ref()
+                    .is_some_and(|code| &*code.code == "E0658")
+                {
+                    self.too_old = true;
                 }
                 if message
                     .package_id
@@ -1334,10 +1579,13 @@ impl<'a> Messages<'a> {
                 {
                     self.documented_failed = true;
                 }
-                if let Some(rendered) = rendered
-                    && self.errors.len() < MAX_ERRORS
-                {
-                    self.errors.push(rendered);
+                if diagnostic.is_the_count() {
+                    return;
+                }
+                match diagnostic.rendered {
+                    Some(rendered) if self.errors.len() < MAX_ERRORS => self.errors.push(rendered),
+                    Some(_) => self.more_errors = self.more_errors.saturating_add(1),
+                    None => {},
                 }
             },
             _ => {},
@@ -1732,6 +1980,195 @@ mod tests {
         assert_eq!(messages.errors.len(), 1);
         messages.read(&message(app, "app", "error"));
         assert!(messages.documented_failed);
+    }
+
+    #[test]
+    fn an_error_of_a_feature_that_the_toolchain_lacks_is_told() {
+        let plan = app_plan(None, false);
+        let message = |code: Option<&str>| {
+            serde_json::json!({
+                "reason": "compiler-message",
+                "package_id": "path+file:///ws/app#0.1.0",
+                "target": {"name": "app", "kind": ["lib"]},
+                "message": {
+                    "level": "error",
+                    "rendered": "error[E0658]: associated type defaults are unstable",
+                    "code": code.map(|code| serde_json::json!({"code": code, "explanation": "…"})),
+                },
+            })
+            .to_string()
+        };
+        let mut messages = Messages::new(&plan);
+        messages.read(&message(None));
+        messages.read(&message(Some("E0557")));
+        assert!(!messages.too_old);
+        assert_eq!(messages.errors.len(), 2);
+        messages.read(&message(Some("E0658")));
+        assert!(messages.too_old);
+        // The compiler's count of them is not one, and those past the most kept are counted.
+        messages.read(
+            &serde_json::json!({
+                "reason": "compiler-message",
+                "package_id": "path+file:///ws/app#0.1.0",
+                "target": {"name": "app", "kind": ["lib"]},
+                "message": {
+                    "level": "error",
+                    "message": "aborting due to 3 previous errors",
+                    "rendered": "error: aborting due to 3 previous errors\n\n",
+                    "code": null,
+                    "spans": [],
+                },
+            })
+            .to_string(),
+        );
+        assert_eq!((messages.errors.len(), messages.more_errors), (3, 0));
+        for _ in 0..MAX_ERRORS {
+            messages.read(&message(None));
+        }
+        assert_eq!(
+            (messages.errors.len(), messages.more_errors),
+            (MAX_ERRORS, 3)
+        );
+    }
+
+    #[test]
+    fn what_may_pass_when_tried_again_is_transient() {
+        let failed = |failure| BuildError::Failed {
+            failure,
+            in_documented: false,
+            errors: Vec::new(),
+            more_errors: 0,
+            stderr: Box::default(),
+        };
+        let fetch = |failure| BuildError::Fetch {
+            failure,
+            stderr: Box::default(),
+        };
+        for transient in [
+            failed(Failure::Killed),
+            fetch(Failure::Other),
+            fetch(Failure::Killed),
+            BuildError::Io(io::Error::other("full")),
+            BuildError::Run(RunError::NotStarted(io::Error::other("no cargo"))),
+            BuildError::Fresh(PathBuf::from("a.json")),
+        ] {
+            assert!(transient.is_transient(), "{transient:?}");
+        }
+        for lasting in [
+            failed(Failure::Other),
+            failed(Failure::TooOld),
+            fetch(Failure::GitFetch(
+                super::super::cargo::GitFetchFailure::Auth,
+            )),
+            fetch(Failure::LockfileOutdated),
+            fetch(Failure::OfflineMiss),
+            BuildError::Run(RunError::TimedOut(Duration::from_mins(30))),
+            BuildError::NoJson(PathBuf::from("a.json")),
+        ] {
+            assert!(!lasting.is_transient(), "{lasting:?}");
+        }
+    }
+
+    #[test]
+    fn a_failure_holds_while_what_the_build_is_made_from_is_the_same() {
+        let body = serde_json::json!({"code": "build_failed"});
+        let lasting = Failed::now(Some("k".into()), None, false, body.clone());
+        assert!(lasting.holds("k"));
+        assert!(!lasting.holds("other"));
+        assert_eq!(lasting.retry_after(), None);
+        let transient = Failed::now(Some("k".into()), None, true, body.clone());
+        assert!(transient.holds("k"));
+        assert!(
+            transient
+                .retry_after()
+                .is_some_and(|left| left <= Duration::from_secs(30))
+        );
+        // Over 30 seconds ago, or after a clock set back before it.
+        let past = Failed {
+            at: transient.at.saturating_sub(31),
+            ..transient.clone()
+        };
+        assert!(!past.holds("k"));
+        let ahead = Failed {
+            at: transient.at.saturating_add(3600),
+            ..transient
+        };
+        assert!(!ahead.holds("k"));
+        // Without a key, it is not kept.
+        assert!(!Failed::now(None, None, false, body).holds("k"));
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_remembered_where_the_build_would_be_published() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let published = dir.path().join(LOCAL_DIR).join("p");
+        let failed = Failed::now(
+            Some("k".into()),
+            Some("rustc 1.99.1"),
+            false,
+            serde_json::json!({"code": "build_failed", "retryable": false}),
+        );
+        failed
+            .clone()
+            .remember(&cache, published.clone())
+            .await
+            .expect("remembered");
+        let read = super::failed(&published).expect("read");
+        assert_eq!(
+            (read.key, read.time, read.body),
+            (failed.key, failed.time, failed.body)
+        );
+        // Not outside the cache.
+        let outside = tempfile::tempdir().expect("a temporary directory");
+        let elsewhere = Failed::now(Some("k".into()), None, false, serde_json::Value::Null);
+        assert!(
+            elsewhere
+                .remember(&cache, outside.path().to_path_buf())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_not_remembered_over_a_build_of_its_key() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let published = dir.path().join(LOCAL_DIR).join("p");
+        fs::create_dir_all(&published).expect("made");
+        let json = b"{}";
+        fs::write(published.join("61.json"), json).expect("written");
+        fs::write(published.join("61.json.sha256"), cache::sha256_hex(json)).expect("written");
+        let record = serde_json::json!({
+            "package": "path+file:///ws/app#0.1.0",
+            "crate_name": "app",
+            "crate_version": "0.1.0",
+            "format_version": 61,
+            "target": null,
+            "toolchain": null,
+            "chosen_toolchain": null,
+            "built_at": "2026-10-21T00:00:00Z",
+            "features_requested": null,
+            "features_effective": null,
+            "bootstrap_all": false,
+            "cfg_docsrs": true,
+            "sha256": cache::sha256_hex(json),
+            "key": "k",
+        });
+        fs::write(published.join(RECORD), record.to_string()).expect("written");
+        assert!(super::published(&published).is_some(), "published");
+        let failed =
+            |key: &str| Failed::now(Some(key.into()), None, false, serde_json::Value::Null);
+        failed("k")
+            .remember(&cache, published.clone())
+            .await
+            .expect("not written");
+        assert!(super::failed(&published).is_none());
+        failed("other")
+            .remember(&cache, published.clone())
+            .await
+            .expect("written");
+        assert!(super::failed(&published).is_some());
     }
 
     #[test]

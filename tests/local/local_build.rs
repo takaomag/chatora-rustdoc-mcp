@@ -410,10 +410,20 @@ impl Members {
         &self,
         name: &str,
     ) -> std::sync::Arc<chatora_rustdoc_mcp::query::local::LocalBuilt> {
-        use chatora_rustdoc_mcp::{
-            data::flight::Joined,
-            query::local::{LocalWanted, local_archive},
+        let chatora_rustdoc_mcp::data::flight::Joined::Done(Ok(built)) = self.joined(name).await
+        else {
+            panic!("built");
         };
+        built
+    }
+
+    /// The build of the member `name`, or why there is none.
+    async fn joined(
+        &self,
+        name: &str,
+    ) -> chatora_rustdoc_mcp::data::flight::Joined<chatora_rustdoc_mcp::query::local::SharedLocal>
+    {
+        use chatora_rustdoc_mcp::query::local::{LocalWanted, local_archive};
 
         let resolution = self
             .resolver
@@ -440,12 +450,7 @@ impl Members {
         let until = tokio::time::Instant::now()
             .checked_add(std::time::Duration::from_secs(300))
             .expect("a time");
-        let Joined::Done(Ok(built)) =
-            local_archive(&self.flights, &self.cache, wanted, until).await
-        else {
-            panic!("built");
-        };
-        built
+        local_archive(&self.flights, &self.cache, wanted, until).await
     }
 
     /// The build of the member `name`, once its dep-info is recorded (decided in M2's D4).
@@ -519,6 +524,154 @@ async fn a_member_is_built_again_only_when_what_it_is_made_from_changes() {
         assert_ne!(after.record.key, before.record.key, "{}", path.display());
     }
     assert!(items_at(&members.built("one").await.json).contains("added"));
+}
+
+/// The failures remembered in `cache`, with when each was written.
+fn failures(cache: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+    let mut found = Vec::new();
+    let mut dirs = vec![cache.join(build::LOCAL_DIR)];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.file_name().is_some_and(|name| name == "failed.json") {
+                let written = fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .expect("a time");
+                found.push((path, written));
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn a_member_that_failed_is_not_built_again_until_what_it_is_made_from_changes() {
+    use chatora_rustdoc_mcp::{data::flight::Joined, query::local::LocalError};
+
+    let Some(dir) = in_isolated_child(
+        "local_build::a_member_that_failed_is_not_built_again_until_what_it_is_made_from_changes",
+    ) else {
+        return;
+    };
+    let members = Members::in_dir(&dir).await;
+    let first = members.built("one").await;
+    let source = dir.join("local-build/ws/one/src/lib.rs");
+    let fine = fs::read_to_string(&source).expect("readable");
+    fs::write(
+        &source,
+        format!("{fine}\npub fn broken() -> Missing {{}}\n"),
+    )
+    .expect("written");
+    // Told, with the build before there, and remembered (requirement R-WS-7, decided in M2's D5).
+    let failed = |joined: &Joined<chatora_rustdoc_mcp::query::local::SharedLocal>| {
+        let Joined::Done(Err(error)) = joined else {
+            return None;
+        };
+        let LocalError::Failed { failed, kept } = &**error else {
+            return None;
+        };
+        Some(((**failed).clone(), *kept))
+    };
+    let joined = members.joined("one").await;
+    let Some((told, true)) = failed(&joined) else {
+        panic!("a failure that is kept: {joined:?}");
+    };
+    assert_eq!(told.body["code"], "build_failed");
+    assert_eq!(told.body["retryable"], false);
+    assert!(
+        told.body["diagnostics"][0]
+            .as_str()
+            .is_some_and(|text| text.contains("cannot find type `Missing`")),
+        "{}",
+        told.body
+    );
+    let remembered = failures(members.cache.dir());
+    assert_eq!(remembered.len(), 1, "{remembered:?}");
+    // Not built again while the sources are the same.
+    let joined = members.joined("one").await;
+    let Some((again, true)) = failed(&joined) else {
+        panic!("the failure again: {joined:?}");
+    };
+    assert_eq!((again.time, again.body), (told.time, told.body));
+    assert_eq!(
+        failures(members.cache.dir()),
+        remembered,
+        "not written again"
+    );
+    // Fixed, it is built, and the failure is forgotten.
+    fs::write(&source, format!("{fine}\npub fn mended() {{}}\n")).expect("written");
+    let fixed = members.built("one").await;
+    assert_ne!(fixed.record.sha256, first.record.sha256);
+    assert!(items_at(&fixed.json).contains("mended"));
+    assert_eq!(failures(members.cache.dir()), []);
+}
+
+#[tokio::test]
+async fn a_member_that_failed_as_its_sources_were_edited_is_not_found_failed() {
+    use chatora_rustdoc_mcp::{data::flight::Joined, query::local::LocalError};
+
+    let Some(dir) = in_isolated_child(
+        "local_build::a_member_that_failed_as_its_sources_were_edited_is_not_found_failed",
+    ) else {
+        return;
+    };
+    let members = Members::in_dir(&dir).await;
+    let package = dir.join("local-build/ws/one");
+    // A build script that sleeps, so that the sources are edited after the key is taken, and
+    // before rustdoc reads them.
+    fs::write(
+        package.join("build.rs"),
+        "fn main() { std::thread::sleep(std::time::Duration::from_secs(3)); }\n",
+    )
+    .expect("written");
+    let source = package.join("src/lib.rs");
+    let fine = fs::read_to_string(&source).expect("readable");
+    let broken = format!("{fine}\npub fn broken() -> Missing {{}}\n");
+    let (joined, ()) = tokio::join!(members.joined("one"), async {
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        fs::write(&source, &broken).expect("written");
+    });
+    let Joined::Done(Err(error)) = &joined else {
+        panic!("failed: {joined:?}");
+    };
+    assert!(
+        matches!(**error, LocalError::Failed { kept: false, .. }),
+        "told, not kept: {error:?}"
+    );
+    assert_eq!(failures(members.cache.dir()), []);
+    // The edit undone, it is built.
+    fs::write(&source, &fine).expect("written");
+    let built = members.built("one").await;
+    assert!(!items_at(&built.json).contains("broken"));
+}
+
+#[tokio::test]
+async fn a_member_that_needs_a_newer_rustc_is_told_so() {
+    use chatora_rustdoc_mcp::{data::flight::Joined, query::local::LocalError};
+
+    let Some(dir) = in_isolated_child("local_build::a_member_that_needs_a_newer_rustc_is_told_so")
+    else {
+        return;
+    };
+    let members = Members::in_dir(&dir).await;
+    let manifest = dir.join("local-build/ws/one/Cargo.toml");
+    let text = fs::read_to_string(&manifest).expect("readable");
+    fs::write(
+        &manifest,
+        text.replacen("[package]\n", "[package]\nrust-version = \"1.999\"\n", 1),
+    )
+    .expect("written");
+    let joined = members.joined("one").await;
+    let Joined::Done(Err(error)) = &joined else {
+        panic!("failed: {joined:?}");
+    };
+    let LocalError::Failed { failed, .. } = &**error else {
+        panic!("a failed build: {error:?}");
+    };
+    assert_eq!(failed.body["code"], "toolchain_too_old", "{}", failed.body);
+    assert_eq!(failed.body["retryable"], false);
 }
 
 #[tokio::test]

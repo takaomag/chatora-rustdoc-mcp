@@ -11,6 +11,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use serde_json::{Value, json};
 use tokio::time::Instant;
 use tracing::Instrument as _;
 
@@ -18,7 +19,7 @@ use super::load::{self, Archived, LoadError};
 use crate::data::{
     build::{self, BuildError, BuildRecord, Built, DepInfoRun, Documented, Plan},
     cache::{self, Cache},
-    cargo::Failure,
+    cargo::{Failure, GitFetchFailure, RunError},
     child,
     flight::{Doing, Flights, Joined, Stage},
     freshness,
@@ -87,9 +88,16 @@ pub enum LocalError {
     /// The toolchain cannot build for the target.
     #[error(transparent)]
     Missing(Missing),
-    /// The build failed.
-    #[error(transparent)]
-    Build(BuildError),
+    /// The build failed, or failed before, made from the same (requirement R-WS-7, decided in
+    /// M2's D5): its record, with the error to return, and whether it is kept, so that it is not
+    /// made again meanwhile.
+    #[error("the build failed")]
+    Failed {
+        /// The record.
+        failed: Box<build::Failed>,
+        /// Whether it is kept.
+        kept: bool,
+    },
     /// The JSON could not be read, parsed or archived.
     #[error(transparent)]
     Load(LoadError),
@@ -102,15 +110,18 @@ pub enum LocalError {
 pub type SharedLocal = Result<Arc<LocalBuilt>, Arc<LocalError>>;
 
 /// Whether a member's build that went on past a deadline is handed to the next call for it
-/// (decided in M2's D4).
+/// (decided in M2's D4 and D5).
 ///
-/// It is when it has no key, so that the next call cannot find it fresh, and would make it again,
-/// or when it failed, which the calls that stopped waiting did not see: they had the build before.
+/// It is when the next call would not find it: a build without a key, which it cannot find
+/// fresh, and would make again, or a failure that is not kept, which the calls that stopped
+/// waiting did not see, as they had the build before. A failure that is kept is found by the
+/// next call while what the build is made from is the same.
 #[must_use]
 pub fn hands_over(built: &SharedLocal) -> bool {
-    built
-        .as_ref()
-        .map_or(true, |built| built.record.key.is_none())
+    match built {
+        Ok(built) => built.record.key.is_none(),
+        Err(error) => !matches!(**error, LocalError::Failed { kept: true, .. }),
+    }
 }
 
 /// The archive of the member's crate that `wanted` names, built and archived by work that the
@@ -145,8 +156,8 @@ pub async fn local_archive(
         .await
 }
 
-/// The key of what `wanted` names in [`REBUILDING`] and [`REBUILD_FAILED`]: of the work, in the
-/// cache, as one process may have more than one.
+/// The key of what `wanted` names in [`REBUILDING`]: of the work, in the cache, as one process
+/// may have more than one.
 fn table_key(cache: &Cache, wanted: &LocalWanted) -> String {
     format!("{}|{}", cache.dir().display(), flight_key(wanted))
 }
@@ -172,11 +183,6 @@ static REBUILDING: LazyLock<Mutex<HashMap<String, Given>>> = LazyLock::new(Mutex
 /// A build given while the work numbered so builds it again.
 type Given = (u64, Arc<Built>);
 
-/// The key of the inputs of the last build that failed, by [`table_key`]: while they are the same,
-/// the build before is not given while the member is built again, so that the failure is told
-/// rather than the build before again and again (until M2's D5 remembers failures).
-static REBUILD_FAILED: LazyLock<Mutex<HashMap<String, Box<str>>>> = LazyLock::new(Mutex::default);
-
 /// Numbers the works that build members.
 static NEXT_REBUILD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -188,25 +194,11 @@ struct Rebuilding {
 }
 
 impl Rebuilding {
-    /// Gives `before` while the work builds it again, unless the build of the same inputs, of
-    /// the key `inputs`, failed last.
-    fn give(&self, before: Box<Built>, inputs: &str) {
-        if REBUILD_FAILED.lock().get(&self.key).map(AsRef::as_ref) == Some(inputs) {
-            return;
-        }
+    /// Gives `before` while the work builds it again.
+    fn give(&self, before: Box<Built>) {
         REBUILDING
             .lock()
             .insert(self.key.clone(), (self.work, Arc::from(before)));
-    }
-
-    /// Notes how the build of the inputs of the key `inputs` ended.
-    fn ended(&self, inputs: &str, failed: bool) {
-        let mut failures = REBUILD_FAILED.lock();
-        if failed {
-            failures.insert(self.key.clone(), inputs.into());
-        } else {
-            failures.remove(&self.key);
-        }
     }
 }
 
@@ -356,7 +348,7 @@ async fn after_install(
     toolchain::forget_project(root);
     let checked = toolchain::check_target(rustc, None, root, target).await;
     match (built, checked) {
-        (Err(LocalError::Build(_)), Err(missing)) => Err(LocalError::Missing(missing)),
+        (Err(LocalError::Failed { .. }), Err(missing)) => Err(LocalError::Missing(missing)),
         (Ok(mut built), Ok(checked)) => {
             built.record.toolchain = checked.toolchain.map(Into::into);
             if let Err(error) = built.write_record(cache).await {
@@ -398,6 +390,9 @@ impl Builder<'_> {
     /// build published before, which ended without them when a build of the same plan worked
     /// only so (decided in M2's D4): an error of the crate's own, which fails them all, publishes
     /// nothing, so it is not taken for it. `warnings` gets what the response tells of it.
+    ///
+    /// A failure is remembered with the key, and told again without a build while it holds
+    /// ([`build::Failed`]), unless the server stopped the build as it ends (decided in M2's D5).
     async fn build(
         &self,
         plan: &mut Plan,
@@ -439,38 +434,67 @@ impl Builder<'_> {
                 }
                 return Ok(*built);
             },
+            // Not the build before: the failure is told until what it is made from changes
+            // (requirement R-WS-7, decided in M2's D5).
+            Freshness::Failed(failed) => {
+                return Err(LocalError::Failed { failed, kept: true });
+            },
             Freshness::Stale(fresh, before) => {
                 let earlier = before.as_ref().map(|before| before.record.clone());
-                if let (Some(before), Some(fresh)) = (before, &fresh) {
-                    self.rebuilding.give(before, &fresh.key);
+                if let (Some(before), Some(_)) = (before, &fresh) {
+                    self.rebuilding.give(before);
                 }
                 (fresh, earlier)
             },
         };
-        let built = self
+        let error = match self
             .tries(
                 plan,
                 toolchain.as_deref(),
                 (fresh.as_deref(), earlier.as_ref()),
                 warnings,
             )
-            .await;
-        if let Some(fresh) = &fresh {
-            self.rebuilding
-                .ended(&fresh.key, matches!(built, Err(LocalError::Build(_))));
-        }
-        built
+            .await
+        {
+            Ok(built) => return Ok(built),
+            Err(error) => error,
+        };
+        let failed = build::Failed::now(
+            fresh.as_ref().map(|fresh| fresh.key.clone()),
+            toolchain.as_deref(),
+            error.is_transient(),
+            failure_body(plan, &error),
+        );
+        // Not a build that the server stopped, as it ends (requirement R-WS-7), nor one of sources
+        // that changed since its key was taken, as while an agent edits them: undone, they would
+        // be found failed.
+        let kept = match &fresh {
+            Some(fresh) if !child::stopping() && settled(Some(fresh)).await => failed
+                .clone()
+                .remember(self.cache, fresh.dir.clone())
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "the failure of a build could not be remembered");
+                })
+                .is_ok(),
+            _ => false,
+        };
+        Err(LocalError::Failed {
+            failed: Box::new(failed),
+            kept,
+        })
     }
 
     /// The build of `plan`, as [`Self::build`] tries it, with the toolchain that `rustc -vV`
-    /// tells, `toolchain`, and the key and inputs `fresh`, for its record.
+    /// tells, `toolchain`, and the key and inputs `fresh`, for its record. cargo fetches the
+    /// dependencies first.
     async fn tries(
         &self,
         plan: &mut Plan,
         toolchain: Option<&str>,
         (fresh, earlier): (Option<&build::Fresh>, Option<&BuildRecord>),
         warnings: &mut Vec<Box<str>>,
-    ) -> Result<Built, LocalError> {
+    ) -> Result<Built, BuildError> {
         let told = warnings.len();
         let planned = build::Planned {
             server: env!("CARGO_PKG_VERSION").into(),
@@ -491,6 +515,9 @@ impl Builder<'_> {
             warnings.push(DOCS_RS_FEATURES_BROKE_IT.into());
         }
         let mut tell = |doing| self.stage.set(doing);
+        // Apart from the build, as trying again may mend it (requirement R-WS-7).
+        build::fetch(plan, &mut tell).await?;
+        self.stage.set(Doing::Building);
         let mut retried = false;
         let mut built =
             build::build(self.cache, plan, self.work, toolchain, fresh, &mut tell).await;
@@ -513,7 +540,7 @@ impl Builder<'_> {
         let compiler_failed = matches!(
             &built,
             Err(BuildError::Failed {
-                failure: Failure::Other,
+                failure: Failure::Other | Failure::TooOld,
                 errors,
                 ..
             }) if !errors.is_empty()
@@ -534,7 +561,7 @@ impl Builder<'_> {
                     .into(),
             );
         }
-        let mut built = built.map_err(LocalError::Build)?;
+        let mut built = built?;
         // For the builds that find it fresh, and those that plan it so again: unless what failed
         // may have been sources changing between the tries, as while an agent edits them.
         built.record.warnings = warnings.get(told..).unwrap_or_default().to_vec();
@@ -574,8 +601,8 @@ impl Builder<'_> {
         };
         let dir = plan.published_dir(self.cache.dir(), Some(target));
         let facts = plan.facts(toolchain, self.docs_rs);
-        let before = match crate::task::spawn_blocking(move || build::published(&dir)).await {
-            Ok(before) => before,
+        let (before, failed) = match published_and_failed(dir.clone()).await {
+            Ok(found) => found,
             Err(error) => {
                 let error = crate::task::resume_if_panic(error);
                 tracing::debug!(%error, "the check of a build was stopped");
@@ -643,8 +670,12 @@ impl Builder<'_> {
                     deps,
                     scanned,
                     walked,
+                    dir,
                 };
                 Freshness::Fresh(Box::new(before), Box::new(fresh))
+            },
+            _ if let Some(failed) = failed.filter(|failed| failed.holds(&key)) => {
+                Freshness::Failed(Box::new(failed))
             },
             before => Freshness::Stale(
                 Some(Box::new(build::Fresh {
@@ -655,6 +686,7 @@ impl Builder<'_> {
                     deps,
                     scanned,
                     walked,
+                    dir,
                 })),
                 before.map(Box::new),
             ),
@@ -889,6 +921,250 @@ impl Drop for Following {
     }
 }
 
+/// The error of a build of `plan` that failed so (requirement R-WS-7): its code, and whether trying
+/// again may work, with the first errors of the compiler, as many as `build.max_diagnostics` and
+/// their lengths allow, or else the end of cargo's stderr.
+fn failure_body(plan: &Plan, error: &BuildError) -> Value {
+    let what = format!("{} {}", plan.crate_name, plan.version);
+    let retryable = error.is_transient();
+    let (failure, mut body) = match error {
+        BuildError::Failed { failure, .. } => (
+            Some(*failure),
+            json!({
+                "code": failure.code(),
+                "message": if *failure == Failure::Killed {
+                    format!(
+                        "cargo or one of its children was killed, as by the OOM killer, while it \
+                         built the documentation of {what}"
+                    )
+                } else {
+                    format!("cargo failed to build the documentation of {what}")
+                },
+                "retryable": retryable,
+                "suggestions": suggestions(plan, *failure, "run `cargo doc` in the project's terminal to see the error there"),
+            }),
+        ),
+        BuildError::Fetch { failure, .. } => (
+            Some(*failure),
+            json!({
+                "code": failure.code(),
+                "message": format!("cargo could not fetch the dependencies of {what}"),
+                "retryable": retryable,
+                "suggestions": suggestions(plan, *failure, "run `cargo fetch` in the project's terminal to see why it fails"),
+            }),
+        ),
+        BuildError::Run(RunError::TimedOut(_)) => (
+            None,
+            json!({
+                "code": "build_failed",
+                "message": format!("the build of the documentation of {what} took too long: {error}"),
+                "retryable": retryable,
+                "suggestions": [],
+                "reason": "timeout",
+            }),
+        ),
+        BuildError::Io(error) => (
+            None,
+            json!({
+                "code": "build_failed",
+                "message": format!("the documentation of {what} could not be published: {error}"),
+                "retryable": retryable,
+                "suggestions": [],
+            }),
+        ),
+        BuildError::Run(RunError::NotStarted(_))
+        | BuildError::NoJson(_)
+        | BuildError::Fresh(_)
+        | BuildError::Unreadable(_)
+        | BuildError::NotTheCrate { .. } => (
+            None,
+            json!({
+                "code": "build_failed",
+                "message": format!("the documentation of {what} could not be built: {error}"),
+                "retryable": retryable,
+                "suggestions": [],
+            }),
+        ),
+    };
+    if let Some(fields) = body.as_object_mut() {
+        if let Some(Failure::GitFetch(reason)) = failure {
+            fields.insert("reason".to_owned(), json!(reason.as_str()));
+        }
+        match error {
+            BuildError::Failed {
+                errors,
+                more_errors,
+                ..
+            } if !errors.is_empty() => {
+                let (shown, omitted) = diagnostics(errors, build::max_diagnostics());
+                let omitted = omitted.saturating_add(*more_errors);
+                fields.insert("diagnostics".to_owned(), json!(shown));
+                if omitted > 0 {
+                    fields.insert("diagnostics_omitted".to_owned(), json!(omitted));
+                }
+            },
+            BuildError::Failed { stderr, .. } | BuildError::Fetch { stderr, .. } => {
+                fields.insert(
+                    "stderr".to_owned(),
+                    json!(tail_within(stderr, MAX_DIAGNOSTICS_CHARS)),
+                );
+            },
+            BuildError::Run(_)
+            | BuildError::NoJson(_)
+            | BuildError::Fresh(_)
+            | BuildError::Unreadable(_)
+            | BuildError::NotTheCrate { .. }
+            | BuildError::Io(_) => {},
+        }
+    }
+    body
+}
+
+/// What to do of a failure of the build of `plan`, as its messages tell it, or else `otherwise`
+/// (requirement R-WS-7 and §8).
+fn suggestions(plan: &Plan, failure: Failure, otherwise: &str) -> Vec<String> {
+    match failure {
+        Failure::TooOld => too_old(plan),
+        // GitHub asks for credentials for a repository that does not exist, too.
+        Failure::GitFetch(GitFetchFailure::Auth) => vec![
+            "check the URL of the git dependency first: GitHub asks for credentials for a \
+             repository that does not exist, too"
+                .to_owned(),
+            "then run `cargo fetch` in the project's terminal, to pass the credentials; with the \
+             GitHub CLI, `gh auth setup-git` once lets git and cargo use its login"
+                .to_owned(),
+        ],
+        Failure::GitFetch(GitFetchFailure::NoRepository | GitFetchFailure::NoRev) => {
+            vec!["check the URL and the branch, tag or rev of the git dependency".to_owned()]
+        },
+        Failure::LockfileOutdated => vec![
+            "update Cargo.lock in the project's terminal, as with `cargo update --workspace`: the \
+             server builds with --locked"
+                .to_owned(),
+        ],
+        Failure::OfflineMiss => vec![
+            "run `cargo fetch` in the project's terminal while online, or turn the server's \
+             offline mode off"
+                .to_owned(),
+        ],
+        Failure::Killed | Failure::Other => vec![otherwise.to_owned()],
+    }
+}
+
+/// What updates the toolchain that built `plan`, too old for it (`toolchain_too_old`, requirement
+/// R-WS-7): the nightly that the server chose, or the project's, as its `rust-toolchain.toml`
+/// names it.
+fn too_old(plan: &Plan) -> Vec<String> {
+    let pinned = || {
+        plan.root.ancestors().any(|dir| {
+            dir.join("rust-toolchain.toml").is_file() || dir.join("rust-toolchain").is_file()
+        })
+    };
+    let suggestion = match plan.toolchain.as_deref() {
+        Some(toolchain) if toolchain.starts_with("nightly-") => format!(
+            "set build.nightly_date to a later day than that of {toolchain}, which the server built \
+             it with, as the project's toolchain writes too old a format"
+        ),
+        Some(toolchain) => format!(
+            "update {toolchain}, which the server built it with, as with `rustup update {toolchain}`"
+        ),
+        None if pinned() => {
+            "update the toolchain that the project's rust-toolchain.toml names".to_owned()
+        },
+        None => "update the project's toolchain, as with `rustup update`".to_owned(),
+    };
+    vec![suggestion]
+}
+
+/// The most characters of a diagnostic in the response, as JSON escapes it (requirement R-WS-7,
+/// until F5 measures it).
+const MAX_DIAGNOSTIC_CHARS: usize = 3_500;
+
+/// The most characters of the diagnostics in the response, or of the end of cargo's stderr, as
+/// JSON escapes them (requirement R-WS-7).
+const MAX_DIAGNOSTICS_CHARS: usize = 8_000;
+
+/// The first `count` of `errors`, each cut to [`MAX_DIAGNOSTIC_CHARS`] and all to
+/// [`MAX_DIAGNOSTICS_CHARS`], and how many of the rest were left out.
+fn diagnostics(errors: &[Box<str>], count: usize) -> (Vec<String>, usize) {
+    let mut left = MAX_DIAGNOSTICS_CHARS;
+    let mut shown = Vec::new();
+    for error in errors.iter().take(count) {
+        let limit = MAX_DIAGNOSTIC_CHARS.min(left);
+        if limit == 0 {
+            break;
+        }
+        let text = head_within(error, limit);
+        left = left.saturating_sub(escaped_len(&text));
+        shown.push(text);
+    }
+    let omitted = errors.len().saturating_sub(shown.len());
+    (shown, omitted)
+}
+
+/// What marks where a text was cut.
+const CUT: &str = "…";
+
+/// The start of `text`, at most `limit` characters as JSON escapes them, with [`CUT`] at its end
+/// when it is cut.
+fn head_within(text: &str, limit: usize) -> String {
+    if escaped_len(text) <= limit {
+        return text.to_owned();
+    }
+    let mut left = limit.saturating_sub(escaped_len(CUT));
+    let mut head: String = text
+        .chars()
+        .take_while(|c| {
+            let fits = escaped_char_len(*c) <= left;
+            left = left.saturating_sub(escaped_char_len(*c));
+            fits
+        })
+        .collect();
+    head.push_str(CUT);
+    head
+}
+
+/// The end of `text`, at most `limit` characters as JSON escapes them, with [`CUT`] at its start
+/// when it is cut.
+fn tail_within(text: &str, limit: usize) -> String {
+    if escaped_len(text) <= limit {
+        return text.to_owned();
+    }
+    let mut left = limit.saturating_sub(escaped_len(CUT));
+    let mut tail: Vec<char> = text
+        .chars()
+        .rev()
+        .take_while(|c| {
+            let fits = escaped_char_len(*c) <= left;
+            left = left.saturating_sub(escaped_char_len(*c));
+            fits
+        })
+        .collect();
+    tail.reverse();
+    CUT.chars().chain(tail).collect()
+}
+
+/// How many characters `text` is in a JSON string, as escaped.
+fn escaped_len(text: &str) -> usize {
+    text.chars().map(escaped_char_len).sum()
+}
+
+/// How many characters `c` is in a JSON string, as `serde_json` escapes it.
+const fn escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        '\0'..='\u{1f}' => 6,
+        _ => 1,
+    }
+}
+
+/// The build published in `dir`, and the failure remembered there, if any.
+async fn published_and_failed(
+    dir: PathBuf,
+) -> Result<(Option<Built>, Option<build::Failed>), tokio::task::JoinError> {
+    crate::task::spawn_blocking(move || (build::published(&dir), build::failed(&dir))).await
+}
+
 /// Whether a build is fresh.
 enum Freshness {
     /// It is, as published, with its key and the inputs that it was made from.
@@ -896,6 +1172,8 @@ enum Freshness {
     /// It is to be made, with this key and these inputs, if they could be taken, and was built
     /// before so, if it was.
     Stale(Option<Box<build::Fresh>>, Option<Box<Built>>),
+    /// It failed before, made from the same, as this record tells, which still holds.
+    Failed(Box<build::Failed>),
 }
 
 /// What the response warns about a member built with the project's features, as the features
@@ -1016,6 +1294,149 @@ fn read_checked(path: &Path, sha256: &str) -> io::Result<Box<[u8]>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plan of the member `app` of the workspace at `root`, with the toolchain that the
+    /// server chose, `toolchain`.
+    fn plan(root: &Path, toolchain: Option<&str>) -> Plan {
+        Plan {
+            root: root.to_path_buf(),
+            offline: false,
+            toolchain: toolchain.map(Into::into),
+            bootstrap: build::Bootstrap::All,
+            target_dir: build::TargetDir::of(Path::new("/c"), root),
+            package: PackageId("path+file:///ws/app#0.1.0".into()),
+            manifest: root.join("app/Cargo.toml"),
+            documented: Documented::Lib { proc_macro: false },
+            crate_name: "app".into(),
+            version: semver::Version::new(0, 1, 0),
+            target: None,
+            cfg_docsrs: true,
+            cfgs: Box::default(),
+            features: None,
+        }
+    }
+
+    #[test]
+    fn a_text_is_cut_to_its_length_as_json_escapes_it() {
+        assert_eq!(escaped_len("a\"\\\n\u{1}é"), 1 + 2 + 2 + 2 + 6 + 1);
+        assert_eq!(head_within("abc", 3), "abc");
+        assert_eq!(head_within("abcdef", 4), "abc…");
+        // Not in the middle of an escape.
+        assert_eq!(head_within("ab\ncd", 3), "ab…");
+        assert_eq!(tail_within("abcdef", 4), "…def");
+        assert_eq!(tail_within("ab\ncd", 4), "…cd");
+        assert_eq!(escaped_len(&tail_within(&"\"".repeat(10), 5)), 5);
+    }
+
+    #[test]
+    fn the_diagnostics_are_the_first_ones_within_the_limits() {
+        let errors: Vec<Box<str>> = vec!["a".repeat(5_000).into(), "b".into(), "c".into()];
+        let (shown, omitted) = diagnostics(&errors, 2);
+        assert_eq!(shown.len(), 2);
+        assert_eq!(escaped_len(&shown[0]), MAX_DIAGNOSTIC_CHARS);
+        assert!(shown[0].ends_with(CUT));
+        assert_eq!(shown[1], "b");
+        assert_eq!(omitted, 1);
+        // The whole within its limit.
+        let long: Vec<Box<str>> = (0..4).map(|_| "x".repeat(3_000).into()).collect();
+        let (shown, omitted) = diagnostics(&long, 4);
+        assert_eq!(
+            shown.iter().map(|text| escaped_len(text)).sum::<usize>(),
+            MAX_DIAGNOSTICS_CHARS
+        );
+        assert_eq!((shown.len(), omitted), (3, 1));
+    }
+
+    #[test]
+    fn only_a_failure_that_is_not_kept_is_handed_over() {
+        let failed = |kept| -> SharedLocal {
+            Err(Arc::new(LocalError::Failed {
+                failed: Box::new(build::Failed::now(None, None, false, Value::Null)),
+                kept,
+            }))
+        };
+        assert!(!hands_over(&failed(true)));
+        assert!(hands_over(&failed(false)));
+        assert!(hands_over(&Err(Arc::new(LocalError::Stopped))));
+    }
+
+    #[test]
+    fn a_failure_tells_its_code_and_whether_trying_again_may_work() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let failed = |failure, errors: Vec<Box<str>>| BuildError::Failed {
+            failure,
+            in_documented: true,
+            errors,
+            more_errors: 0,
+            stderr: "the end of stderr".into(),
+        };
+        let unpinned = plan(dir.path(), None);
+        let body = failure_body(&unpinned, &failed(Failure::Other, vec!["error: x".into()]));
+        assert_eq!(body["code"], "build_failed");
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["diagnostics"], json!(["error: x"]));
+        assert!(body.get("stderr").is_none());
+        let body = failure_body(&unpinned, &failed(Failure::Killed, Vec::new()));
+        assert_eq!(body["retryable"], true);
+        assert_eq!(body["stderr"], "the end of stderr");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("killed")),
+            "{body}"
+        );
+        // Those that were not kept are counted with those not shown.
+        let body = failure_body(&unpinned, &BuildError::Failed {
+            failure: Failure::Other,
+            in_documented: true,
+            errors: vec!["a".into(), "b".into(), "c".into()],
+            more_errors: 4,
+            stderr: Box::default(),
+        });
+        assert_eq!(body["diagnostics_omitted"], 5);
+        let body = failure_body(&unpinned, &BuildError::Fetch {
+            failure: Failure::Other,
+            stderr: "error: failed to download".into(),
+        });
+        assert_eq!(
+            (&body["code"], &body["retryable"]),
+            (&json!("build_failed"), &json!(true))
+        );
+        let body = failure_body(&unpinned, &BuildError::Fetch {
+            failure: Failure::GitFetch(GitFetchFailure::Auth),
+            stderr: Box::default(),
+        });
+        assert_eq!(
+            (&body["code"], &body["retryable"], &body["reason"]),
+            (&json!("fetch_failed"), &json!(false), &json!("auth"))
+        );
+        let timed_out = failure_body(
+            &unpinned,
+            &BuildError::Run(RunError::TimedOut(std::time::Duration::from_mins(30))),
+        );
+        assert_eq!(
+            (&timed_out["reason"], &timed_out["retryable"]),
+            (&json!("timeout"), &json!(false))
+        );
+        // What updates the toolchain that was too old.
+        let too_old = |plan: &Plan| failure_body(plan, &failed(Failure::TooOld, Vec::new()));
+        let body = too_old(&unpinned);
+        assert_eq!(body["code"], "toolchain_too_old");
+        assert_eq!(
+            body["suggestions"],
+            json!(["update the project's toolchain, as with `rustup update`"])
+        );
+        assert!(
+            too_old(&plan(dir.path(), Some("nightly-2026-10-01")))["suggestions"][0]
+                .as_str()
+                .is_some_and(|text| text.starts_with("set build.nightly_date"))
+        );
+        fs::write(dir.path().join("rust-toolchain.toml"), "").expect("written");
+        assert_eq!(
+            too_old(&unpinned)["suggestions"],
+            json!(["update the toolchain that the project's rust-toolchain.toml names"])
+        );
+    }
 
     /// The record of a build planned as `planned`, made with `cfg_docsrs` and the features
     /// `features`, by the toolchain `rustc 1.99.1`.

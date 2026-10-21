@@ -25,6 +25,7 @@ const KEYS: &[&str] = &[
     "build.cargo_path",
     "build.cfg_docsrs",
     "build.jobs",
+    "build.max_diagnostics",
     "build.nightly_date",
     "build.rustc_path",
     "build.rustdoc_path",

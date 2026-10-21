@@ -12,8 +12,8 @@ use tokio::time::Instant;
 use super::{ToolState, error_result, get_item, project};
 use crate::{
     data::{
-        build::{self, Bootstrap, BuildError, Plan, TargetDir},
-        cargo::{Failure, RunError},
+        build::{self, Bootstrap, Plan, TargetDir},
+        cargo::Failure,
         crate_file,
         crate_name::CrateName,
         flight::{Doing, Joined},
@@ -285,7 +285,7 @@ fn metadata_failed(name: &CrateName, because: &CargoError) -> CallToolResult {
         CargoError::Run(_) | CargoError::Unreadable(_) => Failure::Other,
     };
     let mut body = json!({
-        "code": project::failure_name(failure),
+        "code": failure.code(),
         "message": format!(
             "{name} is not from crates.io, so its documentation is built here, but cargo metadata \
              failed: {because}"
@@ -389,7 +389,7 @@ fn local_error(what: &str, error: &LocalError) -> CallToolResult {
             false,
             &[],
         ),
-        LocalError::Build(error) => return build_error(what, error),
+        LocalError::Failed { failed, .. } => failed_body(failed),
         LocalError::Load(LoadError::Parse(ParseError::UnsupportedFormat { found, .. })) => {
             unsupported(what, *found)
         },
@@ -454,57 +454,45 @@ fn unsupported(what: &str, found: u32) -> Value {
     })
 }
 
-/// The tool error of a build that failed (requirement R-WS-7).
-fn build_error(what: &str, error: &BuildError) -> CallToolResult {
-    let body = match error {
-        BuildError::Failed {
-            failure,
-            errors,
-            stderr,
-            ..
-        } => {
-            let mut body = json!({
-                "code": project::failure_name(*failure),
-                "message": format!("cargo failed to build the documentation of {what}"),
-                // Killed, as by the OOM killer, it may pass (requirement R-WS-7).
-                "retryable": *failure == Failure::Killed,
-                "suggestions": ["run `cargo doc` in the project's terminal to see the error there"],
-            });
-            if let Some(fields) = body.as_object_mut() {
-                if let Failure::GitFetch(reason) = failure {
-                    fields.insert("reason".to_owned(), json!(reason.as_str()));
-                }
-                if errors.is_empty() {
-                    fields.insert("stderr".to_owned(), json!(stderr));
-                } else {
-                    fields.insert("diagnostics".to_owned(), json!(errors));
-                }
-            }
-            body
-        },
-        BuildError::Run(RunError::TimedOut(_)) => json!({
-            "code": "build_failed",
-            "message": format!("the build of the documentation of {what} took too long: {error}"),
-            "retryable": false,
-            "suggestions": [],
-            "reason": "timeout",
-        }),
-        BuildError::Io(error) => json!({
-            "code": "build_failed",
-            "message": format!("the documentation of {what} could not be published: {error}"),
-            "retryable": true,
-            "suggestions": [],
-        }),
-        BuildError::Run(RunError::NotStarted(_))
-        | BuildError::NoJson(_)
-        | BuildError::Fresh(_)
-        | BuildError::Unreadable(_)
-        | BuildError::NotTheCrate { .. } => json!({
-            "code": "build_failed",
-            "message": format!("the documentation of {what} could not be built: {error}"),
-            "retryable": false,
-            "suggestions": [],
-        }),
-    };
-    error_result(&body)
+/// The error of a build that failed, as its record tells (requirement R-WS-7, decided in M2's D5):
+/// when, and how long until trying again may work, if it may.
+fn failed_body(failed: &build::Failed) -> Value {
+    let mut body = failed.body.clone();
+    if let Some(fields) = body.as_object_mut() {
+        fields.insert("failed_at".to_owned(), json!(failed.time));
+        if let Some(left) = failed.retry_after() {
+            fields.insert(
+                "retry_after_secs".to_owned(),
+                json!(
+                    left.as_secs()
+                        .saturating_add(u64::from(left.subsec_nanos() > 0))
+                ),
+            );
+        }
+    }
+    body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failure_tells_when_and_how_long_until_trying_again() {
+        let body = json!({"code": "build_failed", "retryable": true});
+        let transient = build::Failed::now(Some("k".into()), None, true, body.clone());
+        let told = failed_body(&transient);
+        assert_eq!(told["failed_at"], *transient.time);
+        // Rounded up, as it is less than 30 seconds now.
+        assert!(
+            told["retry_after_secs"]
+                .as_u64()
+                .is_some_and(|left| (1..=30).contains(&left)),
+            "{told}"
+        );
+        let lasting = build::Failed::now(Some("k".into()), None, false, body);
+        let told = failed_body(&lasting);
+        assert_eq!(told["failed_at"], *lasting.time);
+        assert!(told.get("retry_after_secs").is_none(), "{told}");
+    }
 }

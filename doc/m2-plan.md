@@ -941,6 +941,45 @@ Claude Code 2.1.304、Linux で測った。
   4. private な item (`query::local::Rebuilding`): 引けたが、可視性が `pub(in ::query::local)` と表示された。Rust として書けない形で、元のコード (何も付かない private) とも見た目が違う。D6 で直す (含むモジュールと同じなら何も付けず、違えば `pub(in crate::…)`)
 - テストの揺れの直し: ログを書き込み専用のスレッドに渡した後 (直し 2)、stdio のテストがログを読む時点で最後の呼び出しの記録がまだ書かれていないことがあった (全体を走らせたときに 1 度落ちた)。テストの `Server::log` は、送った `tools/call` の数だけ呼び出しの記録がそろうまで (最大 10 秒) 待つ
 
+**D5 の下調べと決定 (2026-10-21)**:
+
+- 下調べ: R-WS-7 は、`build_failed` に error の診断を先頭 N 件 (`build.max_diagnostics` の初期値 2、1 件 3,500 文字・合計 8,000 文字。JSON にエスケープした後の長さ。M2 で実際の診断を見て決める)、JSON の診断が無ければ stderr の末尾を付ける。失敗を一時的 (シグナル・サーバーが止めた・ロック待ちの打ち切り・`cargo fetch --locked` の失敗。`retryable: true`、約 30 秒だけ作り直しを抑える。取り消しで止めたビルドは記録しない) と決定的 (それ以外、`timeout` を含む。R-WS-4 の鍵 (toolchain を含む) で記録し、鍵が変わるか `refresh` まで作り直さずに同じ `build_failed` を `retryable: false`・失敗の時刻・`refresh` の hint 付きで返す) に分ける。依存の取得はビルドの前に `cargo fetch --locked` で分ける。E0658 と cargo の `requires rustc` は `toolchain_too_old`。判定の文言はテストに固定する。§6.4 の `refresh` は、cargo を起動しうる照会のツールの引数で、決定的な失敗の固定を解く (成功した結果は作り直さない)。ほかに解く記録は M2 で決める
+- 今のコード: 診断は 5 件まで、stderr の末尾は 8,000 文字。失敗は記録せず呼ぶたびに作り直す (D4c のつなぎの `REBUILD_FAILED` だけ)。`retryable` は SIGKILL と I/O だけ。`refresh`・`toolchain_too_old`・`cargo fetch --locked` は無い
+- `cargo fetch --locked` は、このリポジトリで温まった状態で 0.11 秒 (オフラインでもオンラインでも)
+- 利用者が 1 件ずつ決めたこと:
+  1. 失敗の記録 (決定的な失敗と、一時的な失敗の 30 秒の抑え) は、ディスクの member の置き場 (`local/v1/…`) に `failed.json` で置く (入力の鍵・toolchain・失敗の種類・時刻・返したエラーの本文)。再起動や別のセッションでも作り直さない。docs.rs の `.miss.json` と同じ流儀。D4c のつなぎ (プロセスの間の記憶) は置き換える
+  2. `refresh` は、頼まれた crate について、失敗と後退を覚えているものをすべて解く: member なら失敗の記録・docsrs と docs.rs の組の後退 (D4d の `planned`)・dep-info の失敗の記憶、docs.rs の crate ならその版の否定キャッシュ (`.miss.json`) と index に名前が無かった記憶。成功した結果は作り直さない
+- 聞かずに決めたこと: 診断の件数と文字数は要件の初期値で入れ、F5 の測定で決め直す。`cargo fetch --locked` は要件どおりビルドの前に (作り直すときだけ)
+- D5 は 2 つに分ける: D5a (失敗の分類と記録、診断の上限、`cargo fetch --locked`、`toolchain_too_old`、文言のテスト)、D5b (引数 `refresh` と、解く記録)
+- D5b の下調べ (2026-10-21): `get_item`・`list_module`・`crate_overview`・`list_methods`・`list_impls`・`list_implementors`・`search_items`・`resolve_version` は `get_item::parse_release` の `ReleaseArguments` を共有し、`list_crates` は別。ローカル機能の無い構成では宣言しない (どのツールも cargo を起動しないので。R-MCP-4・R-ARCH-3)。既定のプロジェクトの外では無視する。決定的な失敗の応答の hints に「原因を直したら `refresh`」を足す (R-WS-7)。決定 2 のほかに、短い失敗の記憶がある: `cargo metadata`・`cargo tree` の失敗 (`Resolver`、ワークスペースごとに 30 秒)、`rustc -vV`・rustup の出力 (`tool::output_kept`、「入っていない」を含めて 60 秒)、std の配布物の取得の失敗 (30 秒)
+- D5b で利用者が 1 件ずつ決めたこと:
+  1. member のビルドが新しい (鍵が合う) まま、前回 docsrs なし・通常の組に後退していたときは、記録の `planned` を消すだけで作り直さない (次に作り直すとき docsrs と docs.rs の組から試す。成功した結果は作り直さない)
+  2. 短い失敗の記憶もすべて解く (`cargo metadata`・`cargo tree`、`rustc -vV`・rustup、std の配布物)。そのワークスペース (std ならその配布物) の分だけ
+  3. 何を解いたかは応答で伝えない (ログに書く)
+  4. 1 つの crate を指さない呼び出し (`crate` なしの `search_items`、`list_crates`) では、ワークスペースの分 (`cargo metadata`・`cargo tree`、`rustc -vV`・rustup) だけを解く。横断する crate の否定キャッシュや失敗の記録は解かない
+  5. 同じ member のビルドが進行中なら、記録を解いてから合流する (進行中の仕事が解く前の記録を読んでいたときだけ、古い失敗が 1 度返りうる)
+
+**D5a (失敗の分類と記録・診断の上限・`cargo fetch`・`toolchain_too_old`。2026-10-21)**:
+
+- 分類 (`data::cargo`・`data::build`): `Failure::TooOld` (`toolchain_too_old`) を足した。cargo の stderr の `requires rustc` (cargo 1.99.1 の文言 `a@0.1.0 requires rustc 1.999` と、古い cargo の `cannot be built because it requires rustc …` をテストに固定) と、`--message-format=json` の error の診断のコード `E0658` で判定する。error の code は `Failure::code` に移した (`mcp::tool::project::failure_name` をやめた)
+- `BuildError::is_transient`: 一時的なのは、cargo の子が殺された (`Killed`)、cargo を起動できなかった、JSON を公開できなかった (I/O)、cargo が残したものがビルドのものでなかった (別のビルドが書きうる: `NotTheCrate`・`Fresh`・`Unreadable`)、`cargo fetch` の失敗 (`fetch_failed`・`lockfile_outdated`・`offline_miss` を除く。§8 の `retryable` に合わせる。fetch の時間切れと起動の失敗も一時的)。ほかはすべて決定的 (ビルドの `timeout` を含む)
+- `cargo fetch --locked` (`build::fetch`): 作り直すとき、ビルドの前に 1 回走らせ、失敗は `BuildError::Fetch`。ビルドが `--target` を渡すときは fetch にも渡す (プロジェクトの `build.target` が target JSON だと、stable の cargo の fetch は `-Zjson-target-spec` を求めて落ちる。stdio のテストで見つかった)
+- 診断の上限 (`query::local::failure_body`): `build.max_diagnostics` (既定 2) 件、1 件 3,500 文字、合計 8,000 文字 (どれも JSON にエスケープした後の長さ)。切ったら `…` を付け、見せなかった件数を `diagnostics_omitted` に書く。JSON の診断が無ければ stderr の末尾を 8,000 文字で付ける。ビルドが覚える診断は 20 件まで (前は 5 件)。`toolchain_too_old` の suggestions は、サーバーが選んだ nightly (`nightly-<日付>` なら `build.nightly_date` を後の日に、`nightly` なら `rustup update nightly`)、`rust-toolchain.toml` (か `rust-toolchain`) がプロジェクトの根か上にあればその更新、無ければ `rustup update`。rustup の有無は見ていない
+- 失敗の記録 (`build::Failed`、member の置き場の `failed.json`): 入力の鍵・`rustc -vV` の toolchain・一時的か・時刻 (RFC 3339 と Unix 秒)・返したエラーの本文。鮮度の判定で、前回の成功と鍵が合わず、記録が今の鍵で、決定的か 30 秒以内の一時的な失敗なら、ビルドも stale の応答もせずに記録の本文を返す (`LocalError::Failed { kept: true }`)。応答には `failed_at` と、一時的なら `retry_after_secs` を足す。書くのは鍵が取れたときだけで、サーバーの終了で止めたビルド (`child::stopping`) は書かない。公開と同じロック (`Cache::lock`) の下で書き、その間に同じ鍵のビルドが公開されていれば書かない。公開に成功したら消す
+- D4c のつなぎ (`REBUILD_FAILED`・`Rebuilding::ended`) は消した。`hands_over` は、鍵の無い成功と、記録できなかった失敗 (鍵が取れない、書けない) だけを次の呼び出しに渡す。記録した失敗は次の呼び出しが記録から見つける (渡すと、直した後に 1 度古い失敗が返るため)
+- docs.rs の組での再試行は、`E0658` の失敗 (`toolchain_too_old`) でも行う (docs.rs の組が nightly の機能を有効にしうる)
+- テスト: 分類の文言、`E0658` の読み取り、記録の有効期限 (別の鍵・30 秒過ぎ・時計が戻ったとき・鍵が無いとき)、記録の読み書きとキャッシュの外に書かないこと、エスケープ後の長さでの切り方、診断の件数と合計の上限、本文の code・`retryable`・`reason`・`toolchain_too_old` の suggestions。結合テスト (local): member のソースを壊すと、前回の成功があっても `build_failed` (`retryable: false`、診断付き) を返して `failed.json` を書き、もう一度呼んでもビルドせず (記録は書き直されない) 同じ本文を返し、直すと作り直して記録を消す
+- レビューで直したこと:
+  - 鍵を取った後、rustdoc が読む前にソースが編集されて失敗すると、編集前の鍵で失敗を固定していた (編集を元に戻すと、もう無いコードの `build_failed` を返し続ける。レビューで再現): 記録する前に、鍵を取ったときのソースが今も同じか (`settled`) を確かめ、変わっていれば記録せず (`kept: false`)、次の呼び出しに 1 度渡す。build script が 3 秒眠る間に壊す編集を入れる結合テストを足し、直しを外すと落ちることを確かめた
+  - `cargo fetch` の時間切れが「ビルドの時間切れ」(決定的) になっていた: fetch の実行の失敗は `BuildError::Fetch` (一時的) に包む
+  - rustc の `aborting due to N previous errors` (code も span も無い error) が診断の 2 枠の 1 つを使っていた: 数えない。覚える 20 件を超えた error も数え、`diagnostics_omitted` に足す
+  - `Killed` の本文に、殺されたことを書く (診断があると stderr の SIGKILL の行が出ないため)
+  - suggestions を失敗の種類で分けた: `fetch_failed` の `auth` は §8 の案内 (URL を疑う、端末で `cargo fetch`、`gh auth setup-git`)、`no_repository`・`no_rev` は URL と rev の確認、`lockfile_outdated`・`offline_miss` にも案内。`refresh` の hint は D5b
+  - テストを足した: 本物の cargo で `rust-version = "1.999"` の member が `toolchain_too_old`、`hands_over` が記録した失敗だけを渡さないこと、同じ鍵の公開があれば記録を書かないこと、一時的かどうかの表、MCP の応答の `failed_at` と `retry_after_secs` (切り上げ)
+- 残したもの (レビューの指摘のうち): ビルドの時間切れが、ほとんど cargo のロック待ちだった場合も決定的になる (要件の「ロック待ちの打ち切りは一時的」とずれる)。`toolchain_too_old` は rustup の無い環境でも `rustup update` を案内する。記録は置き場に 1 つなので、計画やサーバーの版の違うビルドが交互に動くと公開のたびに消える。一時的な失敗が 30 秒で切れて作り直す結合テスト、サーバーの終了で止めたビルドを記録しないことのテストは無い。D5a だけでは鍵が変わらないまま原因を直したとき (システムライブラリ・git の認証・環境変数) に抜ける手段が無いので、D5b と一緒に push する
+- 残したもの: 出力のサニタイズ (R-SEC-7) はまだどこにも無いので、診断は切ってからサニタイズすることになる (除く文字は長さを減らすだけなので、上限は超えない)。`refresh` は D5b。README には失敗を覚えることを D5b で書く
+- README: `build.max_diagnostics` を設定の表に足した
+
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
 - 利用者の指示で、デッドロックと止まって戻らない危険を、コード全体で監査した (サブエージェント、読むだけ。D4b のハングの後)。ロックの循環、ガードを持ったままの `.await` (clippy の `await_holding_lock` も `suspicious` の deny で効いている)、自分の結果を待つ形の循環は無かった。止まって長く戻らない箇所は次のとおり

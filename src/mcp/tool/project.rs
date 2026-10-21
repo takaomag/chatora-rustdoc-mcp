@@ -502,7 +502,7 @@ fn raw_warnings(because: &CargoError) -> Vec<Box<str>> {
     let mut warnings: Vec<Box<str>> = vec![
         format!(
             "cargo metadata failed ({}), so the version is read from Cargo.lock directly",
-            failure_name(failure)
+            failure.code()
         )
         .into(),
     ];
@@ -523,20 +523,10 @@ fn raw_warnings(because: &CargoError) -> Vec<Box<str>> {
         Failure::GitFetch(GitFetchFailure::NoRepository | GitFetchFailure::NoRev)
         | Failure::OfflineMiss
         | Failure::Killed
+        | Failure::TooOld
         | Failure::Other => {},
     }
     warnings
-}
-
-/// The name of a kind of failure, as the error codes write it.
-#[cfg(feature = "local")]
-pub(super) const fn failure_name(failure: Failure) -> &'static str {
-    match failure {
-        Failure::LockfileOutdated => "lockfile_outdated",
-        Failure::OfflineMiss => "offline_miss",
-        Failure::GitFetch(_) => "fetch_failed",
-        Failure::Killed | Failure::Other => "build_failed",
-    }
 }
 
 /// `ambiguous_version` or `ambiguous_crate` (§8), with each candidate and what uses it.
