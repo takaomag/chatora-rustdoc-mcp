@@ -45,6 +45,8 @@ pub enum Doing {
     Fetching,
     /// Parsing and indexing it.
     Indexing,
+    /// Waiting for a lock that another cargo holds, as that of the package cache.
+    WaitingForLock,
 }
 
 impl Doing {
@@ -54,6 +56,17 @@ impl Doing {
         match self {
             Self::Fetching => "fetching",
             Self::Indexing => "indexing",
+            Self::WaitingForLock => "waiting_for_lock",
+        }
+    }
+
+    /// What it is, for people: `fetching serde 1.0.228`.
+    #[must_use]
+    pub const fn as_words(self) -> &'static str {
+        match self {
+            Self::Fetching => "fetching",
+            Self::Indexing => "indexing",
+            Self::WaitingForLock => "waiting for a cargo lock for",
         }
     }
 }
@@ -78,10 +91,10 @@ impl Stage {
     /// What the work does now.
     #[must_use]
     pub fn get(&self) -> Doing {
-        if self.0.load(Ordering::Relaxed) == Doing::Indexing as u8 {
-            Doing::Indexing
-        } else {
-            Doing::Fetching
+        match self.0.load(Ordering::Relaxed) {
+            doing if doing == Doing::Indexing as u8 => Doing::Indexing,
+            doing if doing == Doing::WaitingForLock as u8 => Doing::WaitingForLock,
+            _ => Doing::Fetching,
         }
     }
 }
@@ -148,12 +161,45 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
     where
         F: Future<Output = T> + Send + 'static,
     {
+        self.joined(key, what, Some(until), start).await
+    }
+
+    /// [`Self::join`] without a deadline: the result, or `None` when the work ended without one.
+    pub async fn wait<F>(
+        &self,
+        key: &str,
+        what: &str,
+        start: impl FnOnce(Arc<Stage>) -> F,
+    ) -> Option<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+    {
+        match self.joined(key, what, None, start).await {
+            Joined::Done(result) => Some(result),
+            Joined::Ended | Joined::Going(_) => None,
+        }
+    }
+
+    /// [`Self::join`], with no deadline when `until` is `None`.
+    async fn joined<F>(
+        &self,
+        key: &str,
+        what: &str,
+        until: Option<Instant>,
+        start: impl FnOnce(Arc<Stage>) -> F,
+    ) -> Joined<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+    {
         let flight = self.flight(key, start);
         let _waiting = super::waits::waiting(what, &flight.stage);
         let mut done = flight.done.clone();
-        let waited = tokio::time::timeout_at(until, done.wait_for(Option::is_some))
-            .await
-            .map(|done| done.ok().and_then(|done| done.clone()));
+        let ended = done.wait_for(Option::is_some);
+        let waited = match until {
+            Some(until) => tokio::time::timeout_at(until, ended).await,
+            None => Ok(ended.await),
+        }
+        .map(|done| done.ok().and_then(|done| done.clone()));
         match waited {
             Ok(Some(result)) => Joined::Done(result),
             Ok(None) => Joined::Ended,

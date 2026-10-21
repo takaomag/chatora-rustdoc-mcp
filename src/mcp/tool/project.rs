@@ -8,10 +8,13 @@ use std::path::Path;
 use rmcp::model::CallToolResult;
 #[cfg(feature = "local")]
 use serde_json::json;
+use tokio::time::Instant;
 
 use super::ToolState;
 #[cfg(feature = "local")]
 use super::{ErrorChain, error_result};
+#[cfg(feature = "local")]
+use crate::data::flight::{Doing, Joined};
 #[cfg(feature = "local")]
 use crate::data::{
     cargo::{Failure, GitFetchFailure},
@@ -36,6 +39,10 @@ pub(super) enum InProject {
     /// The version cannot be decided: the tool error to return.
     #[cfg(feature = "local")]
     Error(Box<CallToolResult>),
+    /// cargo is still resolving the packages, as this says, past the deadline of the call; it goes
+    /// on (requirement R-WS-6). Where the project came from is given.
+    #[cfg(feature = "local")]
+    Going(Doing, &'static str),
 }
 
 /// A package of the project that a crate name means.
@@ -61,6 +68,7 @@ pub(super) async fn version_in_project(
     state: &ToolState,
     name: &CrateName,
     project: Option<&Path>,
+    until: Instant,
 ) -> InProject {
     let (workspace, project_from) = match workspace(state.project.as_ref(), project) {
         Ok(Some(found)) => found,
@@ -71,9 +79,13 @@ pub(super) async fn version_in_project(
         },
         Err(error) => return InProject::Error(error),
     };
-    let resolution = match state.resolver.resolve(&workspace).await {
-        Ok(resolution) => resolution,
-        Err(error) => return InProject::Error(Box::new(resolve_error(&workspace, &error))),
+    let resolution = match state.resolver.resolve_until(&workspace, until).await {
+        Joined::Done(Ok(resolution)) => resolution,
+        Joined::Done(Err(error)) => {
+            return InProject::Error(Box::new(resolve_error(&workspace, &error)));
+        },
+        Joined::Ended => return InProject::Error(Box::new(super::get_item::stopped())),
+        Joined::Going(doing) => return InProject::Going(doing, project_from.as_str()),
     };
     let mut warnings = Vec::new();
     let resolved_from = match &*resolution {
@@ -138,9 +150,13 @@ pub(super) async fn crates_io_in_project(
     state: &ToolState,
     name: &CrateName,
     project: Option<&Path>,
+    until: Instant,
 ) -> Option<FromCratesIo> {
     let (workspace, project_from) = workspace(state.project.as_ref(), project).ok()??;
-    let resolution = state.resolver.resolve(&workspace).await.ok()?;
+    // Past the deadline, the lookup goes on without it; the resolution goes on for later calls.
+    let Joined::Done(Ok(resolution)) = state.resolver.resolve_until(&workspace, until).await else {
+        return None;
+    };
     // The build's features are known only from `cargo metadata` and `cargo tree`.
     let Resolution::Metadata { .. } = &*resolution else {
         return None;
@@ -179,6 +195,7 @@ pub(super) async fn version_in_project(
     _state: &ToolState,
     _name: &CrateName,
     project: Option<&Path>,
+    _until: Instant,
 ) -> InProject {
     let mut warnings: Vec<Box<str>> = vec![
         "this server is built without local features, so it does not read the project; the \
@@ -368,6 +385,41 @@ fn project_not_found(why: &str, candidates: &[String]) -> CallToolResult {
     }))
 }
 
+/// The response while cargo resolves the packages of the project, past the deadline of the call, as
+/// `doing` says (requirement R-OUT-9). The version is not known yet, so `provenance` has none.
+#[cfg(feature = "local")]
+pub(super) fn resolving(
+    provenance: serde_json::Map<String, serde_json::Value>,
+    doing: Doing,
+    warnings: &[Box<str>],
+) -> CallToolResult {
+    let being = match doing {
+        Doing::WaitingForLock => {
+            "cargo waits for a lock that another cargo holds, to resolve the project's packages"
+        },
+        Doing::Fetching | Doing::Indexing => {
+            "cargo is fetching the project's dependencies, to resolve the project's packages"
+        },
+    };
+    super::get_item::building_response(provenance, doing, being, warnings)
+}
+
+/// [`resolving`] for a lookup of the crate `name` for `target` in the project from
+/// `project_from`.
+#[cfg(feature = "local")]
+pub(super) fn resolving_crate(
+    name: &CrateName,
+    target: &TargetTriple,
+    (doing, project_from): (Doing, &str),
+    warnings: &[Box<str>],
+) -> CallToolResult {
+    let mut provenance = serde_json::Map::new();
+    provenance.insert("crate".to_owned(), json!(name.as_str()));
+    provenance.insert("project_from".to_owned(), json!(project_from));
+    provenance.insert("target".to_owned(), json!(target.as_str()));
+    resolving(provenance, doing, warnings)
+}
+
 /// The tool error for a workspace whose packages cannot be resolved.
 #[cfg(feature = "local")]
 pub(super) fn resolve_error(workspace: &Workspace, error: &ResolveError) -> CallToolResult {
@@ -388,6 +440,7 @@ pub(super) fn resolve_error(workspace: &Workspace, error: &ResolveError) -> Call
             "retryable": false,
             "suggestions": ["check Cargo.lock with `cargo fetch`", "or give the version, as crate@version"],
         })),
+        ResolveError::Stopped => super::get_item::stopped(),
     }
 }
 

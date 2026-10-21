@@ -50,7 +50,7 @@ impl Waits {
     pub fn message(&self) -> Option<String> {
         let waits = self.0.lock();
         let first = waits.first()?;
-        let first = format!("{} {}", first.stage.get().as_str(), first.what);
+        let first = format!("{} {}", first.stage.get().as_words(), first.what);
         Some(match waits.len() {
             1 => first,
             many => format!("loading {many} crates: {first}, …"),

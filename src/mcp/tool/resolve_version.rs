@@ -63,7 +63,7 @@ pub(super) fn definition() -> Tool {
     }));
     Tool::new(NAME, DESCRIPTION, input_schema)
         .with_title("Resolve a crate version")
-        .with_raw_output_schema(Arc::new(output_schema()))
+        .with_raw_output_schema(Arc::new(super::with_building(output_schema())))
         .with_annotations(super::annotations())
 }
 
@@ -95,7 +95,9 @@ fn output_schema() -> JsonObject {
                     },
                     "target": { "type": "string" },
                 },
-                "required": ["source", "crate", "version", "target"],
+                // Before the version is known, a response while it is resolved has no `version`
+                // or `source` (requirement R-OUT-9).
+                "required": ["crate", "target"],
             },
             "warnings": strings,
             "data": {
@@ -152,6 +154,7 @@ struct Decided {
 /// Decides the version as `get_item` does (requirements R-VR-1 to R-VR-3), and tells what
 /// crates.io and docs.rs have of it.
 pub(super) async fn execute(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallToolResult {
+    let until = state.until();
     if get_item::std_crate(&arguments.name).is_some() {
         return super::tool_error(
             "invalid_argument",
@@ -179,7 +182,7 @@ pub(super) async fn execute(arguments: ReleaseArguments, state: Arc<ToolState>) 
             #[cfg(feature = "local")]
             found: None,
         },
-        None => match project::version_in_project(&state, &name, project.as_deref()).await {
+        None => match project::version_in_project(&state, &name, project.as_deref(), until).await {
             #[cfg(feature = "local")]
             InProject::Found(found) => {
                 warnings.extend(found.warnings.iter().cloned());
@@ -198,6 +201,10 @@ pub(super) async fn execute(arguments: ReleaseArguments, state: Arc<ToolState>) 
             },
             #[cfg(feature = "local")]
             InProject::Error(error) => return *error,
+            #[cfg(feature = "local")]
+            InProject::Going(doing, project_from) => {
+                return project::resolving_crate(&name, &target, (doing, project_from), &warnings);
+            },
         },
     };
     // A package of the project that is not from crates.io is not looked for there: a crate of

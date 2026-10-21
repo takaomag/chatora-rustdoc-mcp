@@ -499,7 +499,7 @@ Claude Code 2.1.304、Linux で測った。
   - 段は、選んで取る間が `fetching`、アーカイブを作る間が `indexing`
   - アーカイブを先に 3 つとも作るのは、std の path のほとんどが alloc か core の re-export で、照会の中で作ると期限が効かないため。作れなかったものはログに書き、照会がもう一度作ってその理由を返す
   - get_item (と同じ経路のツール) と、std の横断の検索の両方がこの仕事を待つ
-- 応答: nightly が決まる前なので、provenance は `source: std`・`crate`・`target` だけで `version` が無い。R-OUT-9 が版の解決の前は `version`・`source` を省けるとしているので、outputSchema の provenance の必須を `crate`・`target` だけにした。hints は「std for <target> is being fetched from the Rust distribution server」など。C3a の `building` を、provenance と案内の文を渡す形 (`building_response`) に分けた
+- 応答: nightly が決まる前なので、provenance は `source: std`・`crate`・`target` だけで `version` が無い。R-OUT-9 が版の解決の前は `version`・`source` を省けるとしているので、outputSchema の provenance の必須を `crate`・`target` だけにした。hints は「`the documentation of std for <target> is being fetched from the Rust distribution server`」など。C3a の `building` を、provenance と案内の文を渡す形 (`building_response`) に分けた
 - 展開中のロックの隙間 (C2b と同じ形): 配布物の展開は blocking のスレッドで最後まで走るのに、ディレクトリのロックは待つタスクが abort されると先に外れていた。ロックを展開の作業に渡し、展開が終わってから外すようにした
 - テスト:
   - `std_json`: 遅いローカルの配布物 (要約とアーカイブを 300 ms ずつ遅らせる) で、100 ms の期限の呼び出しは `Going(Fetching)`。後の呼び出しは配布物から選んだものを受け、std のアーカイブは仕事が作っていて、要求は要約とアーカイブの 2 回
@@ -508,6 +508,20 @@ Claude Code 2.1.304、Linux で測った。
 - テストの道具: `test_http::serve_sequence_after` (順に答える偽のサーバーを、各応答の前に待たせる) と、`dist::tests::setup_after`
 - 実測 (この PC、release ビルド、空のキャッシュ、rustup の見えない PATH で配布物から): `std::vec::Vec` の初回は 3.0 秒 (要約の取得・アーカイブの取得と展開・3 つのアーカイブの作成)。続く `core::option::Option` は 0 秒で、先に作った core のアーカイブが使われた。既定の待ち 20 秒に収まる
 - 利用者が、アーカイブを 3 つとも先に作る作りのままとすると決めた (代案は頼まれた crate だけ先に作ること。初回は速いが、re-export をたどる先の crate の作成に期限が効かない)
+
+**C3c-3 (`cargo metadata` の時間の上限。2026-10-21)**:
+
+- `Resolver` を `Flights` の共有の仕事にした。今まではワークスペースのルートごとの Mutex で直列に待ち、`cargo metadata` は呼び出しの future の中で走っていたので、取り消すと cargo も止まり、次の呼び出しが最初からやり直していた。中身 (オフラインか・`$CARGO_HOME`・覚えた結果) を `Inner` にまとめて `Arc` で仕事に渡す。`resolve` は期限なしで待ち (`Flights::wait`)、`resolve_until` は期限まで待つ。覚えた結果を使える呼び出しも仕事を通る (すぐ終わる)
+- 段: cargo の stderr から分かる状態 (`cargo::Activity`。B2・B4 で作り、製品では使っていなかった) を仕事の段につないだ。ロック待ちは `waiting_for_lock` (`Doing::WaitingForLock` を足した。R-OUT-9 の値)、それ以外は `fetching` (`cargo metadata` で時間がかかるのは、ほとんどが依存の取得のため)
+- 期限を過ぎたら、版が決まる前の `status: building` を返す。provenance は `crate`・`project_from`・`target` で、`version`・`source` が無い
+  - 対象のツールは、get_item の経路 (版を省いたとき)、`resolve_version`、`list_crates` (provenance は `source: project`・`workspace`・`project_from`・`target`)、依存の横断の検索 (`target`・`project_from`)
+  - `resolve_version` と `list_crates` の outputSchema も `with_building` を通し、`resolve_version` の provenance の必須を `crate`・`target` にした。`with_building` は `hints` が無ければ足す
+  - 版を明示したときに `enabled_in_project` のためにプロジェクトを読む経路 (`crates_io_in_project`) は、期限を過ぎたらプロジェクトの情報なしで続ける (解決は裏で続く)
+  - feature の組 (`cargo tree`) と、re-export の先の版を決める経路 (`in_project_build`) は、依存がそろった後で速いので、期限の外のままにした
+- `ResolveError` に `Stopped` (仕事が結果なしに終わった) を足し、エラーを `Arc` で共有するようにした
+- テスト:
+  - `CARGO_HOME` を一時ディレクトリにした子プロセスで、パッケージキャッシュのロックを持ったまま解決させると、200 ms の期限の呼び出しが `Going(WaitingForLock)` を受け、ロックを外すと裏で続いた仕事が `cargo metadata` の結果を返す
+  - 版が決まる前の応答 (get_item の系統・`resolve_version`・`list_crates`・横断の検索) が、それぞれの outputSchema に収まる (std の C3c-2 のテストを `fits_the_schemas` に一般化した)
 
 ### 6.5 M2d
 

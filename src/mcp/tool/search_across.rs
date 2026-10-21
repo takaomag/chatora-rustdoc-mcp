@@ -100,9 +100,16 @@ pub(super) async fn dependencies(
             },
             Err(error) => return *error,
         };
-    let resolution = match state.resolver.resolve(&workspace).await {
-        Ok(resolution) => resolution,
-        Err(error) => return super::project::resolve_error(&workspace, &error),
+    let resolution = match state.resolver.resolve_until(&workspace, until).await {
+        Joined::Done(Ok(resolution)) => resolution,
+        Joined::Done(Err(error)) => return super::project::resolve_error(&workspace, &error),
+        Joined::Ended => return get_item::stopped(),
+        Joined::Going(doing) => {
+            let mut provenance = Map::new();
+            provenance.insert("target".to_owned(), json!(target.as_str()));
+            provenance.insert("project_from".to_owned(), json!(project_from.as_str()));
+            return super::project::resolving(provenance, doing, &warnings);
+        },
     };
     let sets = match state.resolver.features(&workspace, &target).await {
         Ok(sets) => Some(sets),

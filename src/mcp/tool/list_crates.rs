@@ -14,8 +14,10 @@ use super::{
 use crate::data::{
     cache::sha256_hex,
     features::FeatureSets,
+    flight::Joined,
     metadata::Resolution,
     packages::{PackageGraph, ProjectPackage, Source},
+    project::Workspace,
     target::TargetTriple,
 };
 
@@ -86,7 +88,7 @@ pub(super) fn definition() -> Tool {
     }));
     Tool::new(NAME, DESCRIPTION, input_schema)
         .with_title("List the project's crates")
-        .with_raw_output_schema(Arc::new(output_schema()))
+        .with_raw_output_schema(Arc::new(super::with_building(output_schema())))
         .with_annotations(super::annotations())
 }
 
@@ -240,8 +242,50 @@ pub(super) fn parse_arguments(
     })
 }
 
+/// The features of the packages in the build of `workspace` for `target`, or `None` with a warning
+/// when the build is not known though `cargo metadata` ran (`resolved_from` is `cargo_lock`).
+async fn build_sets(
+    state: &ToolState,
+    workspace: &Workspace,
+    target: &TargetTriple,
+    resolved_from: &str,
+    warnings: &mut Vec<Value>,
+) -> Option<Arc<FeatureSets>> {
+    match state.resolver.features(workspace, target).await {
+        Ok(sets) => Some(sets),
+        Err(error) => {
+            if resolved_from == "cargo_lock" {
+                warnings.push(json!(format!(
+                    "which crates the build for {target} uses is not known: {}",
+                    super::ErrorChain(&error)
+                )));
+            }
+            None
+        },
+    }
+}
+
+/// The provenance of the list while cargo resolves the packages of `workspace` (requirement
+/// R-OUT-9).
+fn resolving_provenance(
+    workspace: &Workspace,
+    project_from: &str,
+    target: &TargetTriple,
+) -> Map<String, Value> {
+    let mut provenance = Map::new();
+    provenance.insert("source".to_owned(), json!("project"));
+    provenance.insert(
+        "workspace".to_owned(),
+        json!(workspace.root.to_string_lossy()),
+    );
+    provenance.insert("project_from".to_owned(), json!(project_from));
+    provenance.insert("target".to_owned(), json!(target.as_str()));
+    provenance
+}
+
 /// Lists the project's crates.
 pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
+    let until = state.until();
     let (workspace, project_from) =
         match super::project::workspace(state.project.as_ref(), arguments.project.as_deref()) {
             Ok(Some(found)) => found,
@@ -259,9 +303,14 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
         Some(target) => (target.clone(), Vec::new()),
         None => super::project::default_target(&state, arguments.project.as_deref()).await,
     };
-    let resolution = match state.resolver.resolve(&workspace).await {
-        Ok(resolution) => resolution,
-        Err(error) => return super::project::resolve_error(&workspace, &error),
+    let resolution = match state.resolver.resolve_until(&workspace, until).await {
+        Joined::Done(Ok(resolution)) => resolution,
+        Joined::Done(Err(error)) => return super::project::resolve_error(&workspace, &error),
+        Joined::Ended => return super::get_item::stopped(),
+        Joined::Going(doing) => {
+            let provenance = resolving_provenance(&workspace, project_from.as_str(), &target);
+            return super::project::resolving(provenance, doing, &target_warnings);
+        },
     };
     let mut warnings: Vec<Value> = target_warnings
         .iter()
@@ -277,18 +326,7 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
             "cargo_lock_raw"
         },
     };
-    let sets = match state.resolver.features(&workspace, &target).await {
-        Ok(sets) => Some(sets),
-        Err(error) => {
-            if resolved_from == "cargo_lock" {
-                warnings.push(json!(format!(
-                    "which crates the build for {target} uses is not known: {}",
-                    super::ErrorChain(&error)
-                )));
-            }
-            None
-        },
-    };
+    let sets = build_sets(&state, &workspace, &target, resolved_from, &mut warnings).await;
     let graph = PackageGraph::new(&resolution);
     let context = Listing {
         graph: &graph,

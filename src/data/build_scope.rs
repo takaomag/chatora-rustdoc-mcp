@@ -19,6 +19,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use super::{
@@ -85,7 +86,7 @@ impl BuildScope {
 pub enum ScopeError {
     /// The packages cannot be resolved.
     #[error(transparent)]
-    Resolve(#[from] ResolveError),
+    Resolve(#[from] Arc<ResolveError>),
     /// `cargo metadata` failed, so `cargo tree`, which resolves the same way, would fail, too.
     #[error("cargo metadata failed, so the scope is not known")]
     NoMetadata,

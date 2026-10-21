@@ -779,25 +779,15 @@ async fn resolve(
         ..
     } = arguments;
     // Without a version, the project decides it (requirement R-VR-2), or else it is the latest.
-    #[cfg(feature = "local")]
-    let mut from_project = None;
-    let spec = match version {
-        Some(spec) => spec,
-        None => match project::version_in_project(state, &name, project.as_deref()).await {
-            #[cfg(feature = "local")]
-            InProject::Found(found) => {
-                warnings.extend(found.warnings.iter().cloned());
-                let version = found.package.version.clone();
-                from_project = Some(found);
-                VersionSpec::Exact(version)
-            },
-            InProject::Elsewhere(elsewhere) => {
-                warnings.extend(elsewhere);
-                VersionSpec::Latest
-            },
-            #[cfg(feature = "local")]
-            InProject::Error(error) => return Err(error),
-        },
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(unused_variables, reason = "only a project decides it")
+    )]
+    let (spec, from_project) = if let Some(spec) = version {
+        (spec, FromProject::default())
+    } else {
+        let in_project = project::version_in_project(state, &name, project.as_deref(), until).await;
+        decided_in_project(in_project, &name, &target, &mut warnings)?
     };
     // A package of the project that is not from crates.io is not looked for there: docs.rs does
     // not have it, even when crates.io has a crate of that name (requirement R-VR-2).
@@ -814,7 +804,7 @@ async fn resolve(
     // if it has the release from crates.io (requirement R-VR-1), which the index tells below.
     #[cfg(feature = "local")]
     let same_release = match from_project {
-        None => same_release(state, &name, project.as_deref(), &spec).await,
+        None => same_release(state, &name, project.as_deref(), &spec, until).await,
         Some(_) => None,
     };
     #[cfg(feature = "local")]
@@ -878,6 +868,60 @@ async fn resolve(
     Ok((request, warnings))
 }
 
+/// The project's package that decided the version, when it did.
+#[cfg(feature = "local")]
+type FromProject = Option<Box<project::Found>>;
+/// Without local features, no project decides the version.
+#[cfg(not(feature = "local"))]
+type FromProject = ();
+
+/// The version that `in_project` tells for `name`, the project's or else the latest, and the
+/// package that decided it; or the response to return, while the project is being resolved for
+/// `target` or when it cannot be.
+#[cfg_attr(
+    not(feature = "local"),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "only a project gives a response to return"
+    )
+)]
+fn decided_in_project(
+    in_project: InProject,
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(unused_variables, reason = "for a project")
+    )]
+    name: &CrateName,
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(unused_variables, reason = "for a project")
+    )]
+    target: &TargetTriple,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<(VersionSpec, FromProject), Box<CallToolResult>> {
+    match in_project {
+        #[cfg(feature = "local")]
+        InProject::Found(found) => {
+            warnings.extend(found.warnings.iter().cloned());
+            let version = found.package.version.clone();
+            Ok((VersionSpec::Exact(version), Some(found)))
+        },
+        InProject::Elsewhere(elsewhere) => {
+            warnings.extend(elsewhere);
+            Ok((VersionSpec::Latest, FromProject::default()))
+        },
+        #[cfg(feature = "local")]
+        InProject::Error(error) => Err(error),
+        #[cfg(feature = "local")]
+        InProject::Going(doing, project_from) => Err(Box::new(project::resolving_crate(
+            name,
+            target,
+            (doing, project_from),
+            warnings,
+        ))),
+    }
+}
+
 /// The request for `name` at the exact `version` whose JSON is cached, without the crates.io
 /// index.
 fn cached_request(
@@ -914,8 +958,9 @@ async fn same_release(
     name: &CrateName,
     project: Option<&std::path::Path>,
     spec: &VersionSpec,
+    until: Instant,
 ) -> Option<project::FromCratesIo> {
-    let same = project::crates_io_in_project(state, name, project).await?;
+    let same = project::crates_io_in_project(state, name, project, until).await?;
     let may_be = match spec {
         VersionSpec::Exact(version) => same
             .packages
@@ -1364,12 +1409,18 @@ pub(super) const RETRY_AFTER_SECS: u64 = 10;
 /// work that goes on after the call stopped waiting for it (requirements R-ARCH-6 and R-OUT-9):
 /// `status: building`, why, when to call again, and the provenance of what was asked for.
 fn building(arguments: &Request, doing: Doing, warnings: &[Box<str>]) -> CallToolResult {
-    let what = match doing {
-        Doing::Fetching => "fetched from docs.rs",
-        Doing::Indexing => "indexed",
-    };
-    let being = format!("{} {} is being {what}", arguments.name, arguments.version);
+    let what = format!("{} {}", arguments.name, arguments.version);
+    let being = being(&what, doing, "docs.rs");
     building_response(docs_rs_provenance(arguments), doing, &being, warnings)
+}
+
+/// What `what` is going through, for people: fetched from `from`, indexed, or waiting for cargo.
+pub(super) fn being(what: &str, doing: Doing, from: &str) -> String {
+    match doing {
+        Doing::Fetching => format!("{what} is being fetched from {from}"),
+        Doing::Indexing => format!("{what} is being indexed"),
+        Doing::WaitingForLock => format!("{what} waits for a lock that another cargo holds"),
+    }
 }
 
 /// The response while the JSON of std for `target` is being chosen, fetched or indexed, before its
@@ -1384,11 +1435,11 @@ pub(super) fn std_building(
     provenance.insert("source".to_owned(), json!("std"));
     provenance.insert("crate".to_owned(), json!(name));
     provenance.insert("target".to_owned(), json!(target.as_str()));
-    let what = match doing {
-        Doing::Fetching => "fetched from the Rust distribution server",
-        Doing::Indexing => "indexed",
-    };
-    let being = format!("the documentation of std for {target} is being {what}");
+    let being = being(
+        &format!("the documentation of std for {target}"),
+        doing,
+        "the Rust distribution server",
+    );
     building_response(provenance, doing, &being, warnings)
 }
 
@@ -1412,7 +1463,7 @@ fn docs_rs_provenance(arguments: &Request) -> Map<String, Value> {
 
 /// The response with `provenance` while what it is of is being fetched or indexed, as `doing`
 /// says, and `being` tells people (requirement R-OUT-9).
-fn building_response(
+pub(super) fn building_response(
     provenance: Map<String, Value>,
     doing: Doing,
     being: &str,

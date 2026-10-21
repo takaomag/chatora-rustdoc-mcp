@@ -597,6 +597,12 @@ pub(super) fn with_building(schema: JsonObject) -> JsonObject {
         }
         *properties = with;
     }
+    // The response tells when to call again.
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        properties
+            .entry("hints")
+            .or_insert_with(|| json!({ "type": "array", "items": { "type": "string" } }));
+    }
     schema.insert("required".to_owned(), json!(["provenance"]));
     schema
 }
@@ -721,28 +727,29 @@ mod tests {
         assert_eq!(names(&without_project(tool)), expected);
     }
 
-    /// The response while std is being fetched, whose provenance has no version yet, has only
-    /// what the `outputSchema` of the tools that may return it declare, and what they require
-    /// (requirement R-OUT-9).
-    #[test]
-    fn a_response_while_std_is_fetched_fits_the_schemas() {
-        let target = "x86_64-unknown-linux-gnu".parse().expect("a triple");
-        let result =
-            get_item::std_building("std", &target, crate::data::flight::Doing::Fetching, &[]);
+    /// The tools that look one crate up, which share the shape of their responses while it is
+    /// being fetched.
+    const ONE_CRATE: [&str; 7] = [
+        get_item::NAME,
+        crate_overview::NAME,
+        list_module::NAME,
+        list_impls::NAME,
+        list_methods::NAME,
+        list_implementors::NAME,
+        search_items::NAME,
+    ];
+
+    /// Checks that `result` has only what the `outputSchema` of each of `tools` declares, at its
+    /// root and in its provenance, and what they require.
+    #[track_caller]
+    fn fits_the_schemas(result: CallToolResult, tools: &[&str]) {
         let response = result.structured_content.expect("structured");
-        let tools = [
-            get_item::NAME,
-            crate_overview::NAME,
-            list_module::NAME,
-            list_impls::NAME,
-            list_methods::NAME,
-            list_implementors::NAME,
-            search_items::NAME,
-        ];
+        let mut checked = 0_usize;
         for tool in definitions()
             .into_iter()
             .filter(|tool| tools.contains(&tool.name.as_ref()))
         {
+            checked = checked.saturating_add(1);
             let schema = Value::Object((*tool.output_schema.expect("a schema")).clone());
             for (object, schema) in [
                 (&response, &schema),
@@ -766,6 +773,45 @@ mod tests {
                 }
             }
         }
+        assert_eq!(checked, tools.len(), "every tool is in this build");
+    }
+
+    /// The response while std is being fetched, whose provenance has no version yet, fits the
+    /// tools that may return it (requirement R-OUT-9).
+    #[test]
+    fn a_response_while_std_is_fetched_fits_the_schemas() {
+        let target = "x86_64-unknown-linux-gnu".parse().expect("a triple");
+        let result =
+            get_item::std_building("std", &target, crate::data::flight::Doing::Fetching, &[]);
+        fits_the_schemas(result, &ONE_CRATE);
+    }
+
+    /// The responses while cargo resolves the project, before the version is known, fit the tools
+    /// that may return them (requirement R-OUT-9).
+    #[cfg(feature = "local")]
+    #[test]
+    fn responses_while_the_project_is_resolved_fit_the_schemas() {
+        use crate::data::flight::Doing;
+        let target = "x86_64-unknown-linux-gnu".parse().expect("a triple");
+        let name = "serde".parse().expect("a crate name");
+        let going = (Doing::WaitingForLock, "claude_project_dir");
+        let mut tools = ONE_CRATE.to_vec();
+        tools.push(resolve_version::NAME);
+        fits_the_schemas(project::resolving_crate(&name, &target, going, &[]), &tools);
+        let mut provenance = serde_json::Map::new();
+        provenance.insert("source".to_owned(), json!("project"));
+        provenance.insert("workspace".to_owned(), json!("/w"));
+        provenance.insert("project_from".to_owned(), json!("claude_project_dir"));
+        provenance.insert("target".to_owned(), json!("x86_64-unknown-linux-gnu"));
+        fits_the_schemas(project::resolving(provenance, Doing::Fetching, &[]), &[
+            list_crates::NAME,
+        ]);
+        let mut provenance = serde_json::Map::new();
+        provenance.insert("target".to_owned(), json!("x86_64-unknown-linux-gnu"));
+        provenance.insert("project_from".to_owned(), json!("claude_project_dir"));
+        fits_the_schemas(project::resolving(provenance, Doing::Fetching, &[]), &[
+            search_items::NAME,
+        ]);
     }
 
     #[tokio::test]
