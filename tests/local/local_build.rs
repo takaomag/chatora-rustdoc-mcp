@@ -302,6 +302,7 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
     let until = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
     // A member whose build `--cfg docsrs` breaks is built without it, with a warning (decided in
     // M2's D3).
+    // With the files of its package, so that an edit makes it built again.
     let wanted = |name: &str| LocalWanted {
         plan: plan(metadata, &workspace.root, &cache, name, None),
         target: host.clone(),
@@ -310,7 +311,10 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
         docs_rs_features: None,
         warnings: Vec::new(),
         input_files: Vec::new(),
-        input_packages: Vec::new(),
+        input_packages: build::source_packages(
+            metadata,
+            build::member_crate(metadata, name).expect("a member").0,
+        ),
     };
     let without = |built: &LocalBuilt| {
         !built.record.cfg_docsrs
@@ -325,7 +329,18 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
         panic!("built without --cfg docsrs");
     };
     assert!(without(&broken), "{:?}", broken.archived.warnings);
-    // And so from then on: with sources that build with it, what is only for docs.rs is not there.
+    // What it was planned with, by which a build of the same plan begins without it.
+    assert!(
+        broken
+            .record
+            .planned
+            .as_ref()
+            .is_some_and(|planned| planned.cfg_docsrs),
+        "{:?}",
+        broken.record.planned
+    );
+    // And so from then on, as the build before tells (decided in M2's D4): built again, with
+    // sources that build with it, what is only for docs.rs is not there.
     fs::write(
         workspace.root.join("broken/src/lib.rs"),
         "/// A function.\npub fn works() {}\n\n/// Only for docs.rs.\n#[cfg(docsrs)]\npub fn docsrs_only() {}\n",
@@ -335,6 +350,7 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
     else {
         panic!("built");
     };
+    assert_ne!(again.record.sha256, broken.record.sha256, "built again");
     assert!(without(&again), "{:?}", again.archived.warnings);
     assert!(!items_at(&again.json).contains("docsrs_only"));
     // An error of the crate's own is not taken for one of `--cfg docsrs`: once it is fixed, the

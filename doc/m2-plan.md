@@ -919,6 +919,28 @@ Claude Code 2.1.304、Linux で測った。
   - テスト: 作り直しの間に足した item は `status: building`。作り直しが上限より長くかかって失敗すると `build_failed` が届く (2 回続けて通った)
 - 残したもの: stale の member から re-export を追って別の crate に移った応答には、stale の印が付かない (warning に元の crate 名と built_at が出る)。stale の `LocalBuilt.json` は、作り直しで上書きされたファイルを指しうる (今はテストでしか読まない)
 
+**D4d (壊れた記録を前回の記録で。2026-10-21)**:
+
+- 決定のとおり、`--cfg docsrs` と docs.rs の組で壊れたことは、プロセスの中の記憶 (`DOCSRS_BROKE`・`DOCS_RS_FEATURES_BROKE`、package id と toolchain が鍵) をやめ、置き場の前回のビルドの記録で判断する
+  - 記録に `planned` (再試行で変わる前の計画: `--cfg docsrs` の設定・`rustdoc-args` の cfg・docs.rs の組) を足した
+  - 作り直すとき、前回のビルドの `planned` が今の計画と同じで、`rustc -vV` の toolchain とサーバーが選んだ toolchain も同じなら、前回が docsrs なしで終わっていれば最初から docsrs なしで、docs.rs の組で終わっていなければ (`features_requested` が違えば) 最初から通常の組でビルドする (`query::local::broke`)
+  - 前回が無い、`planned` の無い前の記録、計画か toolchain が違うときは、試し直す。crate 自身のエラーで全部失敗したときは何も公開しないので、取り違えない
+  - テスト: `broke` の単体テスト (同じ計画なら前回の終わり方から、toolchain か計画が違えば試し直す、記録や `planned` が無ければ試す)。docsrs で壊れる member の記録に `planned` が残ること
+- レビューで直したこと:
+  - 1 回目が途中まで書いたソースのエラーで落ち、2 回目までに直されると、docsrs (や docs.rs の組) のせいと取り違え、その終わり方を記録に残して以後ずっと試さなかった (前の記憶はプロセスの中だけだった): 再試行したビルドは、ビルドの前に見たソースが今も同じとき (`freshness::unchanged`) だけ `planned` を記録に残す。確かめられなければ残さず、次は試し直す
+  - 鮮度の判定ができない道 (入力が読めない) でも、前回のビルドの記録で始め方を決める
+  - `Planned` にサーバーの版を入れた (更新したら試し直す)
+  - 結合テストは作り直しの道を通っていなかった (入力を渡していなかったので、編集しても新しいと判定されていた): パッケージを入力に渡し、作り直されたこと (JSON の SHA-256 が変わる) と docsrs なしで作られたことを確かめる。`broke` を一時的に無効にすると落ちることを確かめた。単体テストに、4 通りの終わり方、選んだ toolchain・cfg・版だけの違い、docs.rs の組が無いとき、前の形式の記録の読み込みを足した
+  - テストの `Server::log`: 呼び出しの記録がそろい、中身が落ち着くまで待つ (WARN の行も同じスレッドが書くため)。改行で終わらない最後の行は読み飛ばす
+- 残したもの: `build::build` が `planned: None` で公開してから `tries` が書き直すまでの間に、別のサーバーが記録を読んで dep-info を始めると、その書き直しで `planned` と warnings が消えうる (warnings は D4b からの同じ競合。次のビルドで 1 回試し直すだけ)
+- 時間の測定 (このリポジトリの HEAD を写したもの、debug ビルドのサーバー、オフライン、`build.wait_secs` は既定の 10 秒): 初回 (target dir が空) 52.3 秒 (`building` を 4 回返し、5 回目に結果)、同じプロセスで新しいと判定 0.0 秒、別のプロセスで新しいと判定 0.8 秒、1 ファイルを編集した後の作り直し 4.9 秒 (上限の内なので、そのまま新しいビルド)、作り直した後 0.0 秒。D4a の前は、温まっても照会のたびに 4〜5 秒だった
+- Claude Code での試し (利用者が別のセッションで、このリポジトリで `claude --mcp-config` に release ビルドを足して。2026-10-21):
+  1. 自分のワークスペースの item (`chatora_rustdoc_mcp::data::freshness::key`・`query::load::archive_from`) をパスだけで頼むと、モデルはこのサーバーを使わず、grep でソースを読んで答えた。「chatora-rustdoc の MCP で」と明示すると使う。サーバーの instructions とツールの説明文、M2f の eval (F4) の課題
+  2. ソースを編集した直後に引く: このセッションで member を初めてビルドしたので前回の成功が無く、決定 3 のとおり `status: building` を 2 回返し (モデルは `retry_after_secs` に従って呼び直した)、約 30 秒で編集の入った新しいビルドを返した
+  3. 依存 (`tokio::sync::Mutex::lock`) は Cargo.lock の版 (1.53.3) を docs.rs から、`use` に使えるパスで返した。std (`std::vec::Vec::push`) は配布物の nightly から、const の stability 付きで返した。どちらも 1 回で返った
+  4. private な item (`query::local::Rebuilding`): 引けたが、可視性が `pub(in ::query::local)` と表示された。Rust として書けない形で、元のコード (何も付かない private) とも見た目が違う。D6 で直す (含むモジュールと同じなら何も付けず、違えば `pub(in crate::…)`)
+- テストの揺れの直し: ログを書き込み専用のスレッドに渡した後 (直し 2)、stdio のテストがログを読む時点で最後の呼び出しの記録がまだ書かれていないことがあった (全体を走らせたときに 1 度落ちた)。テストの `Server::log` は、送った `tools/call` の数だけ呼び出しの記録がそろうまで (最大 10 秒) 待つ
+
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
 - 利用者の指示で、デッドロックと止まって戻らない危険を、コード全体で監査した (サブエージェント、読むだけ。D4b のハングの後)。ロックの循環、ガードを持ったままの `.await` (clippy の `await_holding_lock` も `suspicious` の deny で効いている)、自分の結果を待つ形の循環は無かった。止まって長く戻らない箇所は次のとおり

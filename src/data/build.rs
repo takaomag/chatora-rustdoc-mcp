@@ -824,6 +824,27 @@ pub struct BuildRecord {
     /// Whether its dep-info was had, or tried: a server may have ended before.
     #[serde(default)]
     pub dep_info: bool,
+    /// What it was planned with, before the tries changed it: a later build of the same plan,
+    /// with the same toolchain, begins as this one ended (decided in M2's D4).
+    #[serde(default)]
+    pub planned: Option<Planned>,
+}
+
+/// What a build was planned with, of what the tries change (decided in M2's D3 and D4).
+///
+/// It is whether it passes `--cfg docsrs`, the `--cfg` of the `rustdoc-args` of
+/// `[package.metadata.docs.rs]`, and its features, to try first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Planned {
+    /// The version of the server that planned it, whose builds may differ.
+    #[serde(default)]
+    pub server: Box<str>,
+    /// Whether it passes `--cfg docsrs`.
+    pub cfg_docsrs: bool,
+    /// The `--cfg` of the `rustdoc-args`.
+    pub cfgs: Box<[Box<str>]>,
+    /// The features of `[package.metadata.docs.rs]`, if it is built with them first.
+    pub docs_rs_features: Option<Vec<Box<str>>>,
 }
 
 /// Why a build published nothing.
@@ -959,6 +980,7 @@ pub async fn build(
         // Until the dep-info of this build tells them.
         deps: fresh.map(|fresh| fresh.deps.clone()).unwrap_or_default(),
         dep_info: false,
+        planned: None,
     };
     let dir = plan.published_dir(cache.dir(), target.as_ref());
     let path = dir.join(format!("{}.json", header.format_version));

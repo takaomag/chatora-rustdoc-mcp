@@ -394,9 +394,10 @@ impl Builder<'_> {
     /// It builds with the features of `[package.metadata.docs.rs]` first, if any, and `--cfg
     /// docsrs`, unless they broke the build before. When the documented crate fails, it builds
     /// without `--cfg docsrs`; when that fails too, or a dependency fails, with the project's
-    /// features: three builds at most (decided in M2's D3). What broke the build is remembered
-    /// only once a build works without it, so that an error of the crate's own, which fails
-    /// them all, is not taken for it. `warnings` gets what the response tells of it.
+    /// features: three builds at most (decided in M2's D3). What broke the build is told by the
+    /// build published before, which ended without them when a build of the same plan worked
+    /// only so (decided in M2's D4): an error of the crate's own, which fails them all, publishes
+    /// nothing, so it is not taken for it. `warnings` gets what the response tells of it.
     async fn build(
         &self,
         plan: &mut Plan,
@@ -422,7 +423,7 @@ impl Builder<'_> {
             .then(|| self.target.clone());
         let toolchain = checked.and_then(|checked| checked.toolchain);
         // A build that is fresh is not made again (requirement R-WS-4, decided in M2's D4).
-        let fresh = match self.fresh(plan, host.as_ref(), toolchain.as_deref()).await {
+        let (fresh, earlier) = match self.fresh(plan, host.as_ref(), toolchain.as_deref()).await {
             Freshness::Fresh(built, fresh) => {
                 warnings.extend(built.record.warnings.iter().cloned());
                 // A server ended before it had the dep-info: with the plan as it was built.
@@ -439,14 +440,20 @@ impl Builder<'_> {
                 return Ok(*built);
             },
             Freshness::Stale(fresh, before) => {
+                let earlier = before.as_ref().map(|before| before.record.clone());
                 if let (Some(before), Some(fresh)) = (before, &fresh) {
                     self.rebuilding.give(before, &fresh.key);
                 }
-                fresh
+                (fresh, earlier)
             },
         };
         let built = self
-            .tries(plan, toolchain.as_deref(), fresh.as_deref(), warnings)
+            .tries(
+                plan,
+                toolchain.as_deref(),
+                (fresh.as_deref(), earlier.as_ref()),
+                warnings,
+            )
             .await;
         if let Some(fresh) = &fresh {
             self.rebuilding
@@ -461,30 +468,30 @@ impl Builder<'_> {
         &self,
         plan: &mut Plan,
         toolchain: Option<&str>,
-        fresh: Option<&build::Fresh>,
+        (fresh, earlier): (Option<&build::Fresh>, Option<&BuildRecord>),
         warnings: &mut Vec<Box<str>>,
     ) -> Result<Built, LocalError> {
         let told = warnings.len();
-        // With the toolchain that built it: the one that rustc tells, if it did.
-        let key = (
-            plan.package.0.clone(),
-            toolchain
-                .map(str::to_owned)
-                .or_else(|| plan.toolchain.clone()),
-        );
-        if plan.cfg_docsrs && DOCSRS_BROKE.lock().contains(&key) {
+        let planned = build::Planned {
+            server: env!("CARGO_PKG_VERSION").into(),
+            cfg_docsrs: plan.cfg_docsrs,
+            cfgs: plan.cfgs.clone(),
+            docs_rs_features: self.docs_rs.map(<[_]>::to_vec),
+        };
+        let (docsrs_broke, features_broke) =
+            broke(earlier, &planned, (toolchain, plan.toolchain.as_deref()));
+        if docsrs_broke {
             plan.cfg_docsrs = false;
         }
         let (projects, cfg_docsrs) = (plan.features.clone(), plan.cfg_docsrs);
-        let docs_rs = self
-            .docs_rs
-            .filter(|_| !DOCS_RS_FEATURES_BROKE.lock().contains(&key));
+        let docs_rs = self.docs_rs.filter(|_| !features_broke);
         if let Some(features) = docs_rs {
             plan.features = Some(features.to_vec());
         } else if self.docs_rs.is_some() {
             warnings.push(DOCS_RS_FEATURES_BROKE_IT.into());
         }
         let mut tell = |doing| self.stage.set(doing);
+        let mut retried = false;
         let mut built =
             build::build(self.cache, plan, self.work, toolchain, fresh, &mut tell).await;
         // Only the documented crate's rustdoc has it, so only its errors may be of it.
@@ -499,9 +506,7 @@ impl Builder<'_> {
             tracing::info!(package = %plan.package.0, "the build failed with --cfg docsrs, so it is tried without");
             plan.cfg_docsrs = false;
             built = build::build(self.cache, plan, self.work, toolchain, fresh, &mut tell).await;
-            if built.is_ok() {
-                DOCSRS_BROKE.lock().insert(key.clone());
-            }
+            retried = true;
         }
         // The features of `[package.metadata.docs.rs]` may break it, the documented crate or a
         // dependency, as the compiler's errors tell; not what fetching or the lock tells.
@@ -518,8 +523,8 @@ impl Builder<'_> {
             // With `--cfg docsrs` as it began, which did not break it: it failed without it too.
             (plan.features, plan.cfg_docsrs) = (projects, cfg_docsrs);
             built = build::build(self.cache, plan, self.work, toolchain, fresh, &mut tell).await;
+            retried = true;
             if built.is_ok() {
-                DOCS_RS_FEATURES_BROKE.lock().insert(key);
                 warnings.push(DOCS_RS_FEATURES_BROKE_IT.into());
             }
         } else if docs_rs.is_some() && built.is_ok() {
@@ -530,8 +535,15 @@ impl Builder<'_> {
             );
         }
         let mut built = built.map_err(LocalError::Build)?;
-        // For the builds that find it fresh.
+        // For the builds that find it fresh, and those that plan it so again: unless what failed
+        // may have been sources changing between the tries, as while an agent edits them.
         built.record.warnings = warnings.get(told..).unwrap_or_default().to_vec();
+        built.record.planned = if retried && !settled(fresh).await {
+            tracing::debug!(package = %plan.package.0, "the sources changed between the tries, so what broke the build is not kept");
+            None
+        } else {
+            Some(planned)
+        };
         if let Err(error) = built.write_record(self.cache).await {
             tracing::warn!(%error, "the record of a build could not be written again");
         }
@@ -601,9 +613,10 @@ impl Builder<'_> {
         .await;
         let (before, inputs) = match found {
             Ok((before, Ok(inputs))) => (before, inputs),
-            Ok((_, Err(error))) => {
+            // The build before still tells how a build of the same plan ends.
+            Ok((before, Err(error))) => {
                 tracing::warn!(%error, "what a build is made from could not be read, so it is made again each time");
-                return Freshness::Stale(None, None);
+                return Freshness::Stale(None, before.map(Box::new));
             },
             Err(error) => {
                 let error = crate::task::resume_if_panic(error);
@@ -890,17 +903,40 @@ enum Freshness {
 const DOCS_RS_FEATURES_BROKE_IT: &str = "built with the features of the project's build, as those \
                                          of [package.metadata.docs.rs] broke the build";
 
-/// The members whose build the features of their `[package.metadata.docs.rs]` broke, by package
-/// id and toolchain, for the life of the process (decided in M2's D3).
-static DOCS_RS_FEATURES_BROKE: LazyLock<Mutex<HashSet<BuildKey>>> = LazyLock::new(Mutex::default);
+/// Whether the sources of a build that `fresh` saw before it have not changed since, so that what
+/// broke a try was not an edit. Without `fresh`, it cannot be told.
+async fn settled(fresh: Option<&build::Fresh>) -> bool {
+    let Some(seen) = fresh.map(|fresh| fresh.seen.clone()) else {
+        return false;
+    };
+    crate::task::spawn_blocking(move || freshness::unchanged(&seen))
+        .await
+        .unwrap_or(false)
+}
 
-/// The members whose build `--cfg docsrs` broke, by package id and toolchain, for the life of the
-/// process (decided in M2's D3).
-static DOCSRS_BROKE: LazyLock<Mutex<HashSet<BuildKey>>> = LazyLock::new(Mutex::default);
-
-/// A member's build, by its package id and its toolchain: as `rustc -vV` tells it, or else the one
-/// that the server chose instead of the project's.
-type BuildKey = (Box<str>, Option<String>);
+/// Whether `--cfg docsrs`, and whether the features of `[package.metadata.docs.rs]`, broke the
+/// build `earlier`, the one published before, planned as `planned` is now, with the same toolchain:
+/// as `rustc -vV` tells it, `toolchain`, and as the server chose it, `chosen` (decided in M2's D4).
+/// It ended without them. A build of the same plan then begins so, rather than trying them again
+/// at each edit, which a rustdoc run costs.
+fn broke(
+    earlier: Option<&BuildRecord>,
+    planned: &build::Planned,
+    (toolchain, chosen): (Option<&str>, Option<&str>),
+) -> (bool, bool) {
+    let Some(earlier) = earlier.filter(|earlier| {
+        earlier.planned.as_ref() == Some(planned)
+            && earlier.toolchain.as_deref() == toolchain
+            && earlier.chosen_toolchain.as_deref() == chosen
+    }) else {
+        return (false, false);
+    };
+    (
+        planned.cfg_docsrs && !earlier.cfg_docsrs,
+        planned.docs_rs_features.is_some()
+            && earlier.features_requested != planned.docs_rs_features,
+    )
+}
 
 /// The archive of the JSON that `built` published, keyed by its SHA-256, which it must still have,
 /// with `warnings` and what else the response warns about.
@@ -980,6 +1016,127 @@ fn read_checked(path: &Path, sha256: &str) -> io::Result<Box<[u8]>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record of a build planned as `planned`, made with `cfg_docsrs` and the features
+    /// `features`, by the toolchain `rustc 1.99.1`.
+    fn record(
+        planned: &build::Planned,
+        cfg_docsrs: bool,
+        features: Option<&[&str]>,
+    ) -> BuildRecord {
+        serde_json::from_value(serde_json::json!({
+            "package": "path+file:///w/a#0.1.0",
+            "crate_name": "a",
+            "crate_version": "0.1.0",
+            "format_version": 61,
+            "target": null,
+            "toolchain": "rustc 1.99.1",
+            "chosen_toolchain": null,
+            "built_at": "2026-10-21T00:00:00Z",
+            "features_requested": features,
+            "features_effective": null,
+            "bootstrap_all": false,
+            "cfg_docsrs": cfg_docsrs,
+            "sha256": "0".repeat(64),
+            "planned": planned,
+        }))
+        .expect("a record")
+    }
+
+    #[test]
+    fn a_build_of_the_same_plan_begins_as_the_one_before_ended() {
+        let planned = build::Planned {
+            server: env!("CARGO_PKG_VERSION").into(),
+            cfg_docsrs: true,
+            cfgs: Box::new(["my_cfg".into()]),
+            docs_rs_features: Some(vec!["extra".into()]),
+        };
+        let toolchain = (Some("rustc 1.99.1"), None);
+        let ended = |cfg_docsrs, features: &[&str]| {
+            broke(
+                Some(&record(&planned, cfg_docsrs, Some(features))),
+                &planned,
+                toolchain,
+            )
+        };
+        // As planned; without `--cfg docsrs`; with the project's features, with `--cfg docsrs`
+        // back as the third try puts it; with neither.
+        assert_eq!(ended(true, &["extra"]), (false, false));
+        assert_eq!(ended(false, &["extra"]), (true, false));
+        assert_eq!(ended(true, &[]), (false, true));
+        assert_eq!(ended(false, &[]), (true, true));
+        let fell_back = record(&planned, false, Some(&[]));
+        // Another toolchain, chosen or told, another plan, or another server, tries again.
+        for (other, toolchain) in [
+            (planned.clone(), (Some("rustc 1.100.0"), None)),
+            (
+                planned.clone(),
+                (Some("rustc 1.99.1"), Some("nightly-2026-10-01")),
+            ),
+            (
+                build::Planned {
+                    docs_rs_features: Some(vec!["more".into()]),
+                    ..planned.clone()
+                },
+                toolchain,
+            ),
+            (
+                build::Planned {
+                    cfgs: Box::new([]),
+                    ..planned.clone()
+                },
+                toolchain,
+            ),
+            (
+                build::Planned {
+                    server: "0.0.1".into(),
+                    ..planned.clone()
+                },
+                toolchain,
+            ),
+        ] {
+            assert_eq!(
+                broke(Some(&fell_back), &other, toolchain),
+                (false, false),
+                "{other:?} {toolchain:?}"
+            );
+        }
+        // Without features of `[package.metadata.docs.rs]`, only `--cfg docsrs` may have broken it.
+        let without = build::Planned {
+            docs_rs_features: None,
+            ..planned.clone()
+        };
+        assert_eq!(
+            broke(Some(&record(&without, false, None)), &without, toolchain),
+            (true, false)
+        );
+        // A record from before plans were kept, or none.
+        let mut unplanned = fell_back;
+        unplanned.planned = None;
+        assert_eq!(broke(Some(&unplanned), &planned, toolchain), (false, false));
+        assert_eq!(broke(None, &planned, toolchain), (false, false));
+    }
+
+    #[test]
+    fn a_record_from_before_plans_were_kept_is_read() {
+        let record: BuildRecord = serde_json::from_value(serde_json::json!({
+            "package": "path+file:///w/a#0.1.0",
+            "crate_name": "a",
+            "crate_version": "0.1.0",
+            "format_version": 61,
+            "target": null,
+            "toolchain": "rustc 1.99.1",
+            "chosen_toolchain": null,
+            "built_at": "2026-10-21T00:00:00Z",
+            "features_requested": null,
+            "features_effective": null,
+            "bootstrap_all": false,
+            "cfg_docsrs": false,
+            "sha256": "0".repeat(64),
+        }))
+        .expect("a record");
+        assert_eq!(record.planned, None);
+    }
 
     #[test]
     fn the_dep_info_of_a_build_is_had_once_at_a_time() {

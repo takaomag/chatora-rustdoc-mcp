@@ -229,6 +229,8 @@ struct Server {
     /// The tools that the `tools/call` requests sent call, by request id, to check their results
     /// against the tools' `outputSchema`.
     calls: HashMap<u64, String>,
+    /// How many `tools/call` requests were sent, each of which the log records.
+    sent_calls: usize,
 }
 
 impl Server {
@@ -297,11 +299,31 @@ impl Server {
             lines,
             pending: Vec::new(),
             calls: HashMap::new(),
+            sent_calls: 0,
         }
     }
 
     /// The lines of the server's log files, oldest first (requirement R-OBS-1).
     fn log(&self) -> Vec<Value> {
+        // A thread of its own writes the log, a moment after the response: its lines are taken
+        // once each call has its record and no more come for a while, or after ten seconds.
+        let started = Instant::now();
+        let mut before = self.log_now();
+        loop {
+            thread::sleep(Duration::from_millis(200));
+            let now = self.log_now();
+            let calls = now.iter().filter(|line| line["kind"] == "call").count();
+            if (calls >= self.sent_calls && now == before)
+                || started.elapsed() > Duration::from_secs(10)
+            {
+                return now;
+            }
+            before = now;
+        }
+    }
+
+    /// The lines of the server's log files as they are now.
+    fn log_now(&self) -> Vec<Value> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(self.cache.path().join(LOG_DIR))
             .expect("the log directory")
             .map(|entry| entry.expect("an entry").path())
@@ -314,8 +336,10 @@ impl Server {
         files
             .iter()
             .flat_map(|path| {
-                std::fs::read_to_string(path)
-                    .expect("readable")
+                let text = std::fs::read_to_string(path).expect("readable");
+                // A last line without its newline is still being written.
+                let whole = text.rsplit_once('\n').map_or("", |(whole, _)| whole);
+                whole
                     .lines()
                     .map(|line| serde_json::from_str(line).expect("a line of JSON"))
                     .collect::<Vec<Value>>()
@@ -330,6 +354,7 @@ impl Server {
                 (message["id"].as_u64(), message["params"]["name"].as_str())
         {
             self.calls.insert(id, tool.to_owned());
+            self.sent_calls = self.sent_calls.saturating_add(1);
         }
         let stdin = self.stdin.as_mut().expect("stdin is open");
         writeln!(stdin, "{message}").expect("the server reads stdin");
@@ -658,7 +683,7 @@ fn errors_carry_the_request_id_of_their_log_line() {
     };
     assert_ne!(not_found_id, invalid_id);
 
-    // Each record is written before its response is sent.
+    // Each call has a record, written a moment after its response.
     let log = server.log();
     assert_eq!(log[0]["kind"], "start", "{log:?}");
     let calls: Vec<&Value> = log.iter().filter(|line| line["kind"] == "call").collect();
