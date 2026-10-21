@@ -16,7 +16,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{cargo_config, target::TargetTriple, tool};
+use super::{
+    cache::{self, Cache},
+    cargo_config,
+    dist::NightlyDate,
+    format_version,
+    rustdoc_json,
+    target::TargetTriple,
+    tool,
+};
 use crate::config::Settings;
 
 /// A program of a toolchain.
@@ -91,11 +99,23 @@ pub enum ProgramsError {
 /// This process's programs, once the server has read its settings.
 static THIS: std::sync::OnceLock<Result<Programs, ProgramsError>> = std::sync::OnceLock::new();
 
+/// The date of the nightly that a project whose toolchain writes too old a format is built with,
+/// `build.nightly_date`, or the latest nightly when it is not set (requirement R-WS-8).
+static NIGHTLY_DATE: std::sync::OnceLock<Option<NightlyDate>> = std::sync::OnceLock::new();
+
 impl Programs {
     /// Sets this process's programs from `settings`, once: a problem is logged, and the builds
     /// return it (requirement R-WS-1). `RUSTUP_TOOLCHAIN` in the server's environment, which the
     /// children run in a project go without, is logged too.
     pub fn set_this(settings: &Settings) {
+        drop(
+            NIGHTLY_DATE.set(settings.get("build.nightly_date", |value| {
+                value
+                    .text()
+                    .and_then(|date| date.parse::<NightlyDate>().ok())
+                    .ok_or("a date as 2026-07-10")
+            })),
+        );
         let read = Self::from_settings(settings);
         if let Err(error) = &read {
             tracing::warn!(%error, "the programs of the build settings cannot be used");
@@ -429,6 +449,294 @@ pub async fn check_target(rustc: &Path, root: &Path, target: &TargetTriple) -> R
     }
 }
 
+/// The nightly that a project whose toolchain writes too old a format is built with: `nightly`, or
+/// `nightly-<date>` with `build.nightly_date` (requirement R-WS-8).
+fn nightly(date: Option<&NightlyDate>) -> String {
+    date.map_or_else(|| "nightly".to_owned(), |date| format!("nightly-{date}"))
+}
+
+/// The directory of what the probes of toolchains found, in the cache, for the format of its
+/// records (decided in M2's C1).
+pub const PROBES_DIR: &str = "toolchains/v1";
+
+/// What the probe of a toolchain found, kept in the cache by the commit of its rustdoc.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Probed {
+    /// The format of the rustdoc JSON that it writes.
+    format: u32,
+    /// The commit of its rustdoc, as `-vV` tells it.
+    commit: String,
+    /// Its rustdoc.
+    rustdoc: PathBuf,
+    /// rustup's toolchain that it ran with (`+<toolchain>`), if one.
+    toolchain: Option<String>,
+}
+
+/// Why the format of a toolchain is not known.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProbeError {
+    /// rustup has not installed it.
+    #[error(transparent)]
+    Missing(Missing),
+    /// Its rustdoc did not run, or wrote no JSON that tells its format.
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// The format of the rustdoc JSON that `rustdoc` writes, run in the project at `root` (rustup's
+/// `+toolchain` when `toolchain` is given), as cargo would run it.
+///
+/// It is read from the cache, by the commit that `rustdoc -vV` tells, or else from a run of it on
+/// a crate of one line in `work`, and then kept there (decided in M2's D1): a run takes from a
+/// tenth of a second (stable) to most of a second (nightly). A rustdoc that tells no commit is
+/// run each time.
+///
+/// # Errors
+///
+/// Returns an error when the toolchain is not installed, or its rustdoc does not tell its format.
+pub async fn format_of(
+    rustdoc: &Path,
+    toolchain: Option<&str>,
+    root: &Path,
+    cache: &Cache,
+    work: &Path,
+) -> Result<u32, ProbeError> {
+    let plus = toolchain.map(|toolchain| format!("+{toolchain}"));
+    let failed = |why: std::borrow::Cow<'static, str>| {
+        not_installed(&why)
+            .map_or_else(|| ProbeError::Failed(why.into_owned()), ProbeError::Missing)
+    };
+    let version_args: Vec<&str> = plus.as_deref().into_iter().chain(["-vV"]).collect();
+    let version = tool::output_kept(root, tool::Place::Project, rustdoc, &version_args)
+        .await
+        .map_err(failed)?;
+    let commit = version
+        .lines()
+        .find_map(|line| line.strip_prefix("commit-hash: "))
+        .map(str::trim)
+        .filter(|commit| !commit.is_empty() && *commit != "unknown");
+    let record = commit.map(|commit| {
+        let key = format!(
+            "{commit}\n{}\n{}",
+            rustdoc.display(),
+            toolchain.unwrap_or_default()
+        );
+        let digest = cache::sha256_hex(key.as_bytes());
+        cache
+            .dir()
+            .join(PROBES_DIR)
+            .join(format!("{}.json", digest.get(..32).unwrap_or(&digest)))
+    });
+    if let Some(kept) = record
+        .as_ref()
+        .and_then(|record| std::fs::read(record).ok())
+        .and_then(|json| serde_json::from_slice::<Probed>(&json).ok())
+    {
+        return Ok(kept.format);
+    }
+    let format = probe(rustdoc, plus.as_deref(), root, work)
+        .await
+        .map_err(failed)?;
+    if let (Some(record), Some(commit)) = (record, commit) {
+        let probed = Probed {
+            format,
+            commit: commit.to_owned(),
+            rustdoc: rustdoc.to_path_buf(),
+            toolchain: toolchain.map(str::to_owned),
+        };
+        let written = std::fs::create_dir_all(record.parent().unwrap_or(&record))
+            .and_then(|()| serde_json::to_vec(&probed).map_err(std::io::Error::other))
+            .and_then(|json| cache::write_atomically(&record, &json));
+        if let Err(error) = written {
+            tracing::warn!(%error, "what the probe of a toolchain found could not be kept");
+        }
+    }
+    Ok(format)
+}
+
+/// Runs `rustdoc` on a crate of one line in a new directory in `work`, and reads the format of the
+/// JSON that it writes. `plus` is rustup's `+toolchain` argument, if any.
+async fn probe(
+    rustdoc: &Path,
+    plus: Option<&str>,
+    root: &Path,
+    work: &Path,
+) -> Result<u32, std::borrow::Cow<'static, str>> {
+    static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let number = PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = work.join(format!("probe-{}-{number}", std::process::id()));
+    let made = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(dir.join("probe.rs"), "//! A probe.\n"));
+    if let Err(error) = made {
+        return Err(format!("the probe could not be written: {error}").into());
+    }
+    let (source, out) = (dir.join("probe.rs"), dir.join("out"));
+    let (source, out) = (source.to_string_lossy(), out.to_string_lossy());
+    let args: Vec<&str> = plus
+        .into_iter()
+        // No `--edition`: rustdoc before 1.56 refuses 2021, and a line of docs needs none.
+        .chain([
+            "--crate-type",
+            "lib",
+            "--crate-name",
+            "probe",
+            "-Z",
+            "unstable-options",
+            "--output-format",
+            "json",
+            "-o",
+            &out,
+            &source,
+        ])
+        .collect();
+    // A stable rustdoc takes `-Z` for the crate that `RUSTC_BOOTSTRAP` names (requirement R-WS-8).
+    let ran = tool::output_with(root, tool::Place::Project, rustdoc, &args, &[(
+        "RUSTC_BOOTSTRAP",
+        "probe",
+    )])
+    .await;
+    let json = std::fs::read(dir.join("out/probe.json"));
+    drop(std::fs::remove_dir_all(&dir));
+    ran?;
+    let json = json.map_err(|error| format!("the probe wrote no JSON: {error}"))?;
+    format_version::peek(&json)
+        .ok_or_else(|| "the JSON of the probe tells no format_version".into())
+}
+
+/// What builds the documentation of a project (requirement R-WS-8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Chosen {
+    /// Its own toolchain, which writes `format`: one that this server reads, or a newer one,
+    /// which is read if it can be, with a warning (decided in M2's D1).
+    Project {
+        /// The format.
+        format: u32,
+    },
+    /// rustup's `toolchain`, a nightly, as the project's writes too old a format.
+    Nightly {
+        /// The toolchain, `nightly` or `nightly-<date>`.
+        toolchain: String,
+        /// The format that it writes.
+        format: u32,
+        /// The format that the project's toolchain writes, or `None` when its rustdoc could not
+        /// write rustdoc JSON at all, as one older than the formats is.
+        project_format: Option<u32>,
+    },
+}
+
+/// Why no toolchain builds the documentation of a project.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChooseError {
+    /// rustup has not installed the project's toolchain. Online, cargo installs it in the build;
+    /// offline, it is `toolchain_missing` (decided in M2's D1).
+    #[error(transparent)]
+    NotInstalled(Missing),
+    /// The project's toolchain writes too old a format, and the nightly to build with is not
+    /// installed (`toolchain_missing`).
+    #[error(
+        "{missing}, and the project's toolchain writes no rustdoc JSON format that this server reads"
+    )]
+    NightlyMissing {
+        /// What is not installed.
+        missing: Missing,
+        /// The format of the project's toolchain, or `None` when it writes none.
+        found: Option<u32>,
+    },
+    /// The project's toolchain writes too old a format, and none can be switched to: the
+    /// programs are set, or not rustup's (`unsupported_format`).
+    #[error("the toolchain writes the rustdoc JSON format {found}, older than {}, the oldest that this server reads", rustdoc_json::SUPPORTED.start())]
+    TooOld {
+        /// The format.
+        found: u32,
+    },
+    /// A toolchain's rustdoc did not tell its format.
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// What builds the documentation of the project at `root`, with `work` for the probes (decided in
+/// M2's D1).
+///
+/// It is the project's toolchain, as cargo runs it there, unless that writes too old a format:
+/// then rustup's nightly (`build.nightly_date`), when the rustdoc is rustup's (`rustdoc` in
+/// `PATH`, not one that a setting or the project names) and rustup is here.
+///
+/// # Errors
+///
+/// Returns an error when no toolchain can build it.
+pub async fn choose(
+    root: &Path,
+    cache: &Cache,
+    cargo_home: Option<&Path>,
+    work: &Path,
+) -> Result<Chosen, ChooseError> {
+    let rustdoc = Programs::this().used_in(Kind::Rustdoc, root, cargo_home);
+    let switchable = rustdoc == Path::new(Kind::Rustdoc.name())
+        && tool::output_kept(cache.dir(), tool::Place::Neutral, Path::new("rustup"), &[
+            "--version",
+        ])
+        .await
+        .is_ok();
+    let nightly = nightly(NIGHTLY_DATE.get().and_then(Option::as_ref));
+    choose_with(
+        &rustdoc,
+        switchable.then_some(nightly.as_str()),
+        root,
+        cache,
+        work,
+    )
+    .await
+}
+
+/// [`choose`] with `rustdoc`, and the nightly to switch to, if it may.
+async fn choose_with(
+    rustdoc: &Path,
+    nightly: Option<&str>,
+    root: &Path,
+    cache: &Cache,
+    work: &Path,
+) -> Result<Chosen, ChooseError> {
+    let format = match format_of(rustdoc, None, root, cache, work).await {
+        Ok(format) if format >= *rustdoc_json::SUPPORTED.start() => {
+            return Ok(Chosen::Project { format });
+        },
+        Ok(format) => Some(format),
+        Err(ProbeError::Missing(missing)) => return Err(ChooseError::NotInstalled(missing)),
+        // A rustdoc that cannot write rustdoc JSON at all is older still: the nightly builds, if
+        // one may be switched to.
+        Err(ProbeError::Failed(why)) if nightly.is_some() => {
+            tracing::info!(%why, "the project's rustdoc wrote no rustdoc JSON, so the nightly is tried");
+            None
+        },
+        Err(ProbeError::Failed(why)) => return Err(ChooseError::Failed(why)),
+    };
+    // Without a nightly, the format is known: a failed probe has returned.
+    let Some(nightly) = nightly else {
+        return Err(ChooseError::TooOld {
+            found: format.unwrap_or_default(),
+        });
+    };
+    let nightly_format = format_of(rustdoc, Some(nightly), root, cache, work)
+        .await
+        .map_err(|error| match error {
+            ProbeError::Missing(missing) => ChooseError::NightlyMissing {
+                missing,
+                found: format,
+            },
+            ProbeError::Failed(why) => ChooseError::Failed(why),
+        })?;
+    if nightly_format < *rustdoc_json::SUPPORTED.start() {
+        return Err(ChooseError::TooOld {
+            found: nightly_format,
+        });
+    }
+    Ok(Chosen::Nightly {
+        toolchain: nightly.to_owned(),
+        format: nightly_format,
+        project_format: format,
+    })
+}
+
 /// The toolchain that rustup says is not installed, in why a command failed:
 /// `error: toolchain '1.80.0-x86_64-unknown-linux-gnu' is not installed` (rustup 1.29.1). One of
 /// the few messages that are matched (requirement R-WS-7).
@@ -666,5 +974,138 @@ mod tests {
             .expect_err("two toolchains");
         assert_eq!(mismatch.rustc, "rustc 1.0.0");
         assert_eq!(mismatch.rustdoc, "rustdoc-2 1.0.0");
+    }
+
+    #[test]
+    fn the_nightly_is_the_latest_or_that_of_the_date_set() {
+        assert_eq!(nightly(None), "nightly");
+        let date: NightlyDate = "2026-06-11".parse().expect("a date");
+        assert_eq!(nightly(Some(&date)), "nightly-2026-06-11");
+    }
+
+    /// The rustdoc here writes a format, which is kept by its commit (decided in M2's D1).
+    #[tokio::test]
+    async fn the_format_of_the_rustdoc_here_is_probed_and_kept() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let format = format_of(Path::new("rustdoc"), None, dir.path(), &cache, dir.path())
+            .await
+            .expect("probed");
+        assert!(format >= *rustdoc_json::SUPPORTED.start(), "{format}");
+        let kept: Vec<_> = std::fs::read_dir(dir.path().join(PROBES_DIR))
+            .expect("kept")
+            .collect();
+        assert_eq!(kept.len(), 1);
+    }
+
+    /// A rustdoc that writes `format`, and 61 with rustup's `+<toolchain>`, unless `nightly` says
+    /// that the nightly is not installed. It notes each probe in `probes`.
+    #[cfg(unix)]
+    fn fake_rustdoc(dir: &Path, format: u32, nightly: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("rustdoc");
+        let missing = if nightly {
+            ""
+        } else {
+            "echo \"error: toolchain 'nightly-x86_64-unknown-linux-gnu' is not installed\" >&2; exit 1"
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 plus=''\n\
+                 case \"$1\" in +*) plus=\"$1\"; shift; {missing};; esac\n\
+                 if [ \"$1\" = -vV ]; then echo 'rustdoc 1.0.0'; echo \"commit-hash: abc$plus\"; exit 0; fi\n\
+                 echo probe >> '{probes}'\n\
+                 if [ -z \"$plus\" ] && [ {format} = 0 ]; then echo 'error: Unrecognized option' >&2; exit 1; fi\n\
+                 out=''\n\
+                 while [ $# -gt 0 ]; do if [ \"$1\" = -o ]; then out=\"$2\"; fi; shift; done\n\
+                 mkdir -p \"$out\"\n\
+                 if [ -n \"$plus\" ]; then f=61; else f={format}; fi\n\
+                 echo \"{{\\\"format_version\\\":$f}}\" > \"$out/probe.json\"\n",
+                probes = dir.join("probes").display(),
+            ),
+        )
+        .expect("written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("made runnable");
+        path
+    }
+
+    /// How many times the fake rustdoc in `dir` ran a probe.
+    #[cfg(unix)]
+    fn probes(dir: &Path) -> usize {
+        std::fs::read_to_string(dir.join("probes")).map_or(0, |probes| probes.lines().count())
+    }
+
+    /// A toolchain that writes a format that this server reads, or a newer one, builds the
+    /// documentation; its format is probed once (decided in M2's D1).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_projects_toolchain_builds_unless_its_format_is_too_old() {
+        for format in [61, 62] {
+            let dir = tempfile::tempdir().expect("a temporary directory");
+            let (cache, rustdoc) = (
+                Cache::at(dir.path()),
+                fake_rustdoc(dir.path(), format, true),
+            );
+            for _ in 0..2 {
+                let chosen =
+                    choose_with(&rustdoc, Some("nightly"), dir.path(), &cache, dir.path()).await;
+                assert_eq!(chosen, Ok(Chosen::Project { format }));
+            }
+            assert_eq!(probes(dir.path()), 1, "kept by its commit");
+        }
+    }
+
+    /// Too old a format is built with the nightly, if one may be switched to: else it is too old,
+    /// and a nightly that is not installed is missing (requirement R-WS-8).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn too_old_a_format_is_built_with_the_nightly() {
+        // One too old to write rustdoc JSON at all, as before 1.48.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (cache, rustdoc) = (Cache::at(dir.path()), fake_rustdoc(dir.path(), 0, true));
+        assert_eq!(
+            choose_with(&rustdoc, Some("nightly"), dir.path(), &cache, dir.path()).await,
+            Ok(Chosen::Nightly {
+                toolchain: "nightly".to_owned(),
+                format: 61,
+                project_format: None,
+            })
+        );
+        assert!(
+            matches!(
+                choose_with(&rustdoc, None, dir.path(), &cache, dir.path()).await,
+                Err(ChooseError::Failed(_))
+            ),
+            "without a nightly, the failure is told"
+        );
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (cache, rustdoc) = (Cache::at(dir.path()), fake_rustdoc(dir.path(), 40, true));
+        assert_eq!(
+            choose_with(&rustdoc, Some("nightly"), dir.path(), &cache, dir.path()).await,
+            Ok(Chosen::Nightly {
+                toolchain: "nightly".to_owned(),
+                format: 61,
+                project_format: Some(40),
+            })
+        );
+        assert_eq!(
+            choose_with(&rustdoc, None, dir.path(), &cache, dir.path()).await,
+            Err(ChooseError::TooOld { found: 40 })
+        );
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (cache, rustdoc) = (Cache::at(dir.path()), fake_rustdoc(dir.path(), 40, false));
+        assert!(
+            matches!(
+                choose_with(&rustdoc, Some("nightly"), dir.path(), &cache, dir.path()).await,
+                Err(ChooseError::NightlyMissing {
+                    missing: Missing::NotInstalled { .. },
+                    found: Some(40),
+                })
+            ),
+            "the nightly is not installed"
+        );
     }
 }

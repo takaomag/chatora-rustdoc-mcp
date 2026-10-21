@@ -580,7 +580,7 @@ Claude Code 2.1.304、Linux で測った。
 
 **D1 の実測と決定 (2026-10-21)**:
 
-- 実測 (rustup 1.29.1、この PC): 出る形式は stable 1.99.1 (`RUSTC_BOOTSTRAP=1`) が 61、nightly 1.101 (2026-10-19) が 61、nightly 1.98 (2026-06-11) が 57、nightly 1.92 (2025-10-10) が 56。入っていない toolchain を指す `rust-toolchain.toml` では、`RUSTUP_AUTO_INSTALL=0` の `rustc -vV`・`cargo metadata` が終了コード 1 で `error: toolchain '1.80.0-x86_64-unknown-linux-gnu' is not installed` と `help: run \`rustup toolchain install\` to install it` を出す。環境の `RUSTUP_TOOLCHAIN` は `rust-toolchain.toml` に勝ち、`+<toolchain>` はその両方に勝つ。`rustup run` は子に `RUSTUP_TOOLCHAIN` を渡す
+- 実測 (rustup 1.29.1、この PC): 出る形式は stable 1.99.1 (`RUSTC_BOOTSTRAP=1`) が 61、nightly 1.101 (2026-10-19) が 61、nightly 1.98 (2026-06-11) が 57、nightly 1.92 (2025-10-10) が 56。入っていない toolchain を指す `rust-toolchain.toml` では、`RUSTUP_AUTO_INSTALL=0` の `rustc -vV`・`cargo metadata` が終了コード 1 で `error: toolchain '1.80.0-x86_64-unknown-linux-gnu' is not installed` と ``help: run `rustup toolchain install` to install it`` を出す。環境の `RUSTUP_TOOLCHAIN` は `rust-toolchain.toml` に勝ち、`+<toolchain>` はその両方に勝つ。`rustup run` は子に `RUSTUP_TOOLCHAIN` を渡す
 - 実測の途中の事故: 比べるために `RUSTUP_AUTO_INSTALL=1` で 1 回走らせ、rustup が 1.80.0 を入れかけた (3 秒で止めた)。利用者の許可を得て、入れかけの toolchain と `~/.rustup` の `downloads`・`tmp` に残ったもの (どれも自分が作ったもの) を消した
 - 利用者が 1 件ずつ決めたこと:
   1. 形式の知り方: 初めて使う前に、キャッシュの中の 1 行の crate に rustdoc を直接走らせて (cargo を使わない)、出た JSON の `format_version` を読む。結果は `rustc -vV` の commit-hash (と実行ファイルのパス) を鍵にキャッシュに覚える。`rustc -vV` は今どおり 60 秒だけ覚えるので、toolchain を入れ替えたら再起動なしで反映される
@@ -604,6 +604,18 @@ Claude Code 2.1.304、Linux で測った。
 - README の設定の表に `build.*_path` を足した
 - 前提を渡さないレビュー (サブエージェント) で確信を持てる誤りは無かった。弱い指摘から、cargo が `build.rustc`・`build.rustdoc` の上書きに使う `CARGO_BUILD_RUSTC`・`CARGO_BUILD_RUSTDOC` を、`RUSTC`・`RUSTDOC` と設定ファイルの間の順に足し、テストの環境 (`Isolated::apply`) の説明に、サーバーが `RUSTUP_TOOLCHAIN` を子に渡さないことを書き足した
 - D1b のための実測 (cargo を使わない形式の試し): `RUSTC_BOOTSTRAP=probe rustdoc +<toolchain> --edition 2021 --crate-type lib --crate-name probe -Z unstable-options --output-format json -o <dir> probe.rs` は `<dir>/probe.json` を出す。stable 1.99.1 が 0.10 秒、nightly が 0.41〜0.77 秒 (形式は 61・61・56・57)。stable は `RUSTC_BOOTSTRAP` が無いと `the option Z is only accepted on the nightly compiler` で失敗する
+
+**D1b (形式の試しと toolchain の選択。2026-10-21)**:
+
+- 設定 `build.nightly_date` (`YYYY-MM-DD`。`dist::NightlyDate` を使う) を足した。std の配布物の選び方には効かせない
+- `toolchain::format_of`: プロジェクトで (`RUSTUP_TOOLCHAIN` を外して) rustdoc の `-vV` を走らせ、commit-hash と rustdoc のパスと `+toolchain` の SHA-256 を鍵に、キャッシュの `toolchains/v1/` の記録を読む。無ければ、作業用ディレクトリに 1 行の crate を書き、`RUSTC_BOOTSTRAP=probe` で `-Z unstable-options --output-format json` の rustdoc を走らせて、出た JSON の `format_version` を読み、記録する。commit-hash の無い (`unknown`) rustdoc は記録しない。rustup の「not installed」は `Missing::NotInstalled`
+- `toolchain::choose`: プロジェクトの rustdoc (D1a の `used_in`) の形式が 46 以上ならプロジェクトの toolchain (61 より新しくても。決定 2)。46 未満なら、rustdoc が rustup の proxy (PATH の `rustdoc`。設定・環境変数・プロジェクトの設定が別のものを指していない) で rustup があるときだけ `+nightly` (`+nightly-<日付>`) を試し、それも入っていなければ `NightlyMissing` (`toolchain_missing`)、切り替えられなければ `TooOld` (`unsupported_format`)。プロジェクトの toolchain が入っていなければ `NotInstalled` を返し、扱い (オンラインならビルドに任せる、オフラインなら `toolchain_missing`) は D2 が決める。使うのは D2 のビルドの前
+- `tool::output_with` (環境変数を足して走らせる) を足した
+- テスト: 手元の rustdoc の形式が 46 以上で記録される。偽の rustdoc (`+nightly` で 61 を出し、試しの回数を数える) で、61・62 はプロジェクトの toolchain で試しは 1 回、40 は nightly に切り替わり、切り替えられなければ `TooOld`、nightly が入っていなければ `NightlyMissing`。テストの後に toolchain が増えていないことを確かめた
+- README の設定の表に `build.nightly_date` を足した
+- 前提を渡さないレビュー (サブエージェント) の指摘で直したもの: 試しに付けていた `--edition 2021` は 1.56 より前の rustdoc が受け付けず、まさに nightly に切り替えたい古い toolchain で試しが失敗していた。外した (doc コメント 1 行には要らない)。もっと古く JSON を出せない rustdoc は、nightly に切り替えられるなら切り替える (`project_format`・`NightlyMissing` の `found` は `None`)。切り替えられなければ試しの失敗をそのまま返す
+- D1a (a13c883) の CI で、この文書の markdownlint が落ちていた (MD033・MD038): rustup の文言を書いたコードの中で、backtick の前に置いた逆斜線が、コードの区切りの対応を崩していた。二重の backtick で囲んだ
+- 揺れるテストの修正 (C4c のテスト): `what_cannot_be_told_for_sure_is_left` が全体のテストで一度落ちた。持ち主のロックを手放した直後に掃除を走らせるので、ほかのテストが同じ瞬間に起動した子が、exec するまでロックの fd の写しを持ち、掃除が持ち主を生きているとみなして記録を飛ばしていた (C1 で見つけた現象と同じ。製品では、掃除は次のサーバーの起動時なので当たらない)。テストの助け (`Owner::killed_for_test`) が、ロックが本当に外れるまで待つようにし、同じ形の owner のテストもこれを使う。それでも 12 回の繰り返しで 1 回落ちた: 掃除自身が、同じ持ち主の記録ごとにロックを取っては手放していたので、2 件目以降で同じことが起きて「不確か」が 1 件足りなかった。これは製品でも、掃除と同時に子を起動すると起こりうる (記録が次の起動まで残るだけ)。掃除が持ち主ごとに記録をまとめ、ロックを 1 度だけ取って全件を片付けるまで持つようにした。子の記録の片付けと work dir の片付けの間で手放すのは残る (そこで当たると work dir が次の起動まで残るだけ)
 
 ### 6.6 M2e
 

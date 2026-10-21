@@ -85,6 +85,7 @@ and in the environment as `CHATORA_RUSTDOC_MCP_LOG__DIR`: the key in capitals, w
 | Key | Default | |
 | --- | --- | --- |
 | `build.cargo_path`, `build.rustc_path`, `build.rustdoc_path` | none | The cargo, rustc and rustdoc to build the documentation of the project with (absolute paths), instead of those of rustup or `PATH`. Those not set are looked for next to one that is, with its version suffix (`rustdoc-1.80` next to `rustc-1.80`) or else without one; rustc and rustdoc must be of one toolchain |
+| `build.nightly_date` | none | The date of the nightly (`2026-07-10`) to build with when the project's toolchain writes a rustdoc JSON format older than this server reads; the latest nightly when unset. It must be installed: the server does not install it |
 | `cache.dir` | see [Cache](#cache) | The directory of the cache (an absolute path) |
 | `limits.concurrent_calls` | `16` | How many tool calls are handled at once; more get `busy` |
 | `limits.extract_max_size` | `"4GiB"` | The most bytes unpacked from one archive of the standard library |

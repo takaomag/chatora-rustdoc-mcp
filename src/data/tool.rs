@@ -80,6 +80,21 @@ pub(super) async fn output(
     program: &Path,
     args: &[&str],
 ) -> Result<String, Cow<'static, str>> {
+    output_with(dir, place, program, args, &[]).await
+}
+
+/// [`output`] with the environment variables `env` set too.
+///
+/// # Errors
+///
+/// As [`output`].
+pub(super) async fn output_with(
+    dir: &Path,
+    place: Place,
+    program: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Result<String, Cow<'static, str>> {
     let program_path = program;
     let program = program.display();
     std::fs::create_dir_all(dir)
@@ -95,6 +110,7 @@ pub(super) async fn output(
     if place == Place::Project {
         command.env_remove("RUSTUP_TOOLCHAIN");
     }
+    command.envs(env.iter().copied());
     // In a group of its own with what it starts (requirement R-WS-6).
     super::child::prepare(&mut command);
     let not_run = |error| Cow::Owned(format!("{program} could not be run: {error}"));

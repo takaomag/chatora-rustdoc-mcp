@@ -145,10 +145,21 @@ impl Owner {
     }
 
     /// Lets this server's lock go without removing anything, as when the server is killed: for the
-    /// tests of what a later server does.
-    #[cfg(all(test, unix))]
+    /// tests of what a later server does. It returns once the lock is free: a child that another
+    /// test starts meanwhile holds a copy of it until it runs its program.
+    #[cfg(test)]
     pub(super) fn killed_for_test(&self) {
         drop(self.alive.lock().take());
+        let free = process_lock::lock_blocking(
+            &self.root,
+            &owner_key(&self.id),
+            LockMode::Exclusive,
+            Duration::from_secs(10),
+        );
+        assert!(
+            matches!(free, Ok(Some(_))),
+            "the lock of a killed server is let go"
+        );
     }
 
     /// Removes this server's work directories and lock file, as it stops.
@@ -404,37 +415,53 @@ pub fn sweep(me: &Owner, until: Instant) -> Swept {
 /// C4). Returns `false` when it stopped at `until`.
 #[cfg(unix)]
 fn settle_children(me: &Owner, until: Instant, swept: &mut Swept) -> bool {
+    use std::collections::BTreeMap;
+
+    let mut servers: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     for (id, record) in owned(&me.records()) {
-        if record
-            .extension()
-            .is_none_or(|extension| extension != "json")
+        // Not those of a server that runs.
+        if id != *me.id
+            && record
+                .extension()
+                .is_some_and(|extension| extension == "json")
         {
-            continue;
+            servers.entry(id).or_default().push(record);
         }
+    }
+    for (id, records) in servers {
         if Instant::now() >= until {
             swept.unfinished = true;
             return false;
         }
-        // Not those of a server that runs, nor of one that this one cannot tell of.
-        if id == *me.id {
-            continue;
-        }
+        // Nor those of one that this one cannot tell of. Its lock is held over all its records:
+        // a process that another thread starts meanwhile holds a copy of it until it runs its
+        // program, and the server would look alive again.
         let Some(held) = stopped(&me.root, &id) else {
             continue;
         };
-        let settled = settle(&record, until);
+        let mut finished = true;
+        for record in records {
+            if Instant::now() >= until {
+                swept.unfinished = true;
+                finished = false;
+                break;
+            }
+            match settle(&record, until) {
+                Settled::Ended => swept.child_records = swept.child_records.saturating_add(1),
+                Settled::Stopped(count) => {
+                    swept.child_records = swept.child_records.saturating_add(1);
+                    swept.stopped = swept.stopped.saturating_add(count);
+                },
+                Settled::Unsure => swept.unsure = swept.unsure.saturating_add(1),
+            }
+        }
         // The check made its lock file again if an earlier sweep removed it with its work
         // directories; then nothing else would remove it.
         if !me.root.join(WORK_DIR).join(&id).exists() {
             remove_lock_file(&me.root, &id, held);
         }
-        match settled {
-            Settled::Ended => swept.child_records = swept.child_records.saturating_add(1),
-            Settled::Stopped(count) => {
-                swept.child_records = swept.child_records.saturating_add(1);
-                swept.stopped = swept.stopped.saturating_add(count);
-            },
-            Settled::Unsure => swept.unsure = swept.unsure.saturating_add(1),
+        if !finished {
+            return false;
         }
     }
     true
@@ -674,7 +701,7 @@ mod tests {
         let gone = Owner::start(&cache);
         let lock = process_lock::lock_path(dir.path(), &owner_key(gone.id()));
         // Stopped without leaving, as a server that is killed.
-        drop(gone.alive.lock().take());
+        gone.killed_for_test();
         let me = Owner::start(&cache);
         assert_eq!(sweep(&me, later()).work_dirs, 1);
         assert!(!lock.exists());
