@@ -578,7 +578,32 @@ Claude Code 2.1.304、Linux で測った。
 
 ### 6.5 M2d
 
-(まだ無い)
+**D1 の実測と決定 (2026-10-21)**:
+
+- 実測 (rustup 1.29.1、この PC): 出る形式は stable 1.99.1 (`RUSTC_BOOTSTRAP=1`) が 61、nightly 1.101 (2026-10-19) が 61、nightly 1.98 (2026-06-11) が 57、nightly 1.92 (2025-10-10) が 56。入っていない toolchain を指す `rust-toolchain.toml` では、`RUSTUP_AUTO_INSTALL=0` の `rustc -vV`・`cargo metadata` が終了コード 1 で `error: toolchain '1.80.0-x86_64-unknown-linux-gnu' is not installed` と `help: run \`rustup toolchain install\` to install it` を出す。環境の `RUSTUP_TOOLCHAIN` は `rust-toolchain.toml` に勝ち、`+<toolchain>` はその両方に勝つ。`rustup run` は子に `RUSTUP_TOOLCHAIN` を渡す
+- 実測の途中の事故: 比べるために `RUSTUP_AUTO_INSTALL=1` で 1 回走らせ、rustup が 1.80.0 を入れかけた (3 秒で止めた)。利用者の許可を得て、入れかけの toolchain と `~/.rustup` の `downloads`・`tmp` に残ったもの (どれも自分が作ったもの) を消した
+- 利用者が 1 件ずつ決めたこと:
+  1. 形式の知り方: 初めて使う前に、キャッシュの中の 1 行の crate に rustdoc を直接走らせて (cargo を使わない)、出た JSON の `format_version` を読む。結果は `rustc -vV` の commit-hash (と実行ファイルのパス) を鍵にキャッシュに覚える。`rustc -vV` は今どおり 60 秒だけ覚えるので、toolchain を入れ替えたら再起動なしで反映される
+  2. 新しすぎる形式 (61 より新しい): ビルドして、最新の型で読めれば warnings (確かめていない旨) を付けて使い、読めなければ `unsupported_format`。別の toolchain には切り替えない (R-FV-5 と同じ)
+  3. 実行ファイルのパスを一部だけ設定したとき: 指定された名前の版の接尾辞をまねて探し (`rustc-1.80` なら `rustdoc-1.80`)、無ければ接尾辞なし。symlink はたどらず、指定されたパスのディレクトリで探す。rustc と rustdoc の `-vV` の commit-hash が合わなければ、両方の版を書いたエラーにする (Q-31 のこの部分)
+  4. プロジェクトの toolchain が入っていないとき: 事前の確かめは `RUSTUP_AUTO_INSTALL=0` で行い、オンラインならビルドの cargo に rustup の自動インストールを任せる (その間は `status: building`。D2・D3 でつなぐ)。オフラインなら `toolchain_missing`。rustup の「not installed」の文言を R-WS-7 の許す照合に足し、テストに固定する
+  5. プロジェクトの cargo の設定の `build.rustc`・`build.rustdoc` と環境変数 `RUSTC`・`RUSTDOC`: cargo と同じものを事前の確かめにも使う (環境変数が優先)。`rustc-wrapper` は見ない。サーバーの設定 `build.*_path` があればそちらが勝ち、子に `RUSTC`・`RUSTDOC` として渡す
+  6. `rust-version`: 事前に比べず、D5 で cargo の `requires rustc` などから `toolchain_too_old` にする
+  7. `RUSTUP_TOOLCHAIN`: プロジェクトで走らせる子すべて (ビルドの cargo、`cargo metadata`・`cargo tree`、プロジェクトで走らせる `rustc -vV` と形式の試し) から外し、起動時に 1 回ログに書く。中立のディレクトリで走らせる host の `rustc -vV` はそのまま
+  8. 古すぎる形式からの nightly への切り替え (要件どおり): `cargo +nightly` (`build.nightly_date` があれば `+nightly-<日付>`) に `RUSTUP_AUTO_INSTALL=0` を付け、無ければ `toolchain_missing`。パスの設定があるときと rustup が無いときは切り替えず `unsupported_format`。`build.nightly_date` は D1 で足す (std の配布物の選び方には効かせない)
+
+**D1a (ビルドに使う cargo・rustc・rustdoc。2026-10-21)**: D1 を、使うプログラムを決める D1a と、形式の試し・nightly への切り替えの D1b に分けた
+
+- `data::toolchain::Programs`: 設定 `build.cargo_path`・`build.rustc_path`・`build.rustdoc_path` (絶対パス) を読み、設定の無いものを決定 3 のとおり探す (rustc は rustdoc、次に cargo の隣。rustdoc と cargo は rustc の隣)。指定が file でない・見つからないときは、起動時にログに書き、`Programs::problem` で後の段 (D2 のビルド) が返せるようにする。プロセスに 1 つ (`Programs::set_this`)。起動時に、環境に `RUSTUP_TOOLCHAIN` があれば、プロジェクトで走らせる子に渡さない旨をログに書く
+- cargo の起動 (`cargo::project_command`: `cargo metadata`・`cargo tree`、D2 からビルド): 設定の cargo を使い、設定の rustc・rustdoc を `RUSTC`・`RUSTDOC` で渡し、`RUSTUP_TOOLCHAIN` を外す (決定 7)
+- 事前の確かめに使う rustc・rustdoc (`Programs::used_in`、決定 5): 設定、`RUSTC`・`RUSTDOC` (相対パスはプロジェクトから)、プロジェクトの cargo の設定 (`cargo_config` に `build.rustc`・`build.rustdoc` の読み取りを足した。区切りのあるパスは `.cargo` の親から、名前は PATH から。cargo と同じ)、toolchain のもの、の順。std の選び方に使うプロジェクトの toolchain の版 (`project_toolchain`) もこれを使う
+- `tool::output` に走らせる場所 (`Place::Neutral`・`Project`) を足し、プロジェクトでは `RUSTUP_TOOLCHAIN` を外す。プログラムをパスで受けるようにした
+- `toolchain::check_target`: プロジェクトで `rustc -vV` と `--print sysroot` を走らせ (`RUSTUP_AUTO_INSTALL=0`)、rustup が toolchain を「not installed」と言えば `Missing::NotInstalled` (文言は R-WS-7 の許す照合に足し、テストに固定)。sysroot に `lib/rustlib/<target>` が無ければ `Missing::Target`、host なら `lib/rustlib/<host>/lib` に libcore があるかで見る (R-TG-1)
+- `toolchain::same_toolchain`: rustc と rustdoc の `-vV` の commit-hash が合わなければ両方の版を書いたエラー (決定 3)。使うのは D2 のビルドの前
+- テスト: 設定の無いものを接尾辞付きで隣から探す、file でない設定はエラー、cargo の環境 (`RUSTC`・`RUSTDOC`・`RUSTUP_TOOLCHAIN` を外す)、rustc の決まり方の順、rustup の文言の読み取り、host の toolchain は host を作れる、入っていない toolchain (`channel = "1.0.1"`) は `NotInstalled` (何も入らないことを確かめた)、偽の sysroot で他の target が `Target`、偽の rustc・rustdoc で commit の食い違い
+- README の設定の表に `build.*_path` を足した
+- 前提を渡さないレビュー (サブエージェント) で確信を持てる誤りは無かった。弱い指摘から、cargo が `build.rustc`・`build.rustdoc` の上書きに使う `CARGO_BUILD_RUSTC`・`CARGO_BUILD_RUSTDOC` を、`RUSTC`・`RUSTDOC` と設定ファイルの間の順に足し、テストの環境 (`Isolated::apply`) の説明に、サーバーが `RUSTUP_TOOLCHAIN` を子に渡さないことを書き足した
+- D1b のための実測 (cargo を使わない形式の試し): `RUSTC_BOOTSTRAP=probe rustdoc +<toolchain> --edition 2021 --crate-type lib --crate-name probe -Z unstable-options --output-format json -o <dir> probe.rs` は `<dir>/probe.json` を出す。stable 1.99.1 が 0.10 秒、nightly が 0.41〜0.77 秒 (形式は 61・61・56・57)。stable は `RUSTC_BOOTSTRAP` が無いと `the option Z is only accepted on the nightly compiler` で失敗する
 
 ### 6.6 M2e
 

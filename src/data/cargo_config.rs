@@ -41,6 +41,34 @@ pub struct CargoConfig {
     /// `net.offline` in the files (`CARGO_NET_OFFLINE` is not read here): cargo does not reach
     /// the network, so a crate missing from the cache is `offline_miss` (requirement R-WS-7).
     pub net_offline: bool,
+    /// `build.rustc` in the files (`RUSTC` is not read here): the rustc that cargo runs, which
+    /// the checks before a build run too (decided in M2's D1).
+    pub build_rustc: Option<Program>,
+    /// `build.rustdoc` in the files (`RUSTDOC` is not read here), as `build_rustc`.
+    pub build_rustdoc: Option<Program>,
+}
+
+/// A program that a setting of cargo names.
+///
+/// It is a path, which cargo takes relative to the directory that holds the `.cargo` directory of
+/// the file, when it has a separator, or else a name that cargo looks for in `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Program(pub PathBuf);
+
+impl Program {
+    /// The program of the value `value` in the file `file`.
+    fn of(value: &str, file: &Path) -> Self {
+        if value.contains('/') || value.contains(std::path::MAIN_SEPARATOR) {
+            // `<dir>/.cargo/config.toml` names paths relative to `<dir>`.
+            let base = file
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or_else(|| Path::new(""));
+            Self(base.join(value))
+        } else {
+            Self(PathBuf::from(value))
+        }
+    }
 }
 
 /// `build.target`: one target, or several, which cargo builds for each.
@@ -206,6 +234,17 @@ fn merge_file(config: &mut CargoConfig, path: &Path, depth: usize) -> Result<(),
     {
         config.build_std = true;
     }
+    for (key, place) in [
+        ("rustc", &mut config.build_rustc),
+        ("rustdoc", &mut config.build_rustdoc),
+    ] {
+        if let Some(value) = table.get("build").and_then(|build| build.get(key)) {
+            let value = value
+                .as_str()
+                .ok_or_else(|| malformed(format!("build.{key} is not a string")))?;
+            *place = Some(Program::of(value, path));
+        }
+    }
     if let Some(offline) = table.get("net").and_then(|net| net.get("offline")) {
         config.net_offline = offline
             .as_bool()
@@ -369,6 +408,30 @@ mod tests {
                 config.files
             );
         }
+    }
+
+    #[test]
+    fn rustc_and_rustdoc_are_paths_from_the_directory_above_the_settings_or_names() {
+        let dir = tree(&[
+            ("home/config.toml", "[build]\nrustc = \"rustc-1.80\"\n"),
+            (
+                "a/b/.cargo/config.toml",
+                "[build]\nrustdoc = \"tools/rustdoc\"\n",
+            ),
+        ]);
+        let config = read(
+            &dir.path().join("a/b/c"),
+            Some(&dir.path().join("home")),
+            None,
+        )
+        .expect("read");
+        // A name is looked for in PATH.
+        assert_eq!(config.build_rustc, Some(Program("rustc-1.80".into())));
+        // A path is relative to the directory that holds `.cargo`.
+        assert_eq!(
+            config.build_rustdoc,
+            Some(Program(dir.path().join("a/b/tools/rustdoc")))
+        );
     }
 
     #[test]

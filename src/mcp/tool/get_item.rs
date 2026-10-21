@@ -2052,7 +2052,12 @@ pub(super) async fn project_toolchain(state: &ToolState) -> Option<Version> {
     let [workspace] = &*project.workspaces else {
         return None;
     };
-    data::local_std::rustc_release(&workspace.root).await
+    let rustc = data::toolchain::Programs::this().used_in(
+        data::toolchain::Kind::Rustc,
+        &workspace.root,
+        state.resolver.cargo_home(),
+    );
+    data::local_std::rustc_release(&workspace.root, &rustc).await
 }
 
 /// Without local features, no toolchain is run.

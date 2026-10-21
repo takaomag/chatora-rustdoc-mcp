@@ -241,6 +241,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
     let cache = cache?;
     #[cfg(feature = "local")]
     sweep_in_background(&cache);
+    #[cfg(feature = "local")]
+    crate::data::toolchain::Programs::set_this(settings);
     let network = Network::from_settings(settings);
     let server = Server {
         tools: Arc::new(tool::ToolState {

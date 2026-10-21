@@ -22,6 +22,9 @@ pub const CONFIG_ENV_VAR: &str = "CHATORA_RUSTDOC_MCP_CONFIG";
 
 /// The keys that this version reads. Any other key is reported and ignored.
 const KEYS: &[&str] = &[
+    "build.cargo_path",
+    "build.rustc_path",
+    "build.rustdoc_path",
     "cache.dir",
     "limits.concurrent_calls",
     "limits.extract_max_size",

@@ -53,7 +53,8 @@ impl Isolated {
     /// Makes `command` run in this environment. Of the test's own environment, it keeps what
     /// rustup needs to find its toolchains (`RUSTUP_HOME`, `RUSTUP_TOOLCHAIN` and `PATH`), and
     /// removes what would change cargo, rustc or git: the variables that `cargo test` and the
-    /// user set for them.
+    /// user set for them. The server does not pass `RUSTUP_TOOLCHAIN` on to what it runs in a
+    /// project (M2's D1), which then uses the project's toolchain, or else rustup's default.
     pub(crate) fn apply<'c>(&self, command: &'c mut Command) -> &'c mut Command {
         for (name, _) in std::env::vars_os() {
             if is_removed(&name) {

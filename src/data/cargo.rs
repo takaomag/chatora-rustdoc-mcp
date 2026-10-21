@@ -80,7 +80,11 @@ impl GitFetchFailure {
 /// Offline, it does not reach the network, and rustup does not install a toolchain
 /// (requirements R-CA-7 and R-WS-7).
 pub(super) fn project_command(root: &Path, offline: bool) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("cargo");
+    let programs = super::toolchain::Programs::this();
+    let mut command = tokio::process::Command::new(programs.cargo());
+    // That of the settings, and the project's toolchain: not that of `RUSTUP_TOOLCHAIN`
+    // (decided in M2's D1).
+    programs.prepare_cargo(&mut command);
     command.arg("--locked");
     if offline {
         command.arg("--offline").env("RUSTUP_AUTO_INSTALL", "0");

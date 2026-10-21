@@ -143,7 +143,10 @@ fn musl_as_gnu(triple: &str) -> String {
 /// Runs `rustc -vV` in `dir` and reads its `host:` line.
 #[cfg(feature = "local")]
 async fn rustc_host(dir: &Path) -> Result<TargetTriple, Cow<'static, str>> {
-    let version = super::tool::output(dir, "rustc", &["-vV"]).await?;
+    let version = super::tool::output(dir, super::tool::Place::Neutral, Path::new("rustc"), &[
+        "-vV",
+    ])
+    .await?;
     parse_host(&version).ok_or(Cow::Borrowed("rustc -vV printed no valid host line"))
 }
 

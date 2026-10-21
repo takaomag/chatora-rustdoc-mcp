@@ -1,5 +1,5 @@
-//! Running a short command of the toolchain, as `rustc -vV`, in a directory without project
-//! settings.
+//! Running a short command of the toolchain, as `rustc -vV`: in a directory without project
+//! settings, or in a project, whose toolchain then applies.
 
 use std::{
     borrow::Cow,
@@ -20,8 +20,20 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// twice for each lookup in std, against a target of 50 for a whole lookup (§9.1, decided in M1).
 const KEPT_FOR: Duration = Duration::from_secs(60);
 
-/// What commands printed, or why they failed, by directory, program and arguments, and when.
-type Kept = HashMap<(PathBuf, String, Vec<String>), (Instant, Result<String, Cow<'static, str>>)>;
+/// Where a command runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum Place {
+    /// A directory without project settings, as the cache.
+    Neutral,
+    /// A project, whose `rust-toolchain.toml` rustup is to follow: `RUSTUP_TOOLCHAIN`, which
+    /// would win over it, is taken out (decided in M2's D1).
+    Project,
+}
+
+/// What commands printed, or why they failed, by directory, place, program and arguments, and
+/// when.
+type Kept =
+    HashMap<(PathBuf, Place, PathBuf, Vec<String>), (Instant, Result<String, Cow<'static, str>>)>;
 
 static KEPT: LazyLock<Mutex<Kept>> = LazyLock::new(Mutex::default);
 
@@ -32,12 +44,14 @@ static KEPT: LazyLock<Mutex<Kept>> = LazyLock::new(Mutex::default);
 /// As [`output`].
 pub(super) async fn output_kept(
     dir: &Path,
-    program: &str,
+    place: Place,
+    program: &Path,
     args: &[&str],
 ) -> Result<String, Cow<'static, str>> {
     let key = (
         dir.to_path_buf(),
-        program.to_owned(),
+        place,
+        program.to_path_buf(),
         args.iter().map(|&arg| arg.to_owned()).collect::<Vec<_>>(),
     );
     if let Some((at, kept)) = KEPT.lock().get(&key)
@@ -45,7 +59,7 @@ pub(super) async fn output_kept(
     {
         return kept.clone();
     }
-    let printed = output(dir, program, args).await;
+    let printed = output(dir, place, program, args).await;
     let mut kept = KEPT.lock();
     kept.retain(|_, (at, _)| at.elapsed() < KEPT_FOR);
     kept.insert(key, (Instant::now(), printed.clone()));
@@ -62,12 +76,15 @@ pub(super) async fn output_kept(
 /// seconds, or fails.
 pub(super) async fn output(
     dir: &Path,
-    program: &str,
+    place: Place,
+    program: &Path,
     args: &[&str],
 ) -> Result<String, Cow<'static, str>> {
+    let program_path = program;
+    let program = program.display();
     std::fs::create_dir_all(dir)
         .map_err(|error| Cow::Owned(format!("the directory to run {program} in: {error}")))?;
-    let mut command = tokio::process::Command::new(program);
+    let mut command = tokio::process::Command::new(program_path);
     command
         .args(args)
         .current_dir(dir)
@@ -75,6 +92,9 @@ pub(super) async fn output(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if place == Place::Project {
+        command.env_remove("RUSTUP_TOOLCHAIN");
+    }
     // In a group of its own with what it starts (requirement R-WS-6).
     super::child::prepare(&mut command);
     let not_run = |error| Cow::Owned(format!("{program} could not be run: {error}"));

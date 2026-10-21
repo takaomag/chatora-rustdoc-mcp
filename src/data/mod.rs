@@ -45,6 +45,8 @@ pub mod target;
 pub(crate) mod test_http;
 #[cfg(feature = "local")]
 mod tool;
+#[cfg(feature = "local")]
+pub mod toolchain;
 pub mod version;
 pub mod waits;
 
