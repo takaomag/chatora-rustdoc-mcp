@@ -12,14 +12,17 @@ use std::{
 
 use parking_lot::Mutex;
 use tokio::time::Instant;
+use tracing::Instrument as _;
 
 use super::load::{self, Archived, LoadError};
 use crate::data::{
-    build::{self, BuildError, BuildRecord, Built, Documented, Plan},
+    build::{self, BuildError, BuildRecord, Built, DepInfoRun, Documented, Plan},
     cache::{self, Cache},
     cargo::Failure,
+    child,
     flight::{Doing, Flights, Joined, Stage},
     freshness,
+    metadata::PackageId,
     owner::Owner,
     rustdoc_json,
     target::TargetTriple,
@@ -47,9 +50,9 @@ pub struct LocalWanted {
     /// The files that the build is made from, which may not exist: the workspace's manifests,
     /// Cargo.lock and the cargo settings (requirement R-WS-4, decided in M2's D4).
     pub input_files: Vec<PathBuf>,
-    /// The directories of the member and of the path dependencies that it builds with, whose
-    /// files the build is made from.
-    pub input_dirs: Vec<PathBuf>,
+    /// The member and the path dependencies that it builds with, with their directories, whose
+    /// files and build scripts the build is made from.
+    pub input_packages: Vec<(PackageId, PathBuf)>,
 }
 
 /// The archive of a member's build, and its record.
@@ -160,7 +163,7 @@ async fn build_and_archive(
         docs_rs_features,
         mut warnings,
         input_files,
-        input_dirs,
+        input_packages,
     } = wanted;
     let root = plan.root.clone();
     let programs = Programs::this();
@@ -186,7 +189,7 @@ async fn build_and_archive(
     let builder = Builder {
         cache,
         input_files: &input_files,
-        input_dirs: &input_dirs,
+        input_packages: &input_packages,
         rustc: &rustc,
         target: &target,
         project_sets_target,
@@ -255,7 +258,7 @@ struct Builder<'a> {
     /// The files that the member's build is made from, and the directories of them (decided in
     /// M2's D4).
     input_files: &'a [PathBuf],
-    input_dirs: &'a [PathBuf],
+    input_packages: &'a [(PackageId, PathBuf)],
     rustc: &'a Path,
     /// The target asked for.
     target: &'a TargetTriple,
@@ -302,13 +305,24 @@ impl Builder<'_> {
         let toolchain = checked.and_then(|checked| checked.toolchain);
         // A build that is fresh is not made again (requirement R-WS-4, decided in M2's D4).
         let fresh = match self.fresh(plan, host.as_ref(), toolchain.as_deref()).await {
-            Freshness::Fresh(built) => {
+            Freshness::Fresh(built, fresh) => {
                 warnings.extend(built.record.warnings.iter().cloned());
+                // A server ended before it had the dep-info: with the plan as it was built.
+                if !built.record.dep_info {
+                    let mut built_with = plan.clone();
+                    (built_with.cfg_docsrs, built_with.features) = (
+                        built.record.cfg_docsrs,
+                        built.record.features_requested.clone(),
+                    );
+                    if !self.follow_with_dep_info(built_with, (*built).clone(), *fresh) {
+                        warnings.push(DEP_INFO_FAILED_IT.into());
+                    }
+                }
                 return Ok(*built);
             },
             Freshness::Stale(fresh) => fresh,
         };
-        self.tries(plan, toolchain.as_deref(), fresh.as_ref(), warnings)
+        self.tries(plan, toolchain.as_deref(), fresh.as_deref(), warnings)
             .await
     }
 
@@ -392,6 +406,9 @@ impl Builder<'_> {
         if let Err(error) = built.write_record(self.cache).await {
             tracing::warn!(%error, "the record of a build could not be written again");
         }
+        if let Some(fresh) = fresh {
+            self.follow_with_dep_info(plan.clone(), built.clone(), fresh.clone());
+        }
         Ok(built)
     }
 
@@ -416,10 +433,33 @@ impl Builder<'_> {
         };
         let dir = plan.published_dir(self.cache.dir(), Some(target));
         let facts = plan.facts(toolchain, self.docs_rs);
-        let (listed, dirs) = freshness::sources(self.input_dirs).await;
-        let files = [self.input_files, &listed].concat();
+        let before = match crate::task::spawn_blocking(move || build::published(&dir)).await {
+            Ok(before) => before,
+            Err(error) => {
+                let error = crate::task::resume_if_panic(error);
+                tracing::debug!(%error, "the check of a build was stopped");
+                return Freshness::Stale(None);
+            },
+        };
+        // What the dep-info of the build before and its build scripts told: its key has them.
+        let deps = before
+            .as_ref()
+            .map(|before| before.record.deps.clone())
+            .unwrap_or_default();
+        let mut package_dirs: Vec<PathBuf> = self
+            .input_packages
+            .iter()
+            .map(|(_, dir)| dir.clone())
+            .collect();
+        package_dirs.sort();
+        package_dirs.dedup();
+        let (listed, walked) = freshness::sources(&package_dirs).await;
+        let scanned = [self.input_files, &listed].concat();
+        let (files, dirs) = (
+            [scanned.as_slice(), &deps.files].concat(),
+            [walked.as_slice(), &deps.dirs].concat(),
+        );
         let found = crate::task::spawn_blocking(move || {
-            let before = build::published(&dir);
             let inputs = freshness::collect(
                 &files,
                 &dirs,
@@ -442,25 +482,274 @@ impl Builder<'_> {
                 return Freshness::Stale(None);
             },
         };
-        let key = freshness::key(&inputs, &facts);
+        let key = freshness::key(
+            &inputs,
+            &(facts.clone() + &freshness::environment(&deps.env)),
+        );
         match before {
+            // With the inputs as they were before the build, for its dep-info.
             Some(before) if before.record.key.as_deref() == Some(key.as_str()) => {
-                Freshness::Fresh(Box::new(before))
+                let fresh = build::Fresh {
+                    key: key.into(),
+                    inputs: before
+                        .record
+                        .inputs
+                        .clone()
+                        .unwrap_or_else(|| inputs.clone()),
+                    seen: inputs,
+                    facts,
+                    deps,
+                    scanned,
+                    walked,
+                };
+                Freshness::Fresh(Box::new(before), Box::new(fresh))
             },
-            _ => Freshness::Stale(Some(build::Fresh {
+            _ => Freshness::Stale(Some(Box::new(build::Fresh {
                 key: key.into(),
+                seen: inputs.clone(),
                 inputs,
-            })),
+                facts,
+                deps,
+                scanned,
+                walked,
+            }))),
         }
+    }
+
+    /// Runs the build of `plan`, which published `built`, again for its dep-info, in a task of its
+    /// own that the calls do not wait for, and adds what it tells to the record ([`follow`]). A
+    /// build that is found fresh without it, as when a server ended before, has it then. When it
+    /// could not be had for a build, it is not tried again for the life of the process, and this
+    /// returns `false`.
+    fn follow_with_dep_info(&self, plan: Plan, built: Built, fresh: build::Fresh) -> bool {
+        let tried = (built.json.clone(), fresh.key.clone());
+        if DEP_INFO_FAILED.lock().contains(&tried) {
+            return false;
+        }
+        let Some(following) = Following::of(tried) else {
+            return true;
+        };
+        let (cache, work) = (self.cache.clone(), self.work.to_path_buf());
+        let packages = self.input_packages.to_vec();
+        tokio::spawn(
+            async move {
+                let had = follow(&cache, &work, plan, built, fresh, packages).await;
+                if !had {
+                    DEP_INFO_FAILED.lock().insert(following.0.clone());
+                }
+                drop(following);
+            }
+            .in_current_span(),
+        );
+        true
+    }
+}
+
+/// Adds what the dep-info of the build of `plan`, which published `built`, tells to the record
+/// (decided in M2's D4), with what its build scripts told cargo to watch ([`deps_of`]), and
+/// whether it was had, or need not be tried again.
+///
+/// The key is taken again with them, and the inputs of `fresh`, taken before the build, but those
+/// that the dep-info before told and this one does not. The run reads the sources as they are
+/// then: when the files that `fresh` saw changed meanwhile, its dep-info may not be of the build,
+/// and the record loses its key, so that the next call builds again. The record is written only
+/// over the one that it was found with. When the cache's path has a comma, which `--emit` cannot
+/// take, the record notes that it was tried, and warns.
+async fn follow(
+    cache: &Cache,
+    work: &Path,
+    plan: Plan,
+    built: Built,
+    fresh: build::Fresh,
+    packages: Vec<(PackageId, PathBuf)>,
+) -> bool {
+    let key = fresh.key.clone();
+    let still = move |now: &BuildRecord| now.key.as_deref() == Some(&*key) && !now.dep_info;
+    // Not had meanwhile, by this server or another.
+    let dir = built
+        .json
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let now = crate::task::spawn_blocking(move || build::published(&dir)).await;
+    if !now.ok().flatten().is_some_and(|now| still(&now.record)) {
+        return true;
+    }
+    let mut built = built;
+    built.record.dep_info = true;
+    let written = async |built: Built, still| {
+        built
+            .write_record_if(cache, still)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, "the record of a build could not be written with its dep-info");
+            })
+            .is_ok()
+    };
+    if work.to_string_lossy().contains(',') {
+        tracing::warn!(work = %work.display(), "the cache's path has a comma, which --emit=dep-info cannot take");
+        built.record.warnings.push(NO_DEP_INFO.into());
+        return written(built, still).await;
+    }
+    // Once its turn comes: still the record that it was found with, of sources as they were.
+    let (ready_still, ready_seen, ready_dir) = (
+        still.clone(),
+        fresh.seen.clone(),
+        built
+            .json
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default(),
+    );
+    let ready = move || {
+        build::published(&ready_dir).is_some_and(|now| ready_still(&now.record))
+            && freshness::unchanged(&ready_seen)
+    };
+    let run = match build::dep_info(cache, &plan, work, ready).await {
+        Ok(Some(run)) => Ok(run),
+        // Another build, or edits: the next call finds what is to be done.
+        Ok(None) => return true,
+        Err(error) => Err(error),
+    };
+    let (seen, taken_at, package) = (fresh.seen, fresh.inputs.taken_at, plan.package.0.clone());
+    let found = crate::task::spawn_blocking(move || {
+        // What the run read is of the build only if nothing changed meanwhile.
+        if !freshness::unchanged(&seen) {
+            return None;
+        }
+        Some(run.map(|run| {
+            let deps = deps_of(&run, &plan, &packages);
+            let more = freshness::collect_after(&deps.files, &deps.dirs, taken_at);
+            (deps, more)
+        }))
+    })
+    .await;
+    let (deps, more) = match found {
+        Ok(None) => {
+            tracing::debug!(json = %built.json.display(), "the sources changed since the build, so it is to be made again");
+            built.record.key = None;
+            return written(built, still).await;
+        },
+        Ok(Some(Ok((deps, Ok(more))))) => (deps, more),
+        Ok(Some(Ok((_, Err(error))))) => {
+            tracing::info!(%error, "the files of a dep-info could not be read");
+            return false;
+        },
+        Ok(Some(Err(error))) => {
+            tracing::info!(%package, %error, "the dep-info of a build could not be had, so its key has the files of its packages only");
+            return child::stopping();
+        },
+        Err(error) => {
+            let error = crate::task::resume_if_panic(error);
+            tracing::debug!(%error, "the reading of a dep-info was stopped");
+            return true;
+        },
+    };
+    let mut inputs = fresh.inputs;
+    // What only the dep-info before told, and this one does not.
+    let scanned: HashSet<&Path> = fresh.scanned.iter().map(PathBuf::as_path).collect();
+    let told = |path: &Path, deps: &freshness::Deps| {
+        deps.files.iter().any(|file| file == path)
+            || deps.dirs.iter().any(|dir| path.starts_with(dir))
+    };
+    inputs.files.retain(|file| {
+        !told(&file.path, &fresh.deps)
+            || told(&file.path, &deps)
+            || scanned.contains(file.path.as_path())
+            || fresh.walked.iter().any(|dir| file.path.starts_with(dir))
+    });
+    inputs.add(more);
+    let facts = fresh.facts + &freshness::environment(&deps.env);
+    built.record.key = Some(freshness::key(&inputs, &facts).into());
+    (built.record.inputs, built.record.deps) = (Some(inputs), deps);
+    written(built, still).await
+}
+
+/// What the dep-info of the build of `plan`, `run`, tells it read, with what the build scripts of
+/// `packages` told cargo to watch, but what the build wrote in its target directory (decided in
+/// M2's D4). Of the variables that rustdoc read, those of the environment that the server passes
+/// on: cargo and build scripts set the others from what the key has.
+fn deps_of(run: &DepInfoRun, plan: &Plan, packages: &[(PackageId, PathBuf)]) -> freshness::Deps {
+    let found = freshness::dep_info(&run.dep_info, &plan.root);
+    let mut paths = found.files;
+    let mut env: Vec<Box<str>> = found
+        .env
+        .into_iter()
+        .filter(|(name, value)| freshness::from_environment(name, value.as_deref()))
+        .map(|(name, _)| name)
+        .collect();
+    for (id, output) in &run.scripts {
+        // The same id first: two path packages may have the same name and version.
+        let package = packages
+            .iter()
+            .find(|(package, _)| *package.0 == **id)
+            .or_else(|| packages.iter().find(|(package, _)| package.is(id)));
+        if let Some((_, dir)) = package {
+            freshness::watched(output, dir, &mut paths, &mut env);
+        }
+    }
+    // As the OS names it too, as `..` in a path is.
+    let outputs = plan.target_dir.path();
+    let real = dunce::canonicalize(outputs).ok();
+    paths.retain(|path| {
+        !path.starts_with(outputs) && real.as_ref().is_none_or(|real| !path.starts_with(real))
+    });
+    let (mut dirs, mut files): (Vec<PathBuf>, Vec<PathBuf>) =
+        paths.into_iter().partition(|path| path.is_dir());
+    for paths in [&mut files, &mut dirs] {
+        paths.sort();
+        paths.dedup();
+    }
+    env.sort();
+    env.dedup();
+    freshness::Deps { files, dirs, env }
+}
+
+/// What the response warns about a member whose build's dep-info could not be had (decided in M2's
+/// D4).
+const DEP_INFO_FAILED_IT: &str = "the dep-info of this build could not be had: edits to files \
+                                  outside its packages that the crate reads do not make it built \
+                                  again";
+
+/// What the response warns about a member whose builds cannot have their dep-info.
+const NO_DEP_INFO: &str = "the path of the cache has a comma, which rustdoc cannot write its \
+                           dep-info to: edits to files outside the packages that the crate reads \
+                           do not make it built again";
+
+/// A build, by its JSON and its key.
+type Followed = (PathBuf, Box<str>);
+
+/// The builds whose dep-info is had now, so that it is had once at a time.
+static FOLLOWING: LazyLock<Mutex<HashSet<Followed>>> = LazyLock::new(Mutex::default);
+
+/// The builds whose dep-info could not be had, for the life of the process: it is not tried
+/// again for each call that finds them fresh.
+static DEP_INFO_FAILED: LazyLock<Mutex<HashSet<Followed>>> = LazyLock::new(Mutex::default);
+
+/// The dep-info of a build that is had now, until it is dropped.
+struct Following(Followed);
+
+impl Following {
+    /// The dep-info of the build `followed`, unless it is had now.
+    fn of(followed: Followed) -> Option<Self> {
+        let inserted = FOLLOWING.lock().insert(followed.clone());
+        // Made only when it is had now: dropped, it would take away the one that is.
+        if inserted { Some(Self(followed)) } else { None }
+    }
+}
+
+impl Drop for Following {
+    fn drop(&mut self) {
+        FOLLOWING.lock().remove(&self.0);
     }
 }
 
 /// Whether a build is fresh.
 enum Freshness {
-    /// It is, as published.
-    Fresh(Box<Built>),
+    /// It is, as published, with its key and the inputs that it was made from.
+    Fresh(Box<Built>, Box<build::Fresh>),
     /// It is to be made, with this key and these inputs, if they could be taken.
-    Stale(Option<build::Fresh>),
+    Stale(Option<Box<build::Fresh>>),
 }
 
 /// What the response warns about a member built with the project's features, as the features
@@ -549,5 +838,23 @@ fn read_checked(path: &Path, sha256: &str) -> io::Result<Box<[u8]>> {
             io::ErrorKind::InvalidData,
             format!("{} changed after it was built", path.display()),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dep_info_of_a_build_is_had_once_at_a_time() {
+        let followed: Followed = (PathBuf::from("/c/local/v1/a/61.json"), "key".into());
+        let first = Following::of(followed.clone()).expect("not had");
+        // Had now: not again, and the one that is had stays so.
+        assert!(Following::of(followed.clone()).is_none());
+        assert!(Following::of(followed.clone()).is_none());
+        // Another key of the same JSON is another build.
+        let other = Following::of((followed.0.clone(), "other".into())).expect("not had");
+        drop((first, other));
+        assert!(Following::of(followed).is_some());
     }
 }

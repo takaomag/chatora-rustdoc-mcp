@@ -167,6 +167,13 @@ pub fn stop_all() {
     }
 }
 
+/// Whether the server is ending: [`stop_all`] stopped the children, and a child's failure may be
+/// of that.
+#[must_use]
+pub fn stopping() -> bool {
+    STOPPING.load(Ordering::SeqCst)
+}
+
 /// What a request to the thread that starts the children keeps until the child has started, and
 /// hands back: on Unix, the child's record, whose lock the child inherits by the number of its
 /// file descriptor, which must not be closed and used again meanwhile (decided in C4).

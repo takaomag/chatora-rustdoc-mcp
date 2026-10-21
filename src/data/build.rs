@@ -6,6 +6,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    ffi::OsString,
     fs,
     io,
     num::NonZeroUsize,
@@ -25,7 +26,7 @@ use super::{
     cache::{self, Cache},
     cargo::{Failure, RunError, classify, run_building, stderr_tail},
     flight::Doing,
-    freshness::Inputs,
+    freshness::{Deps, Inputs},
     metadata::{Metadata, Package, PackageId, Target},
     process_lock::{self, LockMode, ProcessLock},
     target::TargetTriple,
@@ -417,14 +418,13 @@ pub fn declared_features<'a>(
         .collect()
 }
 
-/// The directories whose files the build of `package` is made from (requirement R-WS-4, decided
-/// in M2's D4).
+/// The packages whose files and build scripts the build of `package` is made from, with their
+/// directories (requirement R-WS-4, decided in M2's D4).
 ///
-/// They are its own and those of the packages that are not from a registry or git (path
-/// dependencies, members) that it builds with, as normal or build dependencies, through others
-/// too.
+/// They are it and the packages that are not from a registry or git (path dependencies, members)
+/// that it builds with, as normal or build dependencies, through others too.
 #[must_use]
-pub fn source_dirs(metadata: &Metadata, package: &Package) -> Vec<PathBuf> {
+pub fn source_packages(metadata: &Metadata, package: &Package) -> Vec<(PackageId, PathBuf)> {
     let nodes: HashMap<&PackageId, &super::metadata::Node> = metadata
         .resolve
         .iter()
@@ -444,7 +444,7 @@ pub fn source_dirs(metadata: &Metadata, package: &Package) -> Vec<PathBuf> {
             && found.source.is_none()
             && let Some(dir) = found.manifest_path.parent()
         {
-            dirs.push(dir.to_path_buf());
+            dirs.push((found.id.clone(), dir.to_path_buf()));
         }
         for dependency in nodes.get(id).into_iter().flat_map(|node| &node.deps) {
             let built = dependency
@@ -457,7 +457,6 @@ pub fn source_dirs(metadata: &Metadata, package: &Package) -> Vec<PathBuf> {
         }
     }
     dirs.sort();
-    dirs.dedup();
     dirs
 }
 
@@ -663,7 +662,8 @@ impl Plan {
 
 /// The digest of the variables of the environment that cargo and rustc read, as this process,
 /// which runs them, has them (decided in M2's D4), but those that the build sets, or that do not
-/// change what it makes. Those that build scripts read are in the dep-info of the build.
+/// change what it makes. Those that the crate reads are in the dep-info of the build, and those
+/// that build scripts read, in what they tell cargo to watch (`rerun-if-env-changed`).
 static ENVIRONMENT: LazyLock<String> = LazyLock::new(|| {
     const NAMES: &[&str] = &[
         "RUSTFLAGS",
@@ -721,6 +721,18 @@ pub struct Fresh {
     pub key: Box<str>,
     /// The inputs.
     pub inputs: Inputs,
+    /// The inputs as they were when the build was found fresh, or else `inputs`: as long as they
+    /// do not change, the build is of the sources.
+    pub seen: Inputs,
+    /// What the build is made from besides its files ([`Plan::facts`]), which the key has with
+    /// the variables `env_deps`.
+    pub facts: String,
+    /// What the dep-info of the build before and its build scripts told, which the key has.
+    pub deps: Deps,
+    /// The files that the inputs have as files of the packages, besides those of `deps`.
+    pub scanned: Vec<PathBuf>,
+    /// The directories of the packages that were walked for the rest.
+    pub walked: Vec<PathBuf>,
 }
 
 /// The build published in `dir`, if its record and its JSON are there, and the digest next to the
@@ -805,6 +817,13 @@ pub struct BuildRecord {
     /// What the response warns about how it was built, as when a try broke it.
     #[serde(default)]
     pub warnings: Vec<Box<str>>,
+    /// What its dep-info and its build scripts told that it read, for the next check: in its
+    /// key (decided in M2's D4).
+    #[serde(flatten)]
+    pub deps: Deps,
+    /// Whether its dep-info was had, or tried: a server may have ended before.
+    #[serde(default)]
+    pub dep_info: bool,
 }
 
 /// Why a build published nothing.
@@ -871,22 +890,7 @@ pub async fn build(
     fresh: Option<&Fresh>,
     mut on_doing: impl FnMut(Doing) + Send,
 ) -> Result<Built, BuildError> {
-    let name = plan.target_dir.name();
-    let using = hold(
-        cache.dir(),
-        &target_key(&name),
-        LockMode::Shared,
-        &mut on_doing,
-    )
-    .await;
-    let writing = hold(
-        cache.dir(),
-        &doc_key(&name),
-        LockMode::Exclusive,
-        &mut on_doing,
-    )
-    .await;
-    let slot = slots().take(&mut on_doing).await;
+    let (using, writing, slot) = take_turn(cache, plan, &mut on_doing).await;
     let mut messages = Messages::new(plan);
     let output = run_building(
         plan.command(),
@@ -949,6 +953,9 @@ pub async fn build(
         key: fresh.map(|fresh| fresh.key.clone()),
         inputs: fresh.map(|fresh| fresh.inputs.clone()),
         warnings: Vec::new(),
+        // Until the dep-info of this build tells them.
+        deps: fresh.map(|fresh| fresh.deps.clone()).unwrap_or_default(),
+        dep_info: false,
     };
     let dir = plan.published_dir(cache.dir(), target.as_ref());
     let path = dir.join(format!("{}.json", header.format_version));
@@ -971,6 +978,114 @@ pub async fn build(
     })
 }
 
+/// What a run of a build for its dep-info told (decided in M2's D4).
+#[derive(Debug, Default)]
+pub struct DepInfoRun {
+    /// The dep-info.
+    pub dep_info: String,
+    /// The output of each build script that cargo ran or found fresh, by the package id of its
+    /// package: what it told cargo, as `cargo::rerun-if-changed=build.rs`.
+    pub scripts: Vec<(Box<str>, String)>,
+}
+
+/// Runs the build of `plan` again for its dep-info, and returns it (decided in M2's D4).
+///
+/// rustdoc writes it to a file in `work` (`--emit=dep-info=<path>`), and no JSON then. rustdoc
+/// splits the value of `--emit` at commas, so `work` must have none. It takes the locks and a
+/// build slot as [`build`] does, and then runs only if `ready` tells so: what it is for may have
+/// changed meanwhile.
+///
+/// # Errors
+///
+/// Returns an error when cargo fails, or the file or the output of a build script cannot be read.
+pub async fn dep_info(
+    cache: &Cache,
+    plan: &Plan,
+    work: &Path,
+    ready: impl FnOnce() -> bool + Send + 'static,
+) -> Result<Option<DepInfoRun>, BuildError> {
+    let (using, writing, slot) = take_turn(cache, plan, &mut |_| {}).await;
+    if !super::blocking(move || Ok(ready())).await.unwrap_or(false) {
+        return Ok(None);
+    }
+    let path = work.join(format!(
+        "dep-info-{}.d",
+        NEXT_WORK.fetch_add(1, Ordering::Relaxed)
+    ));
+    let making = work.to_path_buf();
+    super::blocking(move || fs::create_dir_all(making))
+        .await
+        .map_err(BuildError::Io)?;
+    // With the path, or an older toolchain writes it where cargo runs: the project's directory.
+    let mut emit = OsString::from("--emit=dep-info=");
+    emit.push(&path);
+    let mut command = plan.command();
+    command.arg(emit);
+    // The build scripts, by their package and their `OUT_DIR`, next to which their output is.
+    let mut scripts: Vec<(Box<str>, PathBuf)> = Vec::new();
+    let output = run_building(
+        command,
+        plan.target_dir.path(),
+        |_| {},
+        |line| {
+            if let Ok(ScriptMessage {
+                reason,
+                package_id,
+                out_dir,
+            }) = serde_json::from_str(line)
+                && &*reason == "build-script-executed"
+                && let Some(dir) = out_dir.parent()
+            {
+                scripts.push((package_id, dir.join("output")));
+            }
+        },
+    )
+    .await;
+    drop(slot);
+    let (json, written) = (plan.json(), path);
+    // As in `build`, on a blocking thread, which leaves nothing in `work`.
+    let read = super::blocking(move || {
+        // Not the JSON of a build, if a toolchain wrote one.
+        if let Err(error) = fs::remove_file(&json)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::debug!(%error, "a JSON that a run for the dep-info wrote could not be removed");
+        }
+        // What a build script told cargo to watch is not lost unnoticed.
+        let scripts = scripts
+            .into_iter()
+            .map(|(id, output)| Ok((id, fs::read_to_string(output)?)))
+            .collect::<io::Result<Vec<_>>>();
+        drop(writing);
+        drop(using);
+        let read = fs::read_to_string(&written);
+        drop(fs::remove_file(&written));
+        Ok(DepInfoRun {
+            dep_info: read?,
+            scripts: scripts?,
+        })
+    })
+    .await;
+    let output = output?;
+    if !output.status.success() {
+        return Err(BuildError::Failed {
+            failure: classify(&output, plan.offline),
+            in_documented: false,
+            errors: Vec::new(),
+            stderr: stderr_tail(&output),
+        });
+    }
+    read.map(Some).map_err(BuildError::Io)
+}
+
+/// A `build-script-executed` message of cargo, as far as it is read.
+#[derive(Deserialize)]
+struct ScriptMessage {
+    reason: Box<str>,
+    package_id: Box<str>,
+    out_dir: PathBuf,
+}
+
 impl Built {
     /// Writes the record again, as after more of the toolchain became known, in `cache`, if the
     /// JSON is still the one that it records: another server may have published another build
@@ -980,16 +1095,31 @@ impl Built {
     ///
     /// Returns an error when it cannot be written.
     pub async fn write_record(&self, cache: &Cache) -> io::Result<()> {
+        self.write_record_if(cache, |_| true).await.map(drop)
+    }
+
+    /// [`Self::write_record`], if the record there now is one that `still` takes too, and
+    /// whether it wrote it: another server may have written it meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when it cannot be written.
+    pub async fn write_record_if(
+        &self,
+        cache: &Cache,
+        still: impl FnOnce(&BuildRecord) -> bool + Send + 'static,
+    ) -> io::Result<bool> {
         let json = serde_json::to_vec_pretty(&self.record).map_err(io::Error::from)?;
         let dir = self.json.parent().unwrap_or(&self.json);
         let publishing = cache.lock(dir).await;
         let built = self.clone();
         super::blocking(move || {
-            let written = if is_of(&built.json, &built.record) {
-                cache::write_atomically(&built.record_path(), &json)
+            let now = published(built.json.parent().unwrap_or(&built.json));
+            let written = if now.is_some_and(|now| now.record.sha256 == built.record.sha256 && still(&now.record)) {
+                cache::write_atomically(&built.record_path(), &json).map(|()| true)
             } else {
-                tracing::debug!(json = %built.json.display(), "another build was published meanwhile, so the record is left");
-                Ok(())
+                tracing::debug!(json = %built.json.display(), "another build or record was published meanwhile, so the record is left");
+                Ok(false)
             };
             drop(publishing);
             written
@@ -1029,6 +1159,23 @@ fn target_key(name: &str) -> String {
 /// must not change either.
 fn doc_key(name: &str) -> String {
     format!("doc:{name}")
+}
+
+/// The turn of a build of `plan` (decided in M2's D2 and D3): the shared lock of its target
+/// directory, the exclusive one of writing the documentation there, and a build slot.
+async fn take_turn(
+    cache: &Cache,
+    plan: &Plan,
+    on_doing: &mut (impl FnMut(Doing) + Send),
+) -> (
+    Option<ProcessLock>,
+    Option<ProcessLock>,
+    Option<tokio::sync::SemaphorePermit<'static>>,
+) {
+    let name = plan.target_dir.name();
+    let using = hold(cache.dir(), &target_key(&name), LockMode::Shared, on_doing).await;
+    let writing = hold(cache.dir(), &doc_key(&name), LockMode::Exclusive, on_doing).await;
+    (using, writing, slots().take(on_doing).await)
 }
 
 /// Takes the lock of `key` in the cache at `root` in `mode`, telling `on_doing` while it waits.

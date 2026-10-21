@@ -14,6 +14,7 @@ use std::{
 use chatora_rustdoc_mcp::data::{
     build::{self, Bootstrap, Built, Documented, Plan, TargetDir},
     cache::Cache,
+    freshness,
     metadata::{Metadata, Resolution, Resolver},
     project,
     target::{TargetTriple, host_target},
@@ -240,7 +241,7 @@ async fn a_member_is_built_and_archived_for_the_calls_that_want_it() {
         docs_rs_features: None,
         warnings: Vec::new(),
         input_files: Vec::new(),
-        input_dirs: Vec::new(),
+        input_packages: Vec::new(),
     };
     let flights = Flights::default();
     let until = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
@@ -309,7 +310,7 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
         docs_rs_features: None,
         warnings: Vec::new(),
         input_files: Vec::new(),
-        input_dirs: Vec::new(),
+        input_packages: Vec::new(),
     };
     let without = |built: &LocalBuilt| {
         !built.record.cfg_docsrs
@@ -357,63 +358,132 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
     assert!(items_at(&fixed.json).contains("docsrs_only"));
 }
 
+/// Builds the members of the fixture's workspace as the server does, planned again for each call:
+/// an edit to a manifest changes the plan.
+struct Members {
+    workspace: project::Workspace,
+    resolver: Resolver,
+    host: TargetTriple,
+    cache: Cache,
+    flights:
+        chatora_rustdoc_mcp::data::flight::Flights<chatora_rustdoc_mcp::query::local::SharedLocal>,
+}
+
+impl Members {
+    /// The members of the fixture's workspace, copied into `dir`.
+    async fn in_dir(dir: &Path) -> Self {
+        Self::with_cache(dir, "cache").await
+    }
+
+    /// [`Self::in_dir`], with the cache in `dir` under `name`.
+    async fn with_cache(dir: &Path, name: &str) -> Self {
+        let root = workspace(dir);
+        let cache = Cache::at(&dir.join(name));
+        chatora_rustdoc_mcp::data::owner::Owner::start_this(&cache);
+        Self {
+            workspace: project::workspace_of(&root).expect("a workspace"),
+            resolver: Resolver::new(true),
+            host: host_target(dir).await.triple,
+            cache,
+            flights: chatora_rustdoc_mcp::data::flight::Flights::default(),
+        }
+    }
+
+    /// The build of the member `name`.
+    async fn built(
+        &self,
+        name: &str,
+    ) -> std::sync::Arc<chatora_rustdoc_mcp::query::local::LocalBuilt> {
+        use chatora_rustdoc_mcp::{
+            data::flight::Joined,
+            query::local::{LocalWanted, local_archive},
+        };
+
+        let resolution = self
+            .resolver
+            .resolve(&self.workspace)
+            .await
+            .expect("resolved");
+        let Resolution::Metadata { metadata, .. } = &*resolution else {
+            panic!("cargo metadata works offline here: {resolution:?}");
+        };
+        let (package, _) = build::member_crate(metadata, name).expect("a member");
+        let wanted = LocalWanted {
+            plan: plan(metadata, &self.workspace.root, &self.cache, name, None),
+            target: self.host.clone(),
+            project_sets_target: false,
+            cargo_home: self.resolver.cargo_home().map(Path::to_path_buf),
+            docs_rs_features: None,
+            warnings: Vec::new(),
+            input_files: self
+                .resolver
+                .input_files(&self.workspace.root, metadata)
+                .await,
+            input_packages: build::source_packages(metadata, package),
+        };
+        let until = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(300))
+            .expect("a time");
+        let Joined::Done(Ok(built)) =
+            local_archive(&self.flights, &self.cache, wanted, until).await
+        else {
+            panic!("built");
+        };
+        built
+    }
+
+    /// The build of the member `name`, once its dep-info is recorded (decided in M2's D4).
+    async fn told(
+        &self,
+        name: &str,
+    ) -> std::sync::Arc<chatora_rustdoc_mcp::query::local::LocalBuilt> {
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(120))
+            .expect("a time");
+        loop {
+            let now = self.built(name).await;
+            if now.record.dep_info {
+                return now;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dep-info is not recorded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+}
+
+/// When the inputs of `built` were taken: the same for the same build.
+fn taken(built: &chatora_rustdoc_mcp::query::local::LocalBuilt) -> u128 {
+    built
+        .record
+        .inputs
+        .as_ref()
+        .expect("the inputs are recorded")
+        .taken_at
+}
+
+/// Writes `text` to `path`, and waits until it is settled: a file outside the packages that
+/// changed close to a build, in its time or its status (ctime), makes the next call build again
+/// (decided in M2's D4).
+async fn write_settled(path: &Path, text: &str) {
+    fs::write(path, text).expect("written");
+    tokio::time::sleep(std::time::Duration::from_millis(3_500)).await;
+}
+
 #[tokio::test]
 async fn a_member_is_built_again_only_when_what_it_is_made_from_changes() {
-    use chatora_rustdoc_mcp::{
-        data::{
-            flight::{Flights, Joined},
-            owner::Owner,
-        },
-        query::local::{LocalBuilt, LocalWanted, local_archive},
-    };
-
     let Some(dir) = in_isolated_child(
         "local_build::a_member_is_built_again_only_when_what_it_is_made_from_changes",
     ) else {
         return;
     };
-    let root = workspace(&dir);
-    let workspace = project::workspace_of(&root).expect("a workspace");
-    let resolver = Resolver::new(true);
-    let host = host_target(&dir).await.triple;
-    let cache = Cache::at(&dir.join("cache"));
-    Owner::start_this(&cache);
-    let flights = Flights::default();
-    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
-    // Planned again for each call, as the server does: an edit to a manifest changes the plan.
-    let built = async || -> std::sync::Arc<LocalBuilt> {
-        let resolution = resolver.resolve(&workspace).await.expect("resolved");
-        let Resolution::Metadata { metadata, .. } = &*resolution else {
-            panic!("cargo metadata works offline here: {resolution:?}");
-        };
-        let (package, _) = build::member_crate(metadata, "one").expect("one");
-        let wanted = LocalWanted {
-            plan: plan(metadata, &workspace.root, &cache, "one", None),
-            target: host.clone(),
-            project_sets_target: false,
-            cargo_home: resolver.cargo_home().map(Path::to_path_buf),
-            docs_rs_features: None,
-            warnings: Vec::new(),
-            input_files: resolver.input_files(&workspace.root, metadata).await,
-            input_dirs: build::source_dirs(metadata, package),
-        };
-        let Joined::Done(Ok(built)) = local_archive(&flights, &cache, wanted, until).await else {
-            panic!("built");
-        };
-        built
-    };
-    let taken = |built: &LocalBuilt| {
-        built
-            .record
-            .inputs
-            .as_ref()
-            .expect("the inputs are recorded")
-            .taken_at
-    };
-    let first = built().await;
+    let members = Members::in_dir(&dir).await;
+    let first = members.built("one").await;
     assert!(first.record.key.is_some());
     // Nothing changed: not built again.
-    let again = built().await;
+    let again = members.built("one").await;
     assert_eq!(taken(&again), taken(&first));
     // A source of the member, a file of its package that build.rs may read, and the source of a
     // path dependency outside the workspace: built again.
@@ -422,23 +492,278 @@ async fn a_member_is_built_again_only_when_what_it_is_made_from_changes() {
         ("ws/one/proto/a.proto", "message A {}\n"),
         ("deps/watcher/src/lib.rs", "/// Added.\npub fn more() {}\n"),
     ] {
-        let before = built().await;
+        let before = members.built("one").await;
         let path = dir.join("local-build").join(path);
         fs::create_dir_all(path.parent().expect("a directory")).expect("made");
         let mut contents = fs::read_to_string(&path).unwrap_or_default();
         contents.push_str(text);
         fs::write(&path, contents).expect("written");
-        let after = built().await;
+        let after = members.built("one").await;
         assert_ne!(taken(&after), taken(&before), "{}", path.display());
         assert_ne!(after.record.key, before.record.key, "{}", path.display());
     }
-    assert!(items_at(&built().await.json).contains("added"));
+    assert!(items_at(&members.built("one").await.json).contains("added"));
+}
+
+#[tokio::test]
+async fn a_file_that_the_dep_info_of_a_member_tells_is_in_its_key() {
+    let Some(dir) =
+        in_isolated_child("local_build::a_file_that_the_dep_info_of_a_member_tells_is_in_its_key")
+    else {
+        return;
+    };
+    let members = Members::in_dir(&dir).await;
+    // A file outside the package that the crate reads, which its dep-info tells after the build:
+    // built again when it changes.
+    let notes = dir.join("local-build/ws/notes.md");
+    write_settled(&notes, "Notes.\n").await;
+    let lib = dir.join("local-build/ws/one/src/lib.rs");
+    let mut contents = fs::read_to_string(&lib).expect("read");
+    contents.push_str("#[doc = include_str!(\"../../notes.md\")]\npub fn noted() {}\n");
+    fs::write(&lib, contents).expect("written");
+    let first = members.built("one").await;
+    let told = members.told("one").await;
+    assert!(
+        told.record
+            .deps
+            .files
+            .iter()
+            .any(|file| file.ends_with("ws/notes.md")),
+        "{:?}",
+        told.record.deps
+    );
+    // The record with the dep-info is of the same build, which is fresh.
+    assert_eq!(taken(&told), taken(&first));
+    assert_ne!(told.record.key, first.record.key);
+    assert_eq!(taken(&*members.built("one").await), taken(&first));
+    // As when a server ended before the dep-info: the next call finds the build fresh, and has
+    // the dep-info then.
+    fs::write(
+        first.json.with_file_name("record.json"),
+        serde_json::to_vec(&first.record).expect("JSON"),
+    )
+    .expect("written");
+    let again = members.told("one").await;
+    assert_eq!(taken(&again), taken(&first));
+    assert_eq!(again.record.key, told.record.key);
+    fs::write(&notes, "Other notes.\n").expect("written");
+    let after = members.built("one").await;
+    assert_ne!(taken(&after), taken(&first));
+    assert!(
+        fs::read_to_string(&after.json)
+            .expect("published")
+            .contains("Other notes.")
+    );
+}
+
+/// Whether the record of the build published at `json` on disk notes that its dep-info was had,
+/// or tried.
+fn dep_info_on_disk(json: &Path) -> bool {
+    fs::read(json.with_file_name("record.json"))
+        .ok()
+        .and_then(|record| serde_json::from_slice::<serde_json::Value>(&record).ok())
+        .is_some_and(|record| record["dep_info"] == true)
+}
+
+#[tokio::test]
+async fn the_dep_info_of_a_member_changes_with_its_includes() {
+    let Some(dir) =
+        in_isolated_child("local_build::the_dep_info_of_a_member_changes_with_its_includes")
+    else {
+        return;
+    };
+    let members = Members::in_dir(&dir).await;
+    let notes = dir.join("local-build/ws/notes.md");
+    write_settled(&notes, "Notes.\n").await;
+    let lib = dir.join("local-build/ws/one/src/lib.rs");
+    let original = fs::read_to_string(&lib).expect("read");
+    let with =
+        format!("{original}#[doc = include_str!(\"../../notes.md\")]\npub fn noted() {{}}\n");
+    fs::write(&lib, &with).expect("written");
+    members.built("one").await;
+    let told = members.told("one").await;
+    // Built again for an edit, with the dep-info before: fresh once its own is had.
+    fs::write(&notes, "Other.\n").expect("written");
+    let rebuilt = members.built("one").await;
+    assert_ne!(taken(&rebuilt), taken(&told));
+    assert_eq!(taken(&*members.told("one").await), taken(&rebuilt));
+    assert_eq!(taken(&*members.built("one").await), taken(&rebuilt));
+    // Without the include, `notes.md` leaves the key.
+    fs::write(&lib, &original).expect("written");
+    let without = members.built("one").await;
+    let told = members.told("one").await;
+    assert!(
+        !told
+            .record
+            .deps
+            .files
+            .iter()
+            .any(|file| file.ends_with("ws/notes.md")),
+        "{:?}",
+        told.record.deps
+    );
+    assert_eq!(taken(&*members.built("one").await), taken(&without));
+    fs::write(&notes, "More.\n").expect("written");
+    assert_eq!(taken(&*members.built("one").await), taken(&without));
+}
+
+#[tokio::test]
+async fn an_edit_while_the_dep_info_is_had_makes_the_member_built_again() {
+    let Some(dir) = in_isolated_child(
+        "local_build::an_edit_while_the_dep_info_is_had_makes_the_member_built_again",
+    ) else {
+        return;
+    };
+    let members = Members::in_dir(&dir).await;
+    let notes = dir.join("local-build/ws/notes.md");
+    write_settled(&notes, "Notes.\n").await;
+    let lib = dir.join("local-build/ws/one/src/lib.rs");
+    let original = fs::read_to_string(&lib).expect("read");
+    let with =
+        format!("{original}#[doc = include_str!(\"../../notes.md\")]\npub fn noted() {{}}\n");
+    // Right after the build, an edit that the run for the dep-info may read instead: without
+    // the include, or broken. Undone after it.
+    for edited in [original.clone(), format!("{with}pub fn broken( {{\n")] {
+        fs::write(&lib, &with).expect("written");
+        let first = members.built("one").await;
+        fs::write(&lib, &edited).expect("written");
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(120))
+            .expect("a time");
+        while !dep_info_on_disk(&first.json) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dep-info is not tried"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        fs::write(&lib, &with).expect("written");
+        // Not taken for the build: built again, with the dep-info of what it reads.
+        let again = members.built("one").await;
+        assert_ne!(taken(&again), taken(&first));
+        let told = members.told("one").await;
+        assert!(
+            told.record
+                .deps
+                .files
+                .iter()
+                .any(|file| file.ends_with("ws/notes.md")),
+            "{:?}",
+            told.record.deps
+        );
+        fs::write(&notes, format!("Notes for {}.\n", edited.len())).expect("written");
+        let after = members.built("one").await;
+        assert_ne!(taken(&after), taken(&again));
+    }
+}
+
+#[tokio::test]
+async fn a_build_script_that_writes_in_its_package_does_not_make_it_built_again() {
+    let Some(dir) = in_isolated_child(
+        "local_build::a_build_script_that_writes_in_its_package_does_not_make_it_built_again",
+    ) else {
+        return;
+    };
+    let members = Members::in_dir(&dir).await;
+    // The same contents each time it runs, which, without `rerun-if-changed`, cargo runs again
+    // for the run for the dep-info too: the file is written after the build. It was written
+    // before too: a new file in the package makes the next call build again.
+    fs::write(dir.join("local-build/ws/one/src/gen.rs"), "// Generated.\n").expect("written");
+    fs::write(
+        dir.join("local-build/ws/one/build.rs"),
+        "fn main() {\n\
+             std::fs::write(\"src/gen.rs\", \"// Generated.\\n\").unwrap();\n\
+         }\n",
+    )
+    .expect("written");
+    let first = members.built("one").await;
+    let told = members.told("one").await;
+    assert_eq!(taken(&told), taken(&first));
+    for _ in 0..3 {
+        assert_eq!(taken(&*members.built("one").await), taken(&first));
+    }
+}
+
+#[tokio::test]
+async fn a_cache_with_a_comma_in_its_path_has_no_dep_info() {
+    let Some(dir) =
+        in_isolated_child("local_build::a_cache_with_a_comma_in_its_path_has_no_dep_info")
+    else {
+        return;
+    };
+    // rustdoc splits `--emit` at commas.
+    let members = Members::with_cache(&dir, "ca,che").await;
+    let first = members.built("one").await;
+    let told = members.told("one").await;
+    assert_eq!(taken(&told), taken(&first));
+    assert_eq!(told.record.key, first.record.key);
+    assert_eq!(told.record.deps, freshness::Deps::default());
+    assert!(
+        told.record
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("comma")),
+        "{:?}",
+        told.record.warnings
+    );
+}
+
+#[tokio::test]
+async fn what_the_build_script_of_a_member_watches_is_in_its_key() {
+    let Some(dir) =
+        in_isolated_child("local_build::what_the_build_script_of_a_member_watches_is_in_its_key")
+    else {
+        return;
+    };
+    let members = Members::in_dir(&dir).await;
+    // A file outside the package that the build script reads, and a variable that it watches.
+    let flags = dir.join("local-build/ws/flags.txt");
+    fs::write(
+        dir.join("local-build/ws/cfgenv/build.rs"),
+        "fn main() {\n\
+             println!(\"cargo::rustc-check-cfg=cfg(from_build)\");\n\
+             println!(\"cargo::rustc-cfg=from_build\");\n\
+             let flags = std::fs::read_to_string(\"../flags.txt\").unwrap();\n\
+             println!(\"cargo::rustc-env=FROM_BUILD={}\", flags.trim());\n\
+             println!(\"cargo::rerun-if-changed=../flags.txt\");\n\
+             println!(\"cargo::rerun-if-env-changed=CHATORA_RUSTDOC_MCP_TEST_FLAG\");\n\
+         }\n",
+    )
+    .expect("written");
+    write_settled(&flags, "one\n").await;
+    let first = members.built("cfgenv").await;
+    let told = members.told("cfgenv").await;
+    let deps = &told.record.deps;
+    assert!(
+        deps.files.iter().any(|file| file.ends_with("ws/flags.txt")),
+        "{deps:?}"
+    );
+    // And what the build script of its path dependency watches, as proc-macro2's does; what the
+    // build script sets is not of the environment.
+    assert_eq!(deps.env, [
+        Box::from("CHATORA_RUSTDOC_MCP_TEST_FLAG"),
+        Box::from("RUSTC_BOOTSTRAP")
+    ]);
+    // Nor what it writes in the target directory.
+    assert!(
+        deps.files
+            .iter()
+            .all(|file| !file.starts_with(dir.join("cache"))),
+        "{deps:?}"
+    );
+    assert_eq!(taken(&*members.built("cfgenv").await), taken(&first));
+    fs::write(&flags, "two\n").expect("written");
+    let after = members.built("cfgenv").await;
+    assert_ne!(taken(&after), taken(&first));
+    assert!(
+        fs::read_to_string(&after.json)
+            .expect("published")
+            .contains("two")
+    );
 }
 
 #[tokio::test]
 async fn the_sources_of_a_package_in_git_are_what_git_does_not_ignore() {
-    use chatora_rustdoc_mcp::data::freshness;
-
     let Some(dir) = in_isolated_child(
         "local_build::the_sources_of_a_package_in_git_are_what_git_does_not_ignore",
     ) else {

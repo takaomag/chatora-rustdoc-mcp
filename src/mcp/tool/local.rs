@@ -163,7 +163,7 @@ pub(super) async fn member(
             docs_rs_features: docs_rs.features,
             warnings,
             input_files: state.resolver.input_files(root, metadata).await,
-            input_dirs: build::source_dirs(metadata, package),
+            input_packages: build::source_packages(metadata, package),
         }),
         package: package.name.clone(),
     })

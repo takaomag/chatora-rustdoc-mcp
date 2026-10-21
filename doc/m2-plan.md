@@ -848,7 +848,7 @@ Claude Code 2.1.304、Linux で測った。
 - 残したもの:
   - `rustc -vV` は 60 秒覚える (`tool::output_kept`)。`rustup update` の後 60 秒の間は、前の toolchain のビルドを新しいとしうる。
   - パッケージの外のファイル (`include_str!("../../README.md")` など) と `env!` は D4b (dep-info) まで拾わない。
-  - git が無視するファイルを build.rs が読む場合は、D4b の後も拾わない。
+  - git が無視するファイルを build.rs が読む場合は、build.rs が `rerun-if-changed` で挙げていなければ、D4b の後も拾わない。
   - ビルドの間にファイルの mtime が戻されて、大きさも同じ場合は拾わない (決定 2 の帰結)。
 
 **D4b の下調べ (2026-10-21)**:
@@ -856,6 +856,42 @@ Claude Code 2.1.304、Linux で測った。
 - `--emit=dep-info` は書き先を指定しないと、古い nightly (2025-10-10) が cwd (= 利用者のワークスペースのルート) に `<crate>.d` を書く。`--emit=dep-info=<work dir のパス>` なら、stable と nightly (2025-10・2026-06・今) のどれも指定先にだけ書き、JSON は書かない
 - `.d` は絶対パスで、`include_str!`・`#[path]`・OUT_DIR の生成物・パッケージの外のファイル・`#[cfg(docsrs)]` だけで読むファイル (`--cfg docsrs` を渡したとき) を挙げる。`# env-dep:NAME[=値]` の行もある (値が無ければ変数が無い)
 - このリポジトリで dep-info の 2 回目の rustdoc は 5.57 秒 (`.d` は 92 行)
+- ワークスペースの member では、`.d` の相対パスはワークスペースのルート (cargo が rustdoc を走らせる場所) からのもの (`one/src/lib.rs`)。ファイル名の空白は `\ ` に、`#` と `:` はそのまま。`env-dep` の値は `\` が `\\`、改行が `\n` になる
+- 通常のビルドで cargo は rustdoc の dep-info を出さない (cargo 1.99.1)。2 回目の rustdoc は要る
+- 利用者の決定: dep-info の 2 回目の rustdoc は、呼び出しに JSON を返した後に裏で走らせる (作り直しの応答を遅らせない)。走っている間に来た呼び出しは、dep-info を足す前の鍵で判定する
+
+**D4b (dep-info。2026-10-21)**:
+
+- `build::dep_info`: 作り直しで公開した後、同じ計画 (再試行で変わった後のもの) に `--emit=dep-info=<work の中のパス>` を足して cargo を走らせ、`.d` と、各 build script の `output` (cargo が `out_dir` の隣に残す、build script が cargo に伝えたもの。`build-script-executed` のメッセージで場所が分かる。build script が fresh でもメッセージは出る) を読む。`build` と同じく target dir の共有のロック・`doc:` のロック・枠を取る (`take_turn` にまとめた)。toolchain が JSON を書いていたら消す
+- `freshness::Deps` (記録では `dep_files`・`dep_dirs`・`env_deps`) に入れるもの:
+  - `.d` のファイル (`..` を含むものは、あれば実体のパスで。symlink の後の `..` を OS と同じに読むため)
+  - member と path 依存の build script の `rerun-if-changed` のファイルとディレクトリ (相対はパッケージのディレクトリから)、`rerun-if-env-changed` の変数。D4 の決定 8 の「build.rs が読む変数は dep-info の `env-dep` で入る」は誤りだった (`.d` に出るのは文書化する crate の `env!`・`option_env!` だけ)。利用者の決定で、cargo が build script を走らせ直す条件と同じものを鍵に入れる
+  - `.d` の `env-dep` のうち、サーバーの環境の値と同じもの (無いものは無いまま)。cargo や build script が設定した変数 (`CARGO_PKG_NAME`・`OUT_DIR`・`rustc-env` のもの) は、その元が鍵に入っている
+  - build script が target dir に書いたもの (OUT_DIR) は出力なので除く
+- 鍵は、ビルドの前に取った入力に dep-info で分かったファイルを足し、前回の dep-info だけが挙げて今回は挙げないもの (パッケージの一覧とたどったディレクトリに無いもの) を除いたものと、`Plan::facts` に変数の値の SHA-256 を足したもの。次の判定は、パッケージのファイルに前回の `Deps` のファイルとディレクトリを足して集め、前回の変数の今の値で鍵を求める
+- ビルドの前に取った時刻 (`taken_at`) から 3 秒前より後に変わった dep-info のファイルは、digest を持たない (`freshness::collect_after`): ビルドの間の編集を拾い、次の判定で作り直す。ビルドの直前に外のファイルを編集すると、1 回余計に作り直す
+- 記録の `dep_info` (試したか): 新しいと判定したビルドに印が無ければ (サーバーが dep-info の前に終わったなど)、記録の入力 (ビルドの前のもの) のまま、その場で裏の dep-info を始める。同じビルドの dep-info は (JSON, 鍵) ごとに、プロセスの中で 1 つずつ (`Following`。最初は JSON ごとにしていて、前のビルドの dep-info の後片付けの間に公開した次のビルドが飛ばされていた)。始める前と書く前に、ディスクの記録が見つけたときと同じ (鍵が同じで印が無い) か確かめ、違えば何もしない (`Built::write_record_if`)。別のプロセスが先に済ませた記録を上書きしない
+- dep-info の 2 回目の rustdoc は、ビルドが読んだものではなく、そのときのソースを読む (応答の直後に編集して戻すと、パッケージの外のファイルが鍵から落ちていた。2 回目のレビューで再現)。そこで、判定のときに見た入力 (`Fresh::seen`: 作り直しならビルドの前、新しいと判定したならそのとき) が同じか、2 度確かめる (`freshness::unchanged`)。比べるのは内容 (digest) で、大きさか mtime が違うファイルだけ読み直す (最初は大きさと mtime で比べていて、build script がパッケージの中のファイルを同じ内容で毎回書き直すと、呼び出しのたびに作り直していた。3 回目のレビューで再現)
+  - dep-info の cargo を走らせる前、ロックと枠を取った後: 記録が見つけたときのままで、ソースが同じときだけ走らせる (`build::dep_info` の `ready`)。違えば何もしない (次の呼び出しが判定する)。新しいビルドの後に古い dep-info が数秒走るのも、これで避ける
+  - 走らせた後: 違えば、dep-info がビルドと違うソースを読んだかもしれないので使わず、記録の鍵を外して次の呼び出しで作り直させる。走っている数秒の間に編集して戻されたものは拾えない
+- 失敗の扱い: 記録には何も書かず、(JSON, 鍵) ごとにプロセスの間覚えて、新しいと判定するたびに走らせ直さない (失敗には途中の編集や一時的なものもあり、ディスクに残すと二度と取り直さないため)。覚えているビルドを新しいと判定したら、応答に warning を付ける (パッケージの外のファイルの編集で作り直さない旨)。記録の書き込みの失敗と、build script の `output` が読めないこと (cargo の置き場が変わると、見張るものが黙って落ちるため) も失敗に数える。サーバーの終了 (`child::stopping`) のときは覚えもしない。cache のパスに `,` があると rustdoc が `--emit` を区切ってしまうので、走らせずに印と warning (応答にも出る) を付ける
+- ビルドの後に初めて見つかったファイルは、Unix では ctime も見る (`mv`・`cp -p`・`tar x` で古い mtime のまま置き換えたものを拾うため)。symlink 自体とその先の両方の ctime の新しいほう
+- 書いている途中で、`Following::of` が条件にかかわらず `Following` を作り (`bool::then_some`)、走っている側があると、その `Drop` がロックを持ったまま同じ Mutex を取ってデッドロックした。`#[tokio::test]` は 1 スレッドなので、テストのプロセスごと止まり、cargo の子がゾンビで残った。走っている側の印も消していた。作るのを条件が真のときだけにし、単体テストを足した
+- `build::source_dirs` は `source_packages` に置き換えた。package id は完全に同じものを先に探す (名前と版の同じ path パッケージが 2 つあるとき)。target dir の除外は実体のパスでも比べる (cache のパスに symlink があるとき)。`.d` の行で `# ` で始まるものだけをコメントとする
+- 実測 (このリポジトリ): 作り直し 6.7〜7.1 秒 (dep-info は応答の後)。`.d` のファイル 85 件はどれもパッケージの中で、変数は残らない (`env!("CARGO_PKG_VERSION")` は cargo が設定する)。鮮度が合えば別のプロセスから 0.7 秒
+- テスト: `.d` の読み方 (相対パス・`..`・空白・`env-dep` の値と無いもの)、symlink の後の `..`、build script の `output` の読み方、変数がサーバーの環境のものかの判定、ビルドの後に変わったファイルが digest を持たないこと。隔離した子で (結合テストの準備は `Members` にまとめた):
+  - パッケージの外の `notes.md` を `include_str!` で読む member は、dep-info が記録された後も同じビルドのまま新しく、`notes.md` を編集すると作り直す。dep-info の前の記録に戻すと (サーバーが先に終わった場合)、次の呼び出しは新しいと判定し、dep-info を取り直して同じ鍵になる
+  - build script がパッケージの外の `flags.txt` を `rerun-if-changed` で見張る member は、それが鍵に入り、編集すると作り直す。`rerun-if-env-changed` の変数と path 依存の build script のもの (`RUSTC_BOOTSTRAP`) は入り、`rustc-env` の変数と target dir の中のファイルは入らない
+  - cache のパスに `,` があると、dep-info を取らずに warning を付ける
+  - build script がパッケージの中のファイル (`src/gen.rs`) を毎回同じ内容で書き直しても、作り直さない
+  - include を足して作り直した後と、include を外した後のどちらも、dep-info の後に同じ鍵に落ち着く。dep-info の間にソースを編集して戻すと (include を外す・壊す)、次の呼び出しで作り直し、外のファイルが鍵に入る
+  - テストでは、外のファイルを書いた後に 3.5 秒待つ (`write_settled`)。ctime は戻せないので、ビルドの直前に書くと 1 回余計に作り直す
+- 残したもの:
+  - ビルドの間に外のファイルを書き換える build script (gitignore の下の `src/gen.rs` に毎回違う内容を書き、`include!` するもの) では、呼び出しのたびに作り直す
+  - cargo が利用者の環境から作って渡す変数 (Windows の `PATH` など) は、サーバーの環境の値と違うので鍵に入らない。`option_env!` で UTF-8 でない値の変数を読むものも入らない
+  - 裏の dep-info は枠と `doc:` のロックを数秒持つ (決定 3 のとおり)。その間、同じ target dir の作り直しは待つ
+  - 依存 (registry・git) の build script の `rerun-if-env-changed` (`OPENSSL_DIR` など) は鍵に入らない (D4 は member と path 依存だけ)
+  - Unix の外 (Windows) では ctime を見ないので、古い mtime のまま置き換えた外のファイルを拾わないことがある
 
 ### 6.6 M2e
 

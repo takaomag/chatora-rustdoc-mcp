@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -32,6 +32,20 @@ pub struct Inputs {
     pub files: Vec<InputFile>,
     /// When they were taken, in nanoseconds since the Unix epoch.
     pub taken_at: u128,
+}
+
+impl Inputs {
+    /// Adds the files of `more` that it does not have.
+    pub fn add(&mut self, more: Self) {
+        for file in more.files {
+            if let Err(at) = self
+                .files
+                .binary_search_by(|have| have.path.cmp(&file.path))
+            {
+                self.files.insert(at, file);
+            }
+        }
+    }
 }
 
 /// A file among the inputs.
@@ -213,6 +227,212 @@ pub fn key(inputs: &Inputs, facts: &str) -> String {
         text.push_str(file.sha256.as_deref().unwrap_or("-"));
     }
     cache::sha256_hex(text.as_bytes())
+}
+
+/// [`collect`] for `files` and the files under `dirs` that a build read, as its dep-info told
+/// after it.
+///
+/// A file that changed after `taken_at`, when the inputs were taken before the build, or close to
+/// it, has no digest, so that the next check finds the build stale (requirement R-WS-4).
+///
+/// # Errors
+///
+/// Returns an error when a directory cannot be read, or there are more than 50,000 files.
+pub fn collect_after(files: &[PathBuf], dirs: &[PathBuf], taken_at: u128) -> io::Result<Inputs> {
+    let mut inputs = collect(files, dirs, None)?;
+    let since = taken_at.saturating_sub(CLOSE.as_nanos());
+    for file in &mut inputs.files {
+        if file
+            .modified
+            .max(changed_at(&file.path))
+            .is_some_and(|at| at >= since)
+        {
+            file.sha256 = None;
+        }
+    }
+    inputs.taken_at = taken_at;
+    Ok(inputs)
+}
+
+/// Whether the files of `inputs` have what they had when they were taken: the same digests.
+///
+/// Only the files whose size or time differ are read again. A build script may write a file
+/// again with the same contents.
+#[must_use]
+pub fn unchanged(inputs: &Inputs) -> bool {
+    let paths: Vec<PathBuf> = inputs.files.iter().map(|file| file.path.clone()).collect();
+    collect(&paths, &[], Some(inputs)).is_ok_and(|now| {
+        now.files
+            .iter()
+            .map(|file| &file.sha256)
+            .eq(inputs.files.iter().map(|file| &file.sha256))
+    })
+}
+
+/// When the file at `path` last changed as the OS keeps it apart from its time of change, which
+/// `cp -p` and `mv` keep: its status (ctime), on Unix.
+fn changed_at(path: &Path) -> Option<u128> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // Of a symlink, and of where it leads.
+        [fs::symlink_metadata(path), fs::metadata(path)]
+            .into_iter()
+            .filter_map(|metadata| {
+                let metadata = metadata.ok()?;
+                let seconds = u128::try_from(metadata.ctime()).ok()?;
+                let nanos = u128::try_from(metadata.ctime_nsec()).ok()?;
+                seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+            })
+            .max()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// What the dep-info of a build and its build scripts told that it read, besides the files of
+/// its packages (decided in M2's D4).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deps {
+    /// The files that rustdoc read, and that build scripts told cargo to watch
+    /// (`rerun-if-changed`), but those that build scripts wrote.
+    #[serde(default, rename = "dep_files")]
+    pub files: Vec<PathBuf>,
+    /// The directories that build scripts told cargo to watch, which are walked.
+    #[serde(default, rename = "dep_dirs")]
+    pub dirs: Vec<PathBuf>,
+    /// The variables of the environment that rustdoc read, as `env!` does, from the environment
+    /// that the server passes on, and those that build scripts told cargo to watch
+    /// (`rerun-if-env-changed`).
+    #[serde(default, rename = "env_deps")]
+    pub env: Vec<Box<str>>,
+}
+
+/// What the dep-info of a build (`--emit=dep-info`) tells that rustdoc read (decided in M2's D4).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DepInfo {
+    /// The files, without `.` and `..`.
+    pub files: Vec<PathBuf>,
+    /// The variables of the environment that `env!` and `option_env!` read, by name, with their
+    /// value as the dep-info writes it, or `None` when it was not set.
+    pub env: Vec<(Box<str>, Option<Box<str>>)>,
+}
+
+/// The dep-info `text` of rustdoc run in `dir`, which its relative paths are in.
+///
+/// After the first line, which names the output, each file has a line of its own, `<path>:`, in
+/// which a space is written `\ `. A variable has `# env-dep:<name>=<value>`, in which `\` is
+/// written `\\` and a line break `\n`, or `# env-dep:<name>` when it was not set.
+#[must_use]
+pub fn dep_info(text: &str, dir: &Path) -> DepInfo {
+    let mut found = DepInfo::default();
+    for line in text.lines().skip(1) {
+        if let Some(variable) = line.strip_prefix("# env-dep:") {
+            let (name, value) = variable
+                .split_once('=')
+                .map_or((variable, None), |(name, value)| (name, Some(value)));
+            found.env.push((name.into(), value.map(Into::into)));
+        } else if !line.starts_with("# ")
+            && let Some(path) = line.strip_suffix(':')
+        {
+            found
+                .files
+                .push(normal(&dir.join(path.replace("\\ ", " "))));
+        }
+    }
+    found
+}
+
+/// What the output of a build script of the package in `dir` told cargo to watch (decided in M2's
+/// D4).
+///
+/// The paths of `rerun-if-changed`, which are in `dir` when relative, are added to `paths`, and
+/// the variables of `rerun-if-env-changed` to `variables`.
+pub fn watched(output: &str, dir: &Path, paths: &mut Vec<PathBuf>, variables: &mut Vec<Box<str>>) {
+    for line in output.lines() {
+        let Some(instruction) = line
+            .strip_prefix("cargo::")
+            .or_else(|| line.strip_prefix("cargo:"))
+        else {
+            continue;
+        };
+        if let Some(path) = instruction.strip_prefix("rerun-if-changed=") {
+            paths.push(normal(&dir.join(path)));
+        } else if let Some(name) = instruction.strip_prefix("rerun-if-env-changed=") {
+            variables.push(name.into());
+        }
+    }
+}
+
+/// Whether the variable `name` of this process's environment has `value`, as dep-info writes it.
+///
+/// `None` is a variable that is not set. Then rustdoc read it from the environment that the server
+/// passes on, rather than one that cargo or a build script set.
+#[must_use]
+pub fn from_environment(name: &str, value: Option<&str>) -> bool {
+    match (std::env::var_os(name), value) {
+        (None, None) => true,
+        (Some(ours), Some(value)) => ours.to_str().is_some_and(|ours| {
+            ours.replace('\\', "\\\\")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                == value
+        }),
+        _ => false,
+    }
+}
+
+/// The variables `names` of this process's environment, in one text for the key of a build: each
+/// with the SHA-256 of its value, or alone when it is not set. Empty without them.
+#[must_use]
+pub fn environment(names: &[Box<str>]) -> String {
+    let mut text = String::new();
+    for name in names {
+        text.push('\n');
+        text.push_str(name);
+        if let Some(value) = std::env::var_os(&**name) {
+            text.push('=');
+            text.push_str(&cache::sha256_hex(value.as_encoded_bytes()));
+        }
+    }
+    text
+}
+
+/// `path` without `.` and `..`: through the directories that it names, as the OS takes `..` after a
+/// symlink, when it exists.
+fn normal(path: &Path) -> PathBuf {
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+        && let Ok(real) = dunce::canonicalize(path)
+    {
+        return real;
+    }
+    lexically_normal(path)
+}
+
+/// `path` without `.`, and without `..` after a name, which it takes away.
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {},
+            Component::ParentDir
+                if matches!(normal.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                normal.pop();
+            },
+            part @ (Component::Prefix(_)
+            | Component::RootDir
+            | Component::ParentDir
+            | Component::Normal(_)) => normal.push(part),
+        }
+    }
+    normal
 }
 
 /// Adds the files under `dir`, in `root`, to `paths`: not `target` and `.claude` at the top of
@@ -406,6 +626,134 @@ mod tests {
         fs::write(shared.join("x.rs"), "b").expect("written");
         let edited = collect(&[], &[package], Some(&inputs)).expect("collected");
         assert_ne!(key(&edited, ""), first);
+    }
+
+    #[test]
+    fn the_dep_info_tells_the_files_and_the_variables() {
+        let root = Path::new("/w");
+        let text = "/work/dep-info-0.d: one/src/lib.rs one/src/../README.md /abs/a\\ b#c:d.txt\n\
+                    \n\
+                    one/src/lib.rs:\n\
+                    one/src/../README.md:\n\
+                    /abs/a\\ b#c:d.txt:\n\
+                    \n\
+                    # env-dep:CARGO_PKG_NAME=one\n\
+                    # env-dep:X=a\\\\b\\nc d=e\n\
+                    # env-dep:UNSET\n";
+        assert_eq!(dep_info(text, root), DepInfo {
+            files: vec![
+                root.join("one/src/lib.rs"),
+                root.join("one/README.md"),
+                PathBuf::from("/abs/a b#c:d.txt"),
+            ],
+            env: vec![
+                ("CARGO_PKG_NAME".into(), Some("one".into())),
+                ("X".into(), Some("a\\\\b\\nc d=e".into())),
+                ("UNSET".into(), None),
+            ],
+        });
+    }
+
+    #[test]
+    fn what_a_build_script_watches_is_read_from_its_output() {
+        let dir = Path::new("/w/p");
+        let output = "cargo:rustc-cfg=has_x\n\
+                      cargo::rerun-if-changed=build.rs\n\
+                      cargo:rerun-if-changed=/abs/proto\n\
+                      cargo::rerun-if-env-changed=PROTOC\n\
+                      cargo:warning=rerun-if-changed=not.rs\n";
+        let (mut paths, mut variables) = (Vec::new(), Vec::new());
+        watched(output, dir, &mut paths, &mut variables);
+        assert_eq!(paths, [dir.join("build.rs"), PathBuf::from("/abs/proto")]);
+        assert_eq!(variables, [Box::from("PROTOC")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_after_a_symlink_is_that_of_where_it_leads() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let real = dir.path().join("x/y/src");
+        fs::create_dir_all(&real).expect("made");
+        fs::write(dir.path().join("x/y/README.md"), "").expect("written");
+        std::os::unix::fs::symlink(&real, dir.path().join("src")).expect("linked");
+        let found = normal(&dir.path().join("src/../README.md"));
+        assert_eq!(
+            found,
+            dunce::canonicalize(dir.path().join("x/y/README.md")).expect("there")
+        );
+        // What is not there is taken by its words.
+        assert_eq!(
+            normal(&dir.path().join("src/../gone.md")),
+            dir.path().join("gone.md")
+        );
+    }
+
+    #[test]
+    fn a_variable_is_of_the_environment_when_it_has_its_value() {
+        let path = std::env::var("PATH").expect("PATH is set");
+        assert!(from_environment("PATH", Some(&path.replace('\\', "\\\\"))));
+        assert!(!from_environment("PATH", Some("another")));
+        assert!(!from_environment("PATH", None));
+        let unset = "CHATORA_RUSTDOC_MCP_NOT_SET_IN_ANY_TEST";
+        assert!(from_environment(unset, None));
+        assert!(!from_environment(unset, Some("")));
+        assert_eq!(environment(&[]), "");
+        assert_eq!(environment(&[unset.into()]), format!("\n{unset}"));
+        assert!(environment(&["PATH".into()]).starts_with("\nPATH="));
+    }
+
+    #[test]
+    fn inputs_are_unchanged_while_their_files_keep_their_size_and_time() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (path, missing) = (dir.path().join("lib.rs"), dir.path().join("gone.rs"));
+        fs::write(&path, "a").expect("written");
+        let inputs = collect(&[path.clone(), missing.clone()], &[], None).expect("collected");
+        assert!(unchanged(&inputs));
+        // Written again with the same contents, at another time: unchanged.
+        let at = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .expect("a time");
+        fs::write(&path, "a").expect("written");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(at + Duration::from_secs(1)))
+            .expect("dated");
+        assert!(unchanged(&inputs));
+        // Other contents of the same size.
+        fs::write(&path, "b").expect("written");
+        assert!(!unchanged(&inputs));
+        fs::write(&path, "a").expect("written");
+        // A file that was missing and is there.
+        let inputs = collect(&[path, missing.clone()], &[], None).expect("collected");
+        fs::write(&missing, "").expect("written");
+        assert!(!unchanged(&inputs));
+    }
+
+    #[test]
+    fn a_file_that_changed_after_the_inputs_were_taken_has_no_digest() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("README.md");
+        fs::write(&path, "a").expect("written");
+        let modified = collect(std::slice::from_ref(&path), &[], None)
+            .expect("collected")
+            .files
+            .first()
+            .and_then(|file| file.modified)
+            .expect("a time");
+        let digest = |taken_at| {
+            collect_after(std::slice::from_ref(&path), &[], taken_at)
+                .expect("collected")
+                .files
+                .first()
+                .and_then(|file| file.sha256.clone())
+        };
+        assert!(digest(modified.saturating_add(CLOSE.as_nanos() * 2)).is_some());
+        assert_eq!(digest(modified), None);
+        let mut inputs = collect(&[], &[], None).expect("collected");
+        inputs.add(collect_after(std::slice::from_ref(&path), &[], 0).expect("collected"));
+        inputs.add(collect_after(std::slice::from_ref(&path), &[], 0).expect("collected"));
+        assert_eq!(inputs.files.len(), 1);
     }
 
     #[test]
