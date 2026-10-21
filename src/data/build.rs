@@ -397,6 +397,24 @@ pub fn crate_of(package: &Package, name: &str) -> Option<Documented> {
     }
 }
 
+/// The features of `features`, as the build of the workspace has them on `package`, that it
+/// declares, and that are features as Cargo takes them (requirement R-SEC-4).
+///
+/// Another package of its name and version, from elsewhere, would add some that it does not have.
+#[must_use]
+pub fn declared_features<'a>(
+    package: &Package,
+    features: impl IntoIterator<Item = &'a Box<str>>,
+) -> Vec<Box<str>> {
+    features
+        .into_iter()
+        .filter(|feature| {
+            package.features.contains(*feature) && super::crate_file::is_feature_name(feature)
+        })
+        .cloned()
+        .collect()
+}
+
 /// The member of `metadata` that is the package `name` at `version`.
 #[must_use]
 pub fn member_package<'a>(
@@ -453,6 +471,10 @@ pub struct Plan {
     pub target_dir: TargetDir,
     /// The member.
     pub package: PackageId,
+    /// Its `Cargo.toml`, passed as `--manifest-path`: cargo runs in the workspace's root, whose
+    /// settings apply, and with feature resolver 1, `--features` would be of the package there
+    /// (decided in M2's D3).
+    pub manifest: PathBuf,
     /// Its crate.
     pub documented: Documented,
     /// The name of the crate, with `_` for `-`: the name of its JSON.
@@ -463,12 +485,17 @@ pub struct Plan {
     pub target: Option<TargetTriple>,
     /// Whether the documented crate's rustdoc gets `--cfg docsrs` (requirement R-WS-1).
     pub cfg_docsrs: bool,
+    /// The features of the member, as in the build of the whole workspace, passed with
+    /// `--no-default-features --features` (requirement R-FT-3, decided in M2's D3), or `None` for
+    /// cargo's default of `-p`.
+    pub features: Option<Vec<Box<str>>>,
 }
 
 impl Plan {
-    /// The command (requirement R-WS-1): `cargo [+<toolchain>] --locked [--offline] rustdoc -j
-    /// <jobs> -p <package id> (--lib | --bin <name>) [--target <target>] --message-format=json --
-    /// -Z unstable-options --output-format json [--cfg docsrs] --document-private-items`, with the
+    /// The command (requirement R-WS-1): `cargo [+<toolchain>] --locked [--offline] rustdoc
+    /// --manifest-path <member> -j <jobs> -p <package id> (--lib | --bin <name>) [--target
+    /// <target>] [--no-default-features [--features <features>]] --message-format=json -- -Z
+    /// unstable-options --output-format json [--cfg docsrs] --document-private-items`, with the
     /// value of `RUSTC_BOOTSTRAP` in place of the user's, and the target directory.
     #[must_use]
     pub fn command(&self) -> tokio::process::Command {
@@ -476,6 +503,8 @@ impl Plan {
             super::cargo::project_command(&self.root, self.offline, self.toolchain.as_deref());
         command
             .arg("rustdoc")
+            .arg("--manifest-path")
+            .arg(&self.manifest)
             .arg("-j")
             .arg(jobs().to_string())
             .arg("-p")
@@ -486,6 +515,12 @@ impl Plan {
         };
         if let Some(target) = &self.target {
             command.arg("--target").arg(target.as_str());
+        }
+        if let Some(features) = &self.features {
+            command.arg("--no-default-features");
+            if !features.is_empty() {
+                command.arg("--features").arg(features.join(","));
+            }
         }
         command.args([
             "--message-format=json",
@@ -586,6 +621,9 @@ pub struct BuildRecord {
     pub chosen_toolchain: Option<Box<str>>,
     /// When it was built, in RFC 3339.
     pub built_at: Box<str>,
+    /// The features asked for, as `--features` with `--no-default-features`, or `None` for
+    /// cargo's default (`features_requested`, requirement R-FT-3).
+    pub features_requested: Option<Vec<Box<str>>>,
     /// The features of the crate, as cargo built it (`features_effective`, requirement R-FT-3),
     /// or `None` when no message of cargo told them.
     pub features_effective: Option<Vec<Box<str>>>,
@@ -730,6 +768,7 @@ pub async fn build(
         toolchain: toolchain.map(Into::into),
         chosen_toolchain: plan.toolchain.as_deref().map(Into::into),
         built_at: super::rfc3339(SystemTime::now()).into(),
+        features_requested: plan.features.clone(),
         features_effective: messages.features,
         bootstrap_all: plan.bootstrap == Bootstrap::All,
         cfg_docsrs: plan.cfg_docsrs,
@@ -1198,11 +1237,13 @@ mod tests {
             bootstrap: Bootstrap::All,
             target_dir: TargetDir(PathBuf::from("/c/t/0123456789ab")),
             package: PackageId("path+file:///ws/app#0.1.0".into()),
+            manifest: PathBuf::from("/ws/app/Cargo.toml"),
             documented: Documented::Lib { proc_macro },
             crate_name: "app".into(),
             version: Version::new(0, 1, 0),
             target: target.map(|target| target.parse().expect("a triple")),
             cfg_docsrs: true,
+            features: None,
         }
     }
 
@@ -1326,6 +1367,25 @@ mod tests {
     }
 
     #[test]
+    fn only_the_features_that_a_member_declares_are_asked_for() {
+        let package: Package = serde_json::from_value(serde_json::json!({
+            "id": "path+file:///ws/app#0.1.0", "name": "app", "version": "0.1.0", "source": null,
+            "manifest_path": "/ws/app/Cargo.toml", "targets": [],
+            "features": {"default": ["extra"], "extra": [], "serde": ["dep:serde"]},
+        }))
+        .expect("a package");
+        let unified: Vec<Box<str>> = ["default", "extra", "serde", "from-elsewhere", "bad name"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(declared_features(&package, &unified), [
+            Box::from("default"),
+            "extra".into(),
+            "serde".into()
+        ]);
+    }
+
+    #[test]
     fn the_keys_of_the_locks_do_not_change() {
         assert_eq!(target_key("0123456789ab.1"), "target:0123456789ab.1");
         assert_eq!(doc_key("0123456789ab.1"), "doc:0123456789ab.1");
@@ -1354,6 +1414,7 @@ mod tests {
             bootstrap: Bootstrap::Crates("app,my_app".to_owned()),
             target_dir: TargetDir(PathBuf::from("/c/t/0123456789ab")),
             package: PackageId("path+file:///ws/app#0.1.0".into()),
+            manifest: PathBuf::from("/ws/app/Cargo.toml"),
             documented: Documented::Bin {
                 name: "my-app".into(),
             },
@@ -1361,6 +1422,7 @@ mod tests {
             version: Version::new(0, 1, 0),
             target: Some(other),
             cfg_docsrs: true,
+            features: Some(vec!["default".into(), "extra".into()]),
         };
         let command = plan.command();
         let command = command.as_std();
@@ -1374,6 +1436,8 @@ mod tests {
             "--locked",
             "--offline",
             "rustdoc",
+            "--manifest-path",
+            "/ws/app/Cargo.toml",
             "-j",
             &jobs,
             "-p",
@@ -1382,6 +1446,9 @@ mod tests {
             "my-app",
             "--target",
             "aarch64-apple-darwin",
+            "--no-default-features",
+            "--features",
+            "default,extra",
             "--message-format=json",
             "--",
             "-Z",
@@ -1424,11 +1491,13 @@ mod tests {
             bootstrap: Bootstrap::All,
             target_dir: TargetDir(PathBuf::from("/c/t/0123456789ab")),
             package: PackageId("path+file:///ws/macros#0.1.0".into()),
+            manifest: PathBuf::from("/ws/macros/Cargo.toml"),
             documented: Documented::Lib { proc_macro: true },
             crate_name: "macros".into(),
             version: Version::new(0, 1, 0),
             target: None,
             cfg_docsrs: false,
+            features: None,
         };
         let command = plan.command();
         let args: Vec<_> = command
@@ -1438,11 +1507,15 @@ mod tests {
             .collect();
         assert_eq!(args.first().map(String::as_str), Some("--locked"));
         assert!(args.iter().any(|arg| arg == "--lib"));
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "--target" || arg == "--offline")
-        );
+        assert!(!args.iter().any(|arg| {
+            [
+                "--target",
+                "--offline",
+                "--no-default-features",
+                "--features",
+            ]
+            .contains(&arg.as_str())
+        }));
         assert!(
             !command
                 .as_std()

@@ -84,11 +84,13 @@ fn plan(
         bootstrap: Bootstrap::of(metadata),
         target_dir: TargetDir::of(cache.dir(), root),
         package: package.id.clone(),
+        manifest: package.manifest_path.clone(),
         documented,
         crate_name: name.into(),
         version: package.version.clone(),
         target,
         cfg_docsrs: true,
+        features: None,
     }
 }
 
@@ -234,6 +236,7 @@ async fn a_member_is_built_and_archived_for_the_calls_that_want_it() {
         target: host.clone(),
         project_sets_target: false,
         cargo_home: resolver.cargo_home().map(Path::to_path_buf),
+        warnings: Vec::new(),
     };
     let flights = Flights::handing_over();
     let until = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
@@ -299,6 +302,7 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
         target: host.clone(),
         project_sets_target: false,
         cargo_home: resolver.cargo_home().map(Path::to_path_buf),
+        warnings: Vec::new(),
     };
     let without = |built: &LocalBuilt| {
         !built.record.cfg_docsrs

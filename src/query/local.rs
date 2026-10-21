@@ -36,6 +36,8 @@ pub struct LocalWanted {
     pub project_sets_target: bool,
     /// `$CARGO_HOME`, whose settings apply to the project.
     pub cargo_home: Option<PathBuf>,
+    /// What the response warns about how the build was planned.
+    pub warnings: Vec<Box<str>>,
 }
 
 /// The archive of a member's build, and its record.
@@ -137,6 +139,7 @@ async fn build_and_archive(
         target,
         project_sets_target,
         cargo_home,
+        warnings,
     } = wanted;
     let root = plan.root.clone();
     let programs = Programs::this();
@@ -202,7 +205,7 @@ async fn build_and_archive(
         }
     }
     stage.set(Doing::Indexing);
-    archive(cache, built).await
+    archive(cache, built, warnings).await
 }
 
 /// After a build in which cargo was to install the project's toolchain: what rustup said of it
@@ -296,10 +299,14 @@ static DOCSRS_BROKE: LazyLock<Mutex<HashSet<BuildKey>>> = LazyLock::new(Mutex::d
 /// that the server chose instead of the project's.
 type BuildKey = (Box<str>, Option<String>);
 
-/// The archive of the JSON that `built` published, keyed by its SHA-256, which it must still have.
-async fn archive(cache: &Cache, built: Built) -> Result<LocalBuilt, LocalError> {
+/// The archive of the JSON that `built` published, keyed by its SHA-256, which it must still have,
+/// with `warnings` and what else the response warns about.
+async fn archive(
+    cache: &Cache,
+    built: Built,
+    mut warnings: Vec<Box<str>>,
+) -> Result<LocalBuilt, LocalError> {
     let Built { json, record, .. } = built;
-    let mut warnings = Vec::new();
     if record.bootstrap_all {
         warnings.push(
             "the names of the project's crates were too many for RUSTC_BOOTSTRAP, so it was 1: \

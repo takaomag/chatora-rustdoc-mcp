@@ -761,6 +761,26 @@ Claude Code 2.1.304、Linux で測った。
 - rust-analyzer は既定で `--workspace` を check するので、エディタで見えるのは統合された組
 - `-p a` に features を明示しても、依存 (`x`) の組は `a` の分しか統合されない。`a` のドキュメントに出るのは `a` 自身の item なので、依存の組の違いは re-export の行き先 (D6) の話
 
+**D3d (member の features の組。2026-10-21)**:
+
+- 利用者が 1 件ずつ決めたこと:
+  1. member は、ワークスペース全体で統合した組 (`cargo tree --workspace -e normal` でその member が持つ組) を `--no-default-features --features` で明示してビルドする。`enabled_in_project` と一致し、rust-analyzer が既定で見る組 (`--workspace`) とも合う (R-FT-3 の「通常のビルドで有効な組を再現」)。依存の組はその member の分しか統合されないが、member のドキュメントには効かない
+  2. その組が得られないとき (`cargo tree` の失敗、Cargo.lock だけの解決、通常のビルドで target 向けに作られない member) は、`-p` の既定でビルドして warning
+  3. target 向けと host 向けの組の選び方 (`features.rs` の規則) は今のまま。逆向きの依存木に合わせるのは、依存のビルドを扱う D7
+- 実装: `Plan::features`、`BuildRecord::features_requested`、`LocalWanted::warnings` (計画のときの warning をアーカイブのときに足す)、`mcp::tool::local::member` が `Resolver::features` から組を引く、来歴とスキーマの `features_requested` (D2c の決定 5 で D3 まで出さないとしたもの)
+- テスト: コマンドの引数 (`--no-default-features --features default,extra`、組が無ければ付けない)、stdio で別の member が有効にする feature の item (`front::extra`) が引けて `features_requested: ["extra"]`・`enabled_in_project: true` (member の組を使わないように変えるとこのテストが落ちることを確かめた)
+- 前提を渡さないレビュー (サブエージェント) の指摘と実測:
+  - resolver 1 でルートにパッケージがあるワークスペースでは、`--features`・`--no-default-features` が `-p` の member ではなく cwd (ルート) のパッケージに効く: 実測で `cargo rustdoc -p b --no-default-features --features x` が `package app ... does not have the feature x` で失敗し、`--manifest-path b/Cargo.toml` を足すと (cwd はルートのまま) `b` に `x` が効いた。ビルドに member の `--manifest-path` を足した (`Plan::manifest`。cwd はルートなので、プロジェクトの設定と `rust-toolchain.toml` は今どおり効く)。stdio のテストを足し、`--manifest-path` を外すと落ちることを確かめた
+  - 「proc-macro の member だけが使う lib の member に、host 向けの features が target 向けのビルドに混ざる」は、実測では当たらなかった: `cargo build --workspace --target wasm32-wasip1` でも、target 向けの `helper` は host 向けの依存から来た `std` 付きでビルドされた (cargo は選んだ member の組に host 向けの依存からの features も統合する)。サーバーの組は cargo の実際の組と同じ
+  - 名前と版が同じで取得元の違うパッケージの組が混ざると、member に無い feature を渡して失敗しうる: `cargo metadata` の `features` (宣言された features と optional な依存の名前) を `metadata::Package::features` に読み、組をそれに絞る (`build::declared_features`)。あわせて feature 名の検証 (`crate_file::is_feature_name`、R-SEC-4) を通す
+  - 残したもの: ワークスペース全体の組で member 自身が壊れる (相互排他の features) ときに `-p` の既定に戻らない (`cargo build --workspace` も壊れるプロジェクトの問題として `build_failed`)。組を引く `cargo tree` が期限の外で走る (前もビルドの後に同じものを引いていたので合計は増えない)
+
+**D3e の決定 (2026-10-21)**: 利用者が 1 件ずつ決めた。
+
+1. member の `[package.metadata.docs.rs]` の組 (`features`・`all-features`・`no-default-features`) は、その組で `cargo tree -p <member>` を走らせ、通常のビルドの範囲 (B7 の `build_scope`) に無いパッケージが増えなければ、その組でビルドする。増えるなら通常の組 (D3d) でビルドし、「docs.rs の組は `build_external_docs` で」と warning (R-MCP-3)。`enabled_in_project` は通常の組のまま (R-FT-3)
+2. docs.rs の組で壊れ、通常の組で通った member は、`--cfg docsrs` と同じく、再試行が成功したときだけ package id と toolchain を鍵にプロセスの間覚え、次からは最初から通常の組で warning
+3. 再試行の順: 文書化する crate のエラーなら先に `--cfg docsrs` (と `rustdoc-args` の `--cfg`) を外す。それでも失敗するか、依存のエラーなら通常の組に戻す。ビルドは最大 3 回。それぞれの壊れは別々に覚える
+
 ### 6.6 M2e
 
 (まだ無い)

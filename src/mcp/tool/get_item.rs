@@ -488,6 +488,12 @@ pub(super) fn provenance_schema() -> Value {
                 "description": "When the documentation of a workspace member was built here (RFC \
                                 3339): edits made since are not in it.",
             },
+            "features_requested": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "The features that a workspace member was built with, as in the \
+                                build of the whole workspace, with no default features besides.",
+            },
             "features_effective": {
                 "type": "array",
                 "items": { "type": "string" },
@@ -1560,6 +1566,7 @@ async fn look_up_member(
             project_from: arguments.project_from,
             toolchain: record.toolchain.as_deref(),
             built_at: &record.built_at,
+            features_requested: record.features_requested.as_deref(),
             features_effective: record.features_effective.as_deref(),
         };
         let looked_up = look_up_in(&built.archived.mapped, &arguments, origin);
@@ -3224,6 +3231,7 @@ mod tests {
                 all_features: true,
                 cfg: &features,
                 built_at: some_str(),
+                features_requested: Some(&features),
                 features_effective: Some(&features),
             },
             warnings: Box::from(["x".into()]),

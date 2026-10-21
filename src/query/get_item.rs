@@ -127,6 +127,9 @@ pub enum Origin<'a> {
         toolchain: Option<&'a str>,
         /// When it was built, in RFC 3339 (requirement R-WS-9).
         built_at: &'a str,
+        /// The features asked for with `--no-default-features`, or `None` for cargo's default
+        /// (requirement R-FT-3).
+        features_requested: Option<&'a [Box<str>]>,
         /// The features that cargo built it with, if its messages told them (requirement
         /// R-FT-3).
         features_effective: Option<&'a [Box<str>]>,
@@ -200,6 +203,9 @@ pub struct Provenance<'a> {
     /// When a local build was made (requirement R-WS-9).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub built_at: Option<&'a str>,
+    /// The features that a local build asked for (requirement R-FT-3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub features_requested: Option<&'a [Box<str>]>,
     /// The features that cargo built a local build with (requirement R-FT-3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub features_effective: Option<&'a [Box<str>]>,
@@ -213,6 +219,7 @@ struct FromWhere<'a> {
     toolchain: Option<&'a str>,
     std_from: Option<StdFrom<'a>>,
     built_at: Option<&'a str>,
+    features_requested: Option<&'a [Box<str>]>,
     features_effective: Option<&'a [Box<str>]>,
 }
 
@@ -230,6 +237,7 @@ const fn from_where(origin: Origin<'_>) -> FromWhere<'_> {
             toolchain: None,
             std_from: None,
             built_at: None,
+            features_requested: None,
             features_effective: None,
         },
         Origin::Local {
@@ -237,6 +245,7 @@ const fn from_where(origin: Origin<'_>) -> FromWhere<'_> {
             project_from,
             toolchain,
             built_at,
+            features_requested,
             features_effective,
         } => FromWhere {
             source: Source::Local,
@@ -245,6 +254,7 @@ const fn from_where(origin: Origin<'_>) -> FromWhere<'_> {
             toolchain,
             std_from: None,
             built_at: Some(built_at),
+            features_requested,
             features_effective,
         },
         Origin::Std {
@@ -262,6 +272,7 @@ const fn from_where(origin: Origin<'_>) -> FromWhere<'_> {
                 reason: why,
             }),
             built_at: None,
+            features_requested: None,
             features_effective: None,
         },
     }
@@ -842,6 +853,7 @@ impl<'a> Query<'a> {
             toolchain,
             std_from,
             built_at,
+            features_requested,
             features_effective,
         } = from_where(self.request.origin);
         Provenance {
@@ -861,6 +873,7 @@ impl<'a> Query<'a> {
             all_features: build.is_some_and(|build| build.all_features),
             cfg: build.map_or(&[], |build| &build.cfg),
             built_at,
+            features_requested,
             features_effective,
         }
     }

@@ -3,7 +3,7 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     io,
     path::{Path, PathBuf},
@@ -112,6 +112,18 @@ pub struct Package {
     pub manifest_path: PathBuf,
     /// Its targets: the lib, bins, examples, tests, benches and build script.
     pub targets: Box<[Target]>,
+    /// The names of the features it declares, with those of its optional dependencies.
+    #[serde(default, deserialize_with = "feature_names")]
+    pub features: BTreeSet<Box<str>>,
+}
+
+/// The names of the features of a package: the keys of its `features`.
+fn feature_names<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeSet<Box<str>>, D::Error> {
+    // Each with what it enables, which is not kept.
+    let features: BTreeMap<Box<str>, Vec<Box<str>>> = Deserialize::deserialize(deserializer)?;
+    Ok(features.into_keys().collect())
 }
 
 /// A target of a package.
@@ -992,7 +1004,7 @@ mod tests {
             .await
             .expect("cargo tree works offline here");
         let version = Version::new(0, 1, 0);
-        let names = |set: Option<&std::collections::BTreeSet<Box<str>>>| {
+        let names = |set: Option<&BTreeSet<Box<str>>>| {
             set.expect("built")
                 .iter()
                 .map(ToString::to_string)

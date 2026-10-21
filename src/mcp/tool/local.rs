@@ -113,6 +113,28 @@ pub(super) async fn member(
         return Ok(Member::Not);
     };
     let root = &workspace.root;
+    // The member's features in the build of the whole workspace, as rust-analyzer checks it and
+    // `enabled_in_project` tells (requirement R-FT-3, decided in M2's D3), or else cargo's default.
+    let mut warnings: Vec<Box<str>> = Vec::new();
+    let features = match state.resolver.features(workspace, target).await {
+        Ok(sets) => sets
+            .normal(&package.name, &package.version)
+            .map(|features| build::declared_features(package, features)),
+        Err(error) => {
+            tracing::debug!(%error, "the features of the workspace could not be read");
+            None
+        },
+    };
+    if features.is_none() {
+        warnings.push(
+            format!(
+                "the features of {} in the build of the workspace could not be read, so it is \
+                 built with cargo's default for it alone",
+                package.name
+            )
+            .into(),
+        );
+    }
     let plan = Plan {
         root: root.clone(),
         offline: state.resolver.offline_in(root).await,
@@ -120,11 +142,13 @@ pub(super) async fn member(
         bootstrap: Bootstrap::of(metadata),
         target_dir: TargetDir::of(state.cache.dir(), root),
         package: package.id.clone(),
+        manifest: package.manifest_path.clone(),
         crate_name: build::documented_name(package, &documented).into(),
         documented,
         version: package.version.clone(),
         target: None,
         cfg_docsrs: build::cfg_docsrs(),
+        features,
     };
     Ok(Member::Is {
         wanted: Box::new(LocalWanted {
@@ -132,6 +156,7 @@ pub(super) async fn member(
             target: target.clone(),
             project_sets_target: project::sets_build_target(state, root).await,
             cargo_home: state.resolver.cargo_home().map(Path::to_path_buf),
+            warnings,
         }),
         package: package.name.clone(),
     })

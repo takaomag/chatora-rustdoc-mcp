@@ -1087,6 +1087,135 @@ fn a_member_is_found_by_the_name_that_code_writes() {
     assert!(server.finish().success());
 }
 
+/// A member is built with its features in the build of the whole workspace, which another member
+/// may enable, as rust-analyzer checks it and `enabled_in_project` tells (requirement R-FT-3,
+/// decided in M2's D3).
+#[cfg(feature = "local")]
+#[test]
+fn a_member_is_built_with_the_features_of_the_workspace() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let write = |path: &str, text: &str| {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        std::fs::write(path, text).expect("written");
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"front\", \"back\"]\nresolver = \"3\"\n",
+    );
+    write(
+        "front/Cargo.toml",
+        "[package]\nname = \"front\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [features]\nextra = []\n",
+    );
+    write(
+        "front/src/lib.rs",
+        "/// Only with `extra`.\n#[cfg(feature = \"extra\")]\npub fn extra() {}\n",
+    );
+    write(
+        "back/Cargo.toml",
+        "[package]\nname = \"back\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nfront = { path = \"../front\", features = [\"extra\"] }\n",
+    );
+    write("back/src/lib.rs", "");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = Server::start_in(Some(dir.path()));
+    let mut found = Value::Null;
+    for id in 1..20 {
+        server.send(&call_tool(
+            id,
+            "get_item",
+            json!({ "crate": "front", "path": "extra" }),
+        ));
+        found = server.response(id)["result"].clone();
+        if found["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    assert_ne!(found["isError"], true, "{found}");
+    let found = &found["structuredContent"];
+    assert_eq!(found["provenance"]["source"], "local", "{found}");
+    assert_eq!(
+        found["provenance"]["features_requested"],
+        json!(["extra"]),
+        "{found}"
+    );
+    assert_eq!(found["data"]["enabled_in_project"], true, "{found}");
+    assert!(server.finish().success());
+}
+
+/// With feature resolver 1 and a package at the root, `--features` is of the package that cargo
+/// runs in unless `--manifest-path` names the member, which the build does (decided in M2's D3).
+#[cfg(feature = "local")]
+#[test]
+fn a_member_under_a_root_package_of_resolver_1_gets_its_features() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let write = |path: &str, text: &str| {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        std::fs::write(path, text).expect("written");
+    };
+    write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2018\"\n\n\
+         [workspace]\nmembers = [\"b\"]\n\n\
+         [dependencies]\nb = { path = \"b\", features = [\"x\"] }\n",
+    );
+    write("src/lib.rs", "");
+    write(
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2018\"\n\n\
+         [features]\nx = []\n",
+    );
+    write(
+        "b/src/lib.rs",
+        "/// Only with `x`.\n#[cfg(feature = \"x\")]\npub fn x() {}\n",
+    );
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = Server::start_in(Some(dir.path()));
+    let mut found = Value::Null;
+    for id in 1..20 {
+        server.send(&call_tool(
+            id,
+            "get_item",
+            json!({ "crate": "b", "path": "x" }),
+        ));
+        found = server.response(id)["result"].clone();
+        if found["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    assert_ne!(found["isError"], true, "{found}");
+    let found = &found["structuredContent"];
+    assert_eq!(found["provenance"]["source"], "local", "{found}");
+    assert_eq!(
+        found["provenance"]["features_requested"],
+        json!(["x"]),
+        "{found}"
+    );
+    assert!(server.finish().success());
+}
+
 /// A member's re-export of another member's item is not followed into it (decided in M2's D2,
 /// until D6): the re-export is shown, with why.
 #[cfg(feature = "local")]

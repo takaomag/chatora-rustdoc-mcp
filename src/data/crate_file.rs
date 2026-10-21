@@ -489,7 +489,7 @@ fn closure<'a>(
 }
 
 /// Whether `name` is a feature as Cargo takes it, or a feature of a dependency (`dep/feature`).
-fn is_feature_name(name: &str) -> bool {
+pub(super) fn is_feature_name(name: &str) -> bool {
     let part = |part: &str| {
         part.chars()
             .next()
