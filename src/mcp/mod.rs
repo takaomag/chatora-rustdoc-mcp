@@ -246,6 +246,7 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
     #[cfg(feature = "local")]
     crate::data::build::set_this(settings);
     let network = Network::from_settings(settings);
+    let wait = tool::wait_for_work(settings);
     let server = Server {
         tools: Arc::new(tool::ToolState {
             docs_rs: tool::docs_rs(&network)?,
@@ -271,7 +272,9 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
             #[cfg(feature = "local")]
             locals: Flights::handing_over(),
             calls: tool::CallLimit::from_settings(settings),
-            wait: tool::wait_for_work(settings),
+            wait,
+            #[cfg(feature = "local")]
+            build_wait: tool::wait_for_builds(settings, wait),
         }),
     };
     settings.report();

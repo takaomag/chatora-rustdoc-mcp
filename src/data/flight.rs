@@ -73,6 +73,8 @@ pub enum Doing {
     WaitingForLock,
     /// Building the documentation locally (decided in M2's D2).
     Building,
+    /// Waiting for a build slot (`limits.concurrent_builds`, requirement R-SEC-7).
+    WaitingForSlot,
 }
 
 impl Doing {
@@ -84,6 +86,7 @@ impl Doing {
             Self::Indexing => "indexing",
             Self::WaitingForLock => "waiting_for_lock",
             Self::Building => "building",
+            Self::WaitingForSlot => "waiting_for_slot",
         }
     }
 
@@ -95,6 +98,7 @@ impl Doing {
             Self::Indexing => "indexing",
             Self::WaitingForLock => "waiting for a cargo lock for",
             Self::Building => "building the documentation of",
+            Self::WaitingForSlot => "waiting for a build slot for",
         }
     }
 }
@@ -123,6 +127,7 @@ impl Stage {
             doing if doing == Doing::Indexing as u8 => Doing::Indexing,
             doing if doing == Doing::WaitingForLock as u8 => Doing::WaitingForLock,
             doing if doing == Doing::Building as u8 => Doing::Building,
+            doing if doing == Doing::WaitingForSlot as u8 => Doing::WaitingForSlot,
             _ => Doing::Fetching,
         }
     }

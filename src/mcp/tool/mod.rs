@@ -106,6 +106,10 @@ pub(super) struct ToolState {
     /// How long a call waits for work that goes on without it, such as fetching and indexing a
     /// crate (requirement R-ARCH-6). See [`wait_for_work`].
     pub(super) wait: Duration,
+    /// How long a call waits for a local build, from when it starts to wait for it (requirement
+    /// R-WS-6). See [`wait_for_builds`].
+    #[cfg(feature = "local")]
+    pub(super) build_wait: Duration,
 }
 
 impl ToolState {
@@ -144,6 +148,36 @@ pub(super) fn wait_for_work(settings: &Settings) -> Duration {
         .saturating_mul(2)
         .checked_div(3)
         .unwrap_or_default()
+}
+
+/// `build.wait_secs` unless set (requirement R-WS-6, initial value).
+#[cfg(feature = "local")]
+const DEFAULT_BUILD_WAIT_SECS: u64 = 10;
+
+/// How long a call waits for a local build, from when it starts to wait for it: the setting
+/// `build.wait_secs` (requirement R-WS-6, decided in M2's D3), but no longer than a call waits for
+/// work, `wait`, which is logged. The call then returns `status: building`.
+#[cfg(feature = "local")]
+pub(super) fn wait_for_builds(settings: &Settings, wait: Duration) -> Duration {
+    let set = settings.get("build.wait_secs", |value| {
+        value
+            .whole_number()
+            .filter(|secs| *secs > 0)
+            .ok_or("a whole number of seconds from 1")
+    });
+    let secs = set.unwrap_or(DEFAULT_BUILD_WAIT_SECS);
+    let asked = Duration::from_secs(secs);
+    // Only what the user set is worth a warning: a short `limits.request_timeout_secs` cuts the
+    // default too.
+    if asked > wait && set.is_some() {
+        tracing::warn!(
+            build_wait_secs = secs,
+            wait_secs = wait.as_secs(),
+            "build.wait_secs is longer than a call waits for work (two thirds of \
+             limits.request_timeout_secs), so a call waits for a build as long as that"
+        );
+    }
+    asked.min(wait)
 }
 
 /// The most tool calls handled at once (requirement R-SEC-7). Over it, a call gets `busy`.
@@ -660,6 +694,28 @@ fn error_result(body: &Value) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn a_call_waits_for_a_build_no_longer_than_for_work() {
+        let wait = Duration::from_secs(20);
+        let settings = |toml: &str| {
+            let file = (std::path::PathBuf::from("config.toml"), toml.to_owned());
+            Settings::from_sources(Some(&file), [])
+        };
+        assert_eq!(
+            wait_for_builds(&settings(""), wait),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            wait_for_builds(&settings("[build]\nwait_secs = 5\n"), wait),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            wait_for_builds(&settings("[build]\nwait_secs = 60\n"), wait),
+            wait
+        );
+    }
 
     /// Returns the JSON in `content[0].text` of a tool result.
     fn text_json(result: &CallToolResult) -> Value {

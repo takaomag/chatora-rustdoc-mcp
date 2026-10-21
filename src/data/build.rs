@@ -14,7 +14,7 @@ use std::{
         OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use semver::Version;
@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     cache::{self, Cache},
-    cargo::{Activity, Failure, RunError, classify, run_building, stderr_tail},
+    cargo::{Failure, RunError, classify, run_building, stderr_tail},
+    flight::Doing,
     metadata::{Metadata, Package, PackageId, Target},
     process_lock::{self, LockMode, ProcessLock},
     target::TargetTriple,
@@ -50,6 +51,51 @@ const LIB_KINDS: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib", "pro
 /// The jobs of a build, as the setting `build.jobs` gives them.
 static JOBS: OnceLock<NonZeroUsize> = OnceLock::new();
 
+/// The builds that run at once in this process, unless `limits.concurrent_builds` sets it
+/// (requirement R-SEC-7, initial value).
+const DEFAULT_CONCURRENT_BUILDS: usize = 2;
+
+/// The build slots of this process, as `limits.concurrent_builds` sets them.
+static SLOTS: OnceLock<Slots> = OnceLock::new();
+
+/// Build slots: the builds that run at once (requirement R-SEC-7).
+///
+/// One is held while cargo builds, and let go between the tries of a build, so that one member's
+/// tries do not keep the others waiting (decided in M2's D3). `cargo metadata`, `cargo tree` and
+/// the probes take none.
+#[derive(Debug)]
+pub struct Slots(tokio::sync::Semaphore);
+
+impl Slots {
+    /// `count` slots, at least one.
+    #[must_use]
+    pub fn new(count: usize) -> Self {
+        Self(tokio::sync::Semaphore::new(
+            count.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
+        ))
+    }
+
+    /// Takes a slot, telling `on_doing` while it waits for one and when it has it.
+    pub async fn take(
+        &self,
+        on_doing: &mut (impl FnMut(Doing) + Send),
+    ) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        if let Ok(slot) = self.0.try_acquire() {
+            return Some(slot);
+        }
+        on_doing(Doing::WaitingForSlot);
+        // Never closed.
+        let slot = self.0.acquire().await.ok();
+        on_doing(Doing::Building);
+        slot
+    }
+}
+
+/// This process's build slots.
+fn slots() -> &'static Slots {
+    SLOTS.get_or_init(|| Slots::new(DEFAULT_CONCURRENT_BUILDS))
+}
+
 /// Reads the settings of the builds, once, at startup.
 pub fn set_this(settings: &Settings) {
     let jobs = settings.get("build.jobs", |value| {
@@ -59,9 +105,25 @@ pub fn set_this(settings: &Settings) {
             .and_then(NonZeroUsize::new)
             .ok_or("a whole number from 1")
     });
-    if let Some(jobs) = jobs
-        && JOBS.set(jobs).is_err()
-    {
+    let slots = settings.get("limits.concurrent_builds", |value| {
+        value
+            .whole_number()
+            .and_then(|count| usize::try_from(count).ok())
+            .filter(|count| *count > 0)
+            .ok_or("a whole number from 1")
+    });
+    let run_time = settings.get("build.timeout_secs", |value| {
+        value
+            .whole_number()
+            .filter(|secs| *secs > 0)
+            .ok_or("a whole number of seconds from 1")
+    });
+    if let Some(secs) = run_time {
+        super::cargo::set_run_time(Duration::from_secs(secs));
+    }
+    let jobs_set = jobs.is_none_or(|jobs| JOBS.set(jobs).is_ok());
+    let slots_set = slots.is_none_or(|count| SLOTS.set(Slots::new(count)).is_ok());
+    if !(jobs_set && slots_set) {
         tracing::debug!("the settings of the builds were read before");
     }
     if let Some(value) = std::env::var_os("RUSTC_BOOTSTRAP") {
@@ -560,9 +622,10 @@ pub enum BuildError {
 ///
 /// It uses the target directory with its shared lock, and writes in it with its exclusive one,
 /// which it lets go once the JSON is moved to `work`, a directory in the cache: another build of
-/// a crate of the same name writes the same file (Q-29). Then it checks the JSON and publishes
-/// it. `on_activity` is told when it waits for a lock and when cargo does. `toolchain` is what
-/// `rustc -vV` tells of the toolchain, for the record.
+/// a crate of the same name writes the same file (Q-29). cargo runs with a build slot (decided in
+/// M2's D3). Then it checks the JSON and publishes it. `on_doing` is told when it waits for a lock
+/// or a slot, and what cargo does. `toolchain` is what `rustc -vV` tells of the toolchain, for the
+/// record.
 ///
 /// # Errors
 ///
@@ -572,31 +635,34 @@ pub async fn build(
     plan: &Plan,
     work: &Path,
     toolchain: Option<&str>,
-    mut on_activity: impl FnMut(Activity) + Send,
+    mut on_doing: impl FnMut(Doing) + Send,
 ) -> Result<Built, BuildError> {
     let name = plan.target_dir.name();
     let using = hold(
         cache.dir(),
         &target_key(&name),
         LockMode::Shared,
-        &mut on_activity,
+        &mut on_doing,
     )
     .await;
     let writing = hold(
         cache.dir(),
         &doc_key(&name),
         LockMode::Exclusive,
-        &mut on_activity,
+        &mut on_doing,
     )
     .await;
+    let slot = slots().take(&mut on_doing).await;
     let mut messages = Messages::new(plan);
     let output = run_building(
         plan.command(),
         plan.target_dir.path(),
-        &mut on_activity,
+        |activity| on_doing(activity.of_build()),
         |line| messages.read(line),
     )
-    .await?;
+    .await;
+    drop(slot);
+    let output = output?;
     if !output.status.success() {
         return Err(BuildError::Failed {
             failure: classify(&output, plan.offline),
@@ -710,13 +776,13 @@ fn doc_key(name: &str) -> String {
     format!("doc:{name}")
 }
 
-/// Takes the lock of `key` in the cache at `root` in `mode`, telling `on_activity` while it waits.
+/// Takes the lock of `key` in the cache at `root` in `mode`, telling `on_doing` while it waits.
 /// When the OS cannot lock, it goes on without, with a log line, as [`Cache::lock`] does.
 async fn hold(
     root: &Path,
     key: &str,
     mode: LockMode,
-    on_activity: &mut (impl FnMut(Activity) + Send),
+    on_doing: &mut (impl FnMut(Doing) + Send),
 ) -> Option<ProcessLock> {
     let failed = |error: &io::Error| {
         tracing::warn!(%key, %error, "a lock of a build cannot be taken; going on without it");
@@ -729,12 +795,12 @@ async fn hold(
             return None;
         },
     }
-    on_activity(Activity::WaitingForLock);
+    on_doing(Doing::WaitingForLock);
     let held = process_lock::lock(root, key, mode)
         .await
         .inspect_err(failed)
         .ok();
-    on_activity(Activity::Running);
+    on_doing(Doing::Building);
     held
 }
 
@@ -1168,6 +1234,27 @@ mod tests {
         };
         assert_eq!(found(&app_plan(other, true)).as_deref(), Some(linux));
         assert_eq!(found(&app_plan(Some(linux), false)).as_deref(), Some(linux));
+    }
+
+    #[tokio::test]
+    async fn a_build_waits_for_a_slot_when_all_are_taken() {
+        let slots = std::sync::Arc::new(Slots::new(1));
+        let held = slots.take(&mut |_| {}).await.expect("a slot");
+        let told = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let waiting = {
+            let (slots, told) = (std::sync::Arc::clone(&slots), std::sync::Arc::clone(&told));
+            tokio::spawn(async move {
+                let mut tell = |doing| told.lock().push(doing);
+                slots.take(&mut tell).await.is_some()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*told.lock(), [Doing::WaitingForSlot]);
+        drop(held);
+        assert!(waiting.await.expect("joined"));
+        assert_eq!(*told.lock(), [Doing::WaitingForSlot, Doing::Building]);
+        // At least one.
+        assert!(Slots::new(0).take(&mut |_| {}).await.is_some());
     }
 
     #[test]

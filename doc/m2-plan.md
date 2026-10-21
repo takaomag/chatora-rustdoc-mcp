@@ -717,6 +717,28 @@ Claude Code 2.1.304、Linux で測った。
 - 実際のプロジェクトでの試し (このリポジトリ自身、デバッグビルドのサーバー、オフライン): 冷えた状態の `get_item data::build::Plan` は 62.8 秒で、20 秒と 43 秒に `building` が返り、3 回目で答えた (裏で続いたビルドの結果が渡った)。温まった状態の照会は 4〜5 秒。同じ target dir で `cargo rustdoc` を直接走らせると 4.5〜5.0 秒で、228 unit のうち作り直すのはこの crate だけ (値の固定が効いている)。JSON は約 10 MB。照会のたびの数秒は rustdoc そのもので、D4 の鮮度の判定でしか縮まない
 - 独自の target (決定 7) の実測 (この PC): `.cargo/config.toml` に `build.target = "my-target.json"`・`[unstable] build-std = ["core"]`・その両方を置いて `cargo rustdoc --target <host>` を走らせると、stable 1.99.1 の cargo では 3 つとも成功した (`--target` が `build.target` に勝ち、stable の cargo は `[unstable]` を使わない)。stdio のテストに足した (host 向けにビルドし、「target of its own」の warning)。nightly の cargo は `build-std` を使い、rust-src から std をビルドしようとして、オフラインでは std の依存が無く失敗した (`no matching package named`。オフラインでは `offline_miss`)。形式が古くて nightly に切り替え、かつ build-std を設定したプロジェクトは、オンラインなら std ごとビルドして遅く、オフラインなら `offline_miss` になる。まれなので D7 で扱う
 
+**D2 の後の順番 (2026-10-21)**: D2c-3 のうち Claude Code での試しは、照会のたびに rustdoc を走らせる遅さ (温まって 4〜5 秒) が目立つので、D4 (鮮度) の後に回すと利用者が決めた。次は計画どおり D3 (D4 の鮮度の鍵に、D3 で決める features の組が入るため)
+
+**D3 の下調べ (2026-10-21、サブエージェント、読むだけ)**: D3 の範囲は、ビルドの枠 (`limits.concurrent_builds`、`waiting_for_slot`。§3.7 のローカルビルドの数の上限と同じもの)、`build.wait_secs`、`build.timeout_secs` (今は `cargo.rs` の `MAX_RUN_MINUTES` に固定)、`--cfg docsrs` を外しての再試行 (Q-11、`build.cfg_docsrs`)、member の features の組 (R-FT-3: 通常のビルドの組を `--no-default-features --features` で、`[package.metadata.docs.rs]` の組、R-MCP-3 の範囲の外の依存、壊れた組の再試行、`features_requested`)、Q-31 (複数の member・ワークスペースの path 依存・`default-members` での組の違い)。共有の仕事と取り消し (R-WS-6) は C2b・C3・D2c で済んでいる。分け方の案: D3a (枠と待ち)、D3b (docsrs の再試行)、D3c (Q-31 の実測)、D3d (通常の組の明示)、D3e (`[package.metadata.docs.rs]` の組)。要件・前の決定から聞かずに決めること: `build.cfg_docsrs` を足す (要件の設定の表)、member の `[package.metadata.docs.rs]` は member の Cargo.toml を `crate_file` の `build_of` で読む (R-SEC-4 の検証がある)、`features_requested` と `features_effective` を両方記録し、鍵にどちらを使うかは D4
+
+**D3a (ビルドの枠と待ち。2026-10-21)**:
+
+- 利用者が 1 件ずつ決めたこと:
+  1. ビルドの枠 (`limits.concurrent_builds`、既定 2、プロセスごと) は cargo の 1 回の実行ごとに持つ。再試行のたびに手放して取り直す。`cargo metadata`・`cargo tree`・形式の試しは数えない (R-SEC-7 の「ローカルビルド」)。取るのは決めたロックの順のとおり、`doc:` のロックの後で cargo の直前
+  2. 「呼び出しの上限を超えたとき、ビルドを待っているなら `status: building`」(R-SEC-7) は後 (D5 か F) に回す。今は `busy` のまま
+  3. `build.wait_secs` (既定 10) は、ビルドを待ち始めたときから数え、呼び出しの期限との早いほうを使う。呼び出しが仕事を待つ時間 (`limits.request_timeout_secs` の 3 分の 2) より長ければ、そちらが効き、起動時にログで知らせる
+  4. `build.timeout_secs` (既定 1,800) は cargo の 1 回の実行ごと (ビルド・`cargo metadata`・`cargo tree`)。サーバーのロックと枠を待つ時間は数えない。超えたら子を止めて `build_failed` (`reason: timeout`)
+- 聞かずに決めたこと: 期限を過ぎて裏で続くビルドが枠を持ち続けるのは、R-WS-6 (裏で続くビルドは時間切れかサーバーの終了でしか止めない) のとおりにする (§4 の 197 行目の論点)
+- 実装: `build::Slots` (セマフォ。取れなければ `Doing::WaitingForSlot` を知らせて待つ)、`build::build` の様子の知らせ方を `Activity` から `Doing` に (cargo の様子は `Activity::of_build` で写す)、`Doing::WaitingForSlot` (`waiting_for_slot`)、`cargo::set_run_time` (`MAX_RUN_MINUTES` の固定を置き換え、`RunError::TimedOut` に秒数)、`tool::wait_for_builds` と `ToolState::build_wait`、`look_up_member` の期限、設定 3 つと README
+- テスト: 枠がすべて使われているときの待ちと知らせ、時間切れのエラーと秒数、`build.wait_secs` の既定・設定・上限
+- 前提を渡さないレビュー (サブエージェント) で重大な問題は無かった。小さな指摘を直した: `build.wait_secs` が呼び出しの待ちより長いという warning は、利用者が明示したときだけ (`limits.request_timeout_secs` を小さくしただけなら debug)。ビルドの後の索引作り (`Indexing`) まで `build.wait_secs` で打ち切っていたので、その期限で索引作りに入っていれば呼び出しの期限まで待ち続ける (R-WS-6「ビルド以外の処理は R-ARCH-6 の上限」)。`build::set_this` で `&&` の短絡により設定が捨てられうるのを直した。README の `build.timeout_secs` に `cargo tree` を足した
+
+**D3b の決定 (2026-10-21)**: 利用者が 1 件ずつ決めた。
+
+1. `--cfg docsrs` を外して再試行するのは、compiler の `error` が文書化する member のもの (package id で照らす) のときだけ。`--cfg docsrs` は最後の rustdoc にしか渡さないので、壊れるのはそこだけ。依存やネットの失敗では再試行しない。再試行したら warning
+2. `--cfg docsrs` で壊れた member は、package id と toolchain を鍵にプロセスの間だけ覚え、次からは外してビルドして warning。ディスクに残して `refresh` で消すのは D4・D5
+3. member の `[package.metadata.docs.rs]` の `rustdoc-args` は、`--cfg <名前>` と `--cfg=<名前>` だけを、名前が cfg の文法に合うときに最後の rustdoc に渡す (要件の案)。入れるのは member の Cargo.toml を読む D3e。その cfg で壊れたら docsrs と一緒に外して再試行する
+
 ### 6.6 M2e
 
 (まだ無い)

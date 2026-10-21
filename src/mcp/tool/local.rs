@@ -162,15 +162,23 @@ fn metadata_failed(name: &CrateName, because: &CargoError) -> CallToolResult {
 /// The build of `wanted`, by work that the calls for it share, waiting for it until `until`; or
 /// the response to return: `status: building` while it goes on, with `provenance` and `warnings`,
 /// or the error.
+///
+/// `until` is `(build, call)`: a call waits for the build until the first, and for indexing what
+/// it built until the second, the deadline of the call, as for any work but a build (requirement
+/// R-WS-6, decided in M2's D3).
 pub(super) async fn built(
     state: &ToolState,
     wanted: LocalWanted,
-    until: Instant,
+    (until_built, until): (Instant, Instant),
     provenance: Map<String, Value>,
     warnings: &[Box<str>],
 ) -> Result<Arc<LocalBuilt>, Box<CallToolResult>> {
     let what = format!("{} {}", wanted.plan.crate_name, wanted.plan.version);
-    match local_archive(&state.locals, &state.cache, wanted, until).await {
+    let mut joined = local_archive(&state.locals, &state.cache, wanted.clone(), until_built).await;
+    if matches!(joined, Joined::Going(Doing::Indexing)) && until_built < until {
+        joined = local_archive(&state.locals, &state.cache, wanted, until).await;
+    }
+    match joined {
         Joined::Done(Ok(built)) => Ok(built),
         Joined::Done(Err(error)) => Err(Box::new(local_error(&what, &error))),
         Joined::Ended => Err(Box::new(get_item::stopped())),
@@ -325,7 +333,7 @@ fn build_error(what: &str, error: &BuildError) -> CallToolResult {
             }
             body
         },
-        BuildError::Run(RunError::TimedOut) => json!({
+        BuildError::Run(RunError::TimedOut(_)) => json!({
             "code": "build_failed",
             "message": format!("the build of the documentation of {what} took too long: {error}"),
             "retryable": false,

@@ -7,17 +7,32 @@ use std::{
     io,
     path::Path,
     process::{Output, Stdio},
+    sync::OnceLock,
     time::Duration,
 };
 
 use super::child;
 
-/// Longest run of one cargo command in minutes (`build.timeout_secs`, requirement R-WS-6,
-/// default).
-const MAX_RUN_MINUTES: u64 = 30;
+/// Longest run of one cargo command, unless `build.timeout_secs` sets it (requirement R-WS-6,
+/// default; decided in M2's D3): Claude Code's limit of a call over stdio.
+const DEFAULT_RUN_TIME: Duration = Duration::from_mins(30);
 
-/// [`MAX_RUN_MINUTES`] as a duration.
-const MAX_RUN_TIME: Duration = Duration::from_mins(MAX_RUN_MINUTES);
+/// Longest run of one cargo command, as `build.timeout_secs` sets it.
+static RUN_TIME: OnceLock<Duration> = OnceLock::new();
+
+/// Sets the longest run of one cargo command, once, at startup: build, `cargo metadata` and `cargo
+/// tree` alike (decided in M2's D3). The waits for the server's locks and build slots do not
+/// count.
+pub fn set_run_time(limit: Duration) {
+    if RUN_TIME.set(limit).is_err() {
+        tracing::debug!("the longest run of cargo was set before");
+    }
+}
+
+/// Longest run of one cargo command.
+fn run_time() -> Duration {
+    RUN_TIME.get().copied().unwrap_or(DEFAULT_RUN_TIME)
+}
 
 /// Most of cargo's stderr that is kept for the warnings and the error, from its end.
 const MAX_STDERR_CHARS: usize = 8_000;
@@ -28,9 +43,10 @@ pub enum RunError {
     /// cargo could not be started, as when it is not installed.
     #[error("cargo could not be run")]
     NotStarted(#[source] io::Error),
-    /// cargo ran longer than `build.timeout_secs` (requirement R-WS-6) and was stopped.
-    #[error("cargo did not finish in {MAX_RUN_MINUTES} minutes")]
-    TimedOut,
+    /// cargo ran longer than `build.timeout_secs` (requirement R-WS-6), this long, and was
+    /// stopped.
+    #[error("cargo did not finish in {} seconds", .0.as_secs())]
+    TimedOut(Duration),
 }
 
 /// How a cargo command failed, as far as its messages tell (requirement R-WS-7).
@@ -168,7 +184,7 @@ fn activity_of(line: &str) -> Activity {
 /// lock on package cache`, or `on build directory` (cargo 1.99.1).
 const WAITING_FOR_LOCK: &str = "Blocking waiting for file lock";
 
-/// Runs `command` to the end, and stops it after [`MAX_RUN_TIME`].
+/// Runs `command` to the end, and stops it after `build.timeout_secs`.
 ///
 /// # Errors
 ///
@@ -196,10 +212,18 @@ pub(super) async fn run_reporting(
             on_activity(now);
         }
     });
-    // Dropped on the timeout, or when the call is cancelled, which stops the whole group.
-    tokio::time::timeout(MAX_RUN_TIME, output)
+    limited(run_time(), output).await
+}
+
+/// `output` of a cargo command, which is stopped after `limit`: dropped then, as when the call is
+/// cancelled, which stops the whole group.
+async fn limited(
+    limit: Duration,
+    output: impl Future<Output = io::Result<Output>>,
+) -> Result<Output, RunError> {
+    tokio::time::timeout(limit, output)
         .await
-        .map_err(|_elapsed| RunError::TimedOut)?
+        .map_err(|_elapsed| RunError::TimedOut(limit))?
         .map_err(RunError::NotStarted)
 }
 
@@ -227,11 +251,7 @@ pub(super) async fn run_building(
             on_activity(now);
         }
     });
-    // Dropped on the timeout, or when the call is cancelled, which stops the whole group.
-    tokio::time::timeout(MAX_RUN_TIME, output)
-        .await
-        .map_err(|_elapsed| RunError::TimedOut)?
-        .map_err(RunError::NotStarted)
+    limited(run_time(), output).await
 }
 
 /// What a failed cargo command's `stderr` says about the failure.
@@ -304,6 +324,21 @@ mod tests {
     use std::os::unix::process::ExitStatusExt as _;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_command_that_runs_too_long_is_stopped_with_its_limit() {
+        let limit = Duration::from_millis(20);
+        let never = std::future::pending::<io::Result<Output>>();
+        let error = limited(limit, never).await.expect_err("timed out");
+        assert!(
+            matches!(error, RunError::TimedOut(at) if at == limit),
+            "{error:?}"
+        );
+        assert_eq!(
+            RunError::TimedOut(Duration::from_mins(30)).to_string(),
+            "cargo did not finish in 1800 seconds"
+        );
+    }
 
     fn failed(stderr: &str) -> Output {
         Output {

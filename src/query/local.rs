@@ -251,8 +251,8 @@ async fn build_with(
     let host = checked.as_ref().and_then(|checked| checked.host.as_ref());
     plan.target = build::passes_target(target, host, project_sets_target).then(|| target.clone());
     let toolchain = checked.and_then(|checked| checked.toolchain);
-    build::build(cache, plan, work, toolchain.as_deref(), |activity| {
-        stage.set(activity.of_build());
+    build::build(cache, plan, work, toolchain.as_deref(), |doing| {
+        stage.set(doing);
     })
     .await
     .map_err(LocalError::Build)

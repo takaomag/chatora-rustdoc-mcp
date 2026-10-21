@@ -1536,7 +1536,12 @@ async fn look_up_member(
         LocalSource::Built(built) => built,
         LocalSource::Wanted(wanted) => {
             let provenance = local_provenance(&arguments);
-            match local::built(state, *wanted, arguments.until, provenance, &warnings).await {
+            // `build.wait_secs` from now, within the call's deadline (decided in M2's D3).
+            let until_built = Instant::now()
+                .checked_add(state.build_wait)
+                .map_or(arguments.until, |until| until.min(arguments.until));
+            let until = (until_built, arguments.until);
+            match local::built(state, *wanted, until, provenance, &warnings).await {
                 Ok(built) => {
                     warnings.extend(built.archived.warnings.iter().cloned());
                     built
@@ -1683,6 +1688,9 @@ pub(super) fn being(what: &str, doing: Doing, from: &str) -> String {
         Doing::Indexing => format!("{what} is being indexed"),
         Doing::WaitingForLock => format!("{what} waits for a lock that another cargo holds"),
         Doing::Building => format!("the documentation of {what} is being built"),
+        Doing::WaitingForSlot => {
+            format!("the documentation of {what} waits for one of the builds that run to end")
+        },
     }
 }
 
