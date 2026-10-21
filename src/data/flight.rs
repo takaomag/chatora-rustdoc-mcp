@@ -22,6 +22,9 @@ use tracing::Instrument as _;
 
 use super::fetches::Fetches;
 
+/// How often [`Flights::wait_telling`] tells what the work does.
+const TELL_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// The results that [`Flights::handing_over`] keeps for the next call, by key, with the number of
 /// their flight.
 type Left<T> = parking_lot::Mutex<HashMap<String, (u64, T)>>;
@@ -197,6 +200,9 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
     /// makes, started now, which it gives the [`Stage`] to set. When the work has not ended by
     /// `until`, it goes on, and [`Joined::Going`] says what it is doing.
     ///
+    /// `start` runs while the flights are locked: it only makes the work, which runs in a task of
+    /// its own, and must not call these flights itself, nor wait for anything.
+    ///
     /// Meanwhile, the call in scope notes that it waits for work on `what` (`serde 1.0.228`),
     /// for its progress notifications (requirement R-WS-6).
     pub async fn join<F>(
@@ -209,7 +215,7 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
     where
         F: Future<Output = T> + Send + 'static,
     {
-        self.joined(key, what, Some(until), start).await
+        self.joined(key, what, Some(until), None, start).await
     }
 
     /// [`Self::join`] without a deadline: the result, or `None` when the work ended without one.
@@ -222,7 +228,23 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
     where
         F: Future<Output = T> + Send + 'static,
     {
-        match self.joined(key, what, None, start).await {
+        self.wait_telling(key, what, None, start).await
+    }
+
+    /// [`Self::wait`], telling `telling` what the work does while it waits, every tenth of a
+    /// second: for other work that waits for this one, whose callers would else see only that
+    /// it started (requirement R-OUT-9).
+    pub async fn wait_telling<F>(
+        &self,
+        key: &str,
+        what: &str,
+        telling: Option<&Stage>,
+        start: impl FnOnce(Arc<Stage>) -> F,
+    ) -> Option<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+    {
+        match self.joined(key, what, None, telling, start).await {
             Joined::Done(result) => Some(result),
             Joined::Ended | Joined::Going(_) => None,
         }
@@ -234,6 +256,7 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
         key: &str,
         what: &str,
         until: Option<Instant>,
+        telling: Option<&Stage>,
         start: impl FnOnce(Arc<Stage>) -> F,
     ) -> Joined<T>
     where
@@ -245,7 +268,19 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
         let flight = self.flight(key, start);
         let _waiting = super::waits::waiting(what, &flight.stage);
         let mut done = flight.done.clone();
-        let ended = done.wait_for(Option::is_some);
+        let ended = async {
+            let mut ended = std::pin::pin!(done.wait_for(Option::is_some));
+            loop {
+                tokio::select! {
+                    ended = &mut ended => return ended,
+                    () = tokio::time::sleep(TELL_EVERY), if telling.is_some() => {
+                        if let Some(telling) = telling {
+                            telling.set(flight.stage.get());
+                        }
+                    },
+                }
+            }
+        };
         let waited = match until {
             Some(until) => tokio::time::timeout_at(until, ended).await,
             None => Ok(ended.await),
@@ -456,6 +491,29 @@ mod tests {
             assert_eq!(second.await.expect("joined"), Joined::Done(7));
             assert_eq!(runs.load(Ordering::SeqCst), 2);
         }
+    }
+
+    /// Work that waits for a lock until `go`, and gives 7.
+    async fn waits_for_a_lock(stage: Arc<Stage>, go: Arc<Notify>) -> u32 {
+        stage.set(Doing::WaitingForLock);
+        go.notified().await;
+        7
+    }
+
+    #[tokio::test]
+    async fn a_wait_tells_what_the_work_does() {
+        let flights = Flights::<u32>::default();
+        let (telling, go) = (Stage::default(), Arc::new(Notify::new()));
+        let going = Arc::clone(&go);
+        let waiting = flights.wait_telling("key", "work", Some(&telling), |stage| {
+            waits_for_a_lock(stage, going)
+        });
+        let mut waiting = std::pin::pin!(waiting);
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut waiting).await;
+        assert!(early.is_err(), "the work waits");
+        assert_eq!(telling.get(), Doing::WaitingForLock);
+        go.notify_one();
+        assert_eq!(waiting.await, Some(7));
     }
 
     #[tokio::test]

@@ -7,11 +7,14 @@ use std::{
     io,
     path::Path,
     process::{Output, Stdio},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
-use super::child;
+use super::{
+    child,
+    flight::{Doing, Stage},
+};
 
 /// Longest run of one cargo command, unless `build.timeout_secs` sets it (requirement R-WS-6,
 /// default; decided in M2's D3): Claude Code's limit of a call over stdio.
@@ -159,11 +162,11 @@ impl Activity {
     /// What a build is doing when cargo does this (decided in M2's D2): it builds unless it
     /// waits or fetches.
     #[must_use]
-    pub const fn of_build(self) -> super::flight::Doing {
+    pub const fn of_build(self) -> Doing {
         match self {
-            Self::Running => super::flight::Doing::Building,
-            Self::WaitingForLock => super::flight::Doing::WaitingForLock,
-            Self::Fetching => super::flight::Doing::Fetching,
+            Self::Running => Doing::Building,
+            Self::WaitingForLock => Doing::WaitingForLock,
+            Self::Fetching => Doing::Fetching,
         }
     }
 }
@@ -184,13 +187,46 @@ fn activity_of(line: &str) -> Activity {
 /// lock on package cache`, or `on build directory` (cargo 1.99.1).
 const WAITING_FOR_LOCK: &str = "Blocking waiting for file lock";
 
-/// Runs `command` to the end, and stops it after `build.timeout_secs`.
+tokio::task_local! {
+    /// What the shared work that runs cargo is doing, which [`run`] tells, set by [`staged`].
+    static STAGE: Arc<Stage>;
+}
+
+/// `work`, in which [`run`] tells `stage` whether cargo waits for a lock or fetches (requirement
+/// R-OUT-9): for the shared work that runs `cargo metadata` and `cargo tree`, which a call may
+/// stop waiting for.
+pub(super) async fn staged<T>(stage: Arc<Stage>, work: impl Future<Output = T>) -> T {
+    STAGE.scope(stage, work).await
+}
+
+/// The stage of the [`staged`] work that this task runs, if any.
+pub(super) fn current_stage() -> Option<Arc<Stage>> {
+    STAGE.try_with(Arc::clone).ok()
+}
+
+/// What `activity` of `cargo metadata` or `cargo tree` is, for a call that waits for it: most of
+/// what takes long in them is fetching.
+pub(super) const fn doing_of(activity: Activity) -> Doing {
+    match activity {
+        Activity::WaitingForLock => Doing::WaitingForLock,
+        Activity::Fetching | Activity::Running => Doing::Fetching,
+    }
+}
+
+/// Runs `command` to the end, and stops it after `build.timeout_secs`. In [`staged`] work, it
+/// tells its stage what cargo does.
 ///
 /// # Errors
 ///
 /// Returns an error when cargo cannot be started or runs too long.
 pub(super) async fn run(command: tokio::process::Command) -> Result<Output, RunError> {
-    run_reporting(command, |_| {}).await
+    let stage = STAGE.try_with(Arc::clone).ok();
+    run_reporting(command, |activity| {
+        if let Some(stage) = &stage {
+            stage.set(doing_of(activity));
+        }
+    })
+    .await
 }
 
 /// [`run`], telling `on_activity` when what cargo does changes, as its stderr tells: it waits for
@@ -444,7 +480,7 @@ mod tests {
 /// Unix and `LockFileEx` on Windows, as `File::lock` does.
 #[cfg(test)]
 mod lock_tests {
-    use std::{fs, sync::Arc};
+    use std::fs;
 
     use super::*;
 

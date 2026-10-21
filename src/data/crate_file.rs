@@ -145,12 +145,12 @@ impl StaticCrates {
     /// sparse index (`index.crates.io-…`) and its git index (`github.com-…`), whose directory names
     /// end in a hash that cargo versions may change.
     fn fetched_by_cargo(
-        &self,
+        cargo_home: Option<&Path>,
         name: &CrateName,
         version: &Version,
         checksum: &str,
     ) -> Option<Box<[u8]>> {
-        let registries = fs::read_dir(self.cargo_home.as_ref()?.join("registry/cache")).ok()?;
+        let registries = fs::read_dir(cargo_home?.join("registry/cache")).ok()?;
         let file = format!("{name}-{version}.crate");
         registries
             .filter_map(Result::ok)
@@ -192,25 +192,55 @@ impl StaticCrates {
     ) -> Result<Option<Box<[u8]>>, CrateError> {
         let path = cache.crate_file_path(name, version);
         // Another call that wants the same `.crate` goes first (requirement R-NW-2).
-        let _held = cache.lock(&path).await;
-        match cache.read_verified(&path).map_err(CrateError::Cache)? {
+        let held = cache.lock(&path).await;
+        // Megabytes, read and digested off the async threads, as below.
+        let (reading, read) = (cache.clone(), path.clone());
+        match super::blocking(move || reading.read_verified(&read))
+            .await
+            .map_err(CrateError::Cache)?
+        {
             Verified::Found(contents) => return Ok(Some(contents)),
             Verified::Mismatch | Verified::None => {},
         }
         let Some(checksum) = checksum else {
             return Ok(None);
         };
-        let contents = match self.fetched_by_cargo(name, version, checksum) {
+        let (home, wanted, sum) = (
+            self.cargo_home.clone(),
+            (name.clone(), version.clone()),
+            Box::<str>::from(checksum),
+        );
+        let fetched = super::blocking(move || {
+            Ok(Self::fetched_by_cargo(
+                home.as_deref(),
+                &wanted.0,
+                &wanted.1,
+                &sum,
+            ))
+        })
+        .await
+        .ok()
+        .flatten();
+        let contents = match fetched {
             Some(contents) => contents,
             None => self.fetch_remembering(cache, &path, name, version).await?,
         };
-        if !super::cache::sha256_hex(&contents).eq_ignore_ascii_case(checksum) {
-            return Err(CrateError::ChecksumMismatch);
-        }
-        if let Err(error) = cache.write_verified(&path, &contents) {
-            tracing::warn!(path = %path.display(), %error, "a .crate could not be cached");
-        }
-        Ok(Some(contents))
+        let (writing, sum) = (cache.clone(), Box::<str>::from(checksum));
+        // With the lock, which goes when the writing is done, even when this call is dropped.
+        super::blocking(move || {
+            let checked = if super::cache::sha256_hex(&contents).eq_ignore_ascii_case(&sum) {
+                if let Err(error) = writing.write_verified(&path, &contents) {
+                    tracing::warn!(path = %path.display(), %error, "a .crate could not be cached");
+                }
+                Ok(Some(contents))
+            } else {
+                Err(CrateError::ChecksumMismatch)
+            };
+            drop(held);
+            Ok(checked)
+        })
+        .await
+        .map_err(CrateError::Cache)?
     }
 
     /// [`Self::fetch`], unless it failed transiently a moment ago, which is remembered next to

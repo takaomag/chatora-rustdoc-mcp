@@ -74,6 +74,58 @@ enum Outcome {
     Going(Doing),
 }
 
+/// The features of the packages in the build of `workspace` for `target`, waited for until
+/// `until`, or `None` with a warning: without them, all direct dependencies are searched.
+#[cfg(feature = "local")]
+async fn build_sets(
+    state: &ToolState,
+    workspace: &crate::data::project::Workspace,
+    target: &TargetTriple,
+    until: Instant,
+    warnings: &mut Vec<Box<str>>,
+) -> Option<Arc<FeatureSets>> {
+    match state
+        .resolver
+        .features_until(workspace, target, until)
+        .await
+    {
+        Joined::Done(Ok(sets)) => Some(sets),
+        Joined::Done(Err(error)) => {
+            warnings.push(
+                format!(
+                    "which dependencies the project builds for {target} is not known, so all \
+                     direct ones are searched: {}",
+                    ErrorChain(&error)
+                )
+                .into(),
+            );
+            None
+        },
+        Joined::Ended => {
+            warnings.push(
+                format!(
+                    "which dependencies the project builds for {target} is not known, so all \
+                     direct ones are searched: {}",
+                    get_item::NOT_READ
+                )
+                .into(),
+            );
+            None
+        },
+        Joined::Going(doing) => {
+            warnings.push(
+                format!(
+                    "which dependencies the project builds for {target} is not known yet, so all \
+                     direct ones are searched: {}",
+                    get_item::still_reading(doing)
+                )
+                .into(),
+            );
+            None
+        },
+    }
+}
+
 /// Searches the project's direct dependencies that its normal build or its build with the
 /// dev-dependencies has for `target` (decided in M1 C4b; the workspace's own crates are M2).
 #[cfg(feature = "local")]
@@ -111,20 +163,7 @@ pub(super) async fn dependencies(
             return super::project::resolving(provenance, doing, &warnings);
         },
     };
-    let sets = match state.resolver.features(&workspace, &target).await {
-        Ok(sets) => Some(sets),
-        Err(error) => {
-            warnings.push(
-                format!(
-                    "which dependencies the project builds for {target} is not known, so all \
-                     direct ones are searched: {}",
-                    ErrorChain(&error)
-                )
-                .into(),
-            );
-            None
-        },
-    };
+    let sets = build_sets(&state, &workspace, &target, until, &mut warnings).await;
     let graph = PackageGraph::new(&resolution);
     let mut members = Vec::new();
     let mut loads = Vec::new();
@@ -221,25 +260,22 @@ pub(super) async fn std(
         .json
         .release()
         .unwrap_or_else(|| Version::new(0, 0, 0));
-    let cache = state.cache.clone();
-    // Archived by the shared work already, unless it failed there.
-    let loading = Arc::clone(&chosen);
-    let task = crate::task::spawn_blocking(move || {
-        [StdCrate::Std, StdCrate::Alloc, StdCrate::Core].map(|krate| {
-            let archived = loading
-                .json
-                .archive_key(&cache, krate)
-                .map_err(load::LoadError::Read)
-                .and_then(|(dir, key)| {
-                    load::archive_of(&cache, &dir, krate.as_str(), &key, || {
-                        loading.json.read(&cache, krate)
-                    })
-                });
-            (krate, archived)
-        })
-    });
-    let Ok(archived) = task.await else {
-        return get_item::shutting_down();
+    // Archived by the shared work already, unless it failed there, or another process makes them
+    // now: until the call's deadline (requirement R-ARCH-6). What is being made goes on.
+    let archiving = async {
+        let mut archived = Vec::new();
+        for krate in [StdCrate::Std, StdCrate::Alloc, StdCrate::Core] {
+            archived.push((
+                krate,
+                load::archive_std_crate(&state.cache, &chosen, krate).await?,
+            ));
+        }
+        Some(archived)
+    };
+    let archived = match tokio::time::timeout_at(until, archiving).await {
+        Ok(Some(archived)) => archived,
+        Ok(None) => return get_item::shutting_down(),
+        Err(_) => return get_item::std_building("std", &target, Doing::Indexing, &warnings),
     };
     let members = archived
         .into_iter()

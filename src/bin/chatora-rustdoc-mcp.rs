@@ -65,10 +65,14 @@ fn main() -> std::process::ExitCode {
 fn serve() -> std::process::ExitCode {
     // Read once, at startup (requirement R-DIST-3).
     let settings = chatora_rustdoc_mcp::config::Settings::load();
-    if let Err(error) = chatora_rustdoc_mcp::logging::init(&settings) {
-        eprintln!("{BIN_NAME}: failed to set up logging: {error}");
-        return std::process::ExitCode::FAILURE;
-    }
+    // Written to its end when `serve` returns or a panic unwinds out of it.
+    let _flushing = match chatora_rustdoc_mcp::logging::init(&settings) {
+        Ok(flushing) => flushing,
+        Err(error) => {
+            eprintln!("{BIN_NAME}: failed to set up logging: {error}");
+            return std::process::ExitCode::FAILURE;
+        },
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(chatora_rustdoc_mcp::task::THREAD_STACK_SIZE)

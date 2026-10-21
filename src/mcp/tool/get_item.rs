@@ -854,6 +854,12 @@ async fn in_member(
             (doing, found.project_from),
             &[],
         ))),
+        Member::Planning(doing) => Err(Box::new(project::planning_crate(
+            name,
+            target,
+            (doing, found.project_from),
+            &[],
+        ))),
         Member::OtherVersion(_) | Member::Not => Err(Box::new(local_build_required(
             &found.package,
             DocsRsCheck::NotCratesIo,
@@ -884,7 +890,8 @@ async fn explicit_member(
         Ok(Member::Is { wanted, package }) => {
             warnings.push(
                 format!(
-                    "{name} {version} is the workspace's member, built here, which may differ                      from the release of that name on crates.io"
+                    "{name} {version} is the workspace's member, built here, which may differ \
+                     from the release of that name on crates.io"
                 )
                 .into(),
             );
@@ -907,6 +914,13 @@ async fn explicit_member(
             );
             Ok(None)
         },
+        // The member, whose build is being planned: not the release of that name.
+        Ok(Member::Planning(doing)) => Err(Box::new(project::planning_crate(
+            name,
+            target,
+            (doing, project_from.as_str()),
+            warnings,
+        ))),
         // Not told while cargo resolves, nor when it fails: the release is looked up as asked.
         Ok(Member::Not | Member::Unknown(_) | Member::Resolving(_)) | Err(_) => Ok(None),
     }
@@ -2137,7 +2151,11 @@ async fn in_project_build_of(
     origin: &Request,
 ) -> Option<InProjectBuild> {
     let workspace = origin.in_build.workspace.as_ref()?;
-    let resolution = state.resolver.resolve(workspace).await.ok()?;
+    // Until the call's deadline: past it, the project does not tell (requirement R-ARCH-6).
+    let Joined::Done(Ok(resolution)) = state.resolver.resolve_until(workspace, origin.until).await
+    else {
+        return None;
+    };
     let graph = PackageGraph::new(&resolution);
     let built_with = destination.release.as_ref().map(|(_, version)| version);
     let name = destination
@@ -2186,6 +2204,26 @@ async fn in_project_build_of(
     })))
 }
 
+/// What the response warns about the features of the project's build, when the work that reads
+/// them ended without them, as when it panicked.
+#[cfg(feature = "local")]
+pub(super) const NOT_READ: &str = "the features of the project's build could not be read";
+
+/// What the response warns about the features of the project's build, which cargo is still
+/// reading past the deadline of the call, as `doing` says: the next call has them.
+#[cfg(feature = "local")]
+pub(super) fn still_reading(doing: Doing) -> String {
+    format!(
+        "the features of the project's build are not known yet: cargo is {} them, which goes on \
+         without this call; call again for them",
+        match doing {
+            Doing::WaitingForLock => "waiting for a lock to read",
+            Doing::Fetching | Doing::Indexing | Doing::Building | Doing::WaitingForSlot =>
+                "reading",
+        }
+    )
+}
+
 /// The features of the packages in the build of the workspace that decided the version of
 /// `request`, for its target (requirement R-FT-2). `None`, with a warning, when they cannot be
 /// read, as when `cargo metadata` failed.
@@ -2196,9 +2234,14 @@ async fn feature_sets(
     warnings: &mut Vec<Box<str>>,
 ) -> Option<Arc<FeatureSets>> {
     let workspace = request.in_build.workspace.as_ref()?;
-    match state.resolver.features(workspace, &request.target).await {
-        Ok(sets) => Some(sets),
-        Err(error) => {
+    // Until the call's deadline: they only annotate the items (requirement R-ARCH-6).
+    match state
+        .resolver
+        .features_until(workspace, &request.target, request.until)
+        .await
+    {
+        Joined::Done(Ok(sets)) => Some(sets),
+        Joined::Done(Err(error)) => {
             warnings.push(
                 format!(
                     "whether items are in the project's build is not known: {}",
@@ -2206,6 +2249,14 @@ async fn feature_sets(
                 )
                 .into(),
             );
+            None
+        },
+        Joined::Ended => {
+            warnings.push(NOT_READ.into());
+            None
+        },
+        Joined::Going(doing) => {
+            warnings.push(still_reading(doing).into());
             None
         },
     }
@@ -2243,11 +2294,21 @@ async fn docs_rs_build(
             .crate_file(&state.cache, name, version, checksum.as_deref())
             .await;
     }
-    let read = contents.and_then(|contents| {
-        contents
-            .map(|contents| crate_file::docs_rs_build(&contents, name, version))
-            .transpose()
-    });
+    // Unpacked until its manifest, which may be far into it: off the async threads.
+    let read = match contents {
+        Ok(Some(contents)) => {
+            let (name, version) = (name.clone(), version.clone());
+            crate::task::spawn_blocking(move || {
+                crate_file::docs_rs_build(&contents, &name, &version).map(Some)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                let error = crate::task::resume_if_panic(error);
+                Err(crate_file::CrateError::Cache(std::io::Error::other(error)))
+            })
+        },
+        other => other.map(|_| None),
+    };
     match read {
         Ok(Some(build)) => Some(build),
         Ok(None) => {
@@ -2333,6 +2394,40 @@ async fn execute_std(
         #[cfg(feature = "local")]
         local: None,
     };
+    // The archives that the lookup opens, made here as a task: the lookup, on a blocking thread,
+    // then only opens them, without waiting there for a lock or a place among the crates being
+    // parsed. One that cannot be made is told by the lookup.
+    let mut opened = vec![krate];
+    for other in [StdCrate::Std, StdCrate::Alloc, StdCrate::Core] {
+        if !opened.contains(&other) {
+            opened.push(other);
+        }
+    }
+    // Until the call's deadline: another process may hold an archive's lock, and making one
+    // takes long. What is being made goes on, and the next call opens it.
+    let preparing = async {
+        for krate in opened {
+            if load::archive_std_crate(&state.cache, &chosen, krate)
+                .await
+                .is_none()
+            {
+                return false;
+            }
+        }
+        true
+    };
+    match tokio::time::timeout_at(until, preparing).await {
+        Ok(true) => {},
+        Ok(false) => return stopped(),
+        Err(_) => {
+            return std_building(
+                request.name.as_str(),
+                &request.target,
+                Doing::Indexing,
+                &warnings,
+            );
+        },
+    }
     let cache = state.cache.clone();
     let task = crate::task::spawn_blocking(move || {
         let looked_up = look_up_std(&cache, &chosen, &request, at_least.as_ref());
@@ -2367,11 +2462,13 @@ pub(super) async fn project_toolchain(state: &ToolState) -> Option<Version> {
     let [workspace] = &*project.workspaces else {
         return None;
     };
-    let rustc = data::toolchain::Programs::this().used_in(
-        data::toolchain::Kind::Rustc,
-        &workspace.root,
-        state.resolver.cargo_home(),
-    );
+    let rustc = data::toolchain::Programs::this()
+        .used_in(
+            data::toolchain::Kind::Rustc,
+            &workspace.root,
+            state.resolver.cargo_home(),
+        )
+        .await;
     data::local_std::rustc_release(&workspace.root, &rustc).await
 }
 

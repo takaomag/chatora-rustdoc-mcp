@@ -165,30 +165,42 @@ pub async fn std_json(
             stage.set(Doing::Indexing);
             let chosen = Arc::new(chosen);
             let archiving = Arc::clone(&chosen);
-            // Ended by the end of the server only; the lookup then makes what is missing.
-            drop(crate::task::spawn_blocking(move || archive_std(&cache, &archiving)).await);
+            archive_std(&cache, &archiving).await;
             Ok(chosen)
         })
         .await
 }
 
 /// Makes the archives of std, alloc and core from `chosen`, which a path of std mostly goes
-/// through (requirement R-PR-2). A failure is logged; the lookup that needs the crate tells it.
-fn archive_std(cache: &Cache, chosen: &Chosen) {
+/// through (requirement R-PR-2). A failure is logged; the lookup that needs the crate tells it,
+/// and makes what is missing when the server ended meanwhile.
+async fn archive_std(cache: &Cache, chosen: &Arc<Chosen>) {
     for krate in [StdCrate::Std, StdCrate::Alloc, StdCrate::Core] {
-        let archived = chosen
-            .json
-            .archive_key(cache, krate)
-            .map_err(LoadError::Read)
-            .and_then(|(dir, key)| {
-                archive_of(cache, &dir, krate.as_str(), &key, || {
-                    chosen.json.read(cache, krate)
-                })
-            });
-        if let Err(error) = archived {
-            tracing::warn!(krate = krate.as_str(), %error, "the JSON of std could not be archived");
+        match archive_std_crate(cache, chosen, krate).await {
+            Some(Ok(_)) => {},
+            Some(Err(error)) => {
+                tracing::warn!(krate = krate.as_str(), %error, "the JSON of std could not be archived");
+            },
+            None => return,
         }
     }
+}
+
+/// The archive of `krate` of std from `chosen`, made the first time ([`archive_from`]).
+pub async fn archive_std_crate(
+    cache: &Cache,
+    chosen: &Arc<Chosen>,
+    krate: StdCrate,
+) -> Option<Result<Arc<Mapped<Indexed>>, LoadError>> {
+    let (dir, key) = match chosen.json.archive_key(cache, krate) {
+        Ok(found) => found,
+        Err(error) => return Some(Err(LoadError::Read(error))),
+    };
+    let (reading, json) = (cache.clone(), Arc::clone(chosen));
+    archive_from(cache, &dir, krate.as_str(), &key, move || {
+        json.json.read(&reading, krate)
+    })
+    .await
 }
 
 /// A release on docs.rs, whose archive is made in its directory of the cache.
@@ -313,8 +325,9 @@ impl Release {
         ArchiveError,
     > {
         let (cache, dir) = (self.cache.clone(), self.dir.clone());
+        let parsing = Parsing::enter_as_task().await;
         let ((made, json), held) = holding(held, move || {
-            let made = archive_json(&cache, &dir, &json);
+            let made = archive_json(&cache, &dir, &json, parsing);
             (made, json)
         })
         .await?;
@@ -376,8 +389,11 @@ const MAX_PARSES: usize = 2;
 /// The crates being parsed, at most [`MAX_PARSES`].
 static PARSING: Mutex<usize> = Mutex::new(0);
 
-/// Signalled when a crate has been parsed.
+/// Signalled when a crate has been parsed, to the blocking threads that wait for a place.
 static PARSED: Condvar = Condvar::new();
+
+/// Signalled when a crate has been parsed, to the tasks that wait for a place.
+static PARSED_TO_TASKS: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// A place among the crates being parsed, given back when it is dropped.
 struct Parsing;
@@ -392,6 +408,29 @@ impl Parsing {
         *parsing = parsing.saturating_add(1);
         Self
     }
+
+    /// Waits for a place without holding a thread, as a task.
+    async fn enter_as_task() -> Self {
+        loop {
+            // Told before the place is tried, so that a place given back meanwhile is not missed.
+            let parsed = PARSED_TO_TASKS.notified();
+            let mut parsed = std::pin::pin!(parsed);
+            parsed.as_mut().enable();
+            if let Some(place) = Self::try_enter() {
+                return place;
+            }
+            parsed.await;
+        }
+    }
+
+    /// A place, if one is free.
+    fn try_enter() -> Option<Self> {
+        let mut parsing = PARSING.lock();
+        (*parsing < MAX_PARSES).then(|| {
+            *parsing = parsing.saturating_add(1);
+            Self
+        })
+    }
 }
 
 impl Drop for Parsing {
@@ -400,6 +439,7 @@ impl Drop for Parsing {
         *parsing = parsing.saturating_sub(1);
         drop(parsing);
         PARSED.notify_one();
+        PARSED_TO_TASKS.notify_waiters();
     }
 }
 
@@ -474,18 +514,18 @@ pub fn open_archived(cache: &Cache, dir: &Path) -> io::Result<Option<Arc<Mapped<
 }
 
 /// Parses `json`, indexes it, and archives it in the cache directory `dir`, then opens the
-/// archive. When the archive cannot be written or read back, it is kept in memory for this time,
-/// with a log line.
+/// archive, in the place among the crates being parsed `parsing`. When the archive cannot be
+/// written or read back, it is kept in memory for this time, with a log line.
 ///
 /// # Errors
 ///
 /// Returns an error when the JSON cannot be parsed, or the crate cannot be archived at all.
-pub fn archive_json(
+fn archive_json(
     cache: &Cache,
     dir: &Path,
     json: &[u8],
+    parsing: Parsing,
 ) -> Result<Arc<Mapped<Indexed>>, LoadError> {
-    let parsing = Parsing::enter();
     let parsed = rustdoc_json::parse(json)?;
     let format = parsed.krate.format_version;
     let sha256: Box<str> = cache::sha256_hex(json).into();
@@ -514,7 +554,9 @@ pub fn archive_json(
 }
 
 /// The archive of the JSON of the crate `stem` in the cache directory `dir`, made the first time.
-/// It must be called on a blocking thread, not in async code.
+///
+/// It must be called on a blocking thread, not in async code: [`archive_from`] is for async code,
+/// which waits for the lock and the place among the crates being parsed without holding a thread.
 ///
 /// It is keyed by `source`: the SHA-256 of the JSON, or another id of 64 hex digits that changes
 /// with it. Without it, the JSON that `json` reads is parsed, indexed and archived there (the std
@@ -530,36 +572,109 @@ pub fn archive_of(
     source: &str,
     json: impl FnOnce() -> io::Result<Box<[u8]>>,
 ) -> Result<Arc<Mapped<Indexed>>, LoadError> {
-    let short = source.get(..16).unwrap_or(source);
-    let path = dir.join(format!("{stem}.{short}.{}.rkyv", archive_version()));
+    let path = archive_path_of(dir, stem, source);
     if let Some(mapped) = opened(&path) {
         return Ok(mapped);
     }
     // Another thread that archives the same JSON goes first, and this one then opens its archive
     // (requirement R-WS-6).
     let _held = cache.lock_blocking(&path);
-    // The format is not compared when an archive is opened.
-    match Mapped::open(cache, &path, &header(0, source.into())) {
-        Ok(Some(mapped)) => return Ok(keep(&path, mapped)),
-        Ok(None) => {},
+    if let Some(mapped) = archived_at(cache, &path, source) {
+        return Ok(mapped);
+    }
+    make_at(cache, &path, source, json, Parsing::enter())
+}
+
+/// [`archive_of`] for async code: it waits for the lock and for a place among the crates being
+/// parsed as a task, and parses on a blocking thread. `None` when the work was stopped, as when
+/// the server ends.
+pub async fn archive_from(
+    cache: &Cache,
+    dir: &Path,
+    stem: &str,
+    source: &str,
+    json: impl FnOnce() -> io::Result<Box<[u8]>> + Send + 'static,
+) -> Option<Result<Arc<Mapped<Indexed>>, LoadError>> {
+    let path = archive_path_of(dir, stem, source);
+    if let Some(mapped) = opened(&path) {
+        return Some(Ok(mapped));
+    }
+    // As in `archive_of`, another task or process that archives the same JSON goes first.
+    let (looking, source) = ((cache.clone(), path.clone()), Box::<str>::from(source));
+    let (found, held) = blocking_holding(cache.lock(&path).await, {
+        let source = source.clone();
+        move || archived_at(&looking.0, &looking.1, &source)
+    })
+    .await?;
+    if let Some(mapped) = found {
+        drop(held);
+        return Some(Ok(mapped));
+    }
+    let parsing = Parsing::enter_as_task().await;
+    let cache = cache.clone();
+    let (made, _held) =
+        blocking_holding(held, move || make_at(&cache, &path, &source, json, parsing)).await?;
+    Some(made)
+}
+
+/// Runs `work` on a blocking thread, holding `held` until it ends, even when the task that waits
+/// for it is dropped. `None` when it was stopped.
+async fn blocking_holding<R: Send + 'static>(
+    held: PathGuard,
+    work: impl FnOnce() -> R + Send + 'static,
+) -> Option<(R, PathGuard)> {
+    match crate::task::spawn_blocking(move || (work(), held)).await {
+        Ok(done) => Some(done),
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "an archive could not be read");
+            let error = crate::task::resume_if_panic(error);
+            tracing::debug!(%error, "the work that makes an archive was stopped");
+            None
         },
     }
-    let parsing = Parsing::enter();
+}
+
+/// Where the archive of the JSON of the crate `stem`, keyed by `source`, is kept in `dir`.
+fn archive_path_of(dir: &Path, stem: &str, source: &str) -> PathBuf {
+    let short = source.get(..16).unwrap_or(source);
+    dir.join(format!("{stem}.{short}.{}.rkyv", archive_version()))
+}
+
+/// The archive at `path`, keyed by `source`, if another made it: under its lock.
+fn archived_at(cache: &Cache, path: &Path, source: &str) -> Option<Arc<Mapped<Indexed>>> {
+    // The format is not compared when an archive is opened.
+    match Mapped::open(cache, path, &header(0, source.into())) {
+        Ok(Some(mapped)) => Some(keep(path, mapped)),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "an archive could not be read");
+            None
+        },
+    }
+}
+
+/// Reads the JSON with `json`, parses it, indexes it and archives it at `path`, keyed by
+/// `source`, in the place `parsing`, under the lock of `path`. When the archive cannot be written
+/// or read back, it is kept in memory for this time, with a log line.
+fn make_at(
+    cache: &Cache,
+    path: &Path,
+    source: &str,
+    json: impl FnOnce() -> io::Result<Box<[u8]>>,
+    parsing: Parsing,
+) -> Result<Arc<Mapped<Indexed>>, LoadError> {
     let json = json().map_err(LoadError::Read)?;
     let parsed = rustdoc_json::parse(&json)?;
     drop(json);
     let header = header(parsed.krate.format_version, source.into());
     let indexed = Indexed::new(parsed).with_source(source);
-    match archive::write(cache, &path, &header, &indexed)
-        .and_then(|()| Mapped::open(cache, &path, &header))
+    match archive::write(cache, path, &header, &indexed)
+        .and_then(|()| Mapped::open(cache, path, &header))
     {
         Ok(Some(mapped)) => {
             drop(indexed);
             give_back_memory();
             drop(parsing);
-            return Ok(keep(&path, mapped));
+            return Ok(keep(path, mapped));
         },
         Ok(None) => {
             tracing::warn!(path = %path.display(), "an archive just written does not check out");
@@ -614,7 +729,7 @@ mod tests {
             .write_docs_rs_json(&place, 61, JSON)
             .expect("the JSON is cached");
         assert!(open_archived(&cache, &place).expect("no error").is_none());
-        let made = archive_json(&cache, &place, JSON).expect("archived");
+        let made = archive_json(&cache, &place, JSON, Parsing::enter()).expect("archived");
         assert_eq!(CrateView::new(made.get()).crate_version(), Some("1.0.0"));
         let opened = open_archived(&cache, &place)
             .expect("no error")
@@ -658,7 +773,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let cache = Cache::at(dir.path());
         assert!(matches!(
-            archive_json(&cache, dir.path(), br#"{"format_version":61}"#),
+            archive_json(
+                &cache,
+                dir.path(),
+                br#"{"format_version":61}"#,
+                Parsing::enter()
+            ),
             Err(LoadError::Parse(_))
         ));
     }

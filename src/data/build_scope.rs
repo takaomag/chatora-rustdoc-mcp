@@ -250,10 +250,17 @@ async fn tree_of(
         }
         .into());
     }
-    let text = String::from_utf8(output.stdout).map_err(|error| {
-        CargoError::Unreadable(io::Error::new(io::ErrorKind::InvalidData, error))
-    })?;
-    cargo_tree::parse(&text).map_err(|error| ScopeError::Unknown(error.to_string().into()))
+    // As long as the dependencies are many: read off the async threads.
+    super::blocking(move || {
+        let text = String::from_utf8(output.stdout).map_err(|error| {
+            CargoError::Unreadable(io::Error::new(io::ErrorKind::InvalidData, error))
+        });
+        Ok(text.map_err(ScopeError::from).and_then(|text| {
+            cargo_tree::parse(&text).map_err(|error| ScopeError::Unknown(error.to_string().into()))
+        }))
+    })
+    .await
+    .map_err(|error| ScopeError::Cargo(CargoError::Unreadable(error)))?
 }
 
 /// Where each line of `lines` is built, given where each root is built, in the order of the roots

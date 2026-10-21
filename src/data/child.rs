@@ -783,12 +783,19 @@ mod tests {
             super::super::process_id::machine_and_boot().map(|(_, boot)| boot)
         );
         child.output().await.expect("ran");
-        let left: Vec<_> = std::fs::read_dir(&records)
-            .expect("the directory")
-            .flatten()
-            .map(|entry| entry.file_name())
-            .collect();
-        assert!(left.is_empty(), "{left:?}");
+        // Removed on a blocking thread, a moment later.
+        let left = || -> Vec<_> {
+            std::fs::read_dir(&records)
+                .expect("the directory")
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect()
+        };
+        assert!(
+            wait_for(Duration::from_secs(10), || left().is_empty()).await,
+            "{:?}",
+            left()
+        );
     }
 
     /// A descendant that leaves the child's session is not stopped with the group, but it holds

@@ -910,6 +910,57 @@ Claude Code 2.1.304、Linux で測った。
 - 残したもの (次の段で): 3・4・5・7。`Cache::lock` は、同じパスを待つタスクがプロセスの中に k 個あると、プロセスの中の Mutex を持ったまま順に OS のロックを待つので、k 番目は 10 分 × k 待ちうる (前からある。同期の `lock_blocking` も同じ)
 - 直し 2 の後に、デッドロックと止まる危険をもう一度コード全体で監査する (利用者の指示)
 
+**止まる危険の直し 2 (2026-10-21)**:
+
+- 3 (利用者の決定: 期限で building を返す): `Resolver` の feature の組 (`features`) と範囲 (`scope`)、docs.rs の組で範囲の外を作るか (`outside_scope`) を、`cargo metadata` と同じく (ワークスペース, target) ごとの共有の仕事 (`Flights`) にし、期限付きの待ち (`features_until`・`outside_scope_until`) を足した。結果を覚える Mutex は `cargo tree` の間持たない (共有の仕事が 1 回にまとめる)
+  - member の計画 (`mcp::tool::local::member`) は期限までに分からなければ `Member::Resolving` (`status: building`、`building_reason` は cargo の待ち)
+  - 結果の注記にだけ使う `get_item`・`list_crates`・`search_items` は、期限までに分からなければ、分からない旨の warning を付けて結果を返す (注記が無いだけで、待たせて building にするほどではない。`in_project_build` の `resolve` も期限付きにした)
+  - `cargo tree` の待ちの理由: `cargo::run` が、共有の仕事が tokio の task-local に置いた `Stage` に、cargo が stderr に書くロック待ちと取得を伝える (`cargo::staged`)。`cargo tree` もパッケージキャッシュのロックを rust-analyzer などが持つと `waiting_for_lock` になり、空けば結果が出ることをテストで確かめた (`cargo metadata` のテストに足した)
+- 4: `ChildRecord::drop` の片付け (ロックの待ちに最大 約 155 ms の `thread::sleep` を含む) を、tokio のランタイムの中なら blocking のスレッドに回す
+- 5: シグナルで止め始めて 10 秒 (`STOP_LIMIT`。rmcp は呼び出しを 5 秒、自分のタスクを 2 秒待つ) たっても終わらないか、2 回目のシグナルが来たら、セッションを待たずに `serve` から戻る (`clippy::exit` を禁じているので `process::exit` は使わず、`main` の `shutdown_timeout(1s)` で終わる)。後のサーバーが残りを片付ける (C4)
+- 7:
+  - `Flights::join` の `start` は flights を lock したまま呼ばれる: 仕事を作るだけで、同じ flights を呼んだり待ったりしてはならない制約を doc に書いた (今の `start` はどれも守っている)
+  - 解析の枠 (同時に 2 つ) の待ちを、async の呼び出し元では task として待つ (`Parsing::enter_as_task`。blocking のスレッドを Condvar で塞がない)。`load::archive_from` (`archive_of` の非同期版) は、ロック (`Cache::lock`) と枠を非同期に待ち、解析と書き込みだけを blocking のスレッドで行う。ローカルビルド・std の先回り・検索の std・docs.rs (`Release::make`) はこれを使う。`get_item` が std のパスをたどる途中で開く分 (同期のたどり方の中) だけは同期の `archive_of` のまま (std は共有の仕事が先に作るので、普通は開くだけ)
+- 利用者の指示で、async の中の長い同期処理は `spawn_blocking` に回し、同期のロックより非同期のロックが望ましいところは直す。ロックの基準 (利用者が了承): 持ったまま `.await`・I/O・長い待ちをするものは非同期 (`tokio::sync`) にするかロックの外に出し、表や数を一瞬だけ触るもの、`Drop` や blocking のスレッドの中のものは `parking_lot` のまま (`Drop` と同期の関数では `.await` できず、`parking_lot` のガードは `Send` でないので `.await` をまたぐ持ち方を型で防げる)
+  - サブエージェントで洗い出した (読むだけ)。async のワーカーを分単位で止める同期の待ちは無かった。blocking のスレッドに回したもの:
+    - docs.rs の JSON の zstd の展開 (数百 MB まで)
+    - ローカルビルドの JSON のヘッダ読みと SHA-256、記録の JSON 化 (入力の数に比例)
+    - std の dist のアーカイブの SHA-256 (数十 MB。展開と同じ blocking の中で)
+    - sparse index の解析 (版の多い crate で MB。本体は `Arc<[u8]>` で渡す)
+    - `freshness::sources` の git の一覧の後処理 (ファイルごとの stat)
+    - Cargo.lock の解析 (2 回していたのを、読むのと同じ blocking の中で 1 回に)
+    - `.crate` を丸ごと読んで SHA-256 を取り、キャッシュに書く `CratesFiles::crate_file` と、`.crate` から Cargo.toml を取り出す `docs_rs_build`
+    - toolchain の形式の記録の読み書きと試しのファイル操作 (fsync を含む)
+    - cargo の設定の読み込み (`Programs::used_in` を async に)
+    - `cargo tree` の出力の解析
+  - `std_json` が tokio の `spawn_blocking` を直接使っていた 2 か所を `crate::task::spawn_blocking` に (ログの `request_id` を保つ)
+  - `get_item` の std の照会は、頼まれた crate と std・alloc・core のアーカイブを先に非同期版で用意し、blocking のスレッドの照会は開くだけにした (同期の `lock_blocking` と解析の枠の Condvar を通らない)
+  - ログのファイル: ロックを持ったまま書いていたのを、書き込み専用のスレッド (`logging::writer::Lines`、上限 4096 行の `sync_channel`) に渡す形にした (利用者の決定)。あふれたときだけ書く側が待つ。終了のとき (`main` の最後) に 1 秒まで書き切る。tracing-appender の `non_blocking` も考えたが、その `WorkerGuard` は drop のときにチャネルが詰まっていると stdout に `println!` する (0.2.5 の `non_blocking.rs:296`)。stdout は JSON-RPC 専用 (R-SEC-1) なので使わず、自前で書いた (利用者の決定)
+  - 残したもの: 一瞬で終わる stat・小さなファイルの読み・プロジェクトの Cargo.toml の読み、sysroot の `read_dir` (約 100 件)。パッケージ数の 2 乗の CPU 処理 (`PackageGraph::from_metadata`・`list_crates` の並べ替え・`follow` の `retain`。索引を作る話で、別の段)。`get_item` が std のパスをたどる途中で開く同期の `archive_of` は残る (先に用意するので、普通は開くだけ)
+- レビューで直したこと:
+  - 版を明示した照会 (`name@=ver`) で、member だと分かった後に `cargo tree` が期限に間に合わないと、`Member::Resolving` (member かどうか分からない) と取り違えて crates.io の同名・同版を返していた。新しい `Member::Planning` で、どちらの照会の道でも `status: building` を返す (文言は「cargo is reading the features of the project's build」)
+  - 入れ子の共有の仕事 (features → resolve、outside → scope → resolve) の待ちの理由が外側に伝わっていなかった。`Flights::wait_telling` で、内側の仕事の段を 0.1 秒ごとに外側の段に写す (task-local の `Stage` がある仕事の中だけ)
+  - `list_crates` は features を新しい期限で待ち、呼び出しの期限を越えていた: 呼び出しの `until` を渡す
+  - 注記の warning の文言をそろえた (`still_reading`、仕事が結果なしで終わったときの `NOT_READ`)。member の計画では、features の仕事が結果なしで終わっても `stopped` にせず、読めなかったときと同じに扱う
+  - `get_item` の std の用意は呼び出しの期限で打ち切り、間に合わなければ `status: building` (作りかけは裏で続く)
+  - `ChildRecord::drop` は、まず待たずにロックを試して消す (終了の途中では blocking の仕事が捨てられるため)。取れなければ blocking のスレッドで待つ
+  - `.crate` のロックを、チェックサムの確かめと書き込みの blocking に持たせる (呼び出しが落とされても書き終えるまで持つ)
+  - ログ: `logging::init` は、drop で書き切る `Flushing` を返す (`main` から panic が巻き戻るときも書き切る)。書き込みのスレッドが止まったら stderr に 1 度だけ知らせる
+  - シグナルの受け口は最初に 1 度だけ作る (`StopSignals`): 1 回目と 2 回目の間に来たシグナルを取りこぼさない
+  - 前からあった warning の文字列の、行の継ぎ目の空白を直した
+- 直し 2 の後のデッドロックと止まる危険の再監査 (利用者の指示。サブエージェント、読むだけ): 永久に解けないデッドロック (ロックの循環・自分の結果を待つ循環・通知の取りこぼし) は無かった。clippy に `await_holding_lock`・`significant_drop_in_scrutinee`・`significant_drop_tightening`・`let_underscore_lock` を足しても警告は 0 件。直したもの:
+  - stdin が閉じても、クライアントが stdout を読まないと、rmcp が stdout を閉じるのを上限なしで待ってサーバーが終わらなかった (再現: 60 秒以上)。stdin の終わりも `StopChildrenAtEnd` が `Notify` で知らせ、シグナルと同じく `STOP_LIMIT` の計時を始める (直した後は 11.0 秒で終わる)
+  - `search_items` の std の用意も呼び出しの期限で打ち切る
+  - `test_process::finish` は 5 分で諦める (サーバーを相手にするテストの `child.wait()` は、サーバーが stdin の終わりから 10 秒ほどで終わるので上限が付いた)
+  - `Resolver` の入力ファイルは普通のファイルだけ読む (FIFO で止まらない)
+- 残したもの:
+  - `get_item` の std で、用意に失敗した crate を照会がもう一度解析しうる (失敗のときだけ)。
+  - `Cache::lock` は、プロセスの中の同じパスの待ちが 1 列になり、10 分 × 待つ数になりうる (前からある)。
+  - ビルドの `doc:`・`target:` のロックは上限なし (決めたとおり)。
+  - ログのキューやあふれ、stderr を読まないクライアントでは、ログを書くスレッドが待つ (決めたとおり、前と同じ)。
+  - 呼び出しの進捗の通知 (`notify_progress`) は stdout が詰まると待つ (Claude Code は終了のときに SIGTERM を送るので、`STOP_LIMIT` で終わる)。
+  - テストの `generate-lockfile` などの短い std の `status()`・`output()` には上限が無い。`enter_as_task` の起こし・`archive_from` の取り消し・ログのあふれ・2 回目のシグナルの結合テストは無い
+
 ### 6.6 M2e
 
 (まだ無い)

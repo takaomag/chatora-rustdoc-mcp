@@ -438,7 +438,7 @@ async fn readable_nightly(
     let kept = cache.dir().join("std").join(format!("readable-{target}"));
     let remembered = {
         let (cache, kept) = (cache.clone(), kept.clone());
-        tokio::task::spawn_blocking(move || match cache.read_verified(&kept) {
+        crate::task::spawn_blocking(move || match cache.read_verified(&kept) {
             Ok(Verified::Found(date)) => String::from_utf8(date.into_vec()).ok(),
             Ok(Verified::Mismatch | Verified::None) | Err(_) => None,
         })
@@ -460,7 +460,7 @@ async fn readable_nightly(
         }
         let write = {
             let (cache, kept, date) = (cache.clone(), kept.clone(), date.to_string());
-            tokio::task::spawn_blocking(move || cache.write_verified(&kept, date.as_bytes())).await
+            crate::task::spawn_blocking(move || cache.write_verified(&kept, date.as_bytes())).await
         };
         if !matches!(write, Ok(Ok(()))) {
             tracing::warn!(path = %kept.display(), "the readable nightly could not be kept");

@@ -305,26 +305,46 @@ impl Drop for ChildRecord {
     /// The group has been stopped: the record and the lock go unless a descendant still holds it.
     fn drop(&mut self) {
         drop(self.lock.take());
-        // What was killed lets the lock go as it ends, a moment later, as does a child being
-        // started meanwhile, which holds a copy until it runs its program.
-        match process_lock::lock_blocking_at(
-            &self.lock_path,
-            LockMode::Exclusive,
-            Duration::from_millis(100),
-        ) {
-            Ok(Some(held)) => {
-                drop(fs::remove_file(&self.record));
-                drop(fs::remove_file(&self.lock_path));
-                drop(held);
-            },
-            Ok(None) => tracing::info!(
-                record = %self.record.display(),
-                "a descendant of a child that was stopped still runs, so its record is kept"
-            ),
-            Err(error) => {
-                tracing::debug!(%error, "whether a descendant of a child still runs cannot be told");
-            },
+        let (record, lock_path) = (
+            std::mem::take(&mut self.record),
+            std::mem::take(&mut self.lock_path),
+        );
+        // At once, when nothing holds the lock any more, as when the server ends and starts no
+        // more blocking work.
+        if let Ok(Some(held)) = process_lock::try_lock_at(&lock_path, LockMode::Exclusive) {
+            drop(fs::remove_file(&record));
+            drop(fs::remove_file(&lock_path));
+            drop(held);
+            return;
         }
+        // Else it waits a moment: on a blocking thread, not one that runs async work.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(move || remove_record(&record, &lock_path))),
+            Err(_) => remove_record(&record, &lock_path),
+        }
+    }
+}
+
+/// Removes the record of a child at `record`, and its lock file at `lock_path`, unless a
+/// descendant of the child still holds the lock. What was killed lets the lock go as it ends, a
+/// moment later, as does a child being started meanwhile, which holds a copy until it runs its
+/// program.
+#[cfg(unix)]
+fn remove_record(record: &Path, lock_path: &Path) {
+    match process_lock::lock_blocking_at(lock_path, LockMode::Exclusive, Duration::from_millis(100))
+    {
+        Ok(Some(held)) => {
+            drop(fs::remove_file(record));
+            drop(fs::remove_file(lock_path));
+            drop(held);
+        },
+        Ok(None) => tracing::info!(
+            record = %record.display(),
+            "a descendant of a child that was stopped still runs, so its record is kept"
+        ),
+        Err(error) => {
+            tracing::debug!(%error, "whether a descendant of a child still runs cannot be told");
+        },
     }
 }
 

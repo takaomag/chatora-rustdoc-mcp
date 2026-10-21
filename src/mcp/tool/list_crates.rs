@@ -242,24 +242,37 @@ pub(super) fn parse_arguments(
     })
 }
 
-/// The features of the packages in the build of `workspace` for `target`, or `None` with a warning
-/// when the build is not known though `cargo metadata` ran (`resolved_from` is `cargo_lock`).
+/// The features of the packages in the build of `workspace` for `target`, waited for until
+/// `until`, or `None` with a warning when the build is not known though `cargo metadata` ran
+/// (`resolved_from` is `cargo_lock`), or not yet.
 async fn build_sets(
     state: &ToolState,
-    workspace: &Workspace,
-    target: &TargetTriple,
+    (workspace, target, until): (&Workspace, &TargetTriple, tokio::time::Instant),
     resolved_from: &str,
     warnings: &mut Vec<Value>,
 ) -> Option<Arc<FeatureSets>> {
-    match state.resolver.features(workspace, target).await {
-        Ok(sets) => Some(sets),
-        Err(error) => {
+    // Until the call's deadline: they only annotate the list (requirement R-ARCH-6).
+    match state
+        .resolver
+        .features_until(workspace, target, until)
+        .await
+    {
+        Joined::Done(Ok(sets)) => Some(sets),
+        Joined::Done(Err(error)) => {
             if resolved_from == "cargo_lock" {
                 warnings.push(json!(format!(
                     "which crates the build for {target} uses is not known: {}",
                     super::ErrorChain(&error)
                 )));
             }
+            None
+        },
+        Joined::Ended => {
+            warnings.push(json!(super::get_item::NOT_READ));
+            None
+        },
+        Joined::Going(doing) => {
+            warnings.push(json!(super::get_item::still_reading(doing)));
             None
         },
     }
@@ -326,7 +339,8 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
             "cargo_lock_raw"
         },
     };
-    let sets = build_sets(&state, &workspace, &target, resolved_from, &mut warnings).await;
+    let built_for = (&workspace, &target, until);
+    let sets = build_sets(&state, built_for, resolved_from, &mut warnings).await;
     let graph = PackageGraph::new(&resolution);
     let context = Listing {
         graph: &graph,

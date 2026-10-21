@@ -74,6 +74,9 @@ pub(super) enum Member {
     Unknown(Box<CallToolResult>),
     /// cargo is still resolving the packages, past the deadline of the call, as this says.
     Resolving(Doing),
+    /// A member's crate, whose build cargo is still planning past the deadline of the call: it
+    /// reads the features of the project's build (`cargo tree`), as this says.
+    Planning(Doing),
 }
 
 /// What the crate `name`, as `asked`, is in `workspace`, to build for `target`, waiting for
@@ -117,14 +120,22 @@ pub(super) async fn member(
     // The member's features in the build of the whole workspace, as rust-analyzer checks it and
     // `enabled_in_project` tells (requirement R-FT-3, decided in M2's D3), or else cargo's default.
     let mut warnings: Vec<Box<str>> = Vec::new();
-    let features = match state.resolver.features(workspace, target).await {
-        Ok(sets) => sets
+    let features = match state
+        .resolver
+        .features_until(workspace, target, until)
+        .await
+    {
+        Joined::Done(Ok(sets)) => sets
             .normal(&package.name, &package.version)
             .map(|features| build::declared_features(package, features)),
-        Err(error) => {
+        Joined::Done(Err(error)) => {
             tracing::debug!(%error, "the features of the workspace could not be read");
             None
         },
+        // The work ended without them, as when it panicked: as if they could not be read.
+        Joined::Ended => None,
+        // cargo may wait for its package cache, which rust-analyzer holds (requirement R-ARCH-6).
+        Joined::Going(doing) => return Ok(Member::Planning(doing)),
     };
     if features.is_none() {
         warnings.push(
@@ -136,7 +147,19 @@ pub(super) async fn member(
             .into(),
         );
     }
-    let docs_rs = docs_rs_of(state, workspace, target, package, features.as_deref()).await;
+    let docs_rs = match docs_rs_of(
+        state,
+        workspace,
+        target,
+        package,
+        features.as_deref(),
+        until,
+    )
+    .await
+    {
+        Ok(docs_rs) => docs_rs,
+        Err(going) => return going,
+    };
     warnings.extend(docs_rs.warnings);
     let plan = Plan {
         root: root.clone(),
@@ -184,26 +207,28 @@ struct DocsRsAsks {
 /// for `target`, whose features in the project's build are `projects` (requirements R-FT-3 and
 /// R-MCP-3, decided in M2's D3). Its features are taken when the project's build has them all,
 /// or when a build with them builds no package that the project's build does not; else the
-/// project's are, with a warning.
+/// project's are, with a warning. What `cargo tree` tells of that is waited for until `until`:
+/// else the member is told as being resolved.
 async fn docs_rs_of(
     state: &ToolState,
     workspace: &Workspace,
     target: &TargetTriple,
     package: &Package,
     projects: Option<&[Box<str>]>,
-) -> DocsRsAsks {
+    until: Instant,
+) -> Result<DocsRsAsks, Result<Member, Box<CallToolResult>>> {
     let manifest = package.manifest_path.clone();
     let read = crate::task::spawn_blocking(move || crate_file::member_docs_rs(&manifest)).await;
     let docs = match read {
         Ok(Ok(docs)) if docs.asked => docs,
-        Ok(Ok(_)) => return DocsRsAsks::default(),
+        Ok(Ok(_)) => return Ok(DocsRsAsks::default()),
         Ok(Err(error)) => {
             tracing::debug!(%error, "the manifest of a member could not be read");
-            return DocsRsAsks::default();
+            return Ok(DocsRsAsks::default());
         },
         Err(error) => {
             tracing::debug!(error = %crate::task::resume_if_panic(error), "the manifest of a member was not read");
-            return DocsRsAsks::default();
+            return Ok(DocsRsAsks::default());
         },
     };
     let mut asks = DocsRsAsks {
@@ -214,19 +239,19 @@ async fn docs_rs_of(
     // R-FT-3); the project's are the same otherwise.
     let features = build::declared_features(package, &docs.features);
     if !docs.asks_features || projects == Some(&*features) {
-        return asks;
+        return Ok(asks);
     }
     if projects.is_some_and(|projects| features.iter().all(|feature| projects.contains(feature))) {
         asks.features = Some(features);
-        return asks;
+        return Ok(asks);
     }
     match state
         .resolver
-        .outside_scope(workspace, target, package, &features)
+        .outside_scope_until(workspace, target, (&package.id, &features), until)
         .await
     {
-        Ok(outside) if outside.is_empty() => asks.features = Some(features),
-        Ok(outside) => asks.warnings.push(
+        Joined::Done(Ok(outside)) if outside.is_empty() => asks.features = Some(features),
+        Joined::Done(Ok(outside)) => asks.warnings.push(
             format!(
                 "built with the features of the project's build: those of \
                  [package.metadata.docs.rs] would build {}, which the project's build does not; \
@@ -235,15 +260,21 @@ async fn docs_rs_of(
             )
             .into(),
         ),
-        Err(error) => asks.warnings.push(
+        Joined::Done(Err(error)) => asks.warnings.push(
             format!(
                 "built with the features of the project's build: whether those of \
                  [package.metadata.docs.rs] build more could not be told ({error})"
             )
             .into(),
         ),
+        Joined::Ended => asks.warnings.push(
+            "built with the features of the project's build: whether those of \
+             [package.metadata.docs.rs] build more could not be told"
+                .into(),
+        ),
+        Joined::Going(doing) => return Err(Ok(Member::Planning(doing))),
     }
-    asks
+    Ok(asks)
 }
 
 /// The error when the project's package `name`, not from crates.io, cannot be built, as `cargo

@@ -185,7 +185,13 @@ impl DocsRs {
                     BodyError::TooLarge { limit } => FetchError::TooLarge { limit },
                 })?;
         drop(place);
-        decompress(body, MAX_BYTES).map(Vec::into_boxed_slice)
+        // Hundreds of megabytes at most, unpacked off the async threads.
+        crate::task::spawn_blocking(move || decompress(body, MAX_BYTES).map(Vec::into_boxed_slice))
+            .await
+            .map_err(|error| {
+                let error = crate::task::resume_if_panic(error);
+                FetchError::Corrupt(std::io::Error::other(error))
+            })?
     }
 
     /// Whether docs.rs has rustdoc JSON of `name` at `version` for the crate's default target,

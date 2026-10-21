@@ -23,10 +23,16 @@ pub(crate) fn start(name: &str, env: &[(&str, &OsStr)]) -> Child {
     command.spawn().expect("the test binary starts")
 }
 
-/// Waits for the test that [`start`] started, fails unless it passed, and returns the lines it
-/// printed.
+/// Waits for the test that [`start`] started, five minutes at most, fails unless it passed, and
+/// returns the lines it printed.
 pub(crate) fn finish(child: Child) -> Vec<String> {
-    let output = child.wait_with_output().expect("waited");
+    let id = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || drop(sender.send(child.wait_with_output())));
+    let output = receiver
+        .recv_timeout(std::time::Duration::from_secs(300))
+        .unwrap_or_else(|_| panic!("the test in process {id} did not end in five minutes"))
+        .expect("waited");
     let stdout = String::from_utf8_lossy(&output.stdout);
     // A name that matches no test passes, too.
     assert!(

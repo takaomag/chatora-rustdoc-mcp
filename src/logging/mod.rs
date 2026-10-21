@@ -6,6 +6,7 @@
 
 mod file;
 mod layer;
+mod writer;
 
 use std::{
     path::{Path, PathBuf},
@@ -22,7 +23,10 @@ use tracing_subscriber::{
     util::{SubscriberInitExt as _, TryInitError},
 };
 
-use self::file::{Limits, LogFile};
+use self::{
+    file::{Limits, LogFile},
+    writer::Lines,
+};
 use crate::config::Settings;
 
 /// The name of the span of a tool call. Its `request_id` goes on the warnings in the log file.
@@ -47,8 +51,8 @@ const DEFAULT_RETENTION_DAYS: u64 = 14;
 /// `log.total_max_size` unless set (requirement R-OBS-2, initial value): 50MB.
 const DEFAULT_TOTAL_MAX_SIZE: u64 = 50_000_000;
 
-/// The log file, once [`init`] has opened it.
-static FILE: OnceLock<Arc<LogFile>> = OnceLock::new();
+/// The lines of the log file, once [`init`] has opened it.
+static FILE: OnceLock<Arc<Lines>> = OnceLock::new();
 
 /// Installs the global subscriber that writes the log to stderr and warnings and errors to the log
 /// file, and opens the file for [`write_record`]. The settings are `log.*` (requirements R-OBS-2
@@ -58,19 +62,25 @@ static FILE: OnceLock<Arc<LogFile>> = OnceLock::new();
 /// for [`Settings::report`], and a log file that cannot be opened is done without, which is
 /// logged; the server still starts.
 ///
+/// The lines logged so far are written to the file by the time the returned [`Flushing`] is
+/// dropped, as when the process ends, or a panic unwinds out of `main`.
+///
 /// # Errors
 ///
 /// Returns an error when a global subscriber is already installed.
-pub fn init(settings: &Settings) -> Result<(), TryInitError> {
+pub fn init(settings: &Settings) -> Result<Flushing, TryInitError> {
     let filter = stderr_filter(settings);
     let limits = limits(settings);
     let file = match log_dir(settings) {
-        Ok(dir) => LogFile::open(&dir, limits).map(Arc::new).map_err(|error| {
-            format!(
-                "the log file in {} cannot be written: {error}",
-                dir.display()
-            )
-        }),
+        Ok(dir) => LogFile::open(&dir, limits)
+            .and_then(Lines::start)
+            .map(Arc::new)
+            .map_err(|error| {
+                format!(
+                    "the log file in {} cannot be written: {error}",
+                    dir.display()
+                )
+            }),
         Err(problem) => Err(problem),
     };
     let stderr = tracing_subscriber::fmt::layer()
@@ -95,14 +105,33 @@ pub fn init(settings: &Settings) -> Result<(), TryInitError> {
         },
         Err(problem) => tracing::warn!("{problem}; tool calls are not logged to a file"),
     }
-    Ok(())
+    Ok(Flushing)
+}
+
+/// Writes the lines logged so far to the log file when it is dropped, waiting a second at most.
+#[derive(Debug)]
+#[must_use = "dropped at once, it waits for the lines at once, and not when the process ends"]
+pub struct Flushing;
+
+impl Drop for Flushing {
+    fn drop(&mut self) {
+        flush();
+    }
 }
 
 /// Writes `record` as a line of the log file, if there is one. Records are not filtered: each
 /// tool call has one (requirements R-OBS-1 and R-DIST-3).
 pub fn write_record(record: &Value) {
     if let Some(file) = FILE.get() {
-        file.write_line(&record.to_string());
+        file.write_line(record.to_string());
+    }
+}
+
+/// Waits a second at most for the lines logged so far to be written to the log file: for when the
+/// process ends.
+fn flush() {
+    if let Some(file) = FILE.get() {
+        file.flush(Duration::from_secs(1));
     }
 }
 

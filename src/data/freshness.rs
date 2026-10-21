@@ -160,32 +160,50 @@ pub async fn sources(dirs: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
                 continue;
             },
         };
-        let listed: Vec<&str> = listed.split('\0').filter(|path| !path.is_empty()).collect();
-        // A package that git ignores, as in a directory of vendored packages, is not listed.
-        if !listed.contains(&"Cargo.toml") {
-            tracing::debug!(dir = %dir.display(), "git ignores the package, so the directory is walked");
-            walked.push(dir.clone());
+        // A stat for each file: off the async threads.
+        let listing = dir.clone();
+        match super::blocking(move || Ok(sort_listed(&listing, &listed))).await {
+            Ok((listed_files, listed_walked)) => {
+                files.extend(listed_files);
+                walked.extend(listed_walked);
+            },
+            Err(error) => {
+                tracing::debug!(dir = %dir.display(), %error, "the sources could not be sorted, so the directory is walked");
+                walked.push(dir.clone());
+            },
+        }
+    }
+    (files, walked)
+}
+
+/// The files of `listed`, the output of `git ls-files -z` in `dir`, that are sources of the
+/// package there, and the directories to walk: `dir` itself, when git ignores the package, as in
+/// a directory of vendored packages, and what git lists as a directory, as a submodule.
+fn sort_listed(dir: &Path, listed: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let listed: Vec<&str> = listed.split('\0').filter(|path| !path.is_empty()).collect();
+    if !listed.contains(&"Cargo.toml") {
+        tracing::debug!(dir = %dir.display(), "git ignores the package, so the directory is walked");
+        return (Vec::new(), vec![dir.to_path_buf()]);
+    }
+    let (mut files, mut walked) = (Vec::new(), Vec::new());
+    let mut packages = HashMap::new();
+    for path in listed {
+        // A name that is not UTF-8, which the output does not keep.
+        if path.contains(char::REPLACEMENT_CHARACTER) {
+            tracing::debug!(dir = %dir.display(), path, "a file whose name is not UTF-8 is not an input");
             continue;
         }
-        let mut packages = HashMap::new();
-        for path in listed {
-            // A name that is not UTF-8, which the output does not keep.
-            if path.contains(char::REPLACEMENT_CHARACTER) {
-                tracing::debug!(dir = %dir.display(), path, "a file whose name is not UTF-8 is not an input");
-                continue;
+        if !is_source(dir, Path::new(path), &mut packages) {
+            continue;
+        }
+        let path = dir.join(path);
+        // A submodule, a repository inside, or a symlink to a directory.
+        if path.is_dir() {
+            if !path.join("Cargo.toml").is_file() && !path.join("CACHEDIR.TAG").is_file() {
+                walked.push(path);
             }
-            if !is_source(dir, Path::new(path), &mut packages) {
-                continue;
-            }
-            let path = dir.join(path);
-            // A submodule, a repository inside, or a symlink to a directory.
-            if path.is_dir() {
-                if !path.join("Cargo.toml").is_file() && !path.join("CACHEDIR.TAG").is_file() {
-                    walked.push(path);
-                }
-            } else {
-                files.push(path);
-            }
+        } else {
+            files.push(path);
         }
     }
     (files, walked)

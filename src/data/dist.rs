@@ -450,18 +450,19 @@ pub async fn std_docs(
         ));
     }
     let body = get_remembering(cache, dist, &archive.url, MAX_ARCHIVE_BYTES, &dir).await?;
-    if !cache::sha256_hex(&body).eq_ignore_ascii_case(&archive.sha256) {
-        return Err(DistError::ChecksumMismatch);
-    }
     let unpacked = {
         let (cache, dir) = (cache.clone(), dir.clone());
         let (date, version) = (summary.date.clone(), summary.version.clone());
-        let max = dist.settings.extract_max_size;
+        let (max, sha256) = (dist.settings.extract_max_size, archive.sha256.clone());
         // The lock goes with the unpacking, which goes on to its end even when the task that
         // waits for it is aborted, so that another call does not unpack it again meanwhile
-        // (requirement R-WS-6).
+        // (requirement R-WS-6). Tens of megabytes are checked there too, off the async threads.
         blocking(move || {
-            let unpacked = unpack(&cache, &body, &dir, date, version, triple, max);
+            let unpacked = if cache::sha256_hex(&body).eq_ignore_ascii_case(&sha256) {
+                unpack(&cache, &body, &dir, date, version, triple, max)
+            } else {
+                Err(DistError::ChecksumMismatch)
+            };
             drop(held);
             Ok(unpacked)
         })

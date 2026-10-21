@@ -18,11 +18,11 @@ use tokio::sync::Mutex;
 use super::{
     blocking,
     build_scope::{self, BuildScope, ScopeError},
-    cargo::{self, Activity, Failure, RunError},
+    cargo::{self, Failure, RunError},
     cargo_config,
     cargo_lock::CargoLock,
     features::{self, FeatureSets},
-    flight::{Doing, Flights, Joined, Stage},
+    flight::{Flights, Joined, Stage},
     project::{self, Workspace},
     target::TargetTriple,
 };
@@ -261,20 +261,45 @@ const FAILURE_TTL: Duration = Duration::from_secs(30);
 /// Calls for the same workspace at the same time share the work, which runs cargo once
 /// (requirement R-VR-2). The work goes on when a call stops waiting for it at its deadline, as the
 /// first `cargo metadata` of a project may fetch its dependencies for long (requirement R-WS-6).
+///
+/// The feature sets and the scopes that `cargo tree` tells are work shared the same way, by
+/// workspace and target, which a call may stop waiting for at its deadline (requirement
+/// R-ARCH-6): cargo may wait for its package cache, which rust-analyzer holds.
 #[derive(Debug)]
 pub struct Resolver {
-    inner: Arc<Inner>,
-    /// The resolutions being made, by workspace root.
-    resolving: Flights<Resolved>,
-    /// What [`Self::outside_scope`] found, with the resolution that it is of.
-    outside: parking_lot::Mutex<Outside>,
+    shared: Shared,
+    /// The feature sets being read, by workspace root and target.
+    featuring: Flights<Featured>,
+    /// What [`Self::outside_scope_until`] is finding, by build.
+    outsiding: Flights<Outsides>,
 }
 
-/// What [`Resolver::outside_scope`] found, by the build it looked at, with the resolution that it
+/// What the work of a [`Resolver`] shares, which it takes along.
+#[derive(Debug, Clone)]
+struct Shared {
+    inner: Arc<Inner>,
+    /// The resolutions being made, by workspace root.
+    resolving: Arc<Flights<Resolved>>,
+    /// The scopes being read, by workspace root and target.
+    scoping: Arc<Flights<Scoped>>,
+    /// What [`Resolver::outside_scope_until`] found, with the resolution that it is of.
+    outside: Arc<parking_lot::Mutex<Outside>>,
+}
+
+/// The feature sets of a workspace's build for a target, or why they are not known.
+pub type Featured = Result<Arc<FeatureSets>, Arc<FeaturesError>>;
+
+/// The scope of a workspace's local builds for a target, or why it is not known.
+pub type Scoped = Result<Arc<BuildScope>, Arc<ScopeError>>;
+
+/// The packages that a member's build would build outside the scope, or why they are not known.
+pub type Outsides = Result<Vec<Box<str>>, Arc<ScopeError>>;
+
+/// What [`Resolver::outside_scope_until`] found, by the build it looked at, with the resolution that it
 /// is of.
 type Outside = HashMap<OutsideKey, (Arc<Resolution>, Vec<Box<str>>)>;
 
-/// A build that [`Resolver::outside_scope`] looked at: the workspace's root, the target, the
+/// A build that [`Resolver::outside_scope_until`] looked at: the workspace's root, the target, the
 /// member's package id and the features.
 type OutsideKey = (PathBuf, Box<str>, Box<str>, Vec<Box<str>>);
 
@@ -300,7 +325,7 @@ struct Kept {
     /// When it was made: a failure is given again only for [`FAILURE_TTL`].
     at: Instant,
     /// The feature sets from `cargo tree`, or why they are not known, by target, and when. The
-    /// same inputs decide them. Held while `cargo tree` runs, so that it runs once.
+    /// same inputs decide them.
     features: PerTarget<FeatureSets, FeaturesError>,
     /// The scopes of the local builds from `cargo tree`, as the feature sets.
     scopes: PerTarget<BuildScope, ScopeError>,
@@ -339,20 +364,25 @@ impl Resolver {
     #[must_use]
     pub fn new(offline: bool) -> Self {
         Self {
-            inner: Arc::new(Inner {
-                offline,
-                cargo_home: super::cargo_home(),
-                kept: Mutex::new(HashMap::new()),
-            }),
-            resolving: Flights::default(),
-            outside: parking_lot::Mutex::default(),
+            shared: Shared {
+                inner: Arc::new(Inner {
+                    offline,
+                    cargo_home: super::cargo_home(),
+                    kept: Mutex::new(HashMap::new()),
+                }),
+                resolving: Arc::default(),
+                scoping: Arc::default(),
+                outside: Arc::default(),
+            },
+            featuring: Flights::default(),
+            outsiding: Flights::default(),
         }
     }
 
     /// `$CARGO_HOME`, whose settings apply to every project.
     #[must_use]
     pub fn cargo_home(&self) -> Option<&Path> {
-        self.inner.cargo_home.as_deref()
+        self.shared.inner.cargo_home.as_deref()
     }
 
     /// The files that `cargo metadata` of the workspace at `root`, which `metadata` tells, reads:
@@ -360,14 +390,14 @@ impl Resolver {
     /// settings with what they include, and `rust-toolchain` (requirement R-WS-4): what a member's
     /// build is made from besides its sources (decided in M2's D4). They may not exist.
     pub async fn input_files(&self, root: &Path, metadata: &Metadata) -> Vec<PathBuf> {
-        let files = self.inner.input_files(root, Some(metadata));
-        with_included(files, root, self.inner.cargo_home.clone()).await
+        let files = self.shared.inner.input_files(root, Some(metadata));
+        with_included(files, root, self.shared.inner.cargo_home.clone()).await
     }
 
     /// Whether cargo is offline in the project at `root`: run with `--offline`, or with
     /// `net.offline` in the user's cargo settings (requirement R-WS-7).
     pub async fn offline_in(&self, root: &Path) -> bool {
-        self.inner.offline_in(root).await
+        self.shared.inner.offline_in(root).await
     }
 
     /// The packages of `workspace`, as [`Self::resolve_until`] gives them, waiting for them as
@@ -377,11 +407,7 @@ impl Resolver {
     ///
     /// Returns an error when Cargo.lock is missing or cannot be read, or the work stopped.
     pub async fn resolve(&self, workspace: &Workspace) -> Resolved {
-        let (key, what, start) = self.work(workspace);
-        self.resolving
-            .wait(&key, &what, start)
-            .await
-            .unwrap_or_else(|| Err(Arc::new(ResolveError::Stopped)))
+        self.shared.resolve(workspace).await
     }
 
     /// The packages of `workspace`, by `cargo metadata`, or from its Cargo.lock when cargo fails
@@ -397,8 +423,132 @@ impl Resolver {
         workspace: &Workspace,
         until: tokio::time::Instant,
     ) -> Joined<Resolved> {
+        let (key, what, start) = self.shared.work(workspace);
+        self.shared.resolving.join(&key, &what, until, start).await
+    }
+
+    /// The features that the normal build of `workspace` for `target`, the actual build target,
+    /// enables on each package (requirements R-FT-2 and R-FT-3), as [`Self::features_until`]
+    /// tells, waiting for them as long as it takes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the packages cannot be resolved by `cargo metadata`, or `cargo tree`
+    /// fails, or the work stopped.
+    pub async fn features(&self, workspace: &Workspace, target: &TargetTriple) -> Featured {
+        let (key, what, start) = self.features_work(workspace, target);
+        self.featuring
+            .wait(&key, &what, start)
+            .await
+            .unwrap_or_else(|| Err(Arc::new(Arc::new(ResolveError::Stopped).into())))
+    }
+
+    /// The features that the normal build of `workspace` for `target` enables on each package,
+    /// waiting for them until `until`: the work then goes on, as [`Self::resolve_until`]'s does.
+    /// They are kept with the result of `cargo metadata`, while the same inputs decide both.
+    pub async fn features_until(
+        &self,
+        workspace: &Workspace,
+        target: &TargetTriple,
+        until: tokio::time::Instant,
+    ) -> Joined<Featured> {
+        let (key, what, start) = self.features_work(workspace, target);
+        self.featuring.join(&key, &what, until, start).await
+    }
+
+    /// The key, the name and the start of the work that reads the feature sets of `workspace` for
+    /// `target`.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the start of the work is a closure that only its two callers take"
+    )]
+    fn features_work(
+        &self,
+        workspace: &Workspace,
+        target: &TargetTriple,
+    ) -> (
+        String,
+        String,
+        impl FnOnce(Arc<Stage>) -> std::pin::Pin<Box<dyn Future<Output = Featured> + Send>>,
+    ) {
+        let key = format!("features:{}:{target}", workspace.root.display());
+        let what = format!(
+            "the features of the build of {} for {target}",
+            workspace.root.display()
+        );
+        let (shared, workspace, target) = (self.shared.clone(), workspace.clone(), target.clone());
+        let start =
+            move |stage: Arc<Stage>| -> std::pin::Pin<Box<dyn Future<Output = Featured> + Send>> {
+                Box::pin(async move {
+                    cargo::staged(stage, Box::pin(shared.features(&workspace, &target))).await
+                })
+            };
+        (key, what, start)
+    }
+
+    /// The packages that a build of the member `package` of `workspace` for `target` with
+    /// `--no-default-features --features <features>` would build outside the scope of the
+    /// workspace, as `name version` (requirement R-MCP-3, decided in M2's D3), waiting for them
+    /// until `until`: the work then goes on, as [`Self::resolve_until`]'s does.
+    pub async fn outside_scope_until(
+        &self,
+        workspace: &Workspace,
+        target: &TargetTriple,
+        (package, features): (&PackageId, &[Box<str>]),
+        until: tokio::time::Instant,
+    ) -> Joined<Outsides> {
+        let key = format!(
+            "outside:{}:{target}:{}:{}",
+            workspace.root.display(),
+            package.0,
+            features.join(",")
+        );
+        let what = format!("the build of {} with its features", package.0);
+        let (shared, workspace, target, package, features) = (
+            self.shared.clone(),
+            workspace.clone(),
+            target.clone(),
+            package.clone(),
+            features.to_vec(),
+        );
+        let start =
+            move |stage: Arc<Stage>| -> std::pin::Pin<Box<dyn Future<Output = Outsides> + Send>> {
+                Box::pin(async move {
+                    cargo::staged(
+                        stage,
+                        shared.outside_scope(&workspace, &target, &package, &features),
+                    )
+                    .await
+                })
+            };
+        self.outsiding.join(&key, &what, until, start).await
+    }
+
+    /// Which packages the query tools may build locally for `target`, an actual build target of
+    /// `workspace`, the default project (requirement R-MCP-3). It is kept as the feature sets
+    /// are.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the packages cannot be resolved by `cargo metadata`, or `cargo tree`
+    /// fails or does not tell the scope (`scope_unknown`).
+    pub async fn scope(&self, workspace: &Workspace, target: &TargetTriple) -> Scoped {
+        self.shared.scope(workspace, target).await
+    }
+}
+
+impl Shared {
+    /// [`Resolver::resolve`].
+    ///
+    /// In the work of [`Resolver::features_until`] or [`Resolver::outside_scope_until`], what
+    /// cargo does for it is told to their callers.
+    async fn resolve(&self, workspace: &Workspace) -> Resolved {
         let (key, what, start) = self.work(workspace);
-        self.resolving.join(&key, &what, until, start).await
+        let telling = cargo::current_stage();
+        self.resolving
+            .wait_telling(&key, &what, telling.as_deref(), start)
+            .await
+            .unwrap_or_else(|| Err(Arc::new(ResolveError::Stopped)))
     }
 
     /// The key, the name and the start of the work that resolves `workspace`.
@@ -424,19 +574,8 @@ impl Resolver {
         (key, what, start)
     }
 
-    /// The features that the normal build of `workspace` for `target`, the actual build target,
-    /// enables on each package (requirements R-FT-2 and R-FT-3). They are kept with the result of
-    /// `cargo metadata`, while the same inputs decide both.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the packages cannot be resolved by `cargo metadata`, or `cargo tree`
-    /// fails.
-    pub async fn features(
-        &self,
-        workspace: &Workspace,
-        target: &TargetTriple,
-    ) -> Result<Arc<FeatureSets>, Arc<FeaturesError>> {
+    /// The work of [`Resolver::features`].
+    async fn features(&self, workspace: &Workspace, target: &TargetTriple) -> Featured {
         let resolution = self
             .resolve(workspace)
             .await
@@ -444,14 +583,7 @@ impl Resolver {
         if let Resolution::CargoLockRaw { .. } = &*resolution {
             return Err(Arc::new(FeaturesError::NoMetadata));
         }
-        let kept = self
-            .inner
-            .kept
-            .lock()
-            .await
-            .get(&workspace.root)
-            .filter(|kept| Arc::ptr_eq(&kept.resolution, &resolution))
-            .cloned();
+        let kept = self.kept(workspace, &resolution).await;
         let offline = self.inner.offline_in(&workspace.root).await;
         let read = async {
             features::read(&workspace.root, offline, target)
@@ -465,20 +597,25 @@ impl Resolver {
         }
     }
 
-    /// The packages that a build of the member `package` of `workspace` for `target` with
-    /// `--no-default-features --features <features>` would build outside the scope of the
-    /// workspace, as `name version` (requirement R-MCP-3, decided in M2's D3).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the scope or the build's packages cannot be read.
-    pub async fn outside_scope(
+    /// What is kept with `resolution` of `workspace`, if it is still the one kept.
+    async fn kept(&self, workspace: &Workspace, resolution: &Arc<Resolution>) -> Option<Arc<Kept>> {
+        self.inner
+            .kept
+            .lock()
+            .await
+            .get(&workspace.root)
+            .filter(|kept| Arc::ptr_eq(&kept.resolution, resolution))
+            .cloned()
+    }
+
+    /// The work of [`Resolver::outside_scope_until`].
+    async fn outside_scope(
         &self,
         workspace: &Workspace,
         target: &TargetTriple,
-        package: &Package,
+        package: &PackageId,
         features: &[Box<str>],
-    ) -> Result<Vec<Box<str>>, Arc<ScopeError>> {
+    ) -> Outsides {
         let scope = self.scope(workspace, target).await?;
         let resolution = self
             .resolve(workspace)
@@ -486,6 +623,11 @@ impl Resolver {
             .map_err(|error| Arc::new(error.into()))?;
         let Resolution::Metadata { metadata, .. } = &*resolution else {
             return Err(Arc::new(ScopeError::NoMetadata));
+        };
+        let Some(package) = metadata.packages.iter().find(|found| found.id == *package) else {
+            return Err(Arc::new(ScopeError::Unknown(
+                format!("{} is not in the workspace", package.0).into(),
+            )));
         };
         // Kept while the resolution is, as the scope is: `cargo tree` runs once for them.
         let key = (
@@ -521,19 +663,30 @@ impl Resolver {
         Ok(outside)
     }
 
-    /// Which packages the query tools may build locally for `target`, an actual build target of
-    /// `workspace`, the default project (requirement R-MCP-3). It is kept as the feature sets
-    /// are.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the packages cannot be resolved by `cargo metadata`, or `cargo tree`
-    /// fails or does not tell the scope (`scope_unknown`).
-    pub async fn scope(
-        &self,
-        workspace: &Workspace,
-        target: &TargetTriple,
-    ) -> Result<Arc<BuildScope>, Arc<ScopeError>> {
+    /// [`Resolver::scope`], as work shared by workspace and target.
+    async fn scope(&self, workspace: &Workspace, target: &TargetTriple) -> Scoped {
+        let key = format!("scope:{}:{target}", workspace.root.display());
+        let what = format!(
+            "the scope of the builds of {} for {target}",
+            workspace.root.display()
+        );
+        let (shared, workspace, target) = (self.clone(), workspace.clone(), target.clone());
+        let start =
+            move |stage: Arc<Stage>| -> std::pin::Pin<Box<dyn Future<Output = Scoped> + Send>> {
+                Box::pin(async move {
+                    cargo::staged(stage, Box::pin(shared.read_scope(&workspace, &target))).await
+                })
+            };
+        // What cargo does for it is told to the callers of the work that waits for it, as above.
+        let telling = cargo::current_stage();
+        self.scoping
+            .wait_telling(&key, &what, telling.as_deref(), start)
+            .await
+            .unwrap_or_else(|| Err(Arc::new(Arc::new(ResolveError::Stopped).into())))
+    }
+
+    /// The work of [`Self::scope`].
+    async fn read_scope(&self, workspace: &Workspace, target: &TargetTriple) -> Scoped {
         let resolution = self
             .resolve(workspace)
             .await
@@ -541,14 +694,7 @@ impl Resolver {
         let Resolution::Metadata { metadata, .. } = &*resolution else {
             return Err(Arc::new(ScopeError::NoMetadata));
         };
-        let kept = self
-            .inner
-            .kept
-            .lock()
-            .await
-            .get(&workspace.root)
-            .filter(|kept| Arc::ptr_eq(&kept.resolution, &resolution))
-            .cloned();
+        let kept = self.kept(workspace, &resolution).await;
         let offline = self.inner.offline_in(&workspace.root).await;
         let read = async {
             build_scope::read(&workspace.root, offline, target, metadata)
@@ -583,12 +729,12 @@ impl Inner {
                 return Ok(Arc::clone(&kept.resolution));
             }
         }
-        let (lock_root, lock_text, metadata) = match read_lock(&root).await {
-            Ok(text) => {
+        let (lock_root, (lock_text, lock), metadata) = match read_lock(&root).await {
+            Ok((text, lock)) => {
                 // Cargo.lock that cannot be parsed fails before cargo is run.
-                CargoLock::parse(&text).map_err(ResolveError::Malformed)?;
+                let lock = lock.map_err(ResolveError::Malformed)?;
                 let metadata = self.run_metadata(&root, stage).await;
-                (root.clone(), text, metadata)
+                (root.clone(), (text, Ok(lock)), metadata)
             },
             // An implicit member, such as a path dependency of the root package, has no
             // Cargo.lock of its own: cargo knows its workspace (requirement R-MCP-3).
@@ -603,12 +749,12 @@ impl Inner {
                     })
                     .filter(|above| *above != root && root.starts_with(above))
                     .ok_or(ResolveError::NoCargoLock)?;
-                let text = read_lock(&above).await.map_err(ResolveError::Unreadable)?;
-                (above, text, metadata)
+                let read = read_lock(&above).await.map_err(ResolveError::Unreadable)?;
+                (above, read, metadata)
             },
             Err(error) => return Err(ResolveError::Unreadable(error)),
         };
-        let lock = CargoLock::parse(&lock_text).map_err(ResolveError::Malformed)?;
+        let lock = lock.map_err(ResolveError::Malformed)?;
         let (resolution, files) = match metadata {
             Ok(metadata) => {
                 let files = self.input_files(&lock_root, Some(&metadata));
@@ -669,14 +815,8 @@ impl Inner {
     async fn run_metadata(&self, root: &Path, stage: &Stage) -> Result<Metadata, CargoError> {
         let mut command = cargo::project_command(root, self.offline, None);
         command.args(["metadata", "--format-version", "1"]);
-        let output = cargo::run_reporting(command, |activity| {
-            stage.set(match activity {
-                Activity::WaitingForLock => Doing::WaitingForLock,
-                // Most of what takes long in `cargo metadata` is fetching.
-                Activity::Fetching | Activity::Running => Doing::Fetching,
-            });
-        })
-        .await?;
+        let output =
+            cargo::run_reporting(command, |activity| stage.set(cargo::doing_of(activity))).await?;
         if !output.status.success() {
             return Err(CargoError::Failed {
                 command: "metadata",
@@ -732,21 +872,27 @@ impl Inner {
 }
 
 /// The result for `target` in `results`, kept while it is a success, and a failure for
-/// [`FAILURE_TTL`], or else `read`'s, kept. `read` runs only then, and the lock is held while it
-/// does, so that the calls at the same time run cargo once.
+/// [`FAILURE_TTL`], or else `read`'s, kept. `read` runs only then, without the lock: the calls at
+/// the same time share the work that runs it, by workspace and target.
 async fn per_target<T: Send + Sync, E: Send + Sync>(
     results: &PerTarget<T, E>,
     target: &TargetTriple,
     read: impl Future<Output = Result<Arc<T>, Arc<E>>> + Send,
 ) -> Result<Arc<T>, Arc<E>> {
-    let mut results = results.lock().await;
-    if let Some((at, result)) = results.get(target)
-        && (result.is_ok() || at.elapsed() < FAILURE_TTL)
-    {
-        return result.clone();
+    let kept = results
+        .lock()
+        .await
+        .get(target)
+        .filter(|(at, result)| result.is_ok() || at.elapsed() < FAILURE_TTL)
+        .map(|(_, result)| result.clone());
+    if let Some(result) = kept {
+        return result;
     }
     let result = read.await;
-    results.insert(target.clone(), (Instant::now(), result.clone()));
+    results
+        .lock()
+        .await
+        .insert(target.clone(), (Instant::now(), result.clone()));
     result
 }
 
@@ -781,7 +927,12 @@ async fn read_inputs(root: &Path, files: Vec<PathBuf>) -> Option<Inputs> {
         let files = files
             .into_iter()
             .map(|path| {
-                let contents = fs::read(&path).ok().map(Vec::into_boxed_slice);
+                // Only a regular file: a FIFO would not end.
+                let contents = fs::metadata(&path)
+                    .is_ok_and(|metadata| metadata.is_file())
+                    .then(|| fs::read(&path).ok())
+                    .flatten()
+                    .map(Vec::into_boxed_slice);
                 InputFile { path, contents }
             })
             .collect();
@@ -792,10 +943,16 @@ async fn read_inputs(root: &Path, files: Vec<PathBuf>) -> Option<Inputs> {
     .flatten()
 }
 
-/// The text of the Cargo.lock of the workspace at `root`.
-async fn read_lock(root: &Path) -> io::Result<String> {
+/// The text of the Cargo.lock of the workspace at `root`, and what it reads as.
+async fn read_lock(root: &Path) -> io::Result<(String, Result<CargoLock, toml::de::Error>)> {
     let path = root.join("Cargo.lock");
-    blocking(move || fs::read_to_string(path)).await
+    // Megabytes for a large workspace: read and parsed off the async threads.
+    blocking(move || {
+        let text = fs::read_to_string(path)?;
+        let lock = CargoLock::parse(&text);
+        Ok((text, lock))
+    })
+    .await
 }
 
 /// Whether `inputs` holds `text` as the Cargo.lock of the workspace at `root`.
@@ -1023,14 +1180,14 @@ mod tests {
         if std::env::var_os("CARGO_NET_OFFLINE").is_some() {
             return;
         }
-        assert!(!resolver.inner.offline_in(&workspace.root).await);
+        assert!(!resolver.shared.inner.offline_in(&workspace.root).await);
         fs::create_dir_all(dir.path().join(".cargo")).expect("made");
         fs::write(
             dir.path().join(".cargo/config.toml"),
             "[net]\noffline = true\n",
         )
         .expect("written");
-        assert!(resolver.inner.offline_in(&workspace.root).await);
+        assert!(resolver.shared.inner.offline_in(&workspace.root).await);
     }
 
     #[tokio::test]
@@ -1135,7 +1292,7 @@ mod tests {
                 .checked_add(Duration::from_millis(200))
                 .expect("in range");
             match resolver.resolve_until(&workspace, soon).await {
-                Joined::Going(Doing::WaitingForLock) => break,
+                Joined::Going(crate::data::flight::Doing::WaitingForLock) => break,
                 // cargo has not told it yet.
                 Joined::Going(_) => {},
                 other @ (Joined::Done(_) | Joined::Ended) => panic!("{other:?}"),
@@ -1149,6 +1306,28 @@ mod tests {
         // The work that went on gives the result.
         let resolution = resolver.resolve(&workspace).await.expect("resolved");
         assert!(matches!(*resolution, Resolution::Metadata { .. }));
+        // So does `cargo tree`, for the features.
+        let target = crate::data::target::build_target();
+        lock.lock().expect("locked");
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .expect("in range");
+        loop {
+            let soon = tokio::time::Instant::now()
+                .checked_add(Duration::from_millis(200))
+                .expect("in range");
+            match resolver.features_until(&workspace, &target, soon).await {
+                Joined::Going(crate::data::flight::Doing::WaitingForLock) => break,
+                Joined::Going(_) => {},
+                other @ (Joined::Done(_) | Joined::Ended) => panic!("{other:?}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cargo did not tell that it waits"
+            );
+        }
+        lock.unlock().expect("unlocked");
+        resolver.features(&workspace, &target).await.expect("read");
     }
 
     /// While cargo waits for the lock of the package cache past the deadline of a call, the call

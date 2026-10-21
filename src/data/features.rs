@@ -103,10 +103,14 @@ async fn tree(
             stderr: cargo::stderr_tail(&output),
         });
     }
-    let text = String::from_utf8(output.stdout).map_err(|error| {
-        CargoError::Unreadable(io::Error::new(io::ErrorKind::InvalidData, error))
-    })?;
-    parse(&text).map_err(CargoError::Unreadable)
+    // As long as the dependencies are many: read off the async threads.
+    super::blocking(move || {
+        let text = String::from_utf8(output.stdout)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        parse(&text)
+    })
+    .await
+    .map_err(CargoError::Unreadable)
 }
 
 /// Where a line of the tree stands.

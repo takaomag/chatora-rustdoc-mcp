@@ -925,7 +925,10 @@ pub async fn build(
         renamed?;
         let read = fs::read(&moved);
         drop(fs::remove_file(&moved));
-        read
+        // Megabytes, read and digested here too, off the async threads.
+        let contents = read?;
+        let (header, sha256) = (Header::read(&contents), cache::sha256_hex(&contents));
+        Ok((contents, header, sha256))
     })
     .await
     .map_err(|error| match (error.kind(), messages.documented_fresh) {
@@ -933,9 +936,9 @@ pub async fn build(
         (io::ErrorKind::NotFound, _) => BuildError::NoJson(json),
         _ => BuildError::Io(error),
     })?;
-    let header = Header::read(&contents).map_err(BuildError::Unreadable)?;
+    let (contents, header, sha256) = contents;
+    let header = header.map_err(BuildError::Unreadable)?;
     let target = header.check(plan)?;
-    let sha256 = cache::sha256_hex(&contents);
     let record = BuildRecord {
         package: plan.package.0.clone(),
         crate_name: plan.crate_name.clone(),
@@ -959,11 +962,11 @@ pub async fn build(
     };
     let dir = plan.published_dir(cache.dir(), target.as_ref());
     let path = dir.join(format!("{}.json", header.format_version));
-    let record_json =
-        serde_json::to_vec_pretty(&record).map_err(|error| BuildError::Io(error.into()))?;
     let publishing = cache.lock(&dir).await;
-    let (cache, published) = (cache.clone(), path.clone());
+    let (cache, published, recorded) = (cache.clone(), path.clone(), record.clone());
     super::blocking(move || {
+        // As long as its inputs, made off the async threads.
+        let record_json = serde_json::to_vec_pretty(&recorded).map_err(io::Error::from)?;
         cache.write_verified(&published, &contents)?;
         let written = cache::write_atomically(&dir.join(RECORD), &record_json);
         drop(publishing);
@@ -1109,11 +1112,11 @@ impl Built {
         cache: &Cache,
         still: impl FnOnce(&BuildRecord) -> bool + Send + 'static,
     ) -> io::Result<bool> {
-        let json = serde_json::to_vec_pretty(&self.record).map_err(io::Error::from)?;
         let dir = self.json.parent().unwrap_or(&self.json);
         let publishing = cache.lock(dir).await;
         let built = self.clone();
         super::blocking(move || {
+            let json = serde_json::to_vec_pretty(&built.record).map_err(io::Error::from)?;
             let now = published(built.json.parent().unwrap_or(&built.json));
             let written = if now.is_some_and(|now| now.record.sha256 == built.record.sha256 && still(&now.record)) {
                 cache::write_atomically(&built.record_path(), &json).map(|()| true)

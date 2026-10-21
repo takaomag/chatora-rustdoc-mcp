@@ -167,8 +167,12 @@ async fn build_and_archive(
     } = wanted;
     let root = plan.root.clone();
     let programs = Programs::this();
-    let rustc = programs.used_in(Kind::Rustc, &root, cargo_home.as_deref());
-    let rustdoc = programs.used_in(Kind::Rustdoc, &root, cargo_home.as_deref());
+    let rustc = programs
+        .used_in(Kind::Rustc, &root, cargo_home.as_deref())
+        .await;
+    let rustdoc = programs
+        .used_in(Kind::Rustdoc, &root, cargo_home.as_deref())
+        .await;
     toolchain::same_toolchain(&rustc, &rustdoc, &root)
         .await
         .map_err(LocalError::Mismatch)?;
@@ -808,17 +812,13 @@ async fn archive(
         record.sha256.clone(),
         record.format_version.to_string(),
     );
-    let path = json.clone();
-    let mapped = crate::task::spawn_blocking(move || {
-        let dir = path.parent().unwrap_or(&path);
-        load::archive_of(&cache, dir, &stem, &sha256, || read_checked(&path, &sha256))
+    let (path, dir) = (json.clone(), json.parent().unwrap_or(&json).to_path_buf());
+    let checked = sha256.clone();
+    let mapped = load::archive_from(&cache, &dir, &stem, &sha256, move || {
+        read_checked(&path, &checked)
     })
     .await
-    .map_err(|error| {
-        let error = crate::task::resume_if_panic(error);
-        tracing::debug!(%error, "the work that archives a build was stopped");
-        LocalError::Stopped
-    })?
+    .ok_or(LocalError::Stopped)?
     .map_err(LocalError::Load)?;
     Ok(LocalBuilt {
         archived: Archived { mapped, warnings },

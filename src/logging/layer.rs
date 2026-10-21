@@ -14,11 +14,11 @@ use tracing::{
 };
 use tracing_subscriber::{layer::Context, registry::LookupSpan};
 
-use super::{CALL_SPAN, REQUEST_ID_FIELD, file::LogFile};
+use super::{CALL_SPAN, REQUEST_ID_FIELD, writer::Lines};
 
 /// Writes each event it sees as a line of JSON.
 pub(super) struct FileLayer {
-    pub(super) file: Arc<LogFile>,
+    pub(super) file: Arc<Lines>,
 }
 
 /// The `request_id` of a [`CALL_SPAN`], kept in the span's extensions.
@@ -78,7 +78,7 @@ where
         if !fields.is_empty() {
             line.insert("fields".to_owned(), fields.into());
         }
-        self.file.write_line(&Value::Object(line).to_string());
+        self.file.write_line(Value::Object(line).to_string());
     }
 }
 
@@ -133,12 +133,15 @@ mod tests {
     fn warnings_in_a_call_carry_its_request_id_and_nothing_else_is_written() {
         let temp = tempfile::tempdir().expect("a temporary directory");
         let file = Arc::new(
-            LogFile::open(temp.path(), Limits {
-                file_max_size: 1_000_000,
-                retention: Duration::from_hours(24),
-                total_max_size: 1_000_000,
-            })
-            .expect("opened"),
+            Lines::start(
+                super::super::file::LogFile::open(temp.path(), Limits {
+                    file_max_size: 1_000_000,
+                    retention: Duration::from_hours(24),
+                    total_max_size: 1_000_000,
+                })
+                .expect("opened"),
+            )
+            .expect("started"),
         );
         let subscriber = tracing_subscriber::registry().with(
             FileLayer {
@@ -157,6 +160,7 @@ mod tests {
             );
             tracing::error!("outside a call");
         });
+        file.flush(Duration::from_secs(10));
         let text = std::fs::read_to_string(file.path()).expect("readable");
         let lines: Vec<Value> = text
             .lines()

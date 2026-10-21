@@ -196,7 +196,7 @@ struct Record {
 
 /// A cached index file and how it was fetched.
 struct Cached {
-    body: Box<[u8]>,
+    body: Arc<[u8]>,
     record: Record,
 }
 
@@ -305,7 +305,7 @@ impl SparseIndex {
                 .duration_since(fetched_at)
                 .is_ok_and(|age| age < self.ttl)
             {
-                return parse(&cached.body, fetched_at).map_err(IndexError::Malformed);
+                return parse_off(Arc::clone(&cached.body), fetched_at).await;
             }
         }
 
@@ -338,7 +338,7 @@ impl SparseIndex {
                 Some(cached),
             ) => {
                 let fetched_at = system_time(cached.record.fetched_at);
-                let mut entry = parse(&cached.body, fetched_at).map_err(IndexError::Malformed)?;
+                let mut entry = parse_off(Arc::clone(&cached.body), fetched_at).await?;
                 let why = if matches!(error, IndexError::Offline) {
                     "the server is offline (network.offline)".to_owned()
                 } else {
@@ -380,7 +380,7 @@ impl SparseIndex {
         let mut response = http::send(request).await.map_err(IndexError::Network)?;
         match (response.status(), cached) {
             (StatusCode::NOT_MODIFIED, Some(cached)) => {
-                let entry = parse(&cached.body, now).map_err(IndexError::Malformed)?;
+                let entry = parse_off(Arc::clone(&cached.body), now).await?;
                 let record = Record {
                     fetched_at: unix_seconds(now),
                     ..cached.record.clone()
@@ -401,7 +401,8 @@ impl SparseIndex {
                         BodyError::TooLarge { limit } => IndexError::TooLarge { limit },
                     })?;
                 // Only a file that parses is cached, as with rustdoc JSON (requirement R-CA-4).
-                let entry = parse(&body, now).map_err(IndexError::Malformed)?;
+                let body: Arc<[u8]> = body.into();
+                let entry = parse_off(Arc::clone(&body), now).await?;
                 write_cached(body_path, body, record_path, record).await;
                 Ok(entry)
             },
@@ -476,6 +477,14 @@ fn parse(body: &[u8], fetched_at: SystemTime) -> Result<IndexEntry, MalformedLin
     })
 }
 
+/// [`parse`] on a blocking thread: megabytes for a crate with many versions.
+async fn parse_off(body: Arc<[u8]>, fetched_at: SystemTime) -> Result<IndexEntry, IndexError> {
+    blocking(move || Ok(parse(&body, fetched_at)))
+        .await
+        .map_err(IndexError::Cache)?
+        .map_err(IndexError::Malformed)
+}
+
 /// Reads the cached index file and its record, or `None` if either is missing or the record
 /// cannot be parsed.
 async fn read_cached(
@@ -492,9 +501,10 @@ async fn read_cached(
             tracing::warn!(path = %record_path.display(), "ignoring an unreadable index record");
             return Ok(None);
         };
-        Ok(cache
-            .read_file(&body_path)?
-            .map(|body| Cached { body, record }))
+        Ok(cache.read_file(&body_path)?.map(|body| Cached {
+            body: body.into(),
+            record,
+        }))
     })
     .await
     .map_err(IndexError::Cache)
@@ -502,7 +512,7 @@ async fn read_cached(
 
 /// Writes the index file, then its record. A failure is logged; the file is fetched again next
 /// time.
-async fn write_cached(body_path: PathBuf, body: Vec<u8>, record_path: PathBuf, record: Record) {
+async fn write_cached(body_path: PathBuf, body: Arc<[u8]>, record_path: PathBuf, record: Record) {
     let written = blocking(move || {
         cache::write_atomically(&body_path, &body)?;
         write_record(&record_path, &record)

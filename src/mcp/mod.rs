@@ -284,36 +284,21 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
     tokio::spawn(async move {
         tools.host().await;
     });
+    // Told when stdin ends, as a signal is.
+    #[cfg(feature = "local")]
+    let stdin_ended = Arc::new(tokio::sync::Notify::new());
     #[cfg(feature = "local")]
     let transport = {
         let (stdin, stdout) = stdio();
-        (StopChildrenAtEnd(stdin), stdout)
+        (StopChildrenAtEnd(stdin, Arc::clone(&stdin_ended)), stdout)
     };
     #[cfg(not(feature = "local"))]
     let transport = stdio();
     let outcome = match Box::pin(server.serve(transport)).await {
-        Ok(running) => {
-            #[cfg(feature = "local")]
-            let on_signal = {
-                let token = running.cancellation_token();
-                tokio::spawn(async move {
-                    stop_signal().await;
-                    tracing::info!("stopping on a signal");
-                    crate::data::child::stop_all();
-                    token.cancel();
-                })
-            };
-            let waited = running.waiting().await;
-            #[cfg(feature = "local")]
-            on_signal.abort();
-            match waited {
-                Ok(QuitReason::JoinError(error)) | Err(error) => {
-                    Err(ServeError::Cancelled(crate::task::resume_if_panic(error)))
-                },
-
-                Ok(_) => Ok(()),
-            }
-        },
+        #[cfg(feature = "local")]
+        Ok(running) => stopped(running, stdin_ended).await,
+        #[cfg(not(feature = "local"))]
+        Ok(running) => stopped(running).await,
 
         // The client closed stdin before the session started, for example after only
         // `server/discover`.
@@ -328,6 +313,68 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
     }
     outcome
 }
+
+/// Waits for the session `running` to end: when the client closes stdin, or, with the local
+/// features, on SIGINT or SIGTERM, which stops the children first (requirement R-WS-6). rmcp then
+/// waits for the calls in progress and closes stdout, which may not end, as when the client reads
+/// no more: on another signal, or [`STOP_LIMIT`] after the first signal or the end of stdin
+/// (`stdin_ended`), it is not waited for. A later server sweeps what this one leaves (decided in
+/// C4).
+async fn stopped(
+    running: rmcp::service::RunningService<RoleServer, Server>,
+    #[cfg(feature = "local")] stdin_ended: Arc<tokio::sync::Notify>,
+) -> Result<(), ServeError> {
+    #[cfg(feature = "local")]
+    let (end_now, ending_now) = tokio::sync::oneshot::channel::<()>();
+    #[cfg(feature = "local")]
+    let on_signal = {
+        let token = running.cancellation_token();
+        let mut signals = StopSignals::new();
+        tokio::spawn(async move {
+            // The client stops the server with a signal, or by closing stdin, which rmcp tells
+            // the session by itself, and which stopped the children already.
+            tokio::select! {
+                () = signals.next() => {
+                    tracing::info!("stopping on a signal");
+                    crate::data::child::stop_all();
+                    token.cancel();
+                },
+                () = stdin_ended.notified() => tracing::info!("stopping as stdin ended"),
+            }
+            tokio::select! {
+                () = signals.next() => {},
+                () = tokio::time::sleep(STOP_LIMIT) => {},
+            }
+            if end_now.send(()).is_err() {
+                tracing::debug!("the session ended meanwhile");
+            }
+        })
+    };
+    #[cfg(feature = "local")]
+    let waited = tokio::select! {
+        waited = running.waiting() => Some(waited),
+        Ok(()) = ending_now => None,
+    };
+    #[cfg(not(feature = "local"))]
+    let waited = Some(running.waiting().await);
+    #[cfg(feature = "local")]
+    on_signal.abort();
+    match waited {
+        Some(Ok(QuitReason::JoinError(error)) | Err(error)) => {
+            Err(ServeError::Cancelled(crate::task::resume_if_panic(error)))
+        },
+        Some(Ok(_)) => Ok(()),
+        None => {
+            tracing::warn!("the server did not stop in time; ending at once");
+            Ok(())
+        },
+    }
+}
+
+/// How long the server may take to stop after a signal: more than rmcp waits for the calls in
+/// progress (5 seconds) and for its tasks (2 seconds).
+#[cfg(feature = "local")]
+const STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long the sweep at startup may take (decided in C4).
 #[cfg(feature = "local")]
@@ -352,11 +399,12 @@ fn sweep_in_background(cache: &Cache) {
     }));
 }
 
-/// The server's stdin, which stops every child and what it started when it ends or fails: the
-/// client has gone, and rmcp still waits up to 5 seconds for the calls in progress (requirement
-/// R-WS-6).
+/// The server's stdin, which stops every child and what it started when it ends or fails, and
+/// tells its [`tokio::sync::Notify`]: the client has gone, and rmcp still waits up to 5 seconds for
+/// the calls in progress, and then for stdout to close, which a client that reads no more keeps
+/// open (requirement R-WS-6).
 #[cfg(feature = "local")]
-struct StopChildrenAtEnd<R>(R);
+struct StopChildrenAtEnd<R>(R, Arc<tokio::sync::Notify>);
 
 #[cfg(feature = "local")]
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for StopChildrenAtEnd<R> {
@@ -376,31 +424,53 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for StopChildrenAtEnd
         };
         if ended {
             crate::data::child::stop_all();
+            self.1.notify_one();
         }
         polled
     }
 }
 
-/// Waits for SIGINT or SIGTERM on Unix, and Ctrl+C on Windows: how Claude Code stops the server
-/// (requirement R-WS-6). Never ends if the signals cannot be watched.
+/// SIGINT and SIGTERM on Unix, and Ctrl+C on Windows: how Claude Code stops the server
+/// (requirement R-WS-6). Watched from when it is made, so that a signal that comes between two
+/// waits is not missed. Never comes if the signals cannot be watched.
 #[cfg(feature = "local")]
-async fn stop_signal() {
+struct StopSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let (Ok(mut interrupt), Ok(mut terminate)) = (
-            signal(SignalKind::interrupt()),
-            signal(SignalKind::terminate()),
-        ) else {
-            return std::future::pending().await;
+    watched: Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
+    #[cfg(windows)]
+    watched: Option<tokio::signal::windows::CtrlC>,
+}
+
+#[cfg(feature = "local")]
+impl StopSignals {
+    fn new() -> Self {
+        #[cfg(unix)]
+        let watched = {
+            use tokio::signal::unix::{SignalKind, signal};
+            signal(SignalKind::interrupt())
+                .ok()
+                .zip(signal(SignalKind::terminate()).ok())
         };
-        tokio::select! {
-            _ = interrupt.recv() => {},
-            _ = terminate.recv() => {},
-        }
+        #[cfg(windows)]
+        let watched = tokio::signal::windows::ctrl_c().ok();
+        Self { watched }
     }
-    #[cfg(not(unix))]
-    if tokio::signal::ctrl_c().await.is_err() {
+
+    /// The next signal.
+    async fn next(&mut self) {
+        #[cfg(unix)]
+        if let Some((interrupt, terminate)) = &mut self.watched {
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = terminate.recv() => {},
+            }
+            return;
+        }
+        #[cfg(windows)]
+        if let Some(ctrl_c) = &mut self.watched {
+            ctrl_c.recv().await;
+            return;
+        }
         std::future::pending::<()>().await;
     }
 }

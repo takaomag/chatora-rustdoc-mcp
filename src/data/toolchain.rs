@@ -250,8 +250,7 @@ impl Programs {
     /// that of the settings, or else `RUSTC` or `RUSTDOC`, or else `CARGO_BUILD_RUSTC` or
     /// `CARGO_BUILD_RUSTDOC`, or else the project's cargo settings read with `cargo_home`, or else
     /// the toolchain's (decided in M2's D1).
-    #[must_use]
-    pub fn used_in(&self, kind: Kind, root: &Path, cargo_home: Option<&Path>) -> PathBuf {
+    pub async fn used_in(&self, kind: Kind, root: &Path, cargo_home: Option<&Path>) -> PathBuf {
         let (set, variables) = match kind {
             Kind::Rustdoc => (&self.rustdoc, ["RUSTDOC", "CARGO_BUILD_RUSTDOC"]),
             Kind::Rustc | Kind::Cargo => (&self.rustc, ["RUSTC", "CARGO_BUILD_RUSTC"]),
@@ -259,7 +258,13 @@ impl Programs {
         if let Some(set) = set {
             return set.clone();
         }
-        let config = cargo_config::read(root, cargo_home, None).ok();
+        // The settings files, with what they include: read off the async threads.
+        let (reading, home) = (root.to_path_buf(), cargo_home.map(Path::to_path_buf));
+        let config =
+            super::blocking(move || Ok(cargo_config::read(&reading, home.as_deref(), None).ok()))
+                .await
+                .ok()
+                .flatten();
         let project = config.and_then(|config| match kind {
             Kind::Rustdoc => config.build_rustdoc,
             Kind::Rustc | Kind::Cargo => config.build_rustc,
@@ -556,11 +561,17 @@ pub async fn format_of(
             .join(PROBES_DIR)
             .join(format!("{}.json", digest.get(..32).unwrap_or(&digest)))
     });
-    if let Some(kept) = record
-        .as_ref()
-        .and_then(|record| std::fs::read(record).ok())
-        .and_then(|json| serde_json::from_slice::<Probed>(&json).ok())
-    {
+    // Files of the cache, read and written off the async threads, as below.
+    let reading = record.clone();
+    let kept = super::blocking(move || {
+        Ok(reading
+            .and_then(|record| std::fs::read(record).ok())
+            .and_then(|json| serde_json::from_slice::<Probed>(&json).ok()))
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(kept) = kept {
         return Ok(kept.format);
     }
     let format = probe(rustdoc, plus.as_deref(), root, work)
@@ -573,9 +584,12 @@ pub async fn format_of(
             rustdoc: rustdoc.to_path_buf(),
             toolchain: toolchain.map(str::to_owned),
         };
-        let written = std::fs::create_dir_all(record.parent().unwrap_or(&record))
-            .and_then(|()| serde_json::to_vec(&probed).map_err(std::io::Error::other))
-            .and_then(|json| cache::write_atomically(&record, &json));
+        let written = super::blocking(move || {
+            std::fs::create_dir_all(record.parent().unwrap_or(&record))?;
+            let json = serde_json::to_vec(&probed).map_err(std::io::Error::other)?;
+            cache::write_atomically(&record, &json)
+        })
+        .await;
         if let Err(error) = written {
             tracing::warn!(%error, "what the probe of a toolchain found could not be kept");
         }
@@ -594,8 +608,12 @@ async fn probe(
     static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let number = PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = work.join(format!("probe-{}-{number}", std::process::id()));
-    let made = std::fs::create_dir_all(&dir)
-        .and_then(|()| std::fs::write(dir.join("probe.rs"), "//! A probe.\n"));
+    let making = dir.clone();
+    let made = super::blocking(move || {
+        std::fs::create_dir_all(&making)?;
+        std::fs::write(making.join("probe.rs"), "//! A probe.\n")
+    })
+    .await;
     if let Err(error) = made {
         return Err(format!("the probe could not be written: {error}").into());
     }
@@ -624,8 +642,13 @@ async fn probe(
         "probe",
     )])
     .await;
-    let json = std::fs::read(dir.join("out/probe.json"));
-    drop(std::fs::remove_dir_all(&dir));
+    let json = super::blocking(move || {
+        let json = std::fs::read(dir.join("out/probe.json"));
+        drop(std::fs::remove_dir_all(&dir));
+        Ok(json)
+    })
+    .await
+    .unwrap_or_else(Err);
     ran?;
     let json = json.map_err(|error| format!("the probe wrote no JSON: {error}"))?;
     format_version::peek(&json)
@@ -700,8 +723,12 @@ pub async fn choose(
     cargo_home: Option<&Path>,
     work: &Path,
 ) -> Result<Chosen, ChooseError> {
-    let rustdoc = Programs::this().used_in(Kind::Rustdoc, root, cargo_home);
-    let rustc = Programs::this().used_in(Kind::Rustc, root, cargo_home);
+    let rustdoc = Programs::this()
+        .used_in(Kind::Rustdoc, root, cargo_home)
+        .await;
+    let rustc = Programs::this()
+        .used_in(Kind::Rustc, root, cargo_home)
+        .await;
     // With rustc or rustdoc of a path, `+nightly` would mix toolchains.
     let switchable = rustdoc == Path::new(Kind::Rustdoc.name())
         && rustc == Path::new(Kind::Rustc.name())

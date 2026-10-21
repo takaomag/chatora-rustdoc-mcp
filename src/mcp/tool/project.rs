@@ -440,6 +440,33 @@ pub(super) fn resolving_crate(
     resolving(provenance, doing, warnings)
 }
 
+/// The response while cargo reads the features of the build of the project from `project_from`,
+/// past the deadline of the call, as `doing` says, to plan the build of its member's crate `name`
+/// for `target` (requirement R-OUT-9).
+#[cfg(feature = "local")]
+pub(super) fn planning_crate(
+    name: &CrateName,
+    target: &TargetTriple,
+    (doing, project_from): (Doing, &str),
+    warnings: &[Box<str>],
+) -> CallToolResult {
+    let mut provenance = serde_json::Map::new();
+    provenance.insert("crate".to_owned(), json!(name.as_str()));
+    provenance.insert("project_from".to_owned(), json!(project_from));
+    provenance.insert("target".to_owned(), json!(target.as_str()));
+    provenance.insert("source".to_owned(), json!("local"));
+    let being = match doing {
+        Doing::WaitingForLock => {
+            "cargo waits for a lock that another cargo holds, to read the features of the \
+             project's build"
+        },
+        Doing::Fetching | Doing::Indexing | Doing::Building | Doing::WaitingForSlot => {
+            "cargo is reading the features of the project's build"
+        },
+    };
+    super::get_item::building_response(provenance, doing, being, warnings)
+}
+
 /// The tool error for a workspace whose packages cannot be resolved.
 #[cfg(feature = "local")]
 pub(super) fn resolve_error(workspace: &Workspace, error: &ResolveError) -> CallToolResult {
