@@ -86,6 +86,14 @@ fn other_queries() -> Vec<(&'static str, Value)> {
 
 /// Starts a server, asks it `queries` one at a time, and returns its responses by query, as the
 /// text the client reads. Results are checked against their `outputSchema` on the way.
+/// `answer` without what tells the state of the cache, which the other tests of this binary change
+/// meanwhile (`list_module` of `reqwest@0.13.5` caches its JSON for the host's target): whether
+/// `list_crates` finds a crate's JSON in the cache. It is no input of the response (requirement
+/// R-ARCH-5). The text is kept as it is, to compare the order of the fields too.
+fn without_cache_state(answer: &str) -> String {
+    answer.replace(r#","docs_rs_json":"cached""#, "")
+}
+
 fn answers(queries: &[(&'static str, Value)], logs: &Path) -> BTreeMap<String, String> {
     // The project is this package, for `list_crates`.
     let mut client = Client::start(Some(Path::new(env!("CARGO_MANIFEST_DIR"))), logs);
@@ -94,7 +102,7 @@ fn answers(queries: &[(&'static str, Value)], logs: &Path) -> BTreeMap<String, S
         .map(|(name, arguments)| {
             (
                 format!("{name} {arguments}"),
-                client.call(name, arguments).text(),
+                without_cache_state(&client.call(name, arguments).text()),
             )
         })
         .collect();

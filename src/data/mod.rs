@@ -46,7 +46,7 @@ pub mod waits;
 
 use std::{
     io,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -536,20 +536,30 @@ enum Stored {
 
 /// The failure remembered in `dir` that still holds, and how long it does.
 fn read_miss(cache: &Cache, dir: &Path) -> io::Result<Option<(MissKind, Duration)>> {
+    read_miss_file(cache, &dir.join(MISS_FILE))
+}
+
+/// The failure remembered in the file `path`, and how long it is still remembered.
+fn read_miss_file(cache: &Cache, path: &Path) -> io::Result<Option<(MissKind, Duration)>> {
     Ok(cache
-        .read_file(&dir.join(MISS_FILE))?
+        .read_file(path)?
         .and_then(|miss| serde_json::from_slice::<Miss>(&miss).ok())
         .and_then(|miss| Some((miss.kind, miss.remaining()?))))
 }
 
 /// Remembers in `dir` that fetching or reading failed. A failure to write it is logged.
 async fn remember_miss(dir: &Path, kind: MissKind) {
+    remember_miss_file(&dir.join(MISS_FILE), kind).await;
+}
+
+/// Remembers in the file `path` that `kind` of failure happened now.
+async fn remember_miss_file(path: &Path, kind: MissKind) {
     let miss = Miss {
         kind,
         at: unix_seconds(SystemTime::now()),
         server: env!("CARGO_PKG_VERSION").into(),
     };
-    let path = dir.join(MISS_FILE);
+    let path = path.to_owned();
     let written = blocking(move || {
         let json = serde_json::to_vec(&miss).map_err(io::Error::other)?;
         cache::write_atomically(&path, &json)
@@ -558,6 +568,33 @@ async fn remember_miss(dir: &Path, kind: MissKind) {
     if let Err(error) = written {
         tracing::warn!(%error, "failed to remember a failure in the cache");
     }
+}
+
+/// The file next to `path` in the cache that remembers a transient failure to fetch it.
+fn failure_file(path: &Path) -> PathBuf {
+    with_suffix(path, ".miss.json")
+}
+
+/// How long a transient failure to fetch what goes at `path` in the cache is still remembered,
+/// if one is, so that it is not fetched again meanwhile: every call, and every process that
+/// shares the cache, would wait for the same failure in turn (requirement R-ERR-3, about 30
+/// seconds).
+async fn recent_failure(cache: &Cache, path: &Path) -> Option<Duration> {
+    let (cache, file) = (cache.clone(), failure_file(path));
+    match blocking(move || read_miss_file(&cache, &file)).await {
+        Ok(Some((MissKind::Transient, remaining))) => Some(remaining),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::debug!(%error, "a failure remembered in the cache could not be read");
+            None
+        },
+    }
+}
+
+/// Remembers that fetching what goes at `path` in the cache failed transiently, for
+/// [`recent_failure`].
+async fn remember_failure(path: &Path) {
+    remember_miss_file(&failure_file(path), MissKind::Transient).await;
 }
 
 /// Removes the file at `path`, if there is one. A failure is logged.
@@ -582,10 +619,10 @@ where
 /// `$CARGO_HOME`, or `~/.cargo` when it is unset or empty, as cargo finds it. `None` without a
 /// home directory.
 #[must_use]
-pub fn cargo_home() -> Option<std::path::PathBuf> {
+pub fn cargo_home() -> Option<PathBuf> {
     std::env::var_os("CARGO_HOME")
         .filter(|home| !home.is_empty())
-        .map(std::path::PathBuf::from)
+        .map(PathBuf::from)
         .or_else(|| etcetera::home_dir().ok().map(|home| home.join(".cargo")))
 }
 

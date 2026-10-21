@@ -121,6 +121,12 @@ pub enum IndexError {
     /// The request or the transfer of the body failed.
     #[error("the request to the crates.io index failed")]
     Network(#[source] reqwest::Error),
+    /// Fetching the same index file failed transiently a moment ago (requirement R-ERR-3).
+    #[error("fetching this file of the crates.io index failed a moment ago; it is tried again in {} seconds", retry_after.as_secs())]
+    RecentFailure {
+        /// How long until it is fetched again.
+        retry_after: Duration,
+    },
     /// The index file is larger than the limit.
     #[error("the index file is larger than {limit} bytes")]
     TooLarge {
@@ -305,9 +311,18 @@ impl SparseIndex {
 
         let fetched = if self.offline {
             Err(IndexError::Offline)
+        } else if let Some(retry_after) = super::recent_failure(&self.cache, &body_path).await {
+            Err(IndexError::RecentFailure { retry_after })
         } else {
-            self.fetch(name, cached.as_ref(), body_path, record_path, now)
-                .await
+            let fetched = self
+                .fetch(name, cached.as_ref(), body_path.clone(), record_path, now)
+                .await;
+            // Every call, and every process that shares the cache, would wait for the same
+            // failure in turn (requirement R-ERR-3).
+            if let Err(IndexError::Network(_) | IndexError::Transient { .. }) = &fetched {
+                super::remember_failure(&body_path).await;
+            }
+            fetched
         };
         match (fetched, cached) {
             // The index cannot be reached, or may not be: the file in the cache is used, however
@@ -317,6 +332,7 @@ impl SparseIndex {
                     error @ (IndexError::Network(_)
                     | IndexError::Transient { .. }
                     | IndexError::UnexpectedStatus { .. }
+                    | IndexError::RecentFailure { .. }
                     | IndexError::Offline),
                 ),
                 Some(cached),
@@ -675,6 +691,46 @@ mod tests {
             "{:?}",
             stale.stale
         );
+    }
+
+    /// A transient failure is remembered for a while: the next call does not ask the index again,
+    /// and uses the cached file at once, or fails at once without one (requirement R-ERR-3).
+    #[tokio::test]
+    async fn a_transient_failure_is_not_asked_again_for_a_while() {
+        // Each fetch is tried 3 times.
+        let unavailable = || status("503 Service Unavailable");
+        let (index, requests, _dir) = index(
+            vec![
+                ok(SERDE_INDEX, "\"v1\""),
+                unavailable(),
+                unavailable(),
+                unavailable(),
+                unavailable(),
+                unavailable(),
+                unavailable(),
+            ],
+            Duration::ZERO,
+        );
+        index.entry(&name("serde")).await.expect("found");
+        index.entry(&name("serde")).await.expect("from the cache");
+        let again = index.entry(&name("serde")).await.expect("from the cache");
+        assert!(
+            again
+                .stale
+                .as_deref()
+                .is_some_and(|why| why.contains("a moment ago")),
+            "{:?}",
+            again.stale
+        );
+        assert!(matches!(
+            index.entry(&name("tokio")).await,
+            Err(IndexError::Transient { .. })
+        ));
+        assert!(matches!(
+            index.entry(&name("tokio")).await,
+            Err(IndexError::RecentFailure { .. })
+        ));
+        assert_eq!(requests.try_iter().count(), 7, "not asked again");
     }
 
     /// Offline, the cached file is used however old, and a crate that is not cached is not taken

@@ -523,6 +523,16 @@ Claude Code 2.1.304、Linux で測った。
   - `CARGO_HOME` を一時ディレクトリにした子プロセスで、パッケージキャッシュのロックを持ったまま解決させると、200 ms の期限の呼び出しが `Going(WaitingForLock)` を受け、ロックを外すと裏で続いた仕事が `cargo metadata` の結果を返す
   - 版が決まる前の応答 (get_item の系統・`resolve_version`・`list_crates`・横断の検索) が、それぞれの outputSchema に収まる (std の C3c-2 のテストを `fits_the_schemas` に一般化した)
 
+**C3c-4 (一時的な失敗をディスクに覚える。2026-10-21)**:
+
+- docs.rs の JSON が `miss.json` で使っていた記録 (`MissKind::Transient`、30 秒) を、項目のパスごとのファイル (`<パス>.miss.json`) にも書けるようにし、sparse index・`.crate`・配布物 (要約とアーカイブ) で使う。キャッシュの中にあるので、キャッシュを共有するほかのプロセスにも効く
+  - 覚えるのは、通信の失敗と一時的な状態 (5xx・429) だけ。オフライン・無い (404)・予期しない状態・大きすぎる・チェックサムの不一致は覚えない。予期しない状態を覚えると、1 回目は `retryable: false` なのに 2 回目から `true` に変わるため (レビューの指摘。docs.rs の JSON は予期しない状態も覚えるが、今回は変えない)
+  - 覚えている間は取りに行かず、`RecentFailure` (残りの秒数付き) を返す。ツールの応答は `network_error` (`retryable: true`) に `retry_after_secs` を付ける
+- sparse index は、古いキャッシュがあれば、覚えている間は待たずにすぐそれを使う (warnings の文は「a moment ago」)。今までは応答の無い相手に約 30 秒待ってから古いものを使っていた。配布物の要約も、覚えている間は前に取ったものを warnings 付きで使う (前からの扱い)
+- 配布物のアーカイブの失敗は、展開先のディレクトリの隣 (`std/<hash>/<triple>.miss.json`) に覚える。std の片付けは、期限の切れた記録のファイルを nightly のディレクトリと `std/` から消す (残ると nightly のディレクトリが空にならず、展開先ができなかったときは消す契機も無いため。レビューの指摘)
+- テスト: 3 つの取得元それぞれで、503 で失敗した後の呼び出しは取りに行かずに `RecentFailure` になる (sparse index は、古いキャッシュがあればそれを使い、無い crate は失敗する)。要求の数で確かめた
+- CI の揺れの修正: C3c-3 (85ca537) の CI で、testdata (ubuntu) の決定性のテストが `list_crates` の `docs_rs_json: cached` の有無で落ちた。同じテストのバイナリで並行に走る `questions.rs` が `reqwest@0.13.5` の `list_module` でホストの target の JSON をキャッシュに書くので、その前後で答えが変わる (b870897 からある揺れで、C3 によらない)。キャッシュにあるかは応答の入力ではない (R-ARCH-5) ので、比べる前にこの項目だけ除いた
+
 ### 6.5 M2d
 
 (まだ無い)
@@ -550,6 +560,11 @@ Claude Code 2.1.304、Linux で測った。
    - R-OUT-9 (C3a): 1 つの crate の `status: building` の応答の項目と並び (`provenance`・`status`・`building_reason`・`retry_after_secs`・`warnings`・`hints`)、`retry_after_secs` の値 (10 秒)、path が他の crate に続くときは続く先の crate の `status: building` を返すこと。outputSchema では、1 つの crate を引くツールの必須を `provenance` だけにしたこと (R-OUT-1 のルートに `anyOf` を置かない決まりから)。`building_reason` の 5 つの値は、いま使わないものも宣言したこと
    - R-WS-6 (C3a・C3b): 取得と索引の作成は呼び出しの間で共有する 1 つの仕事で、待つ側が `retry_after_secs` を返したら切り離すこと (以後は取り消しで止めない)。ロックは blocking の作業が終わるまで持つこと。進捗の通知の間隔 (3 秒)、`progress` の値 (経過秒数を 3 ずつ。`total` なし)、`message` の形 (`fetching serde 1.0.228 (3 s)`、仕事が複数なら件数)、送るのは `tools/call` の入口の 1 か所であること。`sleep` は自分で送ること
    - R-QA-5 (C3a): テスト用の口 `CHATORA_RUSTDOC_TEST_DOCS_RS_URL` (debug ビルドで `CHATORA_RUSTDOC_TEST_TOOLS=1` のときだけ効く。設定ではない)
+   - R-OUT-9 (C3c): 横断の検索で結果が 0 件で読み込み中の crate があれば、最上位の `status: building` (`partial` と `data`・`page` も返す)。版が決まる前 (std の nightly、`cargo metadata` の解決) の `status: building` の provenance と、outputSchema の provenance の必須を `crate`・`target` だけにしたこと。`building_reason: waiting_for_lock` を `cargo metadata` のロック待ちに使うこと。`resolve_version`・`list_crates` も `status: building` を返すこと
+   - R-OUT-3 (C3c-1): ビルド中のカーソルは、検索した crate のダイジェストに束縛したままで、読み込み中の crate が揃うと拒まれる。次のページがあるときは hints で案内する (利用者が決めた。「ビルド中の扱いは M2」の文を改める)
+   - R-WS-6 (C3c-2・C3c-3): std の取得と `cargo metadata` も期限付きの共有の仕事にしたこと。std は std・alloc・core のアーカイブを先に作ること (利用者が決めた)。feature の組の `cargo tree` と re-export の先の版を決める経路は期限の外のままであること
+   - R-ERR-3 (C3c-4): 一時的な失敗を項目ごとのファイル (`<パス>.miss.json`) に 30 秒覚えること (sparse index・`.crate`・配布物)。覚えている間は取りに行かず `retry_after_secs` 付きの `network_error`、sparse index は古いキャッシュを待たずに使う
+   - R-OBS-1 (C3c-1): 応答が `status: building` の呼び出しはログに `status` を書き、`cache` を書かないこと
    - §8: `local_build_required` の扱い (M2 で使われなくなるか)、ビルドの状態の値 (R-OUT-9)
    - R-SC-4 の `readme` の扱いを M3 に送る
    - §12 の M2 の到達点と、M3 以降に回したもの

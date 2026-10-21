@@ -66,6 +66,12 @@ pub enum CrateError {
     /// The request or the transfer of the body failed.
     #[error("the request to static.crates.io failed")]
     Network(#[source] reqwest::Error),
+    /// Fetching the same `.crate` failed transiently a moment ago (requirement R-ERR-3).
+    #[error("fetching this .crate failed a moment ago; it is tried again in {} seconds", retry_after.as_secs())]
+    RecentFailure {
+        /// How long until it is fetched again.
+        retry_after: std::time::Duration,
+    },
     /// The `.crate` is larger than the limit.
     #[error("the .crate is larger than {limit} bytes")]
     TooLarge {
@@ -196,7 +202,7 @@ impl StaticCrates {
         };
         let contents = match self.fetched_by_cargo(name, version, checksum) {
             Some(contents) => contents,
-            None => self.fetch(name, version).await?,
+            None => self.fetch_remembering(cache, &path, name, version).await?,
         };
         if !super::cache::sha256_hex(&contents).eq_ignore_ascii_case(checksum) {
             return Err(CrateError::ChecksumMismatch);
@@ -205,6 +211,26 @@ impl StaticCrates {
             tracing::warn!(path = %path.display(), %error, "a .crate could not be cached");
         }
         Ok(Some(contents))
+    }
+
+    /// [`Self::fetch`], unless it failed transiently a moment ago, which is remembered next to
+    /// `path` in `cache`: every call, and every process that shares the cache, would wait for the
+    /// same failure in turn (requirement R-ERR-3).
+    async fn fetch_remembering(
+        &self,
+        cache: &Cache,
+        path: &Path,
+        name: &CrateName,
+        version: &Version,
+    ) -> Result<Box<[u8]>, CrateError> {
+        if let Some(retry_after) = super::recent_failure(cache, path).await {
+            return Err(CrateError::RecentFailure { retry_after });
+        }
+        let fetched = self.fetch(name, version).await;
+        if let Err(CrateError::Network(_) | CrateError::Transient { .. }) = &fetched {
+            super::remember_failure(path).await;
+        }
+        fetched
     }
 
     async fn fetch(&self, name: &CrateName, version: &Version) -> Result<Box<[u8]>, CrateError> {
@@ -491,6 +517,42 @@ pub(crate) mod tests {
     use flate2::{Compression, write::GzEncoder};
 
     use super::*;
+
+    /// A transient failure to fetch a `.crate` is remembered for a while in the cache, so that
+    /// the next call, in this process or another, does not ask again (requirement R-ERR-3).
+    #[tokio::test]
+    async fn a_transient_failure_is_not_asked_again_for_a_while() {
+        let unavailable = || {
+            (
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".to_owned(),
+                Vec::new(),
+            )
+        };
+        // Each fetch is tried 3 times.
+        let (base_url, requests) = super::super::test_http::serve_sequence(vec![
+            unavailable(),
+            unavailable(),
+            unavailable(),
+        ]);
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let crates = StaticCrates::with_base_url(&base_url, &Network::default())
+            .expect("a client")
+            .with_cargo_home(None);
+        let (name, version) = (
+            "demo".parse::<CrateName>().expect("a name"),
+            Version::new(0, 1, 0),
+        );
+        assert!(matches!(
+            crates.crate_file(&cache, &name, &version, Some("00")).await,
+            Err(CrateError::Transient { .. })
+        ));
+        assert!(matches!(
+            crates.crate_file(&cache, &name, &version, Some("00")).await,
+            Err(CrateError::RecentFailure { .. })
+        ));
+        assert_eq!(requests.try_iter().count(), 3, "not asked again");
+    }
 
     /// A `.crate` of `name`-`version` with `manifest` as its `Cargo.toml`.
     pub(crate) fn crate_file(name: &str, version: &str, manifest: &str) -> Vec<u8> {

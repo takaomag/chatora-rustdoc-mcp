@@ -1200,6 +1200,13 @@ pub(super) fn index_error(cache: &Cache, name: &CrateName, error: &IndexError) -
             "retryable": true,
             "suggestions": ["try again in a while"],
         })),
+        IndexError::RecentFailure { retry_after } => error_result(&json!({
+            "code": "network_error",
+            "message": message,
+            "retryable": true,
+            "suggestions": ["try again in a while"],
+            "retry_after_secs": retry_after.as_secs().max(1),
+        })),
         IndexError::UnexpectedStatus { .. }
         | IndexError::TooLarge { .. }
         | IndexError::Malformed(_) => error_result(&json!({
@@ -2143,7 +2150,9 @@ pub(super) fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
         ErrorChain(error)
     );
     let (code, reason, retryable): (&str, Option<&str>, bool) = match error {
-        DistError::Network(_) | DistError::Status { .. } => ("network_error", None, true),
+        DistError::Network(_) | DistError::Status { .. } | DistError::RecentFailure { .. } => {
+            ("network_error", None, true)
+        },
         DistError::Certificate(_) | DistError::Manifest(_) => ("network_error", None, false),
         DistError::NotAvailable { .. } => ("docs_unavailable", Some("no_json"), false),
         DistError::TooLarge { .. } => ("docs_unavailable", Some("too_large"), false),
@@ -2167,6 +2176,12 @@ pub(super) fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
     });
     if let (Some(reason), Some(body)) = (reason, body.as_object_mut()) {
         body.insert("reason".to_owned(), json!(reason));
+    }
+    if let (DistError::RecentFailure { retry_after }, Some(body)) = (error, body.as_object_mut()) {
+        body.insert(
+            "retry_after_secs".to_owned(),
+            json!(retry_after.as_secs().max(1)),
+        );
     }
     error_result(&body)
 }

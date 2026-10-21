@@ -330,6 +330,20 @@ fn note_use(cache: &Cache, dir: PathBuf) {
 /// task or process holds is in use and left, and one that was used while this waited is seen so
 /// (requirement R-CA-4). The mark that the unpacking is complete goes first, so that what is left
 /// when the rest cannot all be removed counts as not unpacked.
+/// Removes the files in `dir` that remembered failures to fetch, once they are no longer
+/// remembered (requirement R-ERR-3): one stays next to an archive that could not be fetched.
+fn remove_expired_failures(cache: &Cache, dir: &Path) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let failure = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(".miss.json"));
+        if failure && matches!(super::read_miss_file(cache, &path), Ok(None)) {
+            drop(fs::remove_file(&path));
+        }
+    }
+}
+
 fn remove_unused(cache: &Cache, std_dir: &Path, keep: &Path, now: SystemTime) -> io::Result<()> {
     let subdirectories = |dir: &Path| -> Vec<PathBuf> {
         fs::read_dir(dir)
@@ -368,9 +382,12 @@ fn remove_unused(cache: &Cache, std_dir: &Path, keep: &Path, now: SystemTime) ->
                 failed = Some(error);
             }
         }
+        remove_expired_failures(cache, &nightly);
         // Gone when nothing is left in it; an error means it is not empty.
         drop(fs::remove_dir(&nightly));
     }
+    // Those of the manifests of the nightly channel.
+    remove_expired_failures(cache, std_dir);
     failed.map_or(Ok(()), Err)
 }
 

@@ -178,6 +178,13 @@ pub enum DistError {
         /// The target asked for.
         target: TargetTriple,
     },
+    /// Fetching the same manifest or archive failed transiently a moment ago (requirement
+    /// R-ERR-3).
+    #[error("fetching this from the Rust distribution server failed a moment ago; it is tried again in {} seconds", retry_after.as_secs())]
+    RecentFailure {
+        /// How long until it is fetched again.
+        retry_after: Duration,
+    },
     /// The archive does not have the SHA-256 that the manifest gives.
     #[error("the archive does not match its SHA-256 in the manifest")]
     ChecksumMismatch,
@@ -442,7 +449,7 @@ pub async fn std_docs(
             format!("the archive is not on {}: {}", dist.base_url, archive.url).into(),
         ));
     }
-    let body = dist.get(&archive.url, MAX_ARCHIVE_BYTES).await?;
+    let body = get_remembering(cache, dist, &archive.url, MAX_ARCHIVE_BYTES, &dir).await?;
     if !cache::sha256_hex(&body).eq_ignore_ascii_case(&archive.sha256) {
         return Err(DistError::ChecksumMismatch);
     }
@@ -545,7 +552,7 @@ async fn summary(
         || format!("{}/dist/channel-rust-nightly.toml", dist.base_url),
         |date| format!("{}/dist/{date}/channel-rust-nightly.toml", dist.base_url),
     );
-    let fetched = match dist.get(&url, MAX_MANIFEST_BYTES).await {
+    let fetched = match get_remembering(cache, dist, &url, MAX_MANIFEST_BYTES, &path).await {
         Ok(body) => blocking(move || Ok(parse_manifest(&body)))
             .await
             .map_err(DistError::Cache)?,
@@ -576,6 +583,32 @@ async fn summary(
         },
         (Err(error), None) => Err(error),
     }
+}
+
+/// [`Dist::get`] of what goes at `path` in `cache`, unless it failed transiently a moment ago,
+/// which is remembered next to `path`: every call, and every process that shares the cache, would
+/// wait for the same failure in turn (requirement R-ERR-3).
+async fn get_remembering(
+    cache: &Cache,
+    dist: &Dist,
+    url: &str,
+    limit: u64,
+    path: &Path,
+) -> Result<Vec<u8>, DistError> {
+    if let Some(retry_after) = super::recent_failure(cache, path).await {
+        return Err(DistError::RecentFailure { retry_after });
+    }
+    let fetched = dist.get(url, limit).await;
+    // A status that is not transient, as a 404, is not remembered.
+    let transient = match &fetched {
+        Err(DistError::Network(_)) => true,
+        Err(DistError::Status { status }) => http::is_transient(*status),
+        Ok(_) | Err(_) => false,
+    };
+    if transient {
+        super::remember_failure(path).await;
+    }
+    fetched
 }
 
 /// Reads the manifest of the nightly channel.
@@ -892,6 +925,33 @@ available = false
 
     pub(crate) fn linux() -> TargetTriple {
         "x86_64-unknown-linux-gnu".parse().expect("a triple")
+    }
+
+    /// A transient failure to fetch the manifest is remembered for a while in the cache, so that
+    /// the next call, in this process or another, does not ask again (requirement R-ERR-3).
+    #[tokio::test]
+    async fn a_transient_failure_is_not_asked_again_for_a_while() {
+        let unavailable = || {
+            (
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".to_owned(),
+                Vec::new(),
+            )
+        };
+        // Each fetch is tried 3 times.
+        let (base_url, requests) =
+            test_http::serve_sequence(vec![unavailable(), unavailable(), unavailable()]);
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let dist = Dist::for_local_test(&base_url);
+        assert!(matches!(
+            std_docs(&cache, &dist, &linux(), None).await,
+            Err(DistError::Status { .. })
+        ));
+        assert!(matches!(
+            std_docs(&cache, &dist, &linux(), None).await,
+            Err(DistError::RecentFailure { .. })
+        ));
+        assert_eq!(requests.try_iter().count(), 3, "not asked again");
     }
 
     #[tokio::test]
