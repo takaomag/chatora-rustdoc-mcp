@@ -56,15 +56,48 @@ impl Child {
     /// Returns an error when the child cannot be waited for, or its output read.
     pub(super) async fn output_watching(
         self,
-        mut on_line: impl FnMut(&str) + Send,
+        on_line: impl FnMut(&str) + Send,
     ) -> io::Result<Output> {
-        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+        self.read_lines(true, |_| {}, on_line).await
+    }
+
+    /// [`Self::output_watching`], handing each line of stdout to `on_stdout` as well, as cargo's
+    /// JSON messages, which are not kept: the stdout of the [`Output`] is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the child cannot be waited for, or its output read.
+    pub(super) async fn output_streaming(
+        self,
+        on_stdout: impl FnMut(&str) + Send,
+        on_stderr: impl FnMut(&str) + Send,
+    ) -> io::Result<Output> {
+        self.read_lines(false, on_stdout, on_stderr).await
+    }
+
+    /// Reads stdout and stderr line by line as they come, keeping stdout if `keep_stdout`.
+    async fn read_lines(
+        self,
+        keep_stdout: bool,
+        mut on_stdout: impl FnMut(&str) + Send,
+        mut on_stderr: impl FnMut(&str) + Send,
+    ) -> io::Result<Output> {
+        use tokio::io::AsyncBufReadExt as _;
         let Self { mut child, group } = self;
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         let read_stdout = async {
             let mut read = Vec::new();
-            if let Some(mut stdout) = stdout {
-                stdout.read_to_end(&mut read).await?;
+            if let Some(stdout) = stdout {
+                let mut stdout = tokio::io::BufReader::new(stdout);
+                let mut line = Vec::new();
+                while stdout.read_until(b'\n', &mut line).await? > 0 {
+                    on_stdout(&String::from_utf8_lossy(&line));
+                    if keep_stdout {
+                        read.append(&mut line);
+                    } else {
+                        line.clear();
+                    }
+                }
             }
             Ok::<_, io::Error>(read)
         };
@@ -74,7 +107,7 @@ impl Child {
                 let mut stderr = tokio::io::BufReader::new(stderr);
                 let mut line = Vec::new();
                 while stderr.read_until(b'\n', &mut line).await? > 0 {
-                    on_line(&String::from_utf8_lossy(&line));
+                    on_stderr(&String::from_utf8_lossy(&line));
                     read.append(&mut line);
                 }
             }
@@ -171,7 +204,6 @@ pub(super) async fn spawn(command: tokio::process::Command) -> io::Result<Child>
 /// # Errors
 ///
 /// As [`spawn`].
-#[expect(dead_code, reason = "the build of M2's D2b starts its children so")]
 pub(super) async fn spawn_building(
     command: tokio::process::Command,
     target_dir: &Path,

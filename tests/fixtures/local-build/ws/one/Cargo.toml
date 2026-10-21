@@ -1,0 +1,12 @@
+[package]
+name = "one"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+watcher = { path = "../../deps/watcher" }
+
+[features]
+default = ["extra"]
+extra = []

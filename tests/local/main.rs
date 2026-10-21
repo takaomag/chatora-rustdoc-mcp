@@ -17,6 +17,8 @@ mod git;
 mod git_failures;
 #[path = "../common/isolated.rs"]
 mod isolated;
+#[cfg(feature = "local")]
+mod local_build;
 #[path = "../common/registry.rs"]
 mod registry;
 mod tools;

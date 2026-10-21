@@ -2,18 +2,29 @@
 //! directory and where the JSON lands (requirements R-WS-1, R-WS-2 and R-WS-8, decided in M2's
 //! D2).
 //!
-//! Nothing here runs: the build itself runs the [`Plan`]'s command.
+//! [`build`] runs a [`Plan`]'s command and publishes the JSON in the cache.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
+    fs,
+    io,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::SystemTime,
 };
 
+use semver::Version;
+use serde::{Deserialize, Serialize};
+
 use super::{
-    cache,
+    cache::{self, Cache},
+    cargo::{Activity, Failure, RunError, classify, run_building, stderr_tail},
     metadata::{Metadata, Package, PackageId},
+    process_lock::{self, LockMode, ProcessLock},
     target::TargetTriple,
 };
 use crate::config::Settings;
@@ -124,6 +135,14 @@ impl Bootstrap {
     }
 }
 
+/// The first digits of the hash of a workspace's root, which name its target directory and its
+/// published builds.
+fn workspace_hash(root: &Path) -> String {
+    let mut hash = cache::sha256_hex(root.as_os_str().as_encoded_bytes());
+    hash.truncate(HASH_DIGITS);
+    hash
+}
+
 /// The name of the crate of a target: `cargo metadata` keeps the `-` of a bin's name.
 fn crate_name(target: &str) -> String {
     target.replace('-', "_")
@@ -141,8 +160,8 @@ impl TargetDir {
     /// `cache`: the first that is not marked [`UNUSABLE`].
     #[must_use]
     pub fn of(cache: &Path, root: &Path) -> Self {
-        let hash = cache::sha256_hex(root.as_os_str().as_encoded_bytes());
-        let stem = hash.get(..HASH_DIGITS).unwrap_or(&hash);
+        let stem = workspace_hash(root);
+        let stem = stem.as_str();
         let dirs = cache.join(TARGET_DIRS);
         let first = dirs.join(stem);
         let dir = (0..=u32::MAX)
@@ -162,6 +181,14 @@ impl TargetDir {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.0
+    }
+
+    /// Its name in `t/`, which names its locks.
+    fn name(&self) -> String {
+        self.0
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     /// cargo's target directory (`CARGO_TARGET_DIR`).
@@ -278,6 +305,10 @@ pub struct Plan {
     pub package: PackageId,
     /// Its crate.
     pub documented: Documented,
+    /// The name of the crate, with `_` for `-`: the name of its JSON.
+    pub crate_name: Box<str>,
+    /// The member's version, which the JSON must have.
+    pub version: Version,
     /// The target passed as `--target`, if any.
     pub target: Option<TargetTriple>,
 }
@@ -327,11 +358,456 @@ impl Plan {
     /// The JSON that the build writes, `<doc dir>/<crate>.json`, where another build of a crate
     /// of the same name writes too (Q-29).
     #[must_use]
-    pub fn json(&self, crate_name: &str) -> PathBuf {
-        let proc_macro = matches!(self.documented, Documented::Lib { proc_macro: true });
+    pub fn json(&self) -> PathBuf {
         self.target_dir
-            .doc_dir(self.target.as_ref(), proc_macro)
-            .join(format!("{crate_name}.json"))
+            .doc_dir(self.target.as_ref(), self.is_proc_macro())
+            .join(format!("{}.json", self.crate_name))
+    }
+
+    /// Whether the crate is a proc-macro, which is built for the host.
+    const fn is_proc_macro(&self) -> bool {
+        matches!(self.documented, Documented::Lib { proc_macro: true })
+    }
+
+    /// The directory that the build is published in, until D4 (decided in M2's D2): `local/<the
+    /// workspace's hash>/<the package id's hash>/<target>/<lib, or bin-<name>>` in the cache.
+    fn published_dir(&self, cache: &Path, target: Option<&TargetTriple>) -> PathBuf {
+        let package = cache::sha256_hex(self.package.0.as_bytes());
+        let package = package.get(..HASH_DIGITS).unwrap_or(&package);
+        let target = target.map_or("_unknown", TargetTriple::as_str);
+        let documented = match &self.documented {
+            Documented::Lib { .. } => "lib".to_owned(),
+            Documented::Bin { name } => format!("bin-{name}"),
+        };
+        cache
+            .join(LOCAL_DIR)
+            .join(workspace_hash(&self.root))
+            .join(package)
+            .join(target)
+            .join(documented)
+    }
+}
+
+/// The directory of the published builds, in the cache, until D4 (decided in M2's D2).
+pub const LOCAL_DIR: &str = "local";
+
+/// The most errors of the compiler that a failed build keeps.
+const MAX_ERRORS: usize = 5;
+
+/// Numbers the JSON files moved into the work directory.
+static NEXT_WORK: AtomicU64 = AtomicU64::new(0);
+
+/// What a build published.
+#[derive(Debug, Clone)]
+pub struct Built {
+    /// The JSON in the cache, next to its `.sha256` and its record (`record.json`).
+    pub json: PathBuf,
+    /// The record.
+    pub record: BuildRecord,
+    /// The units that cargo built, rather than found fresh: the documented crate's alone, once
+    /// the others are built (requirement R-WS-8).
+    pub rebuilt: Vec<Box<str>>,
+}
+
+/// What is recorded of a build, `record.json` next to its JSON, for the provenance (requirement
+/// R-OUT-9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildRecord {
+    /// The package id of the member.
+    pub package: Box<str>,
+    /// The crate, with `_` for `-`.
+    pub crate_name: Box<str>,
+    /// Its version.
+    pub crate_version: Box<str>,
+    /// The format of the JSON.
+    pub format_version: u32,
+    /// The target that the JSON is of (`target.triple`), if it tells: the host's for a
+    /// proc-macro.
+    pub target: Option<Box<str>>,
+    /// The toolchain, as `rustc -vV` tells it, if known.
+    pub toolchain: Option<Box<str>>,
+    /// The toolchain that the server chose instead of the project's, as `nightly`.
+    pub chosen_toolchain: Option<Box<str>>,
+    /// When it was built, in RFC 3339.
+    pub built_at: Box<str>,
+    /// The features of the crate, as cargo built it (`features_effective`, requirement R-FT-3),
+    /// or `None` when no message of cargo told them.
+    pub features_effective: Option<Vec<Box<str>>>,
+    /// Whether `RUSTC_BOOTSTRAP` was `1`, as the names were too long (decided in M2's D2).
+    pub bootstrap_all: bool,
+    /// The SHA-256 of the JSON.
+    pub sha256: Box<str>,
+}
+
+/// Why a build published nothing.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildError {
+    /// cargo could not be run, or ran too long.
+    #[error(transparent)]
+    Run(#[from] RunError),
+    /// cargo failed.
+    #[error("cargo failed to build the documentation")]
+    Failed {
+        /// How, as its messages tell (requirement R-WS-7).
+        failure: Failure,
+        /// The first errors of the compiler.
+        errors: Vec<Box<str>>,
+        /// The end of its stderr.
+        stderr: Box<str>,
+    },
+    /// cargo succeeded, but wrote no JSON where it was looked for.
+    #[error("cargo wrote no rustdoc JSON at {}", .0.display())]
+    NoJson(PathBuf),
+    /// cargo found the documentation fresh and did not run rustdoc, so there is no JSON: cargo
+    /// 1.99.1 runs it every time, but another version might not.
+    #[error("cargo did not run rustdoc, as it found the documentation fresh, so there is no rustdoc JSON at {}", .0.display())]
+    Fresh(PathBuf),
+    /// The JSON cannot be read.
+    #[error("the rustdoc JSON cannot be read")]
+    Unreadable(#[source] serde_json::Error),
+    /// The JSON documents another crate, version or target, as another build of the same name
+    /// may have written (Q-29).
+    #[error("the rustdoc JSON is not that of {expected}, but of {found}")]
+    NotTheCrate {
+        /// What was built.
+        expected: String,
+        /// What the JSON documents.
+        found: String,
+    },
+    /// The JSON could not be moved or published.
+    #[error("the rustdoc JSON could not be published")]
+    Io(#[source] io::Error),
+}
+
+/// Runs the build of `plan`, and publishes its JSON in `cache` (requirements R-WS-1 and R-WS-6,
+/// decided in M2's D2).
+///
+/// It uses the target directory with its shared lock, and writes in it with its exclusive one,
+/// which it lets go once the JSON is moved to `work`, a directory in the cache: another build of
+/// a crate of the same name writes the same file (Q-29). Then it checks the JSON and publishes
+/// it. `on_activity` is told when it waits for a lock and when cargo does. `toolchain` is what
+/// `rustc -vV` tells of the toolchain, for the record.
+///
+/// # Errors
+///
+/// Returns why nothing was published.
+pub async fn build(
+    cache: &Cache,
+    plan: &Plan,
+    work: &Path,
+    toolchain: Option<&str>,
+    mut on_activity: impl FnMut(Activity) + Send,
+) -> Result<Built, BuildError> {
+    let name = plan.target_dir.name();
+    let using = hold(
+        cache.dir(),
+        &target_key(&name),
+        LockMode::Shared,
+        &mut on_activity,
+    )
+    .await;
+    let writing = hold(
+        cache.dir(),
+        &doc_key(&name),
+        LockMode::Exclusive,
+        &mut on_activity,
+    )
+    .await;
+    let mut messages = Messages::new(plan);
+    let output = run_building(
+        plan.command(),
+        plan.target_dir.path(),
+        &mut on_activity,
+        |line| messages.read(line),
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(BuildError::Failed {
+            failure: classify(&output, plan.offline),
+            errors: messages.errors,
+            stderr: stderr_tail(&output),
+        });
+    }
+    let json = plan.json();
+    let moved = work.join(format!(
+        "build-{}.json",
+        NEXT_WORK.fetch_add(1, Ordering::Relaxed)
+    ));
+    let moving = json.clone();
+    // On a blocking thread, which goes on if this future is dropped: it lets the locks go when
+    // the file is out of the way, and leaves nothing in `work`.
+    let contents = super::blocking(move || {
+        fs::create_dir_all(moved.parent().unwrap_or(&moved))?;
+        let renamed = fs::rename(&moving, &moved);
+        drop(writing);
+        drop(using);
+        renamed?;
+        let read = fs::read(&moved);
+        drop(fs::remove_file(&moved));
+        read
+    })
+    .await
+    .map_err(|error| match (error.kind(), messages.documented_fresh) {
+        (io::ErrorKind::NotFound, Some(true)) => BuildError::Fresh(json),
+        (io::ErrorKind::NotFound, _) => BuildError::NoJson(json),
+        _ => BuildError::Io(error),
+    })?;
+    let header = Header::read(&contents).map_err(BuildError::Unreadable)?;
+    let target = header.check(plan)?;
+    let sha256 = cache::sha256_hex(&contents);
+    let record = BuildRecord {
+        package: plan.package.0.clone(),
+        crate_name: plan.crate_name.clone(),
+        crate_version: plan.version.to_string().into(),
+        format_version: header.format_version,
+        target: target.as_ref().map(|target| target.as_str().into()),
+        toolchain: toolchain.map(Into::into),
+        chosen_toolchain: plan.toolchain.as_deref().map(Into::into),
+        built_at: super::rfc3339(SystemTime::now()).into(),
+        features_effective: messages.features,
+        bootstrap_all: plan.bootstrap == Bootstrap::All,
+        sha256: sha256.into(),
+    };
+    let dir = plan.published_dir(cache.dir(), target.as_ref());
+    let path = dir.join(format!("{}.json", header.format_version));
+    let record_json =
+        serde_json::to_vec_pretty(&record).map_err(|error| BuildError::Io(error.into()))?;
+    let publishing = cache.lock(&dir).await;
+    let (cache, published) = (cache.clone(), path.clone());
+    super::blocking(move || {
+        cache.write_verified(&published, &contents)?;
+        let written = cache::write_atomically(&dir.join("record.json"), &record_json);
+        drop(publishing);
+        written
+    })
+    .await
+    .map_err(BuildError::Io)?;
+    Ok(Built {
+        json: path,
+        record,
+        rebuilt: messages.rebuilt,
+    })
+}
+
+/// The key of the lock of the target directory `name` in `t/`: shared by the builds, exclusive
+/// for removing it (decided in C1). Other versions find it by this key, which must not change.
+fn target_key(name: &str) -> String {
+    format!("target:{name}")
+}
+
+/// The key of the lock of writing the documentation in the target directory `name` in `t/`,
+/// where builds of crates of the same name write the same files (decided in M2's D2, Q-29). It
+/// must not change either.
+fn doc_key(name: &str) -> String {
+    format!("doc:{name}")
+}
+
+/// Takes the lock of `key` in the cache at `root` in `mode`, telling `on_activity` while it waits.
+/// When the OS cannot lock, it goes on without, with a log line, as [`Cache::lock`] does.
+async fn hold(
+    root: &Path,
+    key: &str,
+    mode: LockMode,
+    on_activity: &mut (impl FnMut(Activity) + Send),
+) -> Option<ProcessLock> {
+    let failed = |error: &io::Error| {
+        tracing::warn!(%key, %error, "a lock of a build cannot be taken; going on without it");
+    };
+    match process_lock::try_lock(root, key, mode) {
+        Ok(Some(held)) => return Some(held),
+        Ok(None) => {},
+        Err(error) => {
+            failed(&error);
+            return None;
+        },
+    }
+    on_activity(Activity::WaitingForLock);
+    let held = process_lock::lock(root, key, mode)
+        .await
+        .inspect_err(failed)
+        .ok();
+    on_activity(Activity::Running);
+    held
+}
+
+/// What a build's JSON messages tell (`--message-format=json`).
+struct Messages<'a> {
+    plan: &'a Plan,
+    /// The features of the documented crate, from its `compiler-artifact`.
+    features: Option<Vec<Box<str>>>,
+    /// Whether cargo found the documented crate fresh, from the same message.
+    documented_fresh: Option<bool>,
+    /// The units that were built rather than fresh.
+    rebuilt: Vec<Box<str>>,
+    /// The first errors of the compiler, rendered.
+    errors: Vec<Box<str>>,
+}
+
+/// A JSON message of cargo, as far as it is read.
+#[derive(Deserialize)]
+struct Message {
+    reason: Box<str>,
+    #[serde(default)]
+    package_id: Option<Box<str>>,
+    #[serde(default)]
+    target: Option<MessageTarget>,
+    #[serde(default)]
+    features: Vec<Box<str>>,
+    #[serde(default)]
+    fresh: bool,
+    #[serde(default, rename = "message")]
+    diagnostic: Option<Diagnostic>,
+}
+
+/// The target of a unit in a message.
+#[derive(Deserialize)]
+struct MessageTarget {
+    name: Box<str>,
+    kind: Vec<Box<str>>,
+}
+
+/// A message of the compiler.
+#[derive(Deserialize)]
+struct Diagnostic {
+    level: Box<str>,
+    #[serde(default)]
+    rendered: Option<Box<str>>,
+}
+
+impl<'a> Messages<'a> {
+    const fn new(plan: &'a Plan) -> Self {
+        Self {
+            plan,
+            features: None,
+            documented_fresh: None,
+            rebuilt: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    /// Reads a line of stdout. What is not a message is skipped.
+    fn read(&mut self, line: &str) {
+        let Ok(message) = serde_json::from_str::<Message>(line) else {
+            return;
+        };
+        match &*message.reason {
+            "compiler-artifact" => {
+                let Some(target) = &message.target else {
+                    return;
+                };
+                if !message.fresh {
+                    self.rebuilt.push(target.name.clone());
+                }
+                if message.package_id.as_deref() == Some(&*self.plan.package.0)
+                    && self.is_documented(target)
+                {
+                    self.features = Some(message.features);
+                    self.documented_fresh = Some(message.fresh);
+                }
+            },
+            "compiler-message" => {
+                if let Some(Diagnostic {
+                    level,
+                    rendered: Some(rendered),
+                }) = message.diagnostic
+                    && &*level == "error"
+                    && self.errors.len() < MAX_ERRORS
+                {
+                    self.errors.push(rendered);
+                }
+            },
+            _ => {},
+        }
+    }
+
+    /// Whether `target` is the documented crate's, not the lib that a bin of the same name
+    /// needs.
+    fn is_documented(&self, target: &MessageTarget) -> bool {
+        let has = |wanted: &str| target.kind.iter().any(|kind| &**kind == wanted);
+        match &self.plan.documented {
+            Documented::Lib { .. } => {
+                crate_name(&target.name) == *self.plan.crate_name
+                    && target.kind.iter().any(|kind| LIB_KINDS.contains(&&**kind))
+            },
+            Documented::Bin { name } => target.name == *name && has("bin"),
+        }
+    }
+}
+
+/// The top-level members of a build's JSON that tell what it documents.
+#[derive(Deserialize)]
+struct Header {
+    format_version: u32,
+    #[serde(default)]
+    crate_version: Option<Box<str>>,
+    root: serde_json::Value,
+    index: HashMap<Box<str>, Named>,
+    #[serde(default)]
+    target: Option<HeaderTarget>,
+}
+
+/// An item of the index, as far as its name.
+#[derive(Deserialize)]
+struct Named {
+    #[serde(default)]
+    name: Option<Box<str>>,
+}
+
+/// The target of the JSON (format 35 and later).
+#[derive(Deserialize)]
+struct HeaderTarget {
+    triple: Box<str>,
+}
+
+impl Header {
+    /// Reads the header of `json`, skipping all but the names of the items.
+    fn read(json: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(json)
+    }
+
+    /// Checks that the JSON documents the crate, the version and, with `--target`, the target of
+    /// `plan`, and returns its target, if it tells.
+    fn check(&self, plan: &Plan) -> Result<Option<TargetTriple>, BuildError> {
+        // A number in the newer formats and text in the older; the keys of the index are text.
+        let root = if let serde_json::Value::String(id) = &self.root {
+            id.clone()
+        } else {
+            self.root.to_string()
+        };
+        let name = self
+            .index
+            .get(root.as_str())
+            .and_then(|item| item.name.as_deref());
+        let target = self
+            .target
+            .as_ref()
+            .and_then(|target| target.triple.parse::<TargetTriple>().ok());
+        let version = plan.version.to_string();
+        let target_differs = match (&plan.target, &target) {
+            (Some(wanted), Some(found)) => !plan.is_proc_macro() && wanted != found,
+            _ => false,
+        };
+        if name == Some(&*plan.crate_name)
+            && self.crate_version.as_deref() == Some(version.as_str())
+            && !target_differs
+        {
+            return Ok(target);
+        }
+        let wanted = plan
+            .target
+            .as_ref()
+            .map_or(String::new(), |target| format!(" for {target}"));
+        Err(BuildError::NotTheCrate {
+            expected: format!("{} {version}{wanted}", plan.crate_name),
+            found: format!(
+                "{} {}{}",
+                name.unwrap_or("?"),
+                self.crate_version.as_deref().unwrap_or("?"),
+                target
+                    .as_ref()
+                    .map_or(String::new(), |target| format!(" for {target}"))
+            ),
+        })
     }
 }
 
@@ -445,8 +921,8 @@ mod tests {
         );
         assert_eq!(TargetDir::of(cache.path(), root), first, "the same");
         assert_ne!(TargetDir::of(cache.path(), Path::new("/other")), first);
-        std::fs::create_dir_all(first.path()).expect("made");
-        std::fs::write(first.path().join(UNUSABLE), "").expect("marked");
+        fs::create_dir_all(first.path()).expect("made");
+        fs::write(first.path().join(UNUSABLE), "").expect("marked");
         let second = TargetDir::of(cache.path(), root);
         assert_eq!(
             second.path().file_name(),
@@ -464,6 +940,100 @@ mod tests {
         assert!(passes_target(&host, Some(&host), true));
         assert!(passes_target(&other, Some(&host), false));
         assert!(passes_target(&host, None, false));
+    }
+
+    /// A plan of the lib `app` 0.1.0, for `target` if any.
+    fn app_plan(target: Option<&str>, proc_macro: bool) -> Plan {
+        Plan {
+            root: PathBuf::from("/ws"),
+            offline: false,
+            toolchain: None,
+            bootstrap: Bootstrap::All,
+            target_dir: TargetDir(PathBuf::from("/c/t/0123456789ab")),
+            package: PackageId("path+file:///ws/app#0.1.0".into()),
+            documented: Documented::Lib { proc_macro },
+            crate_name: "app".into(),
+            version: Version::new(0, 1, 0),
+            target: target.map(|target| target.parse().expect("a triple")),
+        }
+    }
+
+    fn header(json: &serde_json::Value) -> Header {
+        Header::read(&serde_json::to_vec(json).expect("JSON")).expect("a header")
+    }
+
+    #[test]
+    fn the_json_is_checked_against_the_plan() {
+        let linux = "x86_64-unknown-linux-gnu";
+        // The root is a number in the newer formats, and text in the older.
+        let newer = header(&serde_json::json!({
+            "format_version": 61, "crate_version": "0.1.0", "root": 0,
+            "index": {"0": {"name": "app"}, "1": {"name": "other"}},
+            "target": {"triple": linux},
+        }));
+        assert_eq!(
+            newer
+                .check(&app_plan(None, false))
+                .expect("app")
+                .as_ref()
+                .map(TargetTriple::as_str),
+            Some(linux)
+        );
+        let older = header(&serde_json::json!({
+            "format_version": 30, "crate_version": "0.1.0", "root": "0:0",
+            "index": {"0:0": {"name": "app"}},
+        }));
+        assert_eq!(older.check(&app_plan(None, false)).expect("app"), None);
+        let not = |json: serde_json::Value| {
+            matches!(
+                header(&json).check(&app_plan(None, false)),
+                Err(BuildError::NotTheCrate { .. })
+            )
+        };
+        assert!(
+            not(serde_json::json!({
+                "format_version": 61, "root": 0, "index": {"0": {"name": "app"}},
+            })),
+            "without a version"
+        );
+        assert!(
+            not(serde_json::json!({
+                "format_version": 61, "crate_version": "0.2.0", "root": 0,
+                "index": {"0": {"name": "app"}},
+            })),
+            "another version"
+        );
+        assert!(
+            not(serde_json::json!({
+                "format_version": 61, "crate_version": "0.1.0", "root": 1,
+                "index": {"0": {"name": "app"}, "1": {"name": "other"}},
+            })),
+            "another crate"
+        );
+        // With `--target`, the target must be it, but a proc-macro's is the host's.
+        let built_for_linux = header(&serde_json::json!({
+            "format_version": 61, "crate_version": "0.1.0", "root": 0,
+            "index": {"0": {"name": "app"}}, "target": {"triple": linux},
+        }));
+        let other = Some("aarch64-apple-darwin");
+        assert!(matches!(
+            built_for_linux.check(&app_plan(other, false)),
+            Err(BuildError::NotTheCrate { .. })
+        ));
+        let found = |plan: &Plan| {
+            built_for_linux
+                .check(plan)
+                .expect("app")
+                .map(|target| target.as_str().to_owned())
+        };
+        assert_eq!(found(&app_plan(other, true)).as_deref(), Some(linux));
+        assert_eq!(found(&app_plan(Some(linux), false)).as_deref(), Some(linux));
+    }
+
+    #[test]
+    fn the_keys_of_the_locks_do_not_change() {
+        assert_eq!(target_key("0123456789ab.1"), "target:0123456789ab.1");
+        assert_eq!(doc_key("0123456789ab.1"), "doc:0123456789ab.1");
     }
 
     #[test]
@@ -492,6 +1062,8 @@ mod tests {
             documented: Documented::Bin {
                 name: "my-app".into(),
             },
+            crate_name: "my_app".into(),
+            version: Version::new(0, 1, 0),
             target: Some(other),
         };
         let command = plan.command();
@@ -542,7 +1114,7 @@ mod tests {
             Some(PathBuf::from("/c/t/0123456789ab/build"))
         );
         assert_eq!(
-            plan.json("my_app"),
+            plan.json(),
             Path::new("/c/t/0123456789ab/target/aarch64-apple-darwin/doc/my_app.json")
         );
     }
@@ -557,6 +1129,8 @@ mod tests {
             target_dir: TargetDir(PathBuf::from("/c/t/0123456789ab")),
             package: PackageId("path+file:///ws/macros#0.1.0".into()),
             documented: Documented::Lib { proc_macro: true },
+            crate_name: "macros".into(),
+            version: Version::new(0, 1, 0),
             target: None,
         };
         let command = plan.command();
@@ -580,7 +1154,7 @@ mod tests {
             "rustup may install the project's toolchain online (decided in M2's D1)"
         );
         assert_eq!(
-            plan.json("macros"),
+            plan.json(),
             Path::new("/c/t/0123456789ab/target/doc/macros.json")
         );
     }

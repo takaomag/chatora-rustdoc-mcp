@@ -1,0 +1,3 @@
+[workspace]
+members = ["cdy", "cfgenv", "macros", "one", "same", "tool"]
+resolver = "2"

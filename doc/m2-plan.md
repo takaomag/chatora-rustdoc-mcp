@@ -652,6 +652,21 @@ Claude Code 2.1.304、Linux で測った。
 - 前提を渡さないレビュー (サブエージェント) で確信を持てる誤りは無かった。弱い指摘から、長すぎる値のテストを、ほかの名前に頼らず上限を超えるようにした。D2b への申し送り: `-p` に渡す package id は `cargo metadata` のもの。cargo 1.77 より前は別の形式 (`name ver (path+…)`) で、`-p` には渡せない。プロジェクトの toolchain が古いと、その cargo の `cargo metadata` はこの形式を出すので、D2b で `name@version` に直すか、確かめる
 - D1b の CI (a323f43) は、Windows の `dropping_a_child_stops_its_grandchildren` (PowerShell で起動する孫が 30 秒以内に pid を書かなかった) だけ落ち、その job の再実行で通った。B1 からあるテストで、D1b は Windows の子の起動に触れていないので、揺れとみる
 
+**D2b (ビルドを走らせて公開する。2026-10-21)**:
+
+- `build::build`: target dir のロック (`target:<名前>` を共有) と書き込みのロック (`doc:<名前>` を排他。決定 4) を取り、待つ間は `Activity::WaitingForLock` を知らせる。OS がロックできなければ、`Cache::lock` と同じくログに書いて進む。`cargo::run_building` で `Plan::command` を走らせ (子の記録に target dir を残す `child::spawn_building`)、stdout の JSON のメッセージを 1 行ずつ読む (`Child::output_streaming`。stdout は溜めない)
+  - `compiler-artifact`: 文書化する crate (package id と、lib なら lib の種類、bin なら名前と `bin`) の `features` を `features_effective` に。`fresh` でない unit の名前を `Built::rebuilt` に
+  - `compiler-message`: `error` の `rendered` を最初の 5 件まで、失敗の `BuildError::Failed` に (`classify` の `Failure` と stderr の末尾と一緒に)
+- 成功したら、出た JSON (`Plan::json`) を作業用ディレクトリ (呼ぶ側が渡す。D2c では `Owner::work_dirs`) に rename し、ここで 2 つのロックを手放す。読んで、根の item の名前・`crate_version`・(`--target` を渡し proc-macro でないときは) `target.triple` を `Plan` と照らし (違えば `NotTheCrate`)、`<cache>/local/<ワークスペースの 12 桁>/<package id の 12 桁>/<triple>/<lib か bin-名前>/<format>.json` に `.sha256` と一緒に書き、隣に `record.json` (`BuildRecord`: package id・crate 名・版・形式・target・toolchain (呼ぶ側が渡す `rustc -vV`)・サーバーが選んだ toolchain・`built_at`・`features_effective`・`RUSTC_BOOTSTRAP` が `1` だったか・SHA-256) を書く。書く間はその dir を `Cache::lock` で持つ
+- ロックの鍵 `target:<名前>`・`doc:<名前>` はテストで固定した (版の違うサーバーが同じ名前で見つけるため)
+- dep-info (`--emit=dep-info` の 2 回目の rustdoc) は D4 の鮮度で足す
+- fixture (a)・(e): `tests/fixtures/local-build` (member: 1 つの lib と feature と `RUSTC_BOOTSTRAP` を見る build.rs を持つ path 依存の `one`、同名の lib と bin の `same`、名前の違う lib (`tool_core`) と bin (`tool`) の `tool`、proc-macro の `macros`、build.rs が cfg と環境変数を設定し `one` と同じ path 依存を持つ `cfgenv`、cdylib だけの `cdy`)。`tests/local/local_build.rs` が隔離した子で、全部をビルドして公開し、中身 (private の item、build.rs の cfg と変数、proc-macro を `--target` 付きで、cdylib、同名の lib と bin は別々に公開)、`features_effective`、別の member (`cfgenv`) をビルドしても共有の依存を作り直さないこと、bin の後に同じパッケージの lib を 2 回ビルドできること、2 回目の `one` で作り直したのが `one` だけであること、作業用ディレクトリに何も残らないことを確かめる。この PC で 10 回のビルドを含めて 3.0 秒 (P7: 3 OS の普通の `cargo test` で走らせる)
+- 前提を渡さないレビュー (サブエージェント) の指摘と対応:
+  - 「bin を文書化すると同じパッケージの lib の HTML もでき、その後の lib の 2 回目は cargo が fresh とみなして rustdoc を走らせず JSON が出ない」: cargo 1.99.1 で実測すると起きなかった (bin → lib → lib の 3 回とも文書化する unit は `fresh: false` で JSON が出た。lib の 2 回目の前に HTML の dir は消えていた)。この順をテストに足し、版によって起きたときに分かるよう、文書化する unit が fresh で JSON が無いときは `BuildError::Fresh` にした
+  - 照合できる `compiler-artifact` が無かったとき `features_effective` が黙って空になっていた。`None` (不明) にした。cargo 1.77 より前の package id の形式 (`-p` に渡せない) は D2c で決める
+  - future が落ちても、ロックを rename の後まで持つように、guard をブロッキングのスレッドに渡して手放す (移動と読み込みと削除も 1 つのスレッドで行い、work に残さない)。公開の `Cache::lock` も同じ
+  - `Header::check` の単体テスト (根の ID が数値と文字列、版が無い・違う、別の crate、`--target` と proc-macro の例外) を足した。fixture の `one` の関数を crate 名と違う名前にした (根のモジュールの名前でも満たされていた)
+
 ### 6.6 M2e
 
 (まだ無い)

@@ -190,6 +190,37 @@ pub(super) async fn run_reporting(
         .map_err(RunError::NotStarted)
 }
 
+/// [`run_reporting`] for a build in `target_dir`, a target directory in the cache, which the
+/// child's record names (decided in M2's D2), handing each line of stdout, as cargo's JSON
+/// messages, to `on_message`. The stdout of the output is empty.
+///
+/// # Errors
+///
+/// Returns an error when cargo cannot be started or runs too long.
+pub(super) async fn run_building(
+    command: tokio::process::Command,
+    target_dir: &Path,
+    mut on_activity: impl FnMut(Activity) + Send,
+    on_message: impl FnMut(&str) + Send,
+) -> Result<Output, RunError> {
+    let child = child::spawn_building(command, target_dir)
+        .await
+        .map_err(RunError::NotStarted)?;
+    let mut activity = Activity::Running;
+    let output = child.output_streaming(on_message, |line| {
+        let now = activity_of(line);
+        if now != activity {
+            activity = now;
+            on_activity(now);
+        }
+    });
+    // Dropped on the timeout, or when the call is cancelled, which stops the whole group.
+    tokio::time::timeout(MAX_RUN_TIME, output)
+        .await
+        .map_err(|_elapsed| RunError::TimedOut)?
+        .map_err(RunError::NotStarted)
+}
+
 /// What a failed cargo command's `stderr` says about the failure.
 ///
 /// `offline` is whether cargo was offline: the server passed `--offline`, or the user's settings

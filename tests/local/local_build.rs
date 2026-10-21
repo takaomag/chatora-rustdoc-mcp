@@ -1,0 +1,196 @@
+//! The local build of a member's documentation (requirements R-WS-1, R-WS-6 and R-WS-8;
+//! `doc/m2-plan.md`, D2b): the members of `tests/fixtures/local-build` are built with
+//! `cargo rustdoc`, checked and published in the cache, and once built, a build runs again only
+//! the documented crate's rustdoc. The test runs in an isolated child, as the library starts
+//! cargo in the environment of its own process.
+
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+use chatora_rustdoc_mcp::data::{
+    build::{self, Bootstrap, Built, Documented, Plan, TargetDir},
+    cache::Cache,
+    metadata::{Metadata, Resolution, Resolver},
+    project,
+    target::{TargetTriple, host_target},
+};
+
+use crate::isolated::in_isolated_child;
+
+/// Copies the directory `from` into `to`.
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).expect("made");
+    for entry in fs::read_dir(from).expect("readable") {
+        let entry = entry.expect("readable");
+        let path = entry.path();
+        if path.is_dir() {
+            copy_dir(&path, &to.join(entry.file_name()));
+        } else {
+            fs::copy(&path, to.join(entry.file_name())).expect("copied");
+        }
+    }
+}
+
+/// The fixture's workspace in `dir`, with a Cargo.lock.
+fn workspace(dir: &Path) -> PathBuf {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/local-build");
+    let copy = dir.join("local-build");
+    copy_dir(&fixture, &copy);
+    let root = copy.join("ws");
+    let output = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("cargo runs");
+    assert!(output.status.success(), "{output:?}");
+    root
+}
+
+/// The names of the items of the published JSON.
+fn items(built: &Built) -> BTreeSet<String> {
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&built.json).expect("published")).expect("JSON");
+    json["index"]
+        .as_object()
+        .expect("an index")
+        .values()
+        .filter_map(|item| item["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The plan of the build of the member's crate `name`.
+fn plan(
+    metadata: &Metadata,
+    root: &Path,
+    cache: &Cache,
+    name: &str,
+    target: Option<TargetTriple>,
+) -> Plan {
+    let (package, documented) = build::member_crate(metadata, name).expect(name);
+    Plan {
+        root: root.to_path_buf(),
+        offline: true,
+        toolchain: None,
+        bootstrap: Bootstrap::of(metadata),
+        target_dir: TargetDir::of(cache.dir(), root),
+        package: package.id.clone(),
+        documented,
+        crate_name: name.into(),
+        version: package.version.clone(),
+        target,
+    }
+}
+
+#[tokio::test]
+async fn the_members_are_built_and_published() {
+    let Some(dir) = in_isolated_child("local_build::the_members_are_built_and_published") else {
+        return;
+    };
+    let root = workspace(&dir);
+    let workspace = project::workspace_of(&root).expect("a workspace");
+    let resolver = Resolver::new(true);
+    let resolution = resolver.resolve(&workspace).await.expect("resolved");
+    let Resolution::Metadata { metadata, .. } = &*resolution else {
+        panic!("cargo metadata works offline here: {resolution:?}");
+    };
+    let host = host_target(&dir).await.triple;
+    let cache = Cache::at(&dir.join("cache"));
+    let work = dir.join("cache/work/test");
+    let plan = |name: &str, target: Option<TargetTriple>| {
+        plan(metadata, &workspace.root, &cache, name, target)
+    };
+    let run = async |plan: &Plan| {
+        build::build(&cache, plan, &work, None, |_| {})
+            .await
+            .unwrap_or_else(|error| panic!("{}: {error:?}", plan.crate_name))
+    };
+
+    // A lib, with its private items and the features that cargo built it with.
+    let one = run(&plan("one", None)).await;
+    assert!(
+        items(&one).is_superset(&["answer".to_owned(), "private".to_owned()].into()),
+        "{:?}",
+        items(&one)
+    );
+    assert_eq!(one.record.crate_name.as_ref(), "one");
+    assert_eq!(one.record.crate_version.as_ref(), "0.1.0");
+    assert_eq!(one.record.target.as_deref(), Some(host.as_str()));
+    assert_eq!(
+        one.record.features_effective,
+        Some(vec!["default".into(), "extra".into()])
+    );
+    assert!(!one.record.bootstrap_all);
+    let dir_of = |built: &Built| built.json.parent().expect("a directory").to_path_buf();
+    assert!(dir_of(&one).join("record.json").is_file());
+    assert!(
+        dir_of(&one)
+            .join(format!("{}.json.sha256", one.record.format_version))
+            .is_file()
+    );
+
+    // The cfg and the variable of a build script. The dependency that it shares with `one`,
+    // whose build script watches `RUSTC_BOOTSTRAP`, is not built again: the value is that of
+    // the workspace, not of the member (requirement R-WS-8).
+    let cfgenv = run(&plan("cfgenv", None)).await;
+    assert!(
+        items(&cfgenv).is_superset(&["configured".to_owned(), "FROM_BUILD".to_owned()].into()),
+        "{:?}",
+        items(&cfgenv)
+    );
+    assert!(
+        cfgenv.rebuilt.iter().all(|unit| &**unit != "watcher"),
+        "{:?}",
+        cfgenv.rebuilt
+    );
+
+    // A proc-macro is built for the host, even with `--target`.
+    let macros = run(&plan("macros", Some(host.clone()))).await;
+    assert!(items(&macros).contains("same_tokens"));
+    assert_eq!(macros.record.target.as_deref(), Some(host.as_str()));
+
+    // A lib that is only a cdylib.
+    let cdy = run(&plan("cdy", None)).await;
+    assert!(items(&cdy).contains("exported"));
+
+    // A lib and a bin of the same name write the same file, and are published apart.
+    let lib = run(&plan("same", None)).await;
+    let mut bin_plan = plan("same", None);
+    bin_plan.documented = Documented::Bin {
+        name: "same".into(),
+    };
+    let bin = run(&bin_plan).await;
+    assert!(items(&lib).contains("from_lib") && !items(&lib).contains("from_bin"));
+    assert!(items(&bin).contains("from_bin"));
+    assert_ne!(lib.json, bin.json);
+    assert_eq!(lib.record.crate_version.as_ref(), "0.2.0");
+
+    // After the bin of a package, which documents its lib as HTML too, its lib is built and
+    // built again: cargo runs rustdoc every time (cargo 1.99.1).
+    let (package, documented) = build::member_crate(metadata, "tool").expect("tool");
+    assert_eq!(&*package.name, "tool");
+    assert!(matches!(documented, Documented::Bin { .. }));
+    let tool = run(&plan("tool", None)).await;
+    assert!(items(&tool).contains("main"));
+    for _ in 0..2 {
+        let core = run(&plan("tool_core", None)).await;
+        assert!(items(&core).contains("core_fn"));
+    }
+
+    // With the value fixed, only the documented crate is built again.
+    let again = run(&plan("one", None)).await;
+    assert_eq!(again.rebuilt, ["one".into()]);
+    assert_eq!(again.json, one.json);
+
+    // Nothing is left in the work directory.
+    let left: Vec<_> = fs::read_dir(&work)
+        .expect("the work directory")
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
