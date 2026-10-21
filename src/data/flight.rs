@@ -33,6 +33,8 @@ pub struct Flights<T> {
     /// With [`Self::handing_over`], the results of work that went on past a deadline, by key,
     /// with the number of their flight, for the next call (decided in M2's D2).
     left: Option<Arc<Left<T>>>,
+    /// Which of those results are handed over.
+    hands_over: fn(&T) -> bool,
     /// Numbers the flights.
     next: AtomicU64,
 }
@@ -43,8 +45,16 @@ impl<T> Flights<T> {
     /// and a call that comes after it would start it again (decided in M2's D2).
     #[must_use]
     pub fn handing_over() -> Self {
+        Self::handing_over_only(|_| true)
+    }
+
+    /// [`Self::handing_over`], for the results that `hands_over` tells only: the others, the next
+    /// call finds otherwise (decided in M2's D4).
+    #[must_use]
+    pub fn handing_over_only(hands_over: fn(&T) -> bool) -> Self {
         Self {
             left: Some(Arc::default()),
+            hands_over,
             ..Self::default()
         }
     }
@@ -55,6 +65,7 @@ impl<T> Default for Flights<T> {
         Self {
             flying: parking_lot::Mutex::new(HashMap::new()),
             left: None,
+            hands_over: |_| false,
             next: AtomicU64::new(0),
         }
     }
@@ -289,6 +300,7 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
         let work = start(Arc::clone(&stage));
         let left_going = Arc::new(AtomicBool::new(false));
         let number = self.next.fetch_add(1, Ordering::Relaxed);
+        let hands_over = self.hands_over;
         let handing = self
             .left
             .as_ref()
@@ -302,6 +314,7 @@ impl<T: Clone + Send + Sync + 'static> Flights<T> {
                 // Before it is sent, so that a call that has it forgets it.
                 if let Some((left, left_going, key)) = handing
                     && left_going.load(Ordering::Relaxed)
+                    && hands_over(&result)
                 {
                     left.lock().insert(key, (number, result.clone()));
                 }
@@ -424,19 +437,25 @@ mod tests {
 
     #[tokio::test]
     async fn without_handing_over_a_call_after_the_work_runs_it_again() {
-        let flights = Arc::new(Flights::default());
-        let (runs, go) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
-        let first = flights
-            .join("key", "work", soon(), |_| work(&runs, &go))
-            .await;
-        assert!(matches!(first, Joined::Going(_)), "{first:?}");
-        go.notify_waiters();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let second = join_later(&flights, &runs, &go);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        go.notify_waiters();
-        assert_eq!(second.await.expect("joined"), Joined::Done(7));
-        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        // Nothing handed over, or not this result.
+        for flights in [
+            Flights::default(),
+            Flights::handing_over_only(|&result| result != 7),
+        ] {
+            let flights = Arc::new(flights);
+            let (runs, go) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
+            let first = flights
+                .join("key", "work", soon(), |_| work(&runs, &go))
+                .await;
+            assert!(matches!(first, Joined::Going(_)), "{first:?}");
+            go.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let second = join_later(&flights, &runs, &go);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            go.notify_waiters();
+            assert_eq!(second.await.expect("joined"), Joined::Done(7));
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
+        }
     }
 
     #[tokio::test]

@@ -355,6 +355,15 @@ impl Resolver {
         self.inner.cargo_home.as_deref()
     }
 
+    /// The files that `cargo metadata` of the workspace at `root`, which `metadata` tells, reads:
+    /// Cargo.lock, the manifests of the packages that are not from a registry or git, the cargo
+    /// settings with what they include, and `rust-toolchain` (requirement R-WS-4): what a member's
+    /// build is made from besides its sources (decided in M2's D4). They may not exist.
+    pub async fn input_files(&self, root: &Path, metadata: &Metadata) -> Vec<PathBuf> {
+        let files = self.inner.input_files(root, Some(metadata));
+        with_included(files, root, self.inner.cargo_home.clone()).await
+    }
+
     /// Whether cargo is offline in the project at `root`: run with `--offline`, or with
     /// `net.offline` in the user's cargo settings (requirement R-WS-7).
     pub async fn offline_in(&self, root: &Path) -> bool {

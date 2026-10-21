@@ -724,8 +724,32 @@ fn json_format(file_name: &OsStr) -> Option<u32> {
 /// The SHA-256 of `contents`, in lowercase hex.
 #[must_use]
 pub fn sha256_hex(contents: &[u8]) -> String {
-    let mut hex = String::with_capacity(64);
-    for byte in Sha256::digest(contents) {
+    hex(&Sha256::digest(contents))
+}
+
+/// The SHA-256 of what `reader` reads, in lowercase hex, read a piece at a time.
+///
+/// # Errors
+///
+/// Returns an error when it cannot be read.
+pub fn sha256_hex_read(mut reader: impl io::Read) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut piece = vec![0; 64 * 1024];
+    loop {
+        match reader.read(&mut piece) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(piece.get(..read).unwrap_or_default()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// `bytes` in lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
         for nibble in [byte >> 4, byte & 0xf] {
             hex.extend(char::from_digit(u32::from(nibble), 16));
         }

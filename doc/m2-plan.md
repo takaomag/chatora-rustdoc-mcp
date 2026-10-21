@@ -801,6 +801,62 @@ Claude Code 2.1.304、Linux で測った。
 - テスト: `rustdoc-args` しか書いていない member (`argsonly`) は通常の組で、warning が無く、`--cfg` は効く。`clash` は「`--cfg docsrs` なしで」の warning が無い。`wide` の `features_requested` は通常の組
 - 残したもの: 記憶の鍵に docs.rs の組と `cfgs` を入れること (`[package.metadata.docs.rs]` を書き換えても、プロセスの間は前の記憶が効く)。鍵は決めたとおり package id と toolchain のままで、内容のダイジェストを鍵にディスクへ残すのは D4 で決める
 
+**D4 の下調べと決定 (2026-10-21)**:
+
+- 下調べ (サブエージェント、読むだけ): R-WS-4 は鍵に入れるものを列挙している (各 target の `src_path` の部分木・build.rs・Cargo.toml・Cargo.lock・cargo の設定 (`include` も)・path 依存のソース・features と rustdoc の引数・`RUSTC_BOOTSTRAP` の値・target・使った toolchain の `rustc -vV`・ビルドに効く環境変数)。鍵はビルドの前に取り、dep-info で分かったファイルを後で足し、ビルドの前より新しい mtime のファイルがあれば次は鮮度切れ。mtime は一次の絞り込みだけ。dep-info は同じ引数に `--emit=dep-info` を足した 2 回目の rustdoc (`<doc dir>/<crate>.d`。JSON は書かない。`cargo check` の `.d` は `#[cfg(docsrs)]` だけで読むファイルを落とす)。作り直しの間は前回の成功を `stale: true`・`stale_reason: rebuilding`・`built_at` 付きで、失敗は `build_failed` (R-WS-7)。M0 の B5: dep-info は `include_str!`・`#[path]`・OUT_DIR の生成物と `# env-dep:` を出す。build.rs 自身と、build.rs が `rerun-if-changed` で読むファイルは出ない。使い回せるもの: `cargo metadata` の鮮度の入力 (`metadata::input_files`・`with_included`)、`cargo_config::CargoConfig::files`、`Plan`、`archive_of`
+- 利用者が 1 件ずつ決めたこと:
+  1. 鍵は計画した入力 (docs.rs の組・通常の組・`--cfg docsrs` の設定・`rustdoc-args` の cfg など、ビルドの前に分かるもの) で作る (Q-31)。実際に使ったものは記録に残す
+  2. 各ファイルは (パス・大きさ・mtime・SHA-256) を記録し、大きさか mtime が違うものだけ読み直して内容を比べる。記録の時刻に近い mtime のものは常に読み直す (粒度の粗いファイルシステムのため)
+  3. dep-info の 2 回目の rustdoc は、JSON を公開した後、同じ共有の仕事の中で `doc:` のロックと枠を取り直して走らせ、記録に足す
+  4. ソースが変わって作り直すときは、`build.wait_secs` まで待ち、間に合わなければ同じ crate の前回成功した JSON を `stale: true`・`stale_reason: rebuilding`・`retry_after_secs`・`built_at` 付きで返し、LSP で確かめるよう案内する。前回が無ければ `status: building`
+  5. 置き場は今のまま (crate ごとに 1 つ)、鍵と入力の一覧は記録に
+  6. `--cfg docsrs` や docs.rs の組で壊れた記録は、鍵 (内容のダイジェスト) と toolchain でディスクに残す (`refresh` (D5) で消せる形)。プロセスの中の記憶は外す
+  7. ローカルビルドの `Flights::handing_over` はやめ、ディスクの鮮度の判定に任せる (仕組みは残す)
+  8. 環境変数は、`RUSTFLAGS`・`RUSTDOCFLAGS`・`CARGO_ENCODED_RUSTFLAGS`・`CARGO_ENCODED_RUSTDOCFLAGS`・`RUSTC`・`RUSTDOC`・`RUSTC_WRAPPER`・`RUSTC_WORKSPACE_WRAPPER` と、`CARGO_BUILD_*`・`CARGO_TARGET_*`・`CARGO_PROFILE_*`・`CARGO_UNSTABLE_*`。build.rs が読む変数は dep-info の `env-dep` で入る
+  9. ソースは部分木をたどり、dep-info のファイルも足す。target・`.git`・`.claude/worktrees`・入れ子のワークスペースはたどらない
+  10. たどるのは member の Cargo.toml のあるディレクトリ全体 (入れ子のパッケージは除く): パッケージの中の build.rs の入力 (`proto/` など) も拾う
+- 聞かずに決めたこと: LSP の案内は stale の応答に付ける (R-WS-9)。記録の形式の版はパスに (`local/v1/`。C1 の決定)。D4 は member だけで、依存の鍵に足すもの (取得元・依存の部分木・`[source]`・`[patch]`) は D7。確かめるのは呼び出しのたび (要件に TTL は無い)。`--emit=dep-info` を受け付けない toolchain では dep-info なしで進める (パッケージ全体をたどるので足りる)
+- D4 は 4 つに分ける: D4a (鍵と鮮度が合えばビルドしない近道、記録の v1、パッケージのたどり方、`handing_over` をやめる)、D4b (dep-info)、D4c (作り直しの間の stale の応答と LSP の案内とスキーマ)、D4d (壊れた記録をディスクに、時間の測定、Claude Code での試し)
+
+**D4a (鮮度の鍵と近道。2026-10-21)**:
+
+- `data::freshness`: 鍵に入れるファイルを集め (`collect`)、(パス・大きさ・mtime・SHA-256) を記録する。前回の記録と大きさか mtime が違うファイル、または取った時刻に近い (3 秒以内) mtime のファイルだけ読み直す (決定 2)。鍵 (`key`) は計画の項目 (`Plan::facts`) とファイルの (パス, SHA-256) の SHA-256。5 万ファイルを超えたら鮮度を保たない (毎回ビルド)
+- 集めるもの: `cargo metadata` の鮮度の入力 (Cargo.lock・path のパッケージのマニフェスト・cargo の設定と `include`・`rust-toolchain`。`Resolver::input_files`) と、member と、それが通常の依存かビルドの依存としてたどる path のパッケージのディレクトリ (`build::source_dirs`)
+- 実測で決め直したこと: 決定 10 (パッケージのディレクトリ全体) のまま、このリポジトリで試すと、`poc/m0b/work` (`.gitignore` で無視、9.3 GB、cargo の build dir) まで読んで、入力が 30,109 ファイル・11 GB になり、初回 288 秒、2 回目から 0.6 秒だった。利用者の決定で、git の作業ツリーの中では `git ls-files --cached --others --exclude-standard` (追跡中と、無視されていない未追跡) で集める (`freshness::sources`。`core.fsmonitor=false`・`GIT_OPTIONAL_LOCKS=0`)。git の外ではたどり、`CACHEDIR.TAG` のあるディレクトリも除く。どちらも `target`・`.git`・`.claude`・入れ子のパッケージは除く。直した後は入力が 193 ファイル・3.8 MB、作り直しの 1 回目 8.7 秒、鮮度が合えば 0.0〜0.1 秒 (D4a の前は温まっても 4〜5 秒)
+- `Plan::facts`: package id・マニフェスト・lib か bin・`rustc -vV`・サーバーが選んだ toolchain・`RUSTC_BOOTSTRAP` の値の SHA-256・`--target`・`--cfg docsrs` の設定・`rustdoc-args` の cfg・通常の組・docs.rs の組・環境変数 (決定 8 の一覧の SHA-256。プロセスで 1 回)。計画した入力で、再試行で変わる前 (決定 1)
+- 記録 v1: 置き場を `local/v1/…` に (C1 の決定のとおり版をパスに)。`BuildRecord` に `key`・`inputs`・`warnings` (再試行で出た warning。鮮度が合って飛ばしたときも同じものを返す) を足した (`#[serde(default)]`)
+- `query::local::Builder::fresh`: toolchain を確かめて `--target` を決めた後、ビルドの前に鍵を求め、前回の記録の鍵と同じで JSON があれば、ビルドせずに返す (枠もロックも取らない)。host が分からないとき (ビルドの中で toolchain を入れるとき) は近道しない。ビルドの再試行はどれも同じ鍵と入力を記録に書く
+- ローカルビルドの `Flights` は `handing_over` をやめ、鍵の無いビルドだけを渡す (`Flights::handing_over_only`・`query::local::hands_over`)。決定 7 の帰結として、鍵を取れない member (5 万ファイル超など) は、ビルドが `build.wait_secs` を超えるたびに作り直し、`status: building` から抜けなくなるため (レビューの指摘)
+- テスト: `freshness` の集め方 (除くもの)・鍵 (同じなら同じ、計画か編集で変わる)・時刻が近いときの読み直し。隔離した子で、編集しなければ作り直さず (`inputs.taken_at` が変わらない)、member のソース・パッケージの中の `proto/a.proto`・ワークスペースの外の path 依存のソースを編集すると作り直す。git の作業ツリーで、追跡中と未追跡が入り、無視したもの・`target`・入れ子のパッケージは入らず、git の外はたどる側に回る
+- レビューで直したこと:
+  - 古いビルドを新しいとして返していたもの:
+    - `target` と `.claude` を除くのはパッケージの直下だけにした (`src/target/mod.rs` を拾う。`cc` に実例がある)。`.git` はどの深さでも除く。
+    - git の一覧にパッケージの `Cargo.toml` が無ければ (パッケージごと git に無視されている)、たどる側に回す。
+    - git がディレクトリとして挙げるもの (サブモジュール・入れ子のリポジトリ・ディレクトリへの symlink) はたどる。
+    - たどるときは symlink を追う。ディレクトリへのものは実体のパスで 1 回だけたどる。
+  - 鍵が取れなくなっていたもの:
+    - たどった先の読めないディレクトリと、名前が UTF-8 でないファイルは、ログに残して飛ばす。読めないのが member のディレクトリ自体のときだけ、鍵を取らない。
+  - `Plan::facts` を直した:
+    - サーバーの版を入れた (更新でコマンドが変わっても、前の JSON を新しいとしない)。
+    - proc-macro では target を入れない (target を変えて交互に頼んでも作り直さない)。
+    - 環境変数から、サーバーが上書きする `CARGO_TARGET_DIR`・`CARGO_BUILD_TARGET_DIR`・`CARGO_BUILD_BUILD_DIR` と、出力に効かない `CARGO_BUILD_JOBS` を除いた。
+  - 記録の書き直し (`Built::write_record`) を変えた:
+    - 公開と同じロックの下で行う。
+    - JSON の隣の `.sha256` が自分の `sha256` と同じときだけ書く。
+    - `build::published` も `.sha256` と記録の `sha256` を照合し、違えば作り直す側に回す。別のプロセスが公開した JSON に、自分の記録が重なるのを防ぐため。
+  - SHA-256 はファイル全体を読み込まずに、少しずつ読んで取る (`cache::sha256_hex_read`)。
+- 残したもの:
+  - `rustc -vV` は 60 秒覚える (`tool::output_kept`)。`rustup update` の後 60 秒の間は、前の toolchain のビルドを新しいとしうる。
+  - パッケージの外のファイル (`include_str!("../../README.md")` など) と `env!` は D4b (dep-info) まで拾わない。
+  - git が無視するファイルを build.rs が読む場合は、D4b の後も拾わない。
+  - ビルドの間にファイルの mtime が戻されて、大きさも同じ場合は拾わない (決定 2 の帰結)。
+
+**D4b の下調べ (2026-10-21)**:
+
+- `--emit=dep-info` は書き先を指定しないと、古い nightly (2025-10-10) が cwd (= 利用者のワークスペースのルート) に `<crate>.d` を書く。`--emit=dep-info=<work dir のパス>` なら、stable と nightly (2025-10・2026-06・今) のどれも指定先にだけ書き、JSON は書かない
+- `.d` は絶対パスで、`include_str!`・`#[path]`・OUT_DIR の生成物・パッケージの外のファイル・`#[cfg(docsrs)]` だけで読むファイル (`--cfg docsrs` を渡したとき) を挙げる。`# env-dep:NAME[=値]` の行もある (値が無ければ変数が無い)
+- このリポジトリで dep-info の 2 回目の rustdoc は 5.57 秒 (`.d` は 92 行)
+
 ### 6.6 M2e
 
 (まだ無い)

@@ -19,6 +19,7 @@ use crate::data::{
     cache::{self, Cache},
     cargo::Failure,
     flight::{Doing, Flights, Joined, Stage},
+    freshness,
     owner::Owner,
     rustdoc_json,
     target::TargetTriple,
@@ -43,6 +44,12 @@ pub struct LocalWanted {
     pub docs_rs_features: Option<Vec<Box<str>>>,
     /// What the response warns about how the build was planned.
     pub warnings: Vec<Box<str>>,
+    /// The files that the build is made from, which may not exist: the workspace's manifests,
+    /// Cargo.lock and the cargo settings (requirement R-WS-4, decided in M2's D4).
+    pub input_files: Vec<PathBuf>,
+    /// The directories of the member and of the path dependencies that it builds with, whose
+    /// files the build is made from.
+    pub input_dirs: Vec<PathBuf>,
 }
 
 /// The archive of a member's build, and its record.
@@ -88,15 +95,21 @@ pub enum LocalError {
 /// The build of a member for the calls that wanted it at once, or why there is none.
 pub type SharedLocal = Result<Arc<LocalBuilt>, Arc<LocalError>>;
 
+/// Whether a member's build that went on past a deadline is handed to the next call for it: only
+/// a build without a key, which the next call cannot find fresh, and would make again (decided in
+/// M2's D4).
+#[must_use]
+pub fn hands_over(built: &SharedLocal) -> bool {
+    built.as_ref().is_ok_and(|built| built.record.key.is_none())
+}
+
 /// The archive of the member's crate that `wanted` names, built and archived by work that the
 /// calls for it share (requirements R-WS-6 and R-NW-2).
 ///
 /// A call waits for the work until `until`. The work then goes on, and [`Joined::Going`] says what
-/// it is doing (requirements R-ARCH-6 and R-OUT-9). Until D4 tells whether the sources changed,
-/// every call that does not join one builds again (decided in M2's D2): cargo runs only the
-/// documented crate's rustdoc then. So that a crate whose rustdoc takes longer than a call waits
-/// is answered, `flights` are [`Flights::handing_over`]: the next call has the result of a build
-/// that went on.
+/// it is doing (requirements R-ARCH-6 and R-OUT-9). A build that is fresh, as its key tells, is
+/// not made again (requirement R-WS-4, decided in M2's D4): a build that went on is found so by
+/// the next call, or handed to it, when it has no key ([`hands_over`]).
 pub async fn local_archive(
     flights: &Flights<SharedLocal>,
     cache: &Cache,
@@ -146,6 +159,8 @@ async fn build_and_archive(
         cargo_home,
         docs_rs_features,
         mut warnings,
+        input_files,
+        input_dirs,
     } = wanted;
     let root = plan.root.clone();
     let programs = Programs::this();
@@ -170,6 +185,8 @@ async fn build_and_archive(
     let (cfg_docsrs, features) = (plan.cfg_docsrs, plan.features.clone());
     let builder = Builder {
         cache,
+        input_files: &input_files,
+        input_dirs: &input_dirs,
         rustc: &rustc,
         target: &target,
         project_sets_target,
@@ -180,7 +197,7 @@ async fn build_and_archive(
     let planned = warnings.len();
     let built = builder.build(&mut plan, installs, &mut warnings).await;
     let mut built = if installs {
-        after_install(&rustc, &root, &target, built).await?
+        after_install(cache, &rustc, &root, &target, built).await?
     } else {
         built?
     };
@@ -209,8 +226,9 @@ async fn build_and_archive(
 /// After a build in which cargo was to install the project's toolchain: what rustup said of it
 /// before is forgotten, and it is checked now (decided in M2's D2). A failed build of a toolchain
 /// that is still missing, or lacks the target, is told as that; a build is recorded with the
-/// toolchain.
+/// toolchain, in `cache`.
 async fn after_install(
+    cache: &Cache,
     rustc: &Path,
     root: &Path,
     target: &TargetTriple,
@@ -222,7 +240,7 @@ async fn after_install(
         (Err(LocalError::Build(_)), Err(missing)) => Err(LocalError::Missing(missing)),
         (Ok(mut built), Ok(checked)) => {
             built.record.toolchain = checked.toolchain.map(Into::into);
-            if let Err(error) = built.write_record() {
+            if let Err(error) = built.write_record(cache).await {
                 tracing::warn!(%error, "the record of a build could not be written again");
             }
             Ok(built)
@@ -234,6 +252,10 @@ async fn after_install(
 /// What the builds of a member are made with.
 struct Builder<'a> {
     cache: &'a Cache,
+    /// The files that the member's build is made from, and the directories of them (decided in
+    /// M2's D4).
+    input_files: &'a [PathBuf],
+    input_dirs: &'a [PathBuf],
     rustc: &'a Path,
     /// The target asked for.
     target: &'a TargetTriple,
@@ -274,14 +296,38 @@ impl Builder<'_> {
                 .map_err(LocalError::Missing)?,
             )
         };
-        let host = checked.as_ref().and_then(|checked| checked.host.as_ref());
-        plan.target = build::passes_target(self.target, host, self.project_sets_target)
+        let host = checked.as_ref().and_then(|checked| checked.host.clone());
+        plan.target = build::passes_target(self.target, host.as_ref(), self.project_sets_target)
             .then(|| self.target.clone());
         let toolchain = checked.and_then(|checked| checked.toolchain);
+        // A build that is fresh is not made again (requirement R-WS-4, decided in M2's D4).
+        let fresh = match self.fresh(plan, host.as_ref(), toolchain.as_deref()).await {
+            Freshness::Fresh(built) => {
+                warnings.extend(built.record.warnings.iter().cloned());
+                return Ok(*built);
+            },
+            Freshness::Stale(fresh) => fresh,
+        };
+        self.tries(plan, toolchain.as_deref(), fresh.as_ref(), warnings)
+            .await
+    }
+
+    /// The build of `plan`, as [`Self::build`] tries it, with the toolchain that `rustc -vV`
+    /// tells, `toolchain`, and the key and inputs `fresh`, for its record.
+    async fn tries(
+        &self,
+        plan: &mut Plan,
+        toolchain: Option<&str>,
+        fresh: Option<&build::Fresh>,
+        warnings: &mut Vec<Box<str>>,
+    ) -> Result<Built, LocalError> {
+        let told = warnings.len();
         // With the toolchain that built it: the one that rustc tells, if it did.
         let key = (
             plan.package.0.clone(),
-            toolchain.clone().or_else(|| plan.toolchain.clone()),
+            toolchain
+                .map(str::to_owned)
+                .or_else(|| plan.toolchain.clone()),
         );
         if plan.cfg_docsrs && DOCSRS_BROKE.lock().contains(&key) {
             plan.cfg_docsrs = false;
@@ -297,7 +343,7 @@ impl Builder<'_> {
         }
         let mut tell = |doing| self.stage.set(doing);
         let mut built =
-            build::build(self.cache, plan, self.work, toolchain.as_deref(), &mut tell).await;
+            build::build(self.cache, plan, self.work, toolchain, fresh, &mut tell).await;
         // Only the documented crate's rustdoc has it, so only its errors may be of it.
         if matches!(
             built,
@@ -309,8 +355,7 @@ impl Builder<'_> {
         {
             tracing::info!(package = %plan.package.0, "the build failed with --cfg docsrs, so it is tried without");
             plan.cfg_docsrs = false;
-            built =
-                build::build(self.cache, plan, self.work, toolchain.as_deref(), &mut tell).await;
+            built = build::build(self.cache, plan, self.work, toolchain, fresh, &mut tell).await;
             if built.is_ok() {
                 DOCSRS_BROKE.lock().insert(key.clone());
             }
@@ -329,8 +374,7 @@ impl Builder<'_> {
             tracing::info!(package = %plan.package.0, "the build failed with the features of [package.metadata.docs.rs], so it is tried with the project's");
             // With `--cfg docsrs` as it began, which did not break it: it failed without it too.
             (plan.features, plan.cfg_docsrs) = (projects, cfg_docsrs);
-            built =
-                build::build(self.cache, plan, self.work, toolchain.as_deref(), &mut tell).await;
+            built = build::build(self.cache, plan, self.work, toolchain, fresh, &mut tell).await;
             if built.is_ok() {
                 DOCS_RS_FEATURES_BROKE.lock().insert(key);
                 warnings.push(DOCS_RS_FEATURES_BROKE_IT.into());
@@ -342,8 +386,81 @@ impl Builder<'_> {
                     .into(),
             );
         }
-        built.map_err(LocalError::Build)
+        let mut built = built.map_err(LocalError::Build)?;
+        // For the builds that find it fresh.
+        built.record.warnings = warnings.get(told..).unwrap_or_default().to_vec();
+        if let Err(error) = built.write_record(self.cache).await {
+            tracing::warn!(%error, "the record of a build could not be written again");
+        }
+        Ok(built)
     }
+
+    /// The build of `plan` published before, if it is fresh: its key, of what it is made from
+    /// as `plan` asks and as its files are now, is the one in its record. Else the key and the
+    /// inputs of the build to make, if they could be taken. `host` is the host of the toolchain,
+    /// whose `rustc -vV` is `toolchain`; without it, the build is made.
+    async fn fresh(
+        &self,
+        plan: &Plan,
+        host: Option<&TargetTriple>,
+        toolchain: Option<&str>,
+    ) -> Freshness {
+        let Some(host) = host else {
+            return Freshness::Stale(None);
+        };
+        // Where the JSON tells it is for: the host's for a proc-macro.
+        let target = if plan.is_proc_macro() {
+            host
+        } else {
+            plan.target.as_ref().unwrap_or(host)
+        };
+        let dir = plan.published_dir(self.cache.dir(), Some(target));
+        let facts = plan.facts(toolchain, self.docs_rs);
+        let (listed, dirs) = freshness::sources(self.input_dirs).await;
+        let files = [self.input_files, &listed].concat();
+        let found = crate::task::spawn_blocking(move || {
+            let before = build::published(&dir);
+            let inputs = freshness::collect(
+                &files,
+                &dirs,
+                before
+                    .as_ref()
+                    .and_then(|before| before.record.inputs.as_ref()),
+            );
+            (before, inputs)
+        })
+        .await;
+        let (before, inputs) = match found {
+            Ok((before, Ok(inputs))) => (before, inputs),
+            Ok((_, Err(error))) => {
+                tracing::warn!(%error, "what a build is made from could not be read, so it is made again each time");
+                return Freshness::Stale(None);
+            },
+            Err(error) => {
+                let error = crate::task::resume_if_panic(error);
+                tracing::debug!(%error, "the check of a build was stopped");
+                return Freshness::Stale(None);
+            },
+        };
+        let key = freshness::key(&inputs, &facts);
+        match before {
+            Some(before) if before.record.key.as_deref() == Some(key.as_str()) => {
+                Freshness::Fresh(Box::new(before))
+            },
+            _ => Freshness::Stale(Some(build::Fresh {
+                key: key.into(),
+                inputs,
+            })),
+        }
+    }
+}
+
+/// Whether a build is fresh.
+enum Freshness {
+    /// It is, as published.
+    Fresh(Box<Built>),
+    /// It is to be made, with this key and these inputs, if they could be taken.
+    Stale(Option<build::Fresh>),
 }
 
 /// What the response warns about a member built with the project's features, as the features

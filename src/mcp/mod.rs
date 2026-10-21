@@ -270,7 +270,7 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
             // cargo runs with `--offline` in offline mode (requirement R-CA-7).
             resolver: Resolver::new(network.offline),
             #[cfg(feature = "local")]
-            locals: Flights::handing_over(),
+            locals: Flights::handing_over_only(crate::query::local::hands_over),
             calls: tool::CallLimit::from_settings(settings),
             wait,
             #[cfg(feature = "local")]

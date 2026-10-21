@@ -96,9 +96,9 @@ pub(super) struct ToolState {
     /// Resolves the packages of projects with `cargo metadata` (requirement R-VR-2).
     #[cfg(feature = "local")]
     pub(super) resolver: Resolver,
-    /// The builds of workspace members, shared by the calls that want them at once, and handed
-    /// to the next call when they went on past a deadline (requirement R-WS-6, decided in M2's
-    /// D2).
+    /// The builds of workspace members, shared by the calls that want them at once (requirement
+    /// R-WS-6, decided in M2's D2). A build that went on past a deadline is found fresh by the
+    /// next call, or handed to it when it has no key (decided in M2's D4).
     #[cfg(feature = "local")]
     pub(super) locals: Flights<crate::query::local::SharedLocal>,
     /// The calls being handled, at most `limits.concurrent_calls` (requirement R-SEC-7).

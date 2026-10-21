@@ -11,6 +11,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
+        LazyLock,
         OnceLock,
         atomic::{AtomicU64, Ordering},
     },
@@ -24,6 +25,7 @@ use super::{
     cache::{self, Cache},
     cargo::{Failure, RunError, classify, run_building, stderr_tail},
     flight::Doing,
+    freshness::Inputs,
     metadata::{Metadata, Package, PackageId, Target},
     process_lock::{self, LockMode, ProcessLock},
     target::TargetTriple,
@@ -415,6 +417,50 @@ pub fn declared_features<'a>(
         .collect()
 }
 
+/// The directories whose files the build of `package` is made from (requirement R-WS-4, decided
+/// in M2's D4).
+///
+/// They are its own and those of the packages that are not from a registry or git (path
+/// dependencies, members) that it builds with, as normal or build dependencies, through others
+/// too.
+#[must_use]
+pub fn source_dirs(metadata: &Metadata, package: &Package) -> Vec<PathBuf> {
+    let nodes: HashMap<&PackageId, &super::metadata::Node> = metadata
+        .resolve
+        .iter()
+        .flat_map(|resolve| &resolve.nodes)
+        .map(|node| (&node.id, node))
+        .collect();
+    let packages: HashMap<&PackageId, &Package> = metadata
+        .packages
+        .iter()
+        .map(|package| (&package.id, package))
+        .collect();
+    let mut seen: HashSet<&PackageId> = HashSet::from([&package.id]);
+    let mut next = vec![&package.id];
+    let mut dirs = Vec::new();
+    while let Some(id) = next.pop() {
+        if let Some(found) = packages.get(id)
+            && found.source.is_none()
+            && let Some(dir) = found.manifest_path.parent()
+        {
+            dirs.push(dir.to_path_buf());
+        }
+        for dependency in nodes.get(id).into_iter().flat_map(|node| &node.deps) {
+            let built = dependency
+                .dep_kinds
+                .iter()
+                .any(|kind| kind.kind.as_deref() != Some("dev"));
+            if built && seen.insert(&dependency.pkg) {
+                next.push(&dependency.pkg);
+            }
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 /// The member of `metadata` that is the package `name` at `version`.
 #[must_use]
 pub fn member_package<'a>(
@@ -559,13 +605,16 @@ impl Plan {
     }
 
     /// Whether the crate is a proc-macro, which is built for the host.
-    const fn is_proc_macro(&self) -> bool {
+    #[must_use]
+    pub const fn is_proc_macro(&self) -> bool {
         matches!(self.documented, Documented::Lib { proc_macro: true })
     }
 
-    /// The directory that the build is published in, until D4 (decided in M2's D2): `local/<the
-    /// workspace's hash>/<the package id's hash>/<target>/<lib, or bin-<name>>` in the cache.
-    fn published_dir(&self, cache: &Path, target: Option<&TargetTriple>) -> PathBuf {
+    /// The directory that the build for `target` is published in (decided in M2's D2 and D4):
+    /// `local/v<format>/<the workspace's hash>/<the package id's hash>/<target>/<lib, or
+    /// bin-<name>>` in the cache. One build is kept there: the last.
+    #[must_use]
+    pub fn published_dir(&self, cache: &Path, target: Option<&TargetTriple>) -> PathBuf {
         let package = cache::sha256_hex(self.package.0.as_bytes());
         let package = package.get(..HASH_DIGITS).unwrap_or(&package);
         let target = target.map_or("_unknown", TargetTriple::as_str);
@@ -575,15 +624,123 @@ impl Plan {
         };
         cache
             .join(LOCAL_DIR)
+            .join(format!("v{RECORD_FORMAT}"))
             .join(workspace_hash(&self.root))
             .join(package)
             .join(target)
             .join(documented)
     }
+
+    /// What the build is made from besides its files, in one text, for its key (requirement
+    /// R-WS-4, decided in M2's D4): this server's version, which builds it, the plan as it is
+    /// asked for, before the tries change it, `toolchain` as `rustc -vV` tells it, the features
+    /// of `[package.metadata.docs.rs]` to try first, and the variables of the environment that
+    /// cargo and rustc read. A proc-macro is built for the host, whatever the target.
+    #[must_use]
+    pub fn facts(&self, toolchain: Option<&str>, docs_rs: Option<&[Box<str>]>) -> String {
+        let target = self.target.as_ref().filter(|_| !self.is_proc_macro());
+        let facts = serde_json::json!({
+            "server": env!("CARGO_PKG_VERSION"),
+            "package": self.package.0,
+            "manifest": self.manifest,
+            "documented": match &self.documented {
+                Documented::Lib { proc_macro } => format!("lib {proc_macro}"),
+                Documented::Bin { name } => format!("bin {name}"),
+            },
+            "toolchain": toolchain,
+            "chosen_toolchain": self.toolchain,
+            "bootstrap": cache::sha256_hex(self.bootstrap.value().as_bytes()),
+            "target": target.map(TargetTriple::as_str),
+            "cfg_docsrs": self.cfg_docsrs,
+            "cfgs": self.cfgs,
+            "features": self.features,
+            "docs_rs_features": docs_rs,
+            "environment": *ENVIRONMENT,
+        });
+        facts.to_string()
+    }
 }
 
-/// The directory of the published builds, in the cache, until D4 (decided in M2's D2).
+/// The digest of the variables of the environment that cargo and rustc read, as this process,
+/// which runs them, has them (decided in M2's D4), but those that the build sets, or that do not
+/// change what it makes. Those that build scripts read are in the dep-info of the build.
+static ENVIRONMENT: LazyLock<String> = LazyLock::new(|| {
+    const NAMES: &[&str] = &[
+        "RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_ENCODED_RUSTDOCFLAGS",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+    ];
+    const PREFIXES: &[&str] = &[
+        "CARGO_BUILD_",
+        "CARGO_TARGET_",
+        "CARGO_PROFILE_",
+        "CARGO_UNSTABLE_",
+    ];
+    const NOT: &[&str] = &[
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_TARGET_DIR",
+        "CARGO_BUILD_BUILD_DIR",
+        "CARGO_BUILD_JOBS",
+    ];
+    let mut read: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            ((NAMES.contains(&name.as_str())
+                || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+                && !NOT.contains(&name.as_str()))
+            .then(|| (name, value.to_string_lossy().into_owned()))
+        })
+        .collect();
+    read.sort();
+    let mut text = String::new();
+    for (name, value) in read {
+        text.push_str(&name);
+        text.push('=');
+        text.push_str(&value);
+        text.push('\n');
+    }
+    cache::sha256_hex(text.as_bytes())
+});
+
+/// The directory of the published builds, in the cache (decided in M2's D2).
 pub const LOCAL_DIR: &str = "local";
+
+/// The format of the records of the published builds, which their path has (decided in C1 and
+/// M2's D4).
+const RECORD_FORMAT: u32 = 1;
+
+/// The key and the inputs of a build, taken before it (requirement R-WS-4, decided in M2's D4).
+#[derive(Debug, Clone)]
+pub struct Fresh {
+    /// The key.
+    pub key: Box<str>,
+    /// The inputs.
+    pub inputs: Inputs,
+}
+
+/// The build published in `dir`, if its record and its JSON are there, and the digest next to the
+/// JSON is the record's: another server may be publishing another build there.
+#[must_use]
+pub fn published(dir: &Path) -> Option<Built> {
+    let record: BuildRecord = serde_json::from_slice(&fs::read(dir.join(RECORD)).ok()?).ok()?;
+    let json = dir.join(format!("{}.json", record.format_version));
+    (json.is_file() && is_of(&json, &record)).then(|| Built {
+        json,
+        record,
+        rebuilt: Vec::new(),
+    })
+}
+
+/// Whether the digest next to the JSON at `json` is that of `record`.
+fn is_of(json: &Path, record: &BuildRecord) -> bool {
+    fs::read(cache::with_suffix(json, ".sha256"))
+        .is_ok_and(|digest| digest.trim_ascii() == record.sha256.as_bytes())
+}
 
 /// The record of a published build, next to its JSON.
 const RECORD: &str = "record.json";
@@ -639,6 +796,15 @@ pub struct BuildRecord {
     pub cfg_docsrs: bool,
     /// The SHA-256 of the JSON.
     pub sha256: Box<str>,
+    /// The key of the build, if it was taken (requirement R-WS-4, decided in M2's D4).
+    #[serde(default)]
+    pub key: Option<Box<str>>,
+    /// What the build was made from, as it was before it.
+    #[serde(default)]
+    pub inputs: Option<Inputs>,
+    /// What the response warns about how it was built, as when a try broke it.
+    #[serde(default)]
+    pub warnings: Vec<Box<str>>,
 }
 
 /// Why a build published nothing.
@@ -691,8 +857,8 @@ pub enum BuildError {
 /// which it lets go once the JSON is moved to `work`, a directory in the cache: another build of
 /// a crate of the same name writes the same file (Q-29). cargo runs with a build slot (decided in
 /// M2's D3). Then it checks the JSON and publishes it. `on_doing` is told when it waits for a lock
-/// or a slot, and what cargo does. `toolchain` is what `rustc -vV` tells of the toolchain, for the
-/// record.
+/// or a slot, and what cargo does. `toolchain` is what `rustc -vV` tells of the toolchain, and
+/// `fresh` the key and the inputs of the build, for the record.
 ///
 /// # Errors
 ///
@@ -702,6 +868,7 @@ pub async fn build(
     plan: &Plan,
     work: &Path,
     toolchain: Option<&str>,
+    fresh: Option<&Fresh>,
     mut on_doing: impl FnMut(Doing) + Send,
 ) -> Result<Built, BuildError> {
     let name = plan.target_dir.name();
@@ -779,6 +946,9 @@ pub async fn build(
         bootstrap_all: plan.bootstrap == Bootstrap::All,
         cfg_docsrs: plan.cfg_docsrs,
         sha256: sha256.into(),
+        key: fresh.map(|fresh| fresh.key.clone()),
+        inputs: fresh.map(|fresh| fresh.inputs.clone()),
+        warnings: Vec::new(),
     };
     let dir = plan.published_dir(cache.dir(), target.as_ref());
     let path = dir.join(format!("{}.json", header.format_version));
@@ -802,14 +972,29 @@ pub async fn build(
 }
 
 impl Built {
-    /// Writes the record again, as after more of the toolchain became known.
+    /// Writes the record again, as after more of the toolchain became known, in `cache`, if the
+    /// JSON is still the one that it records: another server may have published another build
+    /// meanwhile.
     ///
     /// # Errors
     ///
     /// Returns an error when it cannot be written.
-    pub fn write_record(&self) -> io::Result<()> {
+    pub async fn write_record(&self, cache: &Cache) -> io::Result<()> {
         let json = serde_json::to_vec_pretty(&self.record).map_err(io::Error::from)?;
-        cache::write_atomically(&self.record_path(), &json)
+        let dir = self.json.parent().unwrap_or(&self.json);
+        let publishing = cache.lock(dir).await;
+        let built = self.clone();
+        super::blocking(move || {
+            let written = if is_of(&built.json, &built.record) {
+                cache::write_atomically(&built.record_path(), &json)
+            } else {
+                tracing::debug!(json = %built.json.display(), "another build was published meanwhile, so the record is left");
+                Ok(())
+            };
+            drop(publishing);
+            written
+        })
+        .await
     }
 
     /// Removes the JSON and the record, as for a format that is not read, so that nothing takes

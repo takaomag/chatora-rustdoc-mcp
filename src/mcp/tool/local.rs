@@ -162,6 +162,8 @@ pub(super) async fn member(
             cargo_home: state.resolver.cargo_home().map(Path::to_path_buf),
             docs_rs_features: docs_rs.features,
             warnings,
+            input_files: state.resolver.input_files(root, metadata).await,
+            input_dirs: build::source_dirs(metadata, package),
         }),
         package: package.name.clone(),
     })

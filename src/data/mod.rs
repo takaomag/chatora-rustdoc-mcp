@@ -25,6 +25,8 @@ pub mod features;
 pub mod fetches;
 pub mod flight;
 pub mod format_version;
+#[cfg(feature = "local")]
+pub mod freshness;
 mod http;
 #[cfg(feature = "local")]
 pub mod local_std;

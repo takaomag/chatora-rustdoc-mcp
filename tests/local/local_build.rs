@@ -114,7 +114,7 @@ async fn the_members_are_built_and_published() {
         plan(metadata, &workspace.root, &cache, name, target)
     };
     let run = async |plan: &Plan| {
-        build::build(&cache, plan, &work, None, |_| {})
+        build::build(&cache, plan, &work, None, None, |_| {})
             .await
             .unwrap_or_else(|error| panic!("{}: {error:?}", plan.crate_name))
     };
@@ -239,8 +239,10 @@ async fn a_member_is_built_and_archived_for_the_calls_that_want_it() {
         cargo_home: resolver.cargo_home().map(Path::to_path_buf),
         docs_rs_features: None,
         warnings: Vec::new(),
+        input_files: Vec::new(),
+        input_dirs: Vec::new(),
     };
-    let flights = Flights::handing_over();
+    let flights = Flights::default();
     let until = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
     // Two calls at once share one build.
     let (first, second) = tokio::join!(
@@ -295,7 +297,7 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
     let cache = Cache::at(&dir.join("cache"));
     // The work directories are this process's.
     Owner::start_this(&cache);
-    let flights = Flights::handing_over();
+    let flights = Flights::default();
     let until = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
     // A member whose build `--cfg docsrs` breaks is built without it, with a warning (decided in
     // M2's D3).
@@ -306,6 +308,8 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
         cargo_home: resolver.cargo_home().map(Path::to_path_buf),
         docs_rs_features: None,
         warnings: Vec::new(),
+        input_files: Vec::new(),
+        input_dirs: Vec::new(),
     };
     let without = |built: &LocalBuilt| {
         !built.record.cfg_docsrs
@@ -351,4 +355,160 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
         fixed.archived.warnings
     );
     assert!(items_at(&fixed.json).contains("docsrs_only"));
+}
+
+#[tokio::test]
+async fn a_member_is_built_again_only_when_what_it_is_made_from_changes() {
+    use chatora_rustdoc_mcp::{
+        data::{
+            flight::{Flights, Joined},
+            owner::Owner,
+        },
+        query::local::{LocalBuilt, LocalWanted, local_archive},
+    };
+
+    let Some(dir) = in_isolated_child(
+        "local_build::a_member_is_built_again_only_when_what_it_is_made_from_changes",
+    ) else {
+        return;
+    };
+    let root = workspace(&dir);
+    let workspace = project::workspace_of(&root).expect("a workspace");
+    let resolver = Resolver::new(true);
+    let host = host_target(&dir).await.triple;
+    let cache = Cache::at(&dir.join("cache"));
+    Owner::start_this(&cache);
+    let flights = Flights::default();
+    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    // Planned again for each call, as the server does: an edit to a manifest changes the plan.
+    let built = async || -> std::sync::Arc<LocalBuilt> {
+        let resolution = resolver.resolve(&workspace).await.expect("resolved");
+        let Resolution::Metadata { metadata, .. } = &*resolution else {
+            panic!("cargo metadata works offline here: {resolution:?}");
+        };
+        let (package, _) = build::member_crate(metadata, "one").expect("one");
+        let wanted = LocalWanted {
+            plan: plan(metadata, &workspace.root, &cache, "one", None),
+            target: host.clone(),
+            project_sets_target: false,
+            cargo_home: resolver.cargo_home().map(Path::to_path_buf),
+            docs_rs_features: None,
+            warnings: Vec::new(),
+            input_files: resolver.input_files(&workspace.root, metadata).await,
+            input_dirs: build::source_dirs(metadata, package),
+        };
+        let Joined::Done(Ok(built)) = local_archive(&flights, &cache, wanted, until).await else {
+            panic!("built");
+        };
+        built
+    };
+    let taken = |built: &LocalBuilt| {
+        built
+            .record
+            .inputs
+            .as_ref()
+            .expect("the inputs are recorded")
+            .taken_at
+    };
+    let first = built().await;
+    assert!(first.record.key.is_some());
+    // Nothing changed: not built again.
+    let again = built().await;
+    assert_eq!(taken(&again), taken(&first));
+    // A source of the member, a file of its package that build.rs may read, and the source of a
+    // path dependency outside the workspace: built again.
+    for (path, text) in [
+        ("ws/one/src/lib.rs", "/// Added.\npub fn added() {}\n"),
+        ("ws/one/proto/a.proto", "message A {}\n"),
+        ("deps/watcher/src/lib.rs", "/// Added.\npub fn more() {}\n"),
+    ] {
+        let before = built().await;
+        let path = dir.join("local-build").join(path);
+        fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        let mut contents = fs::read_to_string(&path).unwrap_or_default();
+        contents.push_str(text);
+        fs::write(&path, contents).expect("written");
+        let after = built().await;
+        assert_ne!(taken(&after), taken(&before), "{}", path.display());
+        assert_ne!(after.record.key, before.record.key, "{}", path.display());
+    }
+    assert!(items_at(&built().await.json).contains("added"));
+}
+
+#[tokio::test]
+async fn the_sources_of_a_package_in_git_are_what_git_does_not_ignore() {
+    use chatora_rustdoc_mcp::data::freshness;
+
+    let Some(dir) = in_isolated_child(
+        "local_build::the_sources_of_a_package_in_git_are_what_git_does_not_ignore",
+    ) else {
+        return;
+    };
+    let package = dir.join("p");
+    let write = |path: &str| {
+        let path = package.join(path);
+        fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        fs::write(path, "x").expect("written");
+    };
+    for path in [
+        "Cargo.toml",
+        ".gitignore",
+        "src/lib.rs",
+        "work/build/out",
+        "target/debug/out",
+        "inner/Cargo.toml",
+        "inner/src/lib.rs",
+    ] {
+        write(path);
+    }
+    fs::write(package.join(".gitignore"), "work/\n").expect("written");
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&package)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "Cargo.toml", "src/lib.rs"]);
+    // Not tracked, and not ignored: a source too.
+    write("src/new.rs");
+    let (listed, walked) = freshness::sources(std::slice::from_ref(&package)).await;
+    let mut listed: Vec<_> = listed
+        .iter()
+        .map(|path| path.strip_prefix(&package).expect("inside").to_owned())
+        .collect();
+    listed.sort();
+    assert_eq!(listed, [
+        PathBuf::from(".gitignore"),
+        PathBuf::from("Cargo.toml"),
+        PathBuf::from("src/lib.rs"),
+        PathBuf::from("src/new.rs"),
+    ]);
+    assert_eq!(walked, Vec::<PathBuf>::new());
+    // A repository inside, which git lists as a directory, is walked.
+    write("c/inner.c");
+    let nested = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(package.join("c"))
+        .status()
+        .expect("git runs");
+    assert!(nested.success());
+    let (_, walked) = freshness::sources(std::slice::from_ref(&package)).await;
+    assert_eq!(walked, [package.join("c/")]);
+    // So is a package that git ignores.
+    fs::write(package.join(".gitignore"), "*\n").expect("written");
+    git(&["rm", "-q", "--cached", "Cargo.toml", "src/lib.rs"]);
+    let (listed, walked) = freshness::sources(std::slice::from_ref(&package)).await;
+    assert_eq!(listed, Vec::<PathBuf>::new());
+    assert_eq!(walked, std::slice::from_ref(&package));
+    // Outside git, the directory is walked.
+    let outside = dir.join("outside");
+    fs::create_dir_all(&outside).expect("made");
+    let (listed, walked) = freshness::sources(std::slice::from_ref(&outside)).await;
+    assert_eq!(listed, Vec::<PathBuf>::new());
+    assert_eq!(walked, [outside]);
 }
