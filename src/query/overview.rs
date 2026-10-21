@@ -3,7 +3,7 @@
 
 use std::{borrow::Cow, collections::BTreeMap};
 
-use rustdoc_types::ItemEnum;
+use rustdoc_types::{Id, ItemEnum};
 use serde::Serialize;
 
 use super::{
@@ -60,7 +60,7 @@ pub struct Overview<'a> {
     /// text.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub sections: Box<[Section]>,
-    /// How many items with a public path the crate has, of each kind.
+    /// How many items with a public path the crate has, of each kind; a workspace member's, all.
     pub counts: BTreeMap<&'static str, usize>,
     /// The modules at the root, each with the first sentence of its documentation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -93,6 +93,65 @@ pub struct FeatureOverview<'a> {
     pub enabled_in_project: Option<Vec<&'a str>>,
 }
 
+/// How many items the crate of `view` has, of each kind: with a public path, but the hidden ones;
+/// of a workspace member, `member`, all that have a definition path (decided in M2's D6).
+fn counts(view: &CrateView<'_>, member: bool) -> BTreeMap<&'static str, usize> {
+    let (index, root) = (view.index(), view.root());
+    let counted: Vec<Id> = if member {
+        index.defined_items().collect()
+    } else {
+        index
+            .public_items()
+            .filter(|&id| !index.is_hidden(id))
+            .collect()
+    };
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for id in counted {
+        if id == root {
+            continue;
+        }
+        // Of a member's items, those that a module has: as many as with a public path.
+        if let Some(item) = view.item(id)
+            && !(member
+                && matches!(
+                    item.inner,
+                    ItemEnum::Variant(_) | ItemEnum::StructField(_) | ItemEnum::Impl(_)
+                ))
+        {
+            let count = counts.entry(kind_of(item, false)).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+    counts
+}
+
+/// Adds the item `id` at the root, at `child` if it is listed there, to the modules or the other
+/// items.
+fn add<'a>(
+    (view, query): (&'a CrateView<'a>, &mut Query<'a>),
+    id: Id,
+    child: Option<&str>,
+    (modules, items): (&mut Vec<ItemData<'a>>, &mut Vec<ItemData<'a>>),
+) {
+    let Some(mut data) = query.item_data(id, None).map(ItemData::listed) else {
+        return;
+    };
+    if let Some(child) = child
+        && *data.path != *child
+    {
+        data.canonical = Some(std::mem::replace(&mut data.path, child.into()));
+    }
+    if data.kind == "module" {
+        data.docs = view
+            .item(id)
+            .and_then(|item| item.docs.as_deref())
+            .map(first_sentence);
+        modules.push(data);
+    } else {
+        items.push(data);
+    }
+}
+
 /// The overview of the crate of `view`, whose root is at `request.path`.
 ///
 /// # Errors
@@ -113,26 +172,22 @@ pub fn crate_overview<'a>(
     });
     let provenance = query.provenance();
     let path: Box<str> = root_item.name.as_deref().unwrap_or("crate").into();
-    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for id in index.public_items() {
-        if id == root {
-            continue;
-        }
-        if let Some(item) = view.item(id) {
-            let count = counts.entry(kind_of(item, false)).or_default();
-            *count = count.saturating_add(1);
-        }
-    }
+    let member = query.is_member();
+    let counts = counts(view, member);
     let (mut modules, mut items) = (Vec::new(), Vec::new());
     for child in index.children(&path) {
         let ids = match index.at_public_path(&child) {
             Some(Resolution::Item(id)) => vec![id],
             Some(Resolution::Ambiguous(ids)) => ids.into_vec(),
             Some(Resolution::ExternalReexport(reexport)) => {
+                if !member && index.is_hidden_reexport(&child) {
+                    continue;
+                }
                 let kind = query.external_kind(reexport.target);
                 let data = ItemData {
                     path: child.clone(),
                     kind,
+                    hidden: query.hidden_reexport(&child),
                     reexport_of: query.reexport_target(&reexport),
                     ..ItemData::default()
                 };
@@ -150,21 +205,24 @@ pub fn crate_overview<'a>(
             )
             | None => continue,
         };
-        for id in ids {
-            let Some(item) = view.item(id) else {
-                continue;
-            };
-            let Some(mut data) = query.item_data(id, None) else {
-                continue;
-            };
-            if *data.path != *child {
-                data.canonical = Some(std::mem::replace(&mut data.path, child.clone()));
-            }
-            if matches!(item.inner, ItemEnum::Module(_)) {
-                data.docs = item.docs.as_deref().map(first_sentence);
-                modules.push(data);
-            } else {
-                items.push(data);
+        for id in ids.into_iter().filter(|&id| member || !index.is_hidden(id)) {
+            add(
+                (view, &mut query),
+                id,
+                Some(&child),
+                (&mut modules, &mut items),
+            );
+        }
+    }
+    // The root's items without a public path, in a workspace member.
+    if member && let Some(ItemEnum::Module(contents)) = view.item(root).map(|item| &item.inner) {
+        for &id in &contents.items {
+            let unlisted = view.item(id).is_some_and(|item| {
+                !matches!(item.inner, ItemEnum::Impl(_) | ItemEnum::Use(_))
+                    && index.canonical_path(id).is_none()
+            });
+            if unlisted {
+                add((view, &mut query), id, None, (&mut modules, &mut items));
             }
         }
     }

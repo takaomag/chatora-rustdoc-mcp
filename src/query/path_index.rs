@@ -14,7 +14,18 @@ use std::{
     fmt,
 };
 
-use rustdoc_types::{Crate, Id, Impl, Item, ItemEnum, StructKind, Type, Use, Visibility};
+use rustdoc_types::{
+    Attribute,
+    Crate,
+    Id,
+    Impl,
+    Item,
+    ItemEnum,
+    StructKind,
+    Type,
+    Use,
+    Visibility,
+};
 
 use super::view::{self, CrateView};
 
@@ -122,6 +133,13 @@ pub struct PathIndex {
     /// The items restricted to the module that has them, as an item written without `pub` is
     /// (decided in M2's D6): only in a build with private items.
     module_private: HashSet<Id>,
+    /// The items of `#[doc(hidden)]`, or whose every public path goes through one, or in an
+    /// `impl` of it, or, without a public path, whose module is (decided in M2's D6): only in a
+    /// build with hidden items.
+    hidden: HashSet<Id>,
+    /// The re-exports of other crates' items that go through an item of `#[doc(hidden)]`, by
+    /// their public path.
+    hidden_reexports: HashSet<Box<str>>,
 }
 
 /// What a path refers to.
@@ -174,13 +192,22 @@ impl PathIndex {
         walker.record(krate.root, vec![crate_name], &[]);
         walker.visit_module(krate.root, &Place::root(crate_name), 0);
 
+        let through_hidden = |via: &[Id]| {
+            via.iter()
+                .any(|id| krate.index.get(id).is_some_and(is_doc_hidden))
+        };
         let mut canonical_via = HashMap::new();
+        // The items whose every public path goes through a hidden item (decided in M2's D6).
+        let mut hidden_paths = HashSet::new();
         let paths_of: HashMap<Id, Box<[PublicPath]>> = walker
             .paths
             .into_iter()
             .map(|(id, paths)| {
                 let name = krate.index.get(&id).and_then(|item| item.name.as_deref());
-                let (paths, via) = canonical_first(paths, name);
+                if paths.iter().all(|place| through_hidden(&place.via)) {
+                    hidden_paths.insert(id);
+                }
+                let (paths, via) = canonical_first(paths, name, &through_hidden);
                 if !via.is_empty() {
                     canonical_via.insert(id, via);
                 }
@@ -199,10 +226,14 @@ impl PathIndex {
                 .filter(|(_, summary)| summary.crate_id == 0)
                 .map(|(&id, summary)| (summary.path.join("::").into_boxed_str(), id)),
         );
+        let mut hidden_reexports = HashSet::new();
         let external_reexports: HashMap<Box<str>, ExternalReexport> = walker
             .external_reexports
             .into_iter()
-            .map(|(path, target)| {
+            .map(|(path, target, via)| {
+                if through_hidden(&via) {
+                    hidden_reexports.insert(path.join("::").into_boxed_str());
+                }
                 let reexport = ExternalReexport {
                     path: PublicPath::new(&path),
                     target,
@@ -223,6 +254,7 @@ impl PathIndex {
             .collect();
         let children = children_of(by_public_path.keys().chain(external_reexports.keys()));
         let module_private = module_private(krate);
+        let hidden = hidden(krate, &paths_of, &hidden_paths, &by_definition_path);
         Self {
             paths_of,
             canonical_via,
@@ -233,8 +265,64 @@ impl PathIndex {
             external_globs,
             incomplete: walker.incomplete,
             module_private,
+            hidden,
+            hidden_reexports,
         }
     }
+}
+
+/// Whether `item` has `#[doc(hidden)]`.
+#[must_use]
+pub fn is_doc_hidden(item: &Item) -> bool {
+    item.attrs.iter().any(|attribute| {
+        matches!(attribute, Attribute::Other(text)
+            if text.starts_with("#[doc")
+                && text.split_whitespace().collect::<String>() == "#[doc(hidden)]")
+    })
+}
+
+/// The items of `krate` that are hidden ([`PathIndex::hidden`]): of `#[doc(hidden)]`, below one
+/// on each of their public paths (`hidden_paths`), in an `impl` of `#[doc(hidden)]`, or, without
+/// a public path, below a module of `#[doc(hidden)]` by their definition path, as rustdoc marks
+/// only the item that has it.
+#[expect(
+    clippy::iter_over_hash_type,
+    reason = "what is found is a set, whose order does not matter"
+)]
+fn hidden(
+    krate: &Crate,
+    paths_of: &HashMap<Id, Box<[PublicPath]>>,
+    hidden_paths: &HashSet<Id>,
+    by_definition_path: &HashMap<Box<str>, Box<[Id]>>,
+) -> HashSet<Id> {
+    let is_hidden = |id: &Id| krate.index.get(id).is_some_and(is_doc_hidden);
+    let mut hidden = HashSet::new();
+    for (&id, item) in &krate.index {
+        if item.crate_id != 0 {
+            continue;
+        }
+        if let ItemEnum::Impl(contents) = &item.inner
+            && is_doc_hidden(item)
+        {
+            hidden.extend(contents.items.iter().copied());
+        }
+        let below_hidden = if paths_of.contains_key(&id) {
+            hidden_paths.contains(&id)
+        } else {
+            krate.paths.get(&id).is_some_and(|summary| {
+                (1..summary.path.len()).any(|end| {
+                    let module = summary.path.get(..end).unwrap_or_default().join("::");
+                    by_definition_path
+                        .get(module.as_str())
+                        .is_some_and(|ids| ids.iter().any(is_hidden))
+                })
+            })
+        };
+        if is_doc_hidden(item) || below_hidden {
+            hidden.insert(id);
+        }
+    }
+    hidden
 }
 
 /// The items of `krate` restricted to the module that has them (`Restricted` to it, as rustdoc
@@ -308,6 +396,17 @@ impl PathIndex {
         self.paths_of.get(&id).and_then(|paths| paths.first())
     }
 
+    /// Whether the item `id` is hidden ([`Self::hidden`]), before archiving.
+    pub(super) fn is_hidden(&self, id: Id) -> bool {
+        self.hidden.contains(&id)
+    }
+
+    /// Whether the re-export at the public path `path` is hidden ([`Self::hidden_reexports`]),
+    /// before archiving.
+    pub(super) fn is_hidden_reexport(&self, path: &str) -> bool {
+        self.hidden_reexports.contains(path)
+    }
+
     /// The items with a public path, sorted by id, before archiving.
     pub(super) fn public_ids(&self) -> Vec<Id> {
         let mut ids: Vec<Id> = self.paths_of.keys().copied().collect();
@@ -329,6 +428,19 @@ impl ArchivedPathIndex {
     #[must_use]
     pub fn is_module_private(&self, id: Id) -> bool {
         self.module_private.contains(&view::archived_id(id))
+    }
+
+    /// Whether the item `id` is hidden: of `#[doc(hidden)]`, or below one (decided in M2's D6).
+    #[must_use]
+    pub fn is_hidden(&self, id: Id) -> bool {
+        self.hidden.contains(&view::archived_id(id))
+    }
+
+    /// Whether the re-export of another crate's item at the public path `path` goes through an
+    /// item of `#[doc(hidden)]` (decided in M2's D6).
+    #[must_use]
+    pub fn is_hidden_reexport(&self, path: &str) -> bool {
+        self.hidden_reexports.contains(path)
     }
 
     /// The canonical path of `id`: among its public paths, one that does not rename the item,
@@ -365,6 +477,13 @@ impl ArchivedPathIndex {
     /// Every item that has a public path, in no particular order.
     pub fn public_items(&self) -> impl Iterator<Item = Id> + '_ {
         self.paths_of.keys().map(view::native)
+    }
+
+    /// The items of this crate that have a definition path, public or not.
+    pub fn defined_items(&self) -> impl Iterator<Item = Id> + '_ {
+        self.by_definition_path
+            .values()
+            .flat_map(|ids| ids.iter().map(view::native))
     }
 
     /// The items at the public path `path`, or the re-export of another crate's item there.
@@ -530,7 +649,8 @@ struct Walker<'a> {
     krate: &'a Crate,
     /// The paths of each item, with the modules and `use` items that each goes through.
     paths: HashMap<Id, Vec<Place<'a>>>,
-    external_reexports: Vec<(Vec<&'a str>, Id)>,
+    /// Re-exports of other crates' items, at their paths, with what each goes through.
+    external_reexports: Vec<(Vec<&'a str>, Id, Vec<Id>)>,
     external_globs: Vec<(Vec<&'a str>, &'a str)>,
     /// The modules being walked, to stop at a cycle.
     on_stack: HashSet<Id>,
@@ -659,8 +779,9 @@ impl<'a> Walker<'a> {
                 self.external_globs
                     .push((place.path.clone(), &reexport.source));
             } else {
+                let via = place.then(None, &[use_id]).via;
                 self.external_reexports
-                    .push((extended(&place.path, &reexport.name), target));
+                    .push((extended(&place.path, &reexport.name), target, via));
             }
             return;
         };
@@ -724,15 +845,20 @@ fn extended<'a>(prefix: &[&'a str], name: &'a str) -> Vec<&'a str> {
 }
 
 /// The paths of an item without duplicates, the canonical one first (requirement R-PR-2): paths
-/// that do not rename the item, then shorter paths, then in lexicographic order. Also returns
-/// what the canonical path goes through, the first way that it was reached.
-fn canonical_first(paths: Vec<Place<'_>>, name: Option<&str>) -> (Box<[PublicPath]>, Box<[Id]>) {
+/// that do not go through a hidden item (`through_hidden`), then that do not rename the item, then
+/// shorter paths, then in lexicographic order. Also returns what the canonical path goes through,
+/// the first way that it was reached.
+fn canonical_first(
+    paths: Vec<Place<'_>>,
+    name: Option<&str>,
+    through_hidden: &impl Fn(&[Id]) -> bool,
+) -> (Box<[PublicPath]>, Box<[Id]>) {
     let renames = |path: &[&str]| path.last().copied() != name;
     let mut paths = paths;
     // Stable, so that equal paths stay in the order they were reached.
     paths.sort_by(|a, b| {
-        (renames(&a.path), a.path.len())
-            .cmp(&(renames(&b.path), b.path.len()))
+        (through_hidden(&a.via), renames(&a.path), a.path.len())
+            .cmp(&(through_hidden(&b.via), renames(&b.path), b.path.len()))
             .then_with(|| a.path.cmp(&b.path))
     });
     paths.dedup_by(|a, b| a.path == b.path);

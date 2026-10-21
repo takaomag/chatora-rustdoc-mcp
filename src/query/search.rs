@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use rustdoc_types::{Attribute, Crate, Id, Item, ItemEnum, StabilityLevel, Type};
+use rustdoc_types::{Attribute, Crate, Id, Item, ItemEnum, StabilityLevel, Type, Visibility};
 use serde::Serialize;
 
 use super::{
@@ -21,13 +21,14 @@ use super::{
         ItemRequest,
         MAX_RESPONSE_CHARS,
         Notes,
+        Origin,
         Provenance,
         Query,
         first_paragraph,
         kind_of,
     },
     list_module::Page,
-    path_index::{ExternalReexport, PathIndex, PublicPath, impls_of},
+    path_index::{ExternalReexport, PathIndex, PublicPath, impls_of, is_doc_hidden},
     view::{self, CrateView},
 };
 
@@ -77,6 +78,9 @@ struct Entry {
     penalized: bool,
     /// It is a re-export of another crate's item, whose documentation is not here.
     external: bool,
+    /// It is not public, or it is hidden (`#[doc(hidden)]`): found only in a workspace member,
+    /// whose own code it is (requirement R-SR-4, decided in M2's D6).
+    restricted: bool,
 }
 
 /// How many times a token is in each field of an item.
@@ -121,7 +125,10 @@ impl Fields {
 impl SearchIndex {
     /// Indexes the items of `krate` that have a public path, their members (the items of their
     /// inherent `impl`s, of a trait, and the variants of an enum), and the re-exports of other
-    /// crates' items. Unstable items of std are left out (requirement R-SR-4).
+    /// crates' items. Unstable items of std are left out (requirement R-SR-4). With private
+    /// items, the others too, at their paths in the crate (`crate::a::Item`), marked as
+    /// restricted, as are the members that are not public and the hidden items (decided in M2's
+    /// D6).
     #[must_use]
     pub fn build(krate: &Crate, paths: &PathIndex) -> Self {
         let mut referenced: HashMap<Id, u32> = HashMap::new();
@@ -147,32 +154,69 @@ impl SearchIndex {
             aliases: HashMap::new(),
         };
         let mut seen = HashSet::new();
-        for id in paths.public_ids() {
+        let public = paths.public_ids().into_iter().filter_map(|id| {
+            let path = paths.canonical(id).map(PublicPath::joined)?;
+            Some((id, path, paths.is_hidden(id)))
+        });
+        // Those without a public path, with private items: in the order of their paths.
+        let mut others: Vec<(Id, Box<str>)> = if krate.includes_private {
+            krate
+                .paths
+                .iter()
+                .filter(|(id, summary)| summary.crate_id == 0 && paths.canonical(**id).is_none())
+                .map(|(&id, summary)| (id, in_crate_path(&summary.path)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        others.sort_unstable_by(|a, b| (&a.1, a.0.0).cmp(&(&b.1, b.0.0)));
+        let all = public.chain(others.into_iter().map(|(id, path)| (id, path, true)));
+        for (id, path, restricted) in all {
             let Some(item) = krate.index.get(&id) else {
                 continue;
             };
             if id == krate.root || is_unstable(item) || !seen.insert(id) {
                 continue;
             }
-            let Some(path) = paths.canonical(id).map(PublicPath::joined) else {
-                continue;
-            };
             for &member in &members(krate, id, item) {
                 if let Some(member_item) = krate.index.get(&member)
                     && let Some(name) = member_item.name.as_deref()
                     && !is_unstable(member_item)
                     && seen.insert(member)
                 {
-                    builder.add(member_item, Some(id), &format!("{path}::{name}"));
+                    let restricted = restricted
+                        || !matches!(
+                            member_item.visibility,
+                            Visibility::Public | Visibility::Default
+                        )
+                        || is_doc_hidden(member_item)
+                        || paths.is_hidden(member);
+                    builder.add(
+                        member_item,
+                        Some(id),
+                        &format!("{path}::{name}"),
+                        restricted,
+                    );
                 }
             }
-            builder.add(item, None, &path);
+            builder.add(item, None, &path, restricted);
         }
         for reexport in paths.external_reexports() {
-            builder.add_external(reexport.target, &reexport.path.joined());
+            let path = reexport.path.joined();
+            builder.add_external(reexport.target, &path, paths.is_hidden_reexport(&path));
         }
         builder.finish()
     }
+}
+
+/// The path of an item of the crate in it, `crate::a::Item`, from its definition path.
+fn in_crate_path(definition: &[String]) -> Box<str> {
+    let mut path = String::from("crate");
+    for segment in definition.iter().skip(1) {
+        path.push_str("::");
+        path.push_str(segment);
+    }
+    path.into()
 }
 
 /// The members of `item` that a search finds: the items of a trait, the variants of an enum,
@@ -241,12 +285,13 @@ struct Builder<'r> {
 }
 
 impl Builder<'_> {
-    /// Adds `item`, a member of `parent` if it is one, at `path`.
-    fn add(&mut self, item: &Item, parent: Option<Id>, path: &str) {
+    /// Adds `item`, a member of `parent` if it is one, at `path`, `restricted` if it is not public
+    /// or hidden.
+    fn add(&mut self, item: &Item, parent: Option<Id>, path: &str, restricted: bool) {
         let Some(name) = item.name.as_deref() else {
             return;
         };
-        let entry = self.push_entry(item.id, parent, path, false);
+        let entry = self.push_entry(item.id, parent, path, (false, restricted));
         let mut counts: HashMap<String, Posting> = HashMap::new();
         let mut count = |token: String, field: fn(&mut Posting) -> &mut u16, by: u16| {
             let posting = counts.entry(token).or_default();
@@ -294,11 +339,12 @@ impl Builder<'_> {
         }
     }
 
-    /// Adds a re-export of another crate's item, `target`, at `path`: found by its name and
-    /// path, as its documentation is in the other crate.
-    fn add_external(&mut self, target: Id, path: &str) {
+    /// Adds a re-export of another crate's item, `target`, at `path`, `hidden` if it goes through
+    /// an item of `#[doc(hidden)]`: found by its name and path, as its documentation is in the
+    /// other crate.
+    fn add_external(&mut self, target: Id, path: &str, hidden: bool) {
         let name = path.rsplit("::").next().unwrap_or(path);
-        let entry = self.push_entry(target, None, path, true);
+        let entry = self.push_entry(target, None, path, (true, hidden));
         let mut counts: HashMap<String, Posting> = HashMap::new();
         for token in tokens(name) {
             let posting = counts.entry(token).or_default();
@@ -324,7 +370,15 @@ impl Builder<'_> {
         }
     }
 
-    fn push_entry(&mut self, id: Id, parent: Option<Id>, path: &str, external: bool) -> u32 {
+    /// Adds the entry of `id`, a member of `parent`, at `path`: a re-export of another crate's
+    /// item, and not public or hidden, as `(external, restricted)` tells.
+    fn push_entry(
+        &mut self,
+        id: Id,
+        parent: Option<Id>,
+        path: &str,
+        (external, restricted): (bool, bool),
+    ) -> u32 {
         let entry = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
         let penalized = path.split("::").any(|segment| {
             segment.starts_with("__") || segment.contains("_private") || segment == "internal"
@@ -336,6 +390,7 @@ impl Builder<'_> {
             referenced: self.referenced.get(&id).copied().unwrap_or_default(),
             penalized,
             external,
+            restricted,
         });
         entry
     }
@@ -681,7 +736,7 @@ pub fn search_across<'a>(
         })
         .collect();
     let did_you_mean = if total == 0 {
-        did_you_mean(&indexes, options.query)
+        did_you_mean(searched, options.query)
     } else {
         Box::default()
     };
@@ -875,11 +930,12 @@ fn hits(
         })
         .collect();
     hits.retain(|hit| {
-        options.kinds.is_empty()
-            || searched.get(hit.source).is_some_and(|source| {
-                entry_kind(source.view, source.view.search_index(), hit.entry)
-                    .is_some_and(|kind| options.kinds.contains(&kind))
-            })
+        searched.get(hit.source).is_some_and(|source| {
+            shows(source, hit.entry)
+                && (options.kinds.is_empty()
+                    || entry_kind(source.view, source.view.search_index(), hit.entry)
+                        .is_some_and(|kind| options.kinds.contains(&kind)))
+        })
     });
     let path_of = |hit: &Hit| -> &str {
         indexes
@@ -902,6 +958,13 @@ fn hits(
             ))
     });
     hits
+}
+
+/// Whether the search of `source` shows its entry `entry`: one that is not public or is hidden only
+/// in a workspace member (requirements R-SR-4 and R-SH-5, decided in M2's D6).
+fn shows(source: &Searched<'_>, entry: u32) -> bool {
+    matches!(source.request.origin, Origin::Local { .. })
+        || entry_at(source.view.search_index(), entry).is_some_and(|found| !found.restricted)
 }
 
 /// The warnings and hints of all the queries, in order.
@@ -1199,7 +1262,7 @@ fn result<'a>(
         });
     }
     let parent = found.parent.as_ref().map(view::native);
-    let mut data = query.item_data(id, parent)?;
+    let mut data = query.item_data(id, parent)?.listed();
     if detail == Detail::Brief {
         data.docs = view
             .item(id)
@@ -1233,7 +1296,7 @@ fn first_sentence(docs: &str) -> Cow<'_, str> {
 /// Names of items spelt like `query`, when nothing matched (requirement R-SR-5): at most 5, by
 /// edit distance in characters, then by name, and only those similar enough. Better none than
 /// unrelated ones (requirement R-PR-7).
-fn did_you_mean(indexes: &[&ArchivedSearchIndex], query: &str) -> Box<[Box<str>]> {
+fn did_you_mean(searched: &[Searched<'_>], query: &str) -> Box<[Box<str>]> {
     let wanted = query
         .trim()
         .rsplit("::")
@@ -1244,11 +1307,12 @@ fn did_you_mean(indexes: &[&ArchivedSearchIndex], query: &str) -> Box<[Box<str>]
     if wanted_len < 3 {
         return Box::default();
     }
-    let mut close: Vec<(usize, &str, &ArchivedEntry)> = indexes
+    let mut close: Vec<(usize, &str, &ArchivedEntry)> = searched
         .iter()
-        .flat_map(|index| {
-            index.names.iter().filter_map(|(name, entries)| {
-                let distance = edit_distance(&wanted, name);
+        .flat_map(|source| {
+            let (index, wanted) = (source.view.search_index(), wanted.as_str());
+            index.names.iter().filter_map(move |(name, entries)| {
+                let distance = edit_distance(wanted, name);
                 let longer = wanted_len.max(name.chars().count());
                 // At least 70% alike, and at most 3 edits.
                 if distance > 3 || distance.saturating_mul(10) > longer.saturating_mul(3) {
@@ -1257,6 +1321,7 @@ fn did_you_mean(indexes: &[&ArchivedSearchIndex], query: &str) -> Box<[Box<str>]
                 // Of the items with the name, one that is not a member, with the shortest path.
                 let best = entries
                     .iter()
+                    .filter(|entry| shows(source, entry.to_native()))
                     .filter_map(|entry| entry_at(index, entry.to_native()))
                     .min_by_key(|found| {
                         (
@@ -1337,7 +1402,7 @@ mod tests {
         data::crate_name::CrateName,
         query::{
             across::Indexed,
-            get_item::{Origin, ResolvedFrom, tests::parsed},
+            get_item::{ResolvedFrom, tests::parsed},
         },
     };
 
@@ -1356,6 +1421,23 @@ mod tests {
     /// The paths that `search_items` finds for `query` in the test crate of `get_item`, after
     /// `change`, and what it suggests when it finds none.
     fn found(query: &str, change: impl FnOnce(&mut Crate)) -> (Vec<String>, serde_json::Value) {
+        found_in(
+            Origin::DocsRs {
+                resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
+                build: None,
+            },
+            query,
+            change,
+        )
+    }
+
+    /// [`found`], of a crate from `origin`.
+    fn found_in(
+        origin: Origin<'_>,
+        query: &str,
+        change: impl FnOnce(&mut Crate),
+    ) -> (Vec<String>, serde_json::Value) {
         let mut parsed = parsed();
         change(&mut parsed.krate);
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&Indexed::new(parsed)).expect("archived");
@@ -1371,11 +1453,7 @@ mod tests {
                 name: &name,
                 version: &version,
                 path: "my_crate",
-                origin: Origin::DocsRs {
-                    resolved_from: ResolvedFrom::Explicit,
-                    project_from: None,
-                    build: None,
-                },
+                origin,
                 detail: Detail::Brief,
                 project_features: None,
                 follow: false,
@@ -1404,6 +1482,45 @@ mod tests {
             })
             .unwrap_or_default();
         (paths, response["data"]["did_you_mean"].clone())
+    }
+
+    #[test]
+    fn what_is_not_public_or_hidden_is_found_only_in_a_workspace_member() {
+        // A build with private items, in which `lock` is the crate's, and `Mutex` is hidden.
+        let change = |krate: &mut Crate| {
+            krate.includes_private = true;
+            krate
+                .index
+                .values_mut()
+                .for_each(|item| match item.name.as_deref() {
+                    Some("lock") => item.visibility = Visibility::Crate,
+                    Some("Mutex") => item.attrs.push(Attribute::Other("#[doc(hidden)]".into())),
+                    _ => {},
+                });
+        };
+        let (paths, _) = found("lock", change);
+        assert!(
+            !paths.iter().any(|path| path.ends_with("::lock")),
+            "{paths:?}"
+        );
+        let (paths, _) = found("Mutex", change);
+        assert!(
+            !paths.iter().any(|path| path.ends_with("::Mutex")),
+            "{paths:?}"
+        );
+        let member = Origin::Local {
+            resolved_from: ResolvedFrom::Explicit,
+            project_from: None,
+            toolchain: None,
+            built_at: "2026-10-21T00:00:00Z",
+            features_requested: None,
+            features_effective: None,
+        };
+        let (paths, _) = found_in(member, "lock", change);
+        assert_eq!(
+            paths.first().map(String::as_str),
+            Some("my_crate::Mutex::lock")
+        );
     }
 
     #[test]

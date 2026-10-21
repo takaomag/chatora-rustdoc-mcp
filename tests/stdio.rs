@@ -1463,6 +1463,30 @@ mod hidden {
 }
 /// At the root.
 fn rooted() {}
+/// Concealed.
+#[doc(hidden)]
+pub fn concealed() {}
+/// Shown.
+pub mod shown {
+    /// Deep.
+    pub struct DeepShown;
+}
+#[doc(hidden)]
+pub use shown::DeepShown;
+/// Plain.
+pub struct Plain;
+#[doc(hidden)]
+impl Plain {
+    /// In a hidden impl.
+    pub fn in_hidden_impl(&self) {}
+}
+#[doc(hidden)]
+pub use std::vec::Vec as HiddenVec;
+mod globbed {
+    /// From a glob.
+    pub fn from_glob() {}
+}
+pub use globbed::*;
 ";
 
 /// A workspace member's items have their visibility as Rust writes it, and one without a public
@@ -1538,15 +1562,127 @@ fn a_members_items_tell_their_visibility_and_their_path_in_the_crate() {
     ));
     let impls = server.response(6_000)["result"]["structuredContent"].clone();
     assert_eq!(impls["data"]["has_private_fields"], true, "{impls}");
-    // A module without a public path, of which only the items with one are listed until M2's
-    // D6b, with a warning of it.
+    // A module without a public path, with its items (decided in M2's D6).
     server.send(&call_tool(
         7_000,
         "list_module",
         json!({ "crate": "demo", "path": "crate::hidden" }),
     ));
     let listed = server.response(7_000)["result"]["structuredContent"].clone();
-    assert!(warns(&listed, "has no public path"), "{listed}");
+    assert_eq!(listed["page"]["total"], 4, "{listed}");
+    assert!(server.finish().success());
+}
+
+/// A workspace member's search and lists have its items without a public path and its hidden
+/// ones, with their visibility when it is not `pub` (requirement R-SR-4, decided in M2's D6).
+#[cfg(feature = "local")]
+#[test]
+fn a_members_private_and_hidden_items_are_searched_and_listed() {
+    let project = demo_workspace();
+    std::fs::write(project.path().join("src/lib.rs"), VISIBILITIES).expect("written");
+    let mut server = Server::start_in(Some(project.path()));
+    // Built first.
+    built_item(
+        &mut server,
+        1,
+        &json!({ "crate": "demo", "path": "crate::rooted" }),
+    );
+    let mut ids = 100..;
+    let mut call = |tool: &str, arguments: Value| -> Value {
+        let id = ids.next().expect("an id");
+        server.send(&call_tool(id, tool, arguments));
+        server.response(id)["result"]["structuredContent"].clone()
+    };
+    let found = |result: &Value, path: &str| -> Value {
+        result["data"]["items"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["path"] == path))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let searched = call(
+        "search_items",
+        json!({ "crate": "demo", "query": "secret" }),
+    );
+    let secret = found(&searched, "crate::hidden::Hidden::secret");
+    assert_eq!(secret["visibility"], "private", "{searched}");
+    let searched = call(
+        "search_items",
+        json!({ "crate": "demo", "query": "concealed" }),
+    );
+    let concealed = found(&searched, "demo::concealed");
+    assert_eq!(concealed["hidden"], true, "{searched}");
+    assert!(
+        concealed.get("visibility").is_none(),
+        "pub is not told: {concealed}"
+    );
+    // A module without a public path, with all its items.
+    let listed = call(
+        "list_module",
+        json!({ "crate": "demo", "path": "crate::hidden" }),
+    );
+    assert!(!warns(&listed, "no public path"), "{listed}");
+    assert_eq!(
+        found(&listed, "crate::hidden::wide")["visibility"],
+        "pub(crate)",
+        "{listed}"
+    );
+    assert!(
+        found(&listed, "crate::hidden::Hidden").is_object(),
+        "{listed}"
+    );
+    // The root, with what has no public path.
+    let root = call("list_module", json!({ "crate": "demo", "path": "demo" }));
+    assert_eq!(
+        found(&root, "crate::rooted")["visibility"],
+        "pub(crate)",
+        "{root}"
+    );
+    assert!(found(&root, "crate::hidden").is_object(), "{root}");
+    // Hidden through a hidden `impl` and a hidden re-export of another crate's item, and not
+    // through a hidden re-export of what has a path that is not.
+    let searched = call(
+        "search_items",
+        json!({ "crate": "demo", "query": "in_hidden_impl" }),
+    );
+    assert_eq!(
+        found(&searched, "demo::Plain::in_hidden_impl")["hidden"],
+        true,
+        "{searched}"
+    );
+    assert_eq!(found(&root, "demo::HiddenVec")["hidden"], true, "{root}");
+    let deep = call("get_item", json!({ "crate": "demo", "path": "DeepShown" }));
+    assert_eq!(deep["data"]["path"], "demo::shown::DeepShown", "{deep}");
+    assert!(deep["data"].get("hidden").is_none(), "{deep}");
+    // Once, though a module without a public path is re-exported with a glob.
+    let all = call(
+        "list_module",
+        json!({ "crate": "demo", "path": "demo", "recursive": true, "limit": 200 }),
+    );
+    let globbed = all["data"]["items"].as_array().map_or(0, |items| {
+        items
+            .iter()
+            .filter(|item| {
+                item["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("::from_glob"))
+            })
+            .count()
+    });
+    assert_eq!(globbed, 1, "{all}");
+    let overview = call("crate_overview", json!({ "crate": "demo" }));
+    assert!(
+        overview["data"]["modules"]
+            .as_array()
+            .is_some_and(|modules| modules
+                .iter()
+                .any(|module| module["path"] == "crate::hidden")),
+        "{overview}"
+    );
+    assert!(
+        overview["data"]["counts"]["function"].as_u64() >= Some(5),
+        "up, alone, wide, rooted and concealed: {overview}"
+    );
     assert!(server.finish().success());
 }
 

@@ -153,6 +153,10 @@ pub fn list_module<'a>(
     let with_root = with_root_name(view, request.name, request.path);
     let path = with_root.as_deref().unwrap_or(request.path);
     let module = find_module(view, &mut query, path, request.follow)?;
+    // Another crate's hidden module is not its API (requirement R-SH-5, decided in M2's D6).
+    if !query.is_member() && index.is_hidden(module) {
+        return Err(GetItemError::NotFound);
+    }
     // Checked in the crate that the path goes on in, if it does.
     if let Some(cursor_data) = options.cursor_data
         && cursor_data != data_digest
@@ -171,16 +175,18 @@ pub fn list_module<'a>(
     } else {
         path.into()
     };
-    // Until the items without a public path are listed (M2's D6b).
-    if query.is_member() && index.canonical_path(module).is_none() {
-        query.warn(format!(
-            "{listed_at} has no public path, and only the items with one are listed"
-        ));
-    }
     let mut entries = Vec::new();
     let depth = if options.recursive { options.depth } else { 1 };
     let mut visited = HashSet::from([module]);
-    collect(view, &listed_at, depth, &mut visited, &mut entries);
+    // A workspace member's items without a public path too (decided in M2's D6).
+    let mut members = query.is_member().then_some(&mut query);
+    collect(
+        view,
+        (module, &listed_at),
+        depth,
+        (&mut visited, &mut members),
+        &mut entries,
+    );
     entries.retain(|(_, entry)| {
         options.kinds.is_empty() || options.kinds.contains(&entry_kind(view, entry))
     });
@@ -316,14 +322,16 @@ fn is_module(view: &CrateView<'_>, id: Id) -> bool {
         .is_some_and(|item| matches!(item.inner, ItemEnum::Module(_)))
 }
 
-/// Puts the items below `path` into `entries`, in order, and with `depth` above 1 those of the
-/// modules among them, each right after its module. A module is listed once, against cycles of
-/// re-exports.
+/// Puts the items below `path`, the path of `module`, into `entries`, in order, and with `depth`
+/// above 1 those of the modules among them, each right after its module. A module is listed once,
+/// against cycles of re-exports. With `query`, of a workspace member, its items without a public
+/// path follow, at their paths in the crate, and, in a module without a public path, all of them
+/// (decided in M2's D6); else hidden items are left out (requirement R-SH-5).
 fn collect(
     view: &CrateView<'_>,
-    path: &str,
+    (module, path): (Id, &str),
     depth: usize,
-    visited: &mut HashSet<Id>,
+    (visited, query): (&mut HashSet<Id>, &mut Option<&mut Query<'_>>),
     entries: &mut Vec<(Box<str>, Entry)>,
 ) {
     let index = view.index();
@@ -332,7 +340,9 @@ fn collect(
             Some(Resolution::Item(id)) => vec![id],
             Some(Resolution::Ambiguous(ids)) => ids.into_vec(),
             Some(Resolution::ExternalReexport(reexport)) => {
-                entries.push((child, Entry::External(reexport)));
+                if query.is_some() || !index.is_hidden_reexport(&child) {
+                    entries.push((child, Entry::External(reexport)));
+                }
                 continue;
             },
             Some(
@@ -343,10 +353,61 @@ fn collect(
             | None => continue,
         };
         for id in ids {
+            if query.is_none() && index.is_hidden(id) {
+                continue;
+            }
             entries.push((child.clone(), Entry::Item(id)));
             if depth > 1 && is_module(view, id) && visited.insert(id) {
-                collect(view, &child, depth.saturating_sub(1), visited, entries);
+                collect(
+                    view,
+                    (id, &child),
+                    depth.saturating_sub(1),
+                    (visited, query),
+                    entries,
+                );
             }
+        }
+    }
+    let Some(query) = query.as_deref_mut() else {
+        return;
+    };
+    let Some(ItemEnum::Module(contents)) = view.item(module).map(|item| &item.inner) else {
+        return;
+    };
+    let public = index.canonical_path(module).is_some();
+    // Not again what the list has, as an item of a module without a public path that a public
+    // module re-exports with a glob.
+    let listed: HashSet<Id> = entries
+        .iter()
+        .filter_map(|(_, entry)| match entry {
+            Entry::Item(id) => Some(*id),
+            Entry::External(_) => None,
+        })
+        .collect();
+    let unlisted: Vec<Id> = contents
+        .items
+        .iter()
+        .copied()
+        .filter(|&id| {
+            !listed.contains(&id)
+                && view.item(id).is_some_and(|item| {
+                    !matches!(item.inner, ItemEnum::Impl(_) | ItemEnum::Use(_))
+                        && (!public || index.canonical_path(id).is_none())
+                })
+        })
+        .collect();
+    for id in unlisted {
+        let at = query.path_of(id);
+        entries.push((at.clone(), Entry::Item(id)));
+        if depth > 1 && is_module(view, id) && visited.insert(id) {
+            let mut query = Some(&mut *query);
+            collect(
+                view,
+                (id, &at),
+                depth.saturating_sub(1),
+                (visited, &mut query),
+                entries,
+            );
         }
     }
 }
@@ -376,12 +437,13 @@ fn entry_data<'a>(
             ItemData {
                 path: path.into(),
                 kind,
+                hidden: query.hidden_reexport(path),
                 reexport_of: query.reexport_target(reexport),
                 ..ItemData::default()
             }
         },
         Entry::Item(id) => {
-            let Some(mut data) = query.item_data(*id, None) else {
+            let Some(mut data) = query.item_data(*id, None).map(ItemData::listed) else {
                 return ItemData {
                     path: path.into(),
                     kind: "unknown",
@@ -437,7 +499,17 @@ mod tests {
 
     /// What `list_module` gives for `path` in the test crate of `get_item`.
     fn listed(path: &str, options: ListOptions<'_>) -> Listed {
-        let krate: Crate = parsed().krate;
+        listed_with(path, options, |_| {})
+    }
+
+    /// [`listed`], after `change`.
+    fn listed_with(
+        path: &str,
+        options: ListOptions<'_>,
+        change: impl FnOnce(&mut Crate),
+    ) -> Listed {
+        let mut krate: Crate = parsed().krate;
+        change(&mut krate);
         let bytes = archive(krate);
         let view = CrateView::new(archived(&bytes));
         let name: CrateName = "my-crate".parse().expect("a crate name");
@@ -501,6 +573,38 @@ mod tests {
             ])
         );
         assert_eq!(page, json!({ "shown": 4, "total": 4, "has_more": false }));
+    }
+
+    #[test]
+    fn another_crates_hidden_items_are_not_listed() {
+        // `sync` and the re-export of `Thing` hidden, with `--document-hidden-items`.
+        let hide = |krate: &mut Crate| {
+            krate
+                .index
+                .values_mut()
+                .filter(|item| {
+                    item.name.as_deref() == Some("sync")
+                        || matches!(&item.inner, ItemEnum::Use(reexport) if reexport.name == "Thing")
+                })
+                .for_each(|item| {
+                    item.attrs
+                        .push(rustdoc_types::Attribute::Other("#[doc(hidden)]".into()));
+                });
+        };
+        let (items, _) = listed_with("my_crate", options(), hide).expect("listed");
+        // `Mutex` is still public at the root, which is not hidden.
+        assert_eq!(
+            items,
+            json!([["my_crate::E", "enum", null], [
+                "my_crate::Mutex",
+                "struct",
+                null
+            ],])
+        );
+        assert!(matches!(
+            listed_with("my_crate::sync", options(), hide),
+            Listed::Err(GetItemError::NotFound)
+        ));
     }
 
     #[test]

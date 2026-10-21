@@ -565,8 +565,9 @@ impl Plan {
     /// The command (requirement R-WS-1): `cargo [+<toolchain>] --locked [--offline] rustdoc
     /// --manifest-path <member> -j <jobs> -p <package id> (--lib | --bin <name>) [--target
     /// <target>] [--no-default-features [--features <features>]] --message-format=json -- -Z
-    /// unstable-options --output-format json [--cfg docsrs] --document-private-items`, with the
-    /// value of `RUSTC_BOOTSTRAP` in place of the user's, and the target directory.
+    /// unstable-options --output-format json [--cfg docsrs] --document-private-items
+    /// --document-hidden-items`, with the value of `RUSTC_BOOTSTRAP` in place of the user's, and
+    /// the target directory.
     #[must_use]
     pub fn command(&self) -> tokio::process::Command {
         let mut command =
@@ -608,8 +609,9 @@ impl Plan {
             }
         }
         command
-            // A member's private items too (requirement R-WS-3).
-            .arg("--document-private-items")
+            // A member's private items too (requirement R-WS-3), and those of `#[doc(hidden)]`,
+            // which its own code uses as well (decided in M2's D6).
+            .args(["--document-private-items", "--document-hidden-items"])
             .env("RUSTC_BOOTSTRAP", self.bootstrap.value())
             .env("CARGO_TARGET_DIR", self.target_dir.target())
             .env("CARGO_BUILD_BUILD_DIR", self.target_dir.build());
@@ -677,6 +679,9 @@ impl Plan {
             "features": self.features,
             "docs_rs_features": docs_rs,
             "environment": *ENVIRONMENT,
+            // What the command documents besides the public items, which a build before
+            // `--document-hidden-items` (M2's D6) lacks.
+            "documents": "private hidden",
         });
         facts.to_string()
     }
@@ -2295,6 +2300,7 @@ mod tests {
             "--cfg",
             "tokio_unstable",
             "--document-private-items",
+            "--document-hidden-items",
         ]);
         let env = |name: &str| {
             command

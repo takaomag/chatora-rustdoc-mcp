@@ -1032,6 +1032,28 @@ Claude Code 2.1.304、Linux で測った。
   - テストに、固有の `impl` の private なメソッド・自分の crate の trait の impl の item・ルートの private・private なモジュールの一覧を足した (型のモジュールでの判定を外すと落ちることを確かめた)
 - 残したもの: 型と別のモジュールや関数の本体にある `impl` の private (`pub(in crate::…)` と出る)。`list_implementors` の sealed の文言は、member でも定義パス (`crate::` でない)。`get_item` の説明文の書き出しは docs.rs と std のまま (F4 で見直す)。アーカイブの形式を上げた後の最初の呼び出しは、作り直しの間の前回のビルド (D4c) を開けず `status: building` になる
 
+**D6b-1 (hidden・検索・list_module・crate_overview。2026-10-21)**:
+
+- D6b を 2 つに分けた: D6b-1 (この段) と D6b-2 (`list_methods`・`list_impls`・`list_implementors`、依存の非公開を `get_item` の定義パスとフィールドから除く)
+- member のビルドに `--document-hidden-items` を足した (決定 4。member の `#[doc(hidden)]` は、これが無いと JSON に入らない。R-WS-1 のコマンドに前から書いてある)。鍵の facts に `"documents": "private hidden"` を入れ、前のビルドを作り直す
+- 実測 (rustdoc 1.99.1): `#[doc(hidden)]` は `Attribute::Other("#[doc(hidden)]")`。hidden なモジュールの中の item には付かないので、パスで判断する
+- 公開パス索引に hidden の集合 (`PathIndex::hidden`) を足した: `#[doc(hidden)]` の item、公開パスのすべてがそれを通る item (正準パスは hidden を通らないものを先に選ぶ)、`#[doc(hidden)]` の `impl` の item、公開パスの無い item は定義パスの上のモジュールがそれのもの。ほかの crate の item の再公開は、通った `use` とモジュールで決める (`hidden_reexports`)。`path_index::is_doc_hidden`。アーカイブの形式を 7 に上げた
+- 検索 (`SearchIndex`): 項目に `restricted` (公開でないか hidden) を足した。公開パスのある item のうち hidden なもの、メンバーのうち可視性が `Public`・`Default` でないものか hidden なもの、private を含むビルドでは公開パスの無い item (crate 内のパス `crate::…` で、パスの順に) とそのメンバーを `restricted` にする。検索 (`hits`) と綴りの候補 (`did_you_mean`) は、member (`Origin::Local`) でなければ `restricted` を除く (決定 4、R-SH-5)
+- `list_module`: member では、各モジュールの公開パスの無い子 (`impl`・`use` を除く) を、公開の子の後に crate 内のパスで並べる。公開パスの無いモジュールでは、子をすべて並べる (公開パスのある子は正準パスで)。`recursive` ではそれらのモジュールの中もたどる。member でなければ hidden な item を除く。D6a のつなぎの warning は消した
+- `crate_overview`: member の数は定義パスのある item すべて (variant・フィールド・`impl` を除く)、ルートの公開パスの無い子も並べる。member でなければ hidden な item を数えず、並べない
+- 応答: `data.hidden` (member の hidden な item)。検索と一覧の項目は、`visibility` が `pub` なら付けない (`ItemData::listed`。決定 5)。出力スキーマに `hidden` を足した
+- テスト: 検索の単体テスト (private を含むビルドで、crate の `lock` と hidden な `Mutex` が docs.rs の crate では見つからず、member では見つかる)。stdio で、member の private な固有メソッドと hidden な関数が検索で見つかること (`visibility`・`hidden`、`pub` に `visibility` が付かないこと)、公開パスの無いモジュールとルートの一覧、`crate_overview` のモジュールと数
+- レビューで直したこと (レビューは std・core・alloc の JSON も `includes_private: true` で hidden を含むこと (core 902・std 120・alloc 69 件) を実測した。除くのは docs.rs の珍しいビルドだけでなく、std で常に効く):
+  - ほかの crate の item の hidden な再公開が漏れていた (`list_module std::panic` の `panic_2021`、hidden なモジュール `std::rt` の中身、alloc の `io::IoHandle`): 通った `use` とモジュールで判定し、検索・一覧・`crate_overview` で除き、member では `hidden` を付ける
+  - `#[doc(hidden)]` の `impl` のメソッドが hidden にならなかった: その `impl` の item を hidden に
+  - 見えるパスでも使える item が、正準パスが hidden を通るだけで隠れていた: 正準パスは hidden を通らないパスを先に選び、すべてのパスが通るときだけ hidden に
+  - 公開パスの無いモジュールの子を並べると、glob で公開モジュールに並んだ item が `recursive` の一覧で 2 度出た: 並べたものは足さない (外すと落ちることを確かめた)
+  - ほかの crate の hidden なモジュールが空の一覧として開けた: `NotFound`
+  - `crate_overview` の数で variant を除いたのが docs.rs と std にも効いていた: member でだけ除く
+  - 公開パスの無い item の並びを、同じパスなら id でも決める。`is_doc_hidden` は `#[doc` で始まる属性だけを調べる (レビューの測定で、core のアーカイブを作る時間が 338 ms から 603 ms に増えていた)
+  - テストを足した: `list_module` の単体テスト (hidden なモジュールと再公開を除き、hidden でない根の再公開の `Mutex` は残り、hidden なモジュールは `NotFound`)。stdio で、hidden な `impl` のメソッドと hidden な再公開に `hidden`、見えるパスのある item は hidden でなく正準パスがそのパス、glob の item が `recursive` の一覧に 1 度だけ
+- 残したもの: BM25 の統計は `restricted` の項目も数える (std・core・alloc では private と hidden が文書の数に入る。上位の順位はほぼ同じとレビューが確かめた)。std の公開パスの無い item も検索の索引に入る (member か分かるのは照会のときなので、アーカイブを作る時間と大きさが増える)。member の名前の `internal`・`_private` も点が半分になる (`penalized`)。crate 名を付けて引いた `crate::…` の item は Path の段に乗らない。形式 56 の `cfg_attr` の hidden は読めない。依存の hidden なフィールドと、依存の hidden な item を `get_item` で引く経路は D6b-2。説明文 (`search_items`・`list_module`・`crate_overview`) に private と hidden を書いていない (F4)
+
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
 - 利用者の指示で、デッドロックと止まって戻らない危険を、コード全体で監査した (サブエージェント、読むだけ。D4b のハングの後)。ロックの循環、ガードを持ったままの `.await` (clippy の `await_holding_lock` も `suspicious` の deny で効いている)、自分の結果を待つ形の循環は無かった。止まって長く戻らない箇所は次のとおり

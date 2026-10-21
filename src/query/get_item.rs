@@ -369,6 +369,10 @@ pub struct ItemData<'a> {
     /// parent's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility: Option<Box<str>>,
+    /// In a workspace member, the item is hidden from its documentation (`#[doc(hidden)]`, or
+    /// below one), as other crates do not see it (decided in M2's D6).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
     /// The type, trait or enum that the item belongs to (requirement R-SH-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<Box<str>>,
@@ -443,6 +447,18 @@ pub struct ItemData<'a> {
     /// Something was cut to keep the response within its budget (requirement R-OUT-3).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+}
+
+impl ItemData<'_> {
+    /// The item as a list shows it: with its visibility only when it is not `pub` (decided in
+    /// M2's D6).
+    #[must_use]
+    pub fn listed(mut self) -> Self {
+        if self.visibility.as_deref() == Some("pub") {
+            self.visibility = None;
+        }
+        self
+    }
 }
 
 /// The stability of an item of std, and of its use in `const`.
@@ -771,11 +787,6 @@ impl<'a> Query<'a> {
         }
     }
 
-    /// Adds a warning.
-    pub(super) fn warn(&mut self, warning: String) {
-        self.warnings.push(Cow::Owned(warning));
-    }
-
     /// Adds a hint of what to call next.
     pub(super) fn hint(&mut self, hint: String) {
         self.hints.push(hint.into());
@@ -900,6 +911,9 @@ impl<'a> Query<'a> {
         let mut data = ItemData {
             kind: kind_of(item, parent.is_some()),
             visibility: self.visibility_of(item, parent),
+            hidden: self.is_member()
+                && (self.index.is_hidden(id)
+                    || parent.is_some_and(|parent| self.index.is_hidden(parent))),
             ..ItemData::default()
         };
         if let Some(parent) = parent {
@@ -1246,6 +1260,12 @@ impl<'a> Query<'a> {
                 return self.visibility_of(of_trait.or_else(|| self.view.item(parent))?, None);
             },
         })
+    }
+
+    /// Whether the re-export of another crate's item at `path` is told hidden: in a workspace
+    /// member, when it goes through an item of `#[doc(hidden)]` (decided in M2's D6).
+    pub(super) fn hidden_reexport(&self, path: &str) -> bool {
+        self.is_member() && self.index.is_hidden_reexport(path)
     }
 
     /// Whether the crate is a workspace member's, built here with its private items (decided in
