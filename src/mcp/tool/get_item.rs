@@ -11,6 +11,8 @@ use semver::Version;
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
+#[cfg(feature = "local")]
+use super::local::{self, LocalSource, Member};
 use super::{
     ErrorChain,
     InvalidArgument,
@@ -24,6 +26,8 @@ use crate::data::{
     packages::{DocsRsCheck, Lookup as PackageLookup, PackageGraph, ProjectPackage, Source},
     project::Workspace,
 };
+#[cfg(feature = "local")]
+use crate::query::local::LocalWanted;
 use crate::{
     data::{
         self,
@@ -330,6 +334,10 @@ struct Request {
     index_fetched_at: Option<Box<str>>,
     /// Until when the call waits for work that goes on without it (requirement R-ARCH-6).
     until: Instant,
+    /// The workspace member's crate that is built here instead, if it is one (decided in M2's
+    /// D2).
+    #[cfg(feature = "local")]
+    local: Option<LocalSource>,
 }
 
 /// The most crates that a path is followed into, through re-exports of their items, after the
@@ -769,6 +777,174 @@ pub(super) fn parse_arguments(
     })
 }
 
+/// The request for a workspace member's crate, built here, when the lookup is in one (decided in
+/// M2's D2): the project decided the version, as `found`, and it is not from crates.io, which
+/// docs.rs does not have even when crates.io has a crate of that name (requirement R-VR-2); or
+/// `spec` is the exact version of the member of that name in the project that `project` names
+/// (requirement R-VR-1).
+#[cfg(feature = "local")]
+async fn member_in_project(
+    state: &ToolState,
+    (found, spec, project): (
+        Option<&project::Found>,
+        &VersionSpec,
+        Option<&std::path::Path>,
+    ),
+    name: &CrateName,
+    (path, target, shape): (&str, &TargetTriple, &Shape),
+    until: Instant,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<Option<Request>, Box<CallToolResult>> {
+    match (found, spec) {
+        (Some(found), _) if found.package.source != Source::CratesIo => {
+            in_member(state, found, name, path, target, shape, until)
+                .await
+                .map(Some)
+        },
+        (None, VersionSpec::Exact(version)) => {
+            explicit_member(
+                state,
+                project,
+                name,
+                (version, path, target, shape),
+                until,
+                warnings,
+            )
+            .await
+        },
+        _ => Ok(None),
+    }
+}
+
+/// The request for the project's package `found`, not from crates.io: the workspace member's crate
+/// `name`, built here, or else `local_build_required` (decided in M2's D2).
+#[cfg(feature = "local")]
+async fn in_member(
+    state: &ToolState,
+    found: &project::Found,
+    name: &CrateName,
+    path: &str,
+    target: &TargetTriple,
+    shape: &Shape,
+    until: Instant,
+) -> Result<Request, Box<CallToolResult>> {
+    let asked = local::Asked::Package {
+        name: &found.package.name,
+        version: &found.package.version,
+    };
+    match local::member(state, &found.workspace, (name, asked), target, until).await? {
+        Member::Is { wanted, package } => Ok(member_request(
+            &package,
+            wanted,
+            (name, path),
+            (target, shape),
+            (found.resolved_from, found.project_from, &found.workspace),
+            until,
+        )),
+        Member::Unknown(error) => Err(error),
+        Member::Resolving(doing) => Err(Box::new(project::resolving_crate(
+            name,
+            target,
+            (doing, found.project_from),
+            &[],
+        ))),
+        Member::OtherVersion(_) | Member::Not => Err(Box::new(local_build_required(
+            &found.package,
+            DocsRsCheck::NotCratesIo,
+        ))),
+    }
+}
+
+/// The request for the crate `name` at the exact version that `explicit` gives, with the path,
+/// target and shape, when it is the version of the member of that name in the project that
+/// `project` names, or else the default project's (requirement R-VR-1, decided in M2's D2). A
+/// member at another version is warned about.
+#[cfg(feature = "local")]
+async fn explicit_member(
+    state: &ToolState,
+    project: Option<&std::path::Path>,
+    name: &CrateName,
+    (version, path, target, shape): (&Version, &str, &TargetTriple, &Shape),
+    until: Instant,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<Option<Request>, Box<CallToolResult>> {
+    // A project that cannot be read leaves the lookup to crates.io, as asked.
+    let Ok(Some((workspace, project_from))) = project::workspace(state.project.as_ref(), project)
+    else {
+        return Ok(None);
+    };
+    let asked = local::Asked::Explicit { version };
+    match local::member(state, &workspace, (name, asked), target, until).await {
+        Ok(Member::Is { wanted, package }) => {
+            warnings.push(
+                format!(
+                    "{name} {version} is the workspace's member, built here, which may differ                      from the release of that name on crates.io"
+                )
+                .into(),
+            );
+            Ok(Some(member_request(
+                &package,
+                wanted,
+                (name, path),
+                (target, shape),
+                (ResolvedFrom::Explicit, project_from.as_str(), &workspace),
+                until,
+            )))
+        },
+        Ok(Member::OtherVersion(member)) => {
+            warnings.push(
+                format!(
+                    "the workspace's member {name} is at {member}, so {version} is the release of \
+                     that name on crates.io, not the member"
+                )
+                .into(),
+            );
+            Ok(None)
+        },
+        // Not told while cargo resolves, nor when it fails: the release is looked up as asked.
+        Ok(Member::Not | Member::Unknown(_) | Member::Resolving(_)) | Err(_) => Ok(None),
+    }
+}
+
+/// The request for the crate of the member `package` that `wanted` builds, with `path` from the
+/// name it was asked by to the crate's, how its version was decided, where the project came from,
+/// and its workspace. The request's name is the package's, which its features are found by.
+#[cfg(feature = "local")]
+fn member_request(
+    package: &str,
+    wanted: Box<LocalWanted>,
+    (name, path): (&CrateName, &str),
+    (target, shape): (&TargetTriple, &Shape),
+    (resolved_from, project_from, workspace): (ResolvedFrom, &'static str, &Workspace),
+    until: Instant,
+) -> Request {
+    // The crate's name, which `[lib] name` may make other than the package's.
+    let path = with_lib_name(name.as_str(), path);
+    let path = match path.split_once("::") {
+        Some((_, rest)) => format!("{}::{rest}", wanted.plan.crate_name).into(),
+        None => wanted.plan.crate_name.clone(),
+    };
+    Request {
+        name: package.parse().unwrap_or_else(|_| name.clone()),
+        version: wanted.plan.version.clone(),
+        project_from: Some(project_from),
+        path,
+        resolved_from,
+        target: target.clone(),
+        shape: shape.clone(),
+        checksum: None,
+        build: None,
+        in_build: InBuild {
+            workspace: Some(workspace.clone()),
+            sets: None,
+        },
+        hops: 0,
+        index_fetched_at: None,
+        until,
+        local: Some(LocalSource::Wanted(wanted)),
+    }
+}
+
 /// Decides the version (requirements R-VR-1 and R-VR-3) for `target`. An exact version whose JSON
 /// for `target` is cached is taken as it is; otherwise the crates.io index is read, which also
 /// gives the crate's published spelling. Returns the request with the warnings about how it was
@@ -799,16 +975,18 @@ async fn resolve(
         let in_project = project::version_in_project(state, &name, project.as_deref(), until).await;
         decided_in_project(in_project, &name, &target, &mut warnings)?
     };
-    // A package of the project that is not from crates.io is not looked for there: docs.rs does
-    // not have it, even when crates.io has a crate of that name (requirement R-VR-2).
     #[cfg(feature = "local")]
-    if let Some(found) = &from_project
-        && found.package.source != Source::CratesIo
+    if let Some(request) = member_in_project(
+        state,
+        (from_project.as_deref(), &spec, project.as_deref()),
+        &name,
+        (&path, &target, &shape),
+        until,
+        &mut warnings,
+    )
+    .await?
     {
-        return Err(Box::new(local_build_required(
-            &found.package,
-            DocsRsCheck::NotCratesIo,
-        )));
+        return Ok((request, warnings));
     }
     // When the project did not decide the version, its build still tells `enabled_in_project`
     // if it has the release from crates.io (requirement R-VR-1), which the index tells below.
@@ -874,6 +1052,8 @@ async fn resolve(
         target,
         shape,
         until,
+        #[cfg(feature = "local")]
+        local: None,
     };
     Ok((request, warnings))
 }
@@ -956,6 +1136,8 @@ fn cached_request(
         hops: 0,
         index_fetched_at: None,
         until,
+        #[cfg(feature = "local")]
+        local: None,
     }
 }
 
@@ -1116,15 +1298,16 @@ pub(super) fn version_not_found(
 }
 
 /// `docs_unavailable` with `reason: local_build_required`: the project's package is not the one
-/// on crates.io, and this server does not build documentation yet (decided in M1, until M2).
+/// on crates.io, and this server builds only the workspace's members yet (decided in M1, and in
+/// M2's D2 until D7).
 #[cfg(feature = "local")]
 fn local_build_required(package: &ProjectPackage, check: DocsRsCheck) -> CallToolResult {
     let why = not_on_docs_rs(package, check);
     error_result(&json!({
         "code": "docs_unavailable",
         "message": format!(
-            "{}@{} in the project is {why}, so docs.rs does not have it, and this server does not \
-             build documentation yet",
+            "{}@{} in the project is {why}, so docs.rs does not have it, and this server builds \
+             the documentation of the workspace's members only yet",
             package.name, package.version
         ),
         "retryable": false,
@@ -1309,6 +1492,11 @@ async fn look_up_release(
     mut arguments: Request,
     mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
+    // Built here: docs.rs and static.crates.io have another crate of its name, if any.
+    #[cfg(feature = "local")]
+    if let Some(source) = arguments.local.take() {
+        return look_up_member(state, arguments, source, warnings).await;
+    }
     arguments.build = docs_rs_build(state, &arguments, &mut warnings)
         .await
         .map(Box::new);
@@ -1332,6 +1520,63 @@ async fn look_up_release(
         Ok((looked_up, arguments)) => conclude(state, looked_up, arguments, warnings).await,
         Err(result) => *result,
     }
+}
+
+/// Looks the item up in the build of the workspace member's crate that `source` names, made by
+/// work that the calls for it share, and follows the path into the crate it goes on in, if any
+/// (decided in M2's D2).
+#[cfg(feature = "local")]
+async fn look_up_member(
+    state: &Arc<ToolState>,
+    mut arguments: Request,
+    source: LocalSource,
+    mut warnings: Vec<Box<str>>,
+) -> CallToolResult {
+    let built = match source {
+        LocalSource::Built(built) => built,
+        LocalSource::Wanted(wanted) => {
+            let provenance = local_provenance(&arguments);
+            match local::built(state, *wanted, arguments.until, provenance, &warnings).await {
+                Ok(built) => {
+                    warnings.extend(built.archived.warnings.iter().cloned());
+                    built
+                },
+                Err(result) => return *result,
+            }
+        },
+    };
+    arguments.in_build.sets = feature_sets(state, &arguments, &mut warnings).await;
+    // Kept for the lookup again when a re-export is not followed.
+    arguments.local = Some(LocalSource::Built(Arc::clone(&built)));
+    let task = crate::task::spawn_blocking(move || {
+        let record = &built.record;
+        let origin = Origin::Local {
+            resolved_from: arguments.resolved_from,
+            project_from: arguments.project_from,
+            toolchain: record.toolchain.as_deref(),
+            built_at: &record.built_at,
+            features_effective: record.features_effective.as_deref(),
+        };
+        let looked_up = look_up_in(&built.archived.mapped, &arguments, origin);
+        (looked_up, arguments)
+    });
+    match task.await {
+        Ok((looked_up, arguments)) => conclude(state, looked_up, arguments, warnings).await,
+        Err(error) => {
+            let error = crate::task::resume_if_panic(error);
+            tracing::error!(%error, "the get_item lookup did not finish");
+            shutting_down()
+        },
+    }
+}
+
+/// The provenance of the workspace member's crate that `arguments` names, as far as it is known
+/// before it is built.
+#[cfg(feature = "local")]
+fn local_provenance(arguments: &Request) -> Map<String, Value> {
+    let mut provenance = docs_rs_provenance(arguments);
+    provenance.insert("source".to_owned(), json!("local"));
+    provenance
 }
 
 /// Looks the item up in the archive of the crate in `dir`, or else in the archive that work made
@@ -1373,7 +1618,7 @@ async fn load_and_look_up(
     warnings.extend(archived.warnings.iter().cloned());
     let mapped = Arc::clone(&archived.mapped);
     let task = crate::task::spawn_blocking(move || {
-        let looked_up = look_up_in(&mapped, &arguments);
+        let looked_up = look_up_in(&mapped, &arguments, docs_rs_origin(&arguments));
         (looked_up, arguments)
     });
     match task.await {
@@ -1760,8 +2005,21 @@ async fn destination_request(
     warnings: &mut Vec<Box<str>>,
 ) -> Result<Request, Box<CallToolResult>> {
     #[cfg(feature = "local")]
-    if let Some(request) = in_project_build(state, destination, origin).await {
-        return Ok(request);
+    match in_project_build(state, destination, origin).await {
+        InProjectBuild::Release(request) => return Ok(*request),
+        // Not the crate of that name on crates.io (decided in M2's D2, until D6).
+        InProjectBuild::NotFromCratesIo(package) => {
+            return Err(Box::new(super::tool_error(
+                "docs_unavailable",
+                &format!(
+                    "{package} in the project is not from crates.io, and a path is not followed \
+                     into it yet"
+                ),
+                false,
+                &[&format!("look the item up in {package} itself")],
+            )));
+        },
+        InProjectBuild::Elsewhere => {},
     }
     let (name, version, resolved_from, index_fetched_at) =
         if let Some((name, version)) = &destination.release {
@@ -1826,18 +2084,43 @@ async fn destination_request(
         hops: origin.hops.saturating_add(1),
         index_fetched_at,
         until: origin.until,
+        #[cfg(feature = "local")]
+        local: None,
     })
 }
 
-/// The request for the crate that the path goes on in, at its version in the project's build,
-/// when the project decided the version of `origin` and has the crate from crates.io. Of several
-/// versions, the one that `origin` was built with on docs.rs.
+/// The crate that the path goes on in, in the project's build.
+#[cfg(feature = "local")]
+enum InProjectBuild {
+    /// The request for it at its version there, a release of crates.io.
+    Release(Box<Request>),
+    /// It is the project's package, as `name@version`, which is not from crates.io.
+    NotFromCratesIo(String),
+    /// The project does not tell.
+    Elsewhere,
+}
+
+/// The crate that the path goes on in, at its version in the project's build, when the project
+/// decided the version of `origin`. Of several versions, the one that `origin` was built with on
+/// docs.rs.
 #[cfg(feature = "local")]
 async fn in_project_build(
     state: &ToolState,
     destination: &Destination,
     origin: &Request,
-) -> Option<Request> {
+) -> InProjectBuild {
+    in_project_build_of(state, destination, origin)
+        .await
+        .unwrap_or(InProjectBuild::Elsewhere)
+}
+
+/// [`in_project_build`], `None` when the project does not tell.
+#[cfg(feature = "local")]
+async fn in_project_build_of(
+    state: &ToolState,
+    destination: &Destination,
+    origin: &Request,
+) -> Option<InProjectBuild> {
     let workspace = origin.in_build.workspace.as_ref()?;
     let resolution = state.resolver.resolve(workspace).await.ok()?;
     let graph = PackageGraph::new(&resolution);
@@ -1861,9 +2144,12 @@ async fn in_project_build(
         PackageLookup::AmbiguousPackage(_) | PackageLookup::NotFound => return None,
     };
     if package.source != Source::CratesIo {
-        return None;
+        return Some(InProjectBuild::NotFromCratesIo(format!(
+            "{}@{}",
+            package.name, package.version
+        )));
     }
-    Some(Request {
+    Some(InProjectBuild::Release(Box::new(Request {
         name: package.name.parse().ok()?,
         version: package.version.clone(),
         project_from: origin.project_from,
@@ -1881,7 +2167,8 @@ async fn in_project_build(
         // The version is the project's, not the index's.
         index_fetched_at: None,
         until: origin.until,
-    })
+        local: None,
+    })))
 }
 
 /// The features of the packages in the build of the workspace that decided the version of
@@ -2028,6 +2315,8 @@ async fn execute_std(
         hops: 0,
         index_fetched_at: None,
         until,
+        #[cfg(feature = "local")]
+        local: None,
     };
     let cache = state.cache.clone();
     let task = crate::task::spawn_blocking(move || {
@@ -2211,7 +2500,10 @@ async fn look_up_archived(
     arguments: Box<Request>,
 ) -> Option<Result<(Result<Value, Failure>, Box<Request>), Box<Request>>> {
     let task = crate::task::spawn_blocking(move || match load::open_archived(&cache, &dir) {
-        Ok(Some(mapped)) => Ok((look_up_in(&mapped, &arguments), arguments)),
+        Ok(Some(mapped)) => Ok((
+            look_up_in(&mapped, &arguments, docs_rs_origin(&arguments)),
+            arguments,
+        )),
         Ok(None) => Err(arguments),
         Err(error) => {
             tracing::warn!(%error, "the archive of the crate could not be read");
@@ -2310,19 +2602,28 @@ enum Failure {
     Serialize(serde_json::Error),
 }
 
-/// Looks the item up in the archive `mapped`, and serializes the response while the items it
-/// borrows from are still there.
-fn look_up_in(mapped: &Mapped<Indexed>, arguments: &Request) -> Result<Value, Failure> {
+/// Where the release that `arguments` names on docs.rs comes from.
+fn docs_rs_origin(arguments: &Request) -> Origin<'_> {
+    Origin::DocsRs {
+        resolved_from: arguments.resolved_from,
+        project_from: arguments.project_from,
+        build: arguments.build.as_deref(),
+    }
+}
+
+/// Looks the item up in the archive `mapped`, of the crate from `origin`, and serializes the
+/// response while the items it borrows from are still there.
+fn look_up_in(
+    mapped: &Mapped<Indexed>,
+    arguments: &Request,
+    origin: Origin<'_>,
+) -> Result<Value, Failure> {
     let view = CrateView::new(mapped.get());
     let item_request = ItemRequest {
         name: &arguments.name,
         version: &arguments.version,
         path: &arguments.path,
-        origin: Origin::DocsRs {
-            resolved_from: arguments.resolved_from,
-            project_from: arguments.project_from,
-            build: arguments.build.as_deref(),
-        },
+        origin,
         target: Some(arguments.target.as_str()),
         detail: arguments.shape.detail,
         project_features: arguments
@@ -2809,6 +3110,8 @@ mod tests {
             hops: 0,
             index_fetched_at: None,
             until: Instant::now(),
+            #[cfg(feature = "local")]
+            local: None,
         };
         let candidates = (0..25).map(|n| format!("item {n}").into()).collect();
         let result = item_error(&request, &GetItemError::Ambiguous { candidates });

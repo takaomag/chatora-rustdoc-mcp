@@ -240,6 +240,25 @@ pub(super) async fn default_target(
     (host.triple.clone(), warnings)
 }
 
+/// Whether the project at `root` sets `build.target` in cargo's settings (or `CARGO_BUILD_TARGET`):
+/// a build then passes `--target` even for the host, which cargo would else take from the setting
+/// (requirement R-WS-1). A target of its own counts: the build is for the host's then (decided in
+/// M2's D2).
+#[cfg(feature = "local")]
+pub(super) async fn sets_build_target(state: &ToolState, root: &Path) -> bool {
+    let (root, home) = (
+        root.to_path_buf(),
+        state.resolver.cargo_home().map(Path::to_path_buf),
+    );
+    let env = std::env::var("CARGO_BUILD_TARGET").ok();
+    crate::task::spawn_blocking(move || {
+        cargo_config::read(&root, home.as_deref(), env.as_deref())
+            .is_ok_and(|config| config.build_target.is_some())
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// The project's `build.target`, as cargo's settings give it (Q-31), when it is a target this
 /// server documents. A target of its own (a target JSON, or with `build-std`) is not yet: the
 /// host's is used, with a warning (decided in M2's B3b, until D7).
@@ -484,7 +503,7 @@ fn raw_warnings(because: &CargoError) -> Vec<Box<str>> {
 
 /// The name of a kind of failure, as the error codes write it.
 #[cfg(feature = "local")]
-const fn failure_name(failure: Failure) -> &'static str {
+pub(super) const fn failure_name(failure: Failure) -> &'static str {
     match failure {
         Failure::LockfileOutdated => "lockfile_outdated",
         Failure::OfflineMiss => "offline_miss",

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     cache::{self, Cache},
     cargo::{Activity, Failure, RunError, classify, run_building, stderr_tail},
-    metadata::{Metadata, Package, PackageId},
+    metadata::{Metadata, Package, PackageId, Target},
     process_lock::{self, LockMode, ProcessLock},
     target::TargetTriple,
 };
@@ -230,8 +230,10 @@ pub enum Documented {
     },
 }
 
-/// The member whose crate is named `name`, with `_` for `-`, and that crate: a member's lib, or
-/// else a member's bin. A bin of the same name as a lib cannot be reached (decided in M2's D2).
+/// The member whose crate is named `name`, with `_` for `-`, and that crate (decided in M2's D2).
+///
+/// That is a member's lib, or else a member's bin, or else the lib of the member whose package has
+/// the name. A bin of the same name as a lib cannot be reached.
 #[must_use]
 pub fn member_crate<'a>(metadata: &'a Metadata, name: &str) -> Option<(&'a Package, Documented)> {
     let members: HashSet<&PackageId> = metadata.workspace_members.iter().collect();
@@ -241,7 +243,7 @@ pub fn member_crate<'a>(metadata: &'a Metadata, name: &str) -> Option<(&'a Packa
             .iter()
             .filter(|package| members.contains(&package.id))
     };
-    let named = |target: &&super::metadata::Target| crate_name(&target.name) == name;
+    let named = |target: &&Target| crate_name(&target.name) == name;
     let lib = member_packages().find_map(|package| {
         package
             .targets
@@ -258,7 +260,7 @@ pub fn member_crate<'a>(metadata: &'a Metadata, name: &str) -> Option<(&'a Packa
             })
             .map(|documented| (package, documented))
     });
-    lib.or_else(|| {
+    let bin = || {
         member_packages().find_map(|package| {
             package
                 .targets
@@ -271,7 +273,78 @@ pub fn member_crate<'a>(metadata: &'a Metadata, name: &str) -> Option<(&'a Packa
                     })
                 })
         })
+    };
+    // The lib of a member asked for by its package's name, as `[lib] name` may differ.
+    let by_package = || {
+        member_packages()
+            .filter(|package| crate_name(&package.name) == name)
+            .find_map(|package| {
+                let lib = package
+                    .targets
+                    .iter()
+                    .find(|target| target.kind.iter().any(|kind| LIB_KINDS.contains(&&**kind)))?;
+                Some((package, Documented::Lib {
+                    proc_macro: lib.kind.iter().any(|kind| &**kind == "proc-macro"),
+                }))
+            })
+    };
+    lib.or_else(bin).or_else(by_package)
+}
+
+/// The crate of the member `package` that a lookup of `name`, with `_` for `-`, is in: its lib
+/// or bin of that name, else its lib, else its bin if it has one alone (decided in M2's D2).
+#[must_use]
+pub fn crate_of(package: &Package, name: &str) -> Option<Documented> {
+    let is_lib = |target: &&Target| target.kind.iter().any(|kind| LIB_KINDS.contains(&&**kind));
+    let is_bin = |target: &&Target| target.kind.iter().any(|kind| &**kind == "bin");
+    let lib = |target: &Target| Documented::Lib {
+        proc_macro: target.kind.iter().any(|kind| &**kind == "proc-macro"),
+    };
+    let bin = |target: &Target| Documented::Bin {
+        name: target.name.clone(),
+    };
+    let named = |target: &&Target| crate_name(&target.name) == name;
+    if let Some(target) = package.targets.iter().filter(named).find(is_lib) {
+        return Some(lib(target));
+    }
+    if let Some(target) = package.targets.iter().filter(named).find(is_bin) {
+        return Some(bin(target));
+    }
+    if let Some(target) = package.targets.iter().find(is_lib) {
+        return Some(lib(target));
+    }
+    let mut bins = package.targets.iter().filter(is_bin);
+    match (bins.next(), bins.next()) {
+        (Some(target), None) => Some(bin(target)),
+        _ => None,
+    }
+}
+
+/// The member of `metadata` that is the package `name` at `version`.
+#[must_use]
+pub fn member_package<'a>(
+    metadata: &'a Metadata,
+    name: &str,
+    version: &Version,
+) -> Option<&'a Package> {
+    metadata.packages.iter().find(|package| {
+        &*package.name == name
+            && package.version == *version
+            && metadata.workspace_members.contains(&package.id)
     })
+}
+
+/// The name of the crate that `documented` of `package` is, with `_` for `-`.
+#[must_use]
+pub fn documented_name(package: &Package, documented: &Documented) -> String {
+    match documented {
+        Documented::Bin { name } => crate_name(name),
+        Documented::Lib { .. } => package
+            .targets
+            .iter()
+            .find(|target| target.kind.iter().any(|kind| LIB_KINDS.contains(&&**kind)))
+            .map_or_else(|| crate_name(&package.name), |lib| crate_name(&lib.name)),
+    }
 }
 
 /// Whether a build for `target` passes `--target` (requirement R-WS-1).
@@ -900,7 +973,7 @@ mod tests {
         let mut metadata = metadata();
         let package = metadata.packages.first_mut().expect("a package");
         let long = "a".repeat(MAX_BOOTSTRAP_BYTES.saturating_add(1));
-        package.targets = vec![super::super::metadata::Target {
+        package.targets = vec![Target {
             name: long.into(),
             kind: vec!["lib".into()].into(),
         }]
@@ -939,6 +1012,35 @@ mod tests {
         // Not a dependency's, nor a build script.
         assert_eq!(found("serde"), None);
         assert_eq!(found("build_script_build"), None);
+    }
+
+    #[test]
+    fn the_crate_of_a_member_package_is_the_one_named_or_its_lib() {
+        let metadata = metadata();
+        let package =
+            |name: &str| member_package(&metadata, name, &Version::new(0, 1, 0)).expect("a member");
+        // The bin named, though the package has a lib.
+        assert_eq!(
+            crate_of(package("app"), "my_app"),
+            Some(Documented::Bin {
+                name: "my-app".into()
+            })
+        );
+        // The lib, when the name is not a target's, as a dependency's renamed name.
+        assert_eq!(
+            crate_of(package("app"), "renamed"),
+            Some(Documented::Lib { proc_macro: false })
+        );
+        // Its bin alone, without a lib.
+        assert_eq!(
+            crate_of(package("tool"), "renamed"),
+            Some(Documented::Bin {
+                name: "tool".into()
+            })
+        );
+        // Not a dependency, nor another version.
+        assert!(member_package(&metadata, "serde", &Version::new(1, 0, 0)).is_none());
+        assert!(member_package(&metadata, "app", &Version::new(0, 2, 0)).is_none());
     }
 
     #[test]

@@ -806,11 +806,18 @@ fn resolve_version_needs_no_network_for_std_and_bad_arguments() {
 /// has a crate named demo too, which must not be looked for in its place.
 #[cfg(feature = "local")]
 fn demo_workspace() -> TempDir {
+    workspace_of("demo")
+}
+
+/// A workspace with the package `name` 0.1.0, whose lib is empty, and its Cargo.lock, in a new
+/// temporary directory.
+#[cfg(feature = "local")]
+fn workspace_of(name: &str) -> TempDir {
     let dir = TempDir::new().expect("a temporary directory");
     std::fs::create_dir_all(dir.path().join("src")).expect("made");
     std::fs::write(
         dir.path().join("Cargo.toml"),
-        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
     )
     .expect("written");
     std::fs::write(dir.path().join("src/lib.rs"), "").expect("written");
@@ -906,21 +913,23 @@ fn lookups_start_nothing_for_a_project_outside_the_default_one() {
 }
 
 /// Without a version, the project decides it (requirements R-MCP-3 and R-VR-2). The project here
-/// is the package itself, which docs.rs does not have, and one outside the default project is not
-/// read with cargo. Without local features, no project is read.
+/// is the package itself, which docs.rs does not have: its documentation is built here, for the
+/// host, while every line of stdout stays a JSON-RPC message (requirement R-SEC-1, decided in
+/// M2's D2). One outside the default project is not read with cargo. Without local features, no
+/// project is read.
 #[cfg(feature = "local")]
 #[test]
 fn without_a_version_the_project_decides_it() {
     let project = demo_workspace();
+    std::fs::write(
+        project.path().join("src/lib.rs"),
+        "/// Says hello.\npub fn hello() {}\n",
+    )
+    .expect("written");
     let elsewhere = demo_workspace();
     let mut server = Server::start_in(Some(project.path()));
     server.send(&call_tool(
         1,
-        "get_item",
-        json!({ "crate": "demo", "path": "hello", "target": TARGET }),
-    ));
-    server.send(&call_tool(
-        2,
         "get_item",
         json!({
             "crate": "demo",
@@ -930,10 +939,213 @@ fn without_a_version_the_project_decides_it() {
         }),
     ));
     let error = text_json(&server.response(1)["result"]);
-    assert_eq!(error["code"], "docs_unavailable");
-    assert_eq!(error["reason"], "local_build_required", "{error}");
-    let error = text_json(&server.response(2)["result"]);
     assert_eq!(error["reason"], "no_record", "{error}");
+    // Called again while it is built past the deadline of a call.
+    let mut found = Value::Null;
+    for id in 2..20 {
+        server.send(&call_tool(
+            id,
+            "get_item",
+            json!({ "crate": "demo", "path": "hello" }),
+        ));
+        found = server.response(id)["result"].clone();
+        if found["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    assert_ne!(found["isError"], true, "{found}");
+    let provenance = &found["structuredContent"]["provenance"];
+    assert_eq!(provenance["source"], "local", "{found}");
+    assert_eq!(provenance["resolved_from"], "cargo_lock", "{found}");
+    assert!(provenance["built_at"].is_string(), "{found}");
+    assert_eq!(found["structuredContent"]["data"]["path"], "demo::hello");
+    // The member at its version is the member, not the crate of that name on crates.io
+    // (requirement R-VR-1).
+    server.send(&call_tool(
+        30,
+        "get_item",
+        json!({ "crate": "demo@0.1.0", "path": "hello" }),
+    ));
+    let found = server.response(30)["result"]["structuredContent"].clone();
+    assert_eq!(found["provenance"]["source"], "local", "{found}");
+    assert_eq!(found["provenance"]["resolved_from"], "explicit", "{found}");
+    assert!(warns(&found, "may differ"), "{found}");
+    assert!(server.finish().success());
+}
+
+/// A project that builds for a target of its own, with a target JSON and `build-std`, has its
+/// member built for the host, with `--target`, which wins over its `build.target`, and a warning
+/// (decided in M2's D2, until D7). A stable cargo does not use `[unstable]`.
+#[cfg(feature = "local")]
+#[test]
+fn a_member_of_a_project_with_a_target_of_its_own_is_built_for_the_host() {
+    let project = demo_workspace();
+    std::fs::write(
+        project.path().join("src/lib.rs"),
+        "/// Says hello.\npub fn hello() {}\n",
+    )
+    .expect("written");
+    set_cargo_settings(
+        project.path(),
+        "[build]\ntarget = \"my-target.json\"\n\n[unstable]\nbuild-std = [\"core\"]\n",
+    );
+    let mut server = Server::start_in(Some(project.path()));
+    let mut found = Value::Null;
+    for id in 1..20 {
+        server.send(&call_tool(
+            id,
+            "get_item",
+            json!({ "crate": "demo", "path": "hello" }),
+        ));
+        found = server.response(id)["result"].clone();
+        if found["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    assert_ne!(found["isError"], true, "{found}");
+    let found = &found["structuredContent"];
+    assert_eq!(found["provenance"]["source"], "local", "{found}");
+    assert!(warns(found, "of its own"), "{found}");
+    assert!(server.finish().success());
+}
+
+/// A lookup that gives the version reads the release from docs.rs when the project cannot tell
+/// whether it is its member: without Cargo.lock, or a project outside the default one (decided in
+/// M2's D2).
+#[cfg(feature = "local")]
+#[test]
+fn a_given_version_is_looked_up_when_the_project_cannot_be_read() {
+    let project = workspace_of("user");
+    std::fs::remove_file(project.path().join("Cargo.lock")).expect("removed");
+    let elsewhere = demo_workspace();
+    let mut server = Server::start_in(Some(project.path()));
+    server.send(&call_tool(
+        1,
+        "get_item",
+        json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET }),
+    ));
+    server.send(&call_tool(
+        2,
+        "get_item",
+        json!({
+            "crate": "demo@0.1.0",
+            "path": "hello",
+            "target": TARGET,
+            "project": elsewhere.path(),
+        }),
+    ));
+    for id in [1, 2] {
+        let found = server.response(id)["result"].clone();
+        assert_ne!(found["isError"], true, "{found}");
+        assert_eq!(
+            found["structuredContent"]["provenance"]["source"], "docs.rs",
+            "{found}"
+        );
+    }
+    assert!(server.finish().success());
+}
+
+/// A member asked for with `_` for the `-` of its package name is that package, whose features
+/// tell `enabled_in_project` (requirement R-FT-2, decided in M2's D2).
+#[cfg(feature = "local")]
+#[test]
+fn a_member_is_found_by_the_name_that_code_writes() {
+    let project = workspace_of("hello-world");
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"hello-world\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [features]\ndefault = [\"extra\"]\nextra = []\n",
+    )
+    .expect("written");
+    std::fs::write(
+        project.path().join("src/lib.rs"),
+        "/// Only with `extra`.\n#[cfg(feature = \"extra\")]\npub fn hi() {}\n",
+    )
+    .expect("written");
+    let mut server = Server::start_in(Some(project.path()));
+    let mut found = Value::Null;
+    for id in 1..20 {
+        server.send(&call_tool(
+            id,
+            "get_item",
+            json!({ "crate": "hello_world", "path": "hi" }),
+        ));
+        found = server.response(id)["result"].clone();
+        if found["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    assert_ne!(found["isError"], true, "{found}");
+    let found = &found["structuredContent"];
+    assert_eq!(found["provenance"]["source"], "local", "{found}");
+    assert_eq!(found["provenance"]["crate"], "hello-world", "{found}");
+    assert_eq!(found["data"]["path"], "hello_world::hi", "{found}");
+    assert_eq!(found["data"]["enabled_in_project"], true, "{found}");
+    assert!(server.finish().success());
+}
+
+/// A member's re-export of another member's item is not followed into it (decided in M2's D2,
+/// until D6): the re-export is shown, with why.
+#[cfg(feature = "local")]
+#[test]
+fn a_reexport_of_another_member_is_not_followed() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let write = |path: &str, text: &str| {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        std::fs::write(path, text).expect("written");
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"front\", \"back\"]\nresolver = \"3\"\n",
+    );
+    write(
+        "front/Cargo.toml",
+        "[package]\nname = \"front\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nback = { path = \"../back\" }\n",
+    );
+    write("front/src/lib.rs", "pub use back::Thing;\n");
+    write(
+        "back/Cargo.toml",
+        "[package]\nname = \"back\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write("back/src/lib.rs", "/// A thing.\npub struct Thing;\n");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = Server::start_in(Some(dir.path()));
+    let mut found = Value::Null;
+    for id in 1..20 {
+        server.send(&call_tool(
+            id,
+            "get_item",
+            json!({ "crate": "front", "path": "Thing" }),
+        ));
+        found = server.response(id)["result"].clone();
+        if found["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    assert_ne!(found["isError"], true, "{found}");
+    let found = &found["structuredContent"];
+    assert_eq!(found["provenance"]["source"], "local", "{found}");
+    assert_eq!(found["provenance"]["crate"], "front", "{found}");
+    assert_eq!(
+        found["data"]["reexport_of"]["path"], "back::Thing",
+        "{found}"
+    );
+    assert!(warns(found, "not from crates.io"), "{found}");
     assert!(server.finish().success());
 }
 
@@ -1509,7 +1721,8 @@ fn warns(response: &Value, part: &str) -> bool {
 #[cfg(feature = "local")]
 #[test]
 fn the_build_target_of_the_project_is_the_target_of_a_lookup() {
-    let project = demo_workspace();
+    // Not `demo`, whose member would be built instead (decided in M2's D2).
+    let project = workspace_of("user");
     set_cargo_settings(
         project.path(),
         &format!("[build]\ntarget = [\"{TARGET}\", \"wasm32-unknown-unknown\"]\n"),

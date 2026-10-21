@@ -699,6 +699,24 @@ Claude Code 2.1.304、Linux で測った。
   - 呼び出しのたびにビルドするので、文書化する crate の rustdoc だけで呼び出しの期限 (20 秒) より長くかかる member には、いつまでも `building` が返っていた (前のビルドが終わった後に来た呼び出しは、新しいビルドを始める)。利用者の決定で、期限を過ぎて裏で続いたビルドの結果は、次の 1 回の呼び出しに渡す: `Flights::handing_over` (結果を仕事の番号と一緒に残し、次の呼び出しが受け取って消す。走っている仕事に合流して結果を受け取った呼び出しも、同じ番号の残りを消す)。ローカルビルドの `Flights` はこれで作る。docs.rs などのほかの `Flights` は今のまま
 - D2c-2 に残したこと: `project_target` がプロジェクトの `build.target` の有無と独自の target かを返すこと (決定 7)、`resolve` での member の分岐 (決定 1・2)、`.crate` の取得を飛ばすこと、building の応答、エラーの写し、re-export を追わないこと (決定 6)、stdio のテスト
 
+**D2c-2 (MCP 側。2026-10-21)**:
+
+- `mcp::tool::local`: `member` (crate 名を `build::member_crate` で member に照らし、`LocalWanted` を組み立てる: オフラインは `Resolver::offline_in`、プロジェクトが `build.target` を設定しているかは `project::sets_build_target`。`cargo metadata` が失敗して Cargo.lock だけのときは `Unknown` で分類した失敗、期限内に解決しなければ `Resolving`)、`built` (`local_archive` を待ち、期限が来たら `status: building`)、`LocalError` から `code` への写し (§6.5「D2c の下調べと決定」の初期案のとおり。`build_failed` には compiler の `error` を `diagnostics` に、無ければ stderr の末尾を `stderr` に。`fetch_failed` には `reason`。時間切れは `reason: timeout`。`unsupported_format` には `found`・`supported`)
+- `build::member_crate` は、crate 名で見つからなければ、パッケージ名が同じ member の lib も探す (`[lib] name` が違う member をパッケージ名で引けるように)。`build::documented_name` を足した
+- `get_item::resolve`: プロジェクトが決めた crates.io でないパッケージが member の crate ならビルドする (決定 1)。版を明示した照会は、その版が member の版と同じなら member をビルドし (決定 2、`resolved_from: explicit`)、違えば crates.io を引いて warning。member でない・解決中・`cargo metadata` の失敗では今どおり。`Request` に `local` (`LocalSource`: ビルド前の `Wanted`、ビルド後の `Built`) を持たせ、`look_up_release` は member なら `.crate` の取得と docs.rs を飛ばして `look_up_member` へ (ビルドを待ち、`Origin::Local` で引く。re-export を追えなかったときの引き直しは `Built` を使い、ビルドし直さない)。パスの先頭は lib の名前に置き換える
+- `ToolState::locals` (`Flights::handing_over`)
+- re-export の行き先が crates.io でないプロジェクトのパッケージなら追わない (決定 6): `destination_request` が `docs_unavailable` を返し、既存の後始末で re-export そのものを warning 付きで返す。これは docs.rs の crate からプロジェクトの path 依存への re-export にも効く (前は crates.io の最新に落ちていた)
+- `local_build_required` の文言を「member だけをビルドする」に直した
+- テスト (stdio): member を実際にビルドして答える (`source: local`・`resolved_from: cargo_lock`・`built_at`。`building` なら呼び直す。stdout の全行が JSON-RPC であることと出力のスキーマは、stdio のテストの仕組みが確かめる。R-SEC-1 の終わりの印)、member と同じ版の `demo@0.1.0` は member (`explicit`)、別の member の re-export は追わず warning。プロジェクトの `build.target` のテストは、パッケージ名を `demo` 以外にして docs.rs のキャッシュを引くようにした
+- 前提を渡さないレビュー (サブエージェント) の指摘と対応:
+  - 版を明示した普通の crate の照会が、プロジェクトのエラー (Cargo.lock が無い・壊れている、`project` が既定のプロジェクトの外、workspace が複数) で失敗するようになっていた (前は `crates_io_in_project` がエラーを飲み込んで crates.io を引いていた)。member の確かめでも、エラーは member でないとして扱う。stdio のテストに、Cargo.lock の無いプロジェクトと外のプロジェクトで `demo@0.1.0` を docs.rs から引くことを足した
+  - member を `-` と `_` の違う名前 (コードでの書き方) で引くと、`Request` の名前が利用者の綴りのままで、パッケージ名で引く `FeatureSets` に当たらず、全 item が `enabled_in_project: false` になっていた。`Request` の名前を member のパッケージ名にした (来歴の `crate` もパッケージ名)。stdio のテストに、`hello-world` を `hello_world` で引いて `enabled_in_project: true` になることを足した
+  - 版を明示して member に当たったとき、R-VR-1 の「crates.io の同じ版とは別物でありうる」warning が無かった。足した
+  - member を名前の文字列で照らし直していたので、依存側で改名した member などを取りこぼしていた。プロジェクトが解決したパッケージ (名前と版) から member を直接選び (`build::member_package`)、その crate を、照会の名前の lib か bin、無ければ lib、無ければ 1 つだけの bin とする (`build::crate_of`)。版を明示した照会は、版が違えば cargo の設定を読む前に終える (`Member::OtherVersion`)
+  - 残したもの: 版を明示した照会で resolve を 2 回する (2 回目は保持した結果の鮮度の確かめだけ)。解決中や `cargo metadata` の失敗では warning なしで crates.io を引く (決めたとおり。warning を付けると、失敗が続く間すべての照会に付く)。`diagnostics` と stderr の長さの上限は D5
+- 実際のプロジェクトでの試し (このリポジトリ自身、デバッグビルドのサーバー、オフライン): 冷えた状態の `get_item data::build::Plan` は 62.8 秒で、20 秒と 43 秒に `building` が返り、3 回目で答えた (裏で続いたビルドの結果が渡った)。温まった状態の照会は 4〜5 秒。同じ target dir で `cargo rustdoc` を直接走らせると 4.5〜5.0 秒で、228 unit のうち作り直すのはこの crate だけ (値の固定が効いている)。JSON は約 10 MB。照会のたびの数秒は rustdoc そのもので、D4 の鮮度の判定でしか縮まない
+- 独自の target (決定 7) の実測 (この PC): `.cargo/config.toml` に `build.target = "my-target.json"`・`[unstable] build-std = ["core"]`・その両方を置いて `cargo rustdoc --target <host>` を走らせると、stable 1.99.1 の cargo では 3 つとも成功した (`--target` が `build.target` に勝ち、stable の cargo は `[unstable]` を使わない)。stdio のテストに足した (host 向けにビルドし、「target of its own」の warning)。nightly の cargo は `build-std` を使い、rust-src から std をビルドしようとして、オフラインでは std の依存が無く失敗した (`no matching package named`。オフラインでは `offline_miss`)。形式が古くて nightly に切り替え、かつ build-std を設定したプロジェクトは、オンラインなら std ごとビルドして遅く、オフラインなら `offline_miss` になる。まれなので D7 で扱う
+
 ### 6.6 M2e
 
 (まだ無い)
