@@ -42,7 +42,7 @@ pub enum LockMode {
 #[derive(Debug)]
 pub struct ProcessLock {
     /// The open lock file, whose lock closing it lets go.
-    _file: File,
+    file: File,
 }
 
 /// The lock file of `key` in the cache at `root`: the first 32 hex digits of the key's SHA-256,
@@ -68,6 +68,19 @@ pub fn lock_path(root: &Path, key: &str) -> PathBuf {
 pub fn try_lock(root: &Path, key: &str, mode: LockMode) -> io::Result<Option<ProcessLock>> {
     let file = open(&lock_path(root, key))?;
     try_lock_file(file, mode)
+}
+
+/// Takes the lock of the file at `path` in `mode` if no other holder stands in the way, or returns
+/// `None`.
+///
+/// It is for a lock that goes with what it guards rather than in `locks/`, as that which the
+/// descendants of a child inherit (`super::owner`).
+///
+/// # Errors
+///
+/// Returns an error when the lock file cannot be made or opened, or the OS fails to lock it.
+pub fn try_lock_at(path: &Path, mode: LockMode) -> io::Result<Option<ProcessLock>> {
+    try_lock_file(open(path)?, mode)
 }
 
 /// Waits for the lock of `key` in the cache at `root` in `mode`, and takes it.
@@ -110,8 +123,29 @@ pub fn lock_blocking(
     mode: LockMode,
     limit: Duration,
 ) -> io::Result<Option<ProcessLock>> {
+    lock_blocking_at(&lock_path(root, key), mode, limit)
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for ProcessLock {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+}
+
+/// [`try_lock_at`], trying again for at most `limit`, as [`lock_blocking`] does. It must not be
+/// called from async code, but with a short `limit`.
+///
+/// # Errors
+///
+/// Returns an error when the lock file cannot be made or opened, or the OS fails to lock it.
+pub fn lock_blocking_at(
+    path: &Path,
+    mode: LockMode,
+    limit: Duration,
+) -> io::Result<Option<ProcessLock>> {
     let start = std::time::Instant::now();
-    let mut file = open(&lock_path(root, key))?;
+    let mut file = open(path)?;
     let mut pause = MIN_PAUSE;
     loop {
         let again = file.try_clone()?;
@@ -134,7 +168,7 @@ fn try_lock_file(file: File, mode: LockMode) -> io::Result<Option<ProcessLock>> 
         LockMode::Shared => file.try_lock_shared(),
     };
     match locked {
-        Ok(()) => Ok(Some(ProcessLock { _file: file })),
+        Ok(()) => Ok(Some(ProcessLock { file })),
         Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(error)) => Err(error),
     }

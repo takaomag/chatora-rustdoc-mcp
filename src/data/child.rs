@@ -133,11 +133,20 @@ pub fn stop_all() {
     }
 }
 
+/// What a request to the thread that starts the children keeps until the child has started, and
+/// hands back: on Unix, the child's record, whose lock the child inherits by the number of its
+/// file descriptor, which must not be closed and used again meanwhile (decided in C4).
+#[cfg(unix)]
+type Kept = Option<super::owner::ChildRecord>;
+#[cfg(not(unix))]
+type Kept = ();
+
 /// A request to the thread that starts the children.
 type Start = (
     tokio::process::Command,
     tokio::runtime::Handle,
-    tokio::sync::oneshot::Sender<io::Result<tokio::process::Child>>,
+    Kept,
+    tokio::sync::oneshot::Sender<(io::Result<tokio::process::Child>, Kept)>,
 );
 
 /// The thread that starts the children, which lives as long as the process.
@@ -151,6 +160,23 @@ static STARTER: OnceLock<io::Result<mpsc::Sender<Start>>> = OnceLock::new();
 /// Returns an error when the child cannot be started, or its group cannot be made, or the server
 /// is ending.
 pub(super) async fn spawn(command: tokio::process::Command) -> io::Result<Child> {
+    spawn_owned(command, super::owner::Owner::this()).await
+}
+
+/// [`spawn`], recording the child for `owner`, if any, on Unix (requirement R-WS-6, decided in
+/// C4): its record, and a lock that its descendants inherit.
+async fn spawn_owned(
+    #[cfg_attr(
+        not(unix),
+        expect(unused_mut, reason = "only Unix adds to the command")
+    )]
+    mut command: tokio::process::Command,
+    #[cfg_attr(
+        not(unix),
+        expect(unused_variables, reason = "only Unix records children")
+    )]
+    owner: Option<&super::owner::Owner>,
+) -> io::Result<Child> {
     let ending = || io::Error::other("the server is ending, so it starts nothing more");
     if STOPPING.load(Ordering::SeqCst) {
         return Err(ending());
@@ -161,27 +187,55 @@ pub(super) async fn spawn(command: tokio::process::Command) -> io::Result<Child>
             std::thread::Builder::new()
                 .name("child-starter".to_owned())
                 .spawn(move || {
-                    for (mut command, runtime, reply) in requests {
+                    for (mut command, runtime, kept, reply) in requests {
                         // The pipes of the child are registered with the caller's runtime.
                         let _entered = runtime.enter();
                         // The caller may have given up waiting; the child is then dropped,
-                        // which kills it.
-                        drop(reply.send(command.spawn()));
+                        // which kills it, and what was kept for it after it has started.
+                        drop(reply.send((command.spawn(), kept)));
                     }
                 })
                 .map(|_| sender)
         })
         .as_ref()
         .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+    let number = NEXT_GROUP.fetch_add(1, Ordering::Relaxed);
+    #[cfg(unix)]
+    let record = owner.and_then(|owner| match owner.child_record(number) {
+        Ok(record) => Some(record),
+        Err(error) => {
+            tracing::warn!(%error, "a child is started without its record");
+            None
+        },
+    });
+    #[cfg(unix)]
+    if let Some(fd) = record
+        .as_ref()
+        .and_then(super::owner::ChildRecord::inherited)
+    {
+        unix::inherit(&mut command, fd);
+    }
+    #[cfg(not(unix))]
+    let record = ();
     let (reply, spawned) = tokio::sync::oneshot::channel();
     to_starter
-        .send((command, tokio::runtime::Handle::current(), reply))
+        .send((command, tokio::runtime::Handle::current(), record, reply))
         .map_err(|_ended| io::Error::other("the thread that starts the children has ended"))?;
-    let child = spawned
+    #[cfg_attr(
+        not(unix),
+        expect(unused_variables, reason = "only Unix records children")
+    )]
+    let (child, record) = spawned
         .await
-        .map_err(|_ended| io::Error::other("the thread that starts the children has ended"))??;
-    let group = Group::of(&child)?;
-    let number = NEXT_GROUP.fetch_add(1, Ordering::Relaxed);
+        .map_err(|_ended| io::Error::other("the thread that starts the children has ended"))?;
+    let child = child?;
+    #[cfg_attr(not(unix), expect(unused_mut, reason = "only Unix records children"))]
+    let mut group = Group::of(&child)?;
+    #[cfg(unix)]
+    if let Some(record) = record {
+        record.started(group.session.unsigned_abs());
+        group.record = Some(record);
+    }
     groups().lock().insert(number, group);
     let child = Child {
         child,
@@ -210,6 +264,10 @@ pub(super) fn prepare(command: &mut tokio::process::Command) {
 struct Group {
     #[cfg(unix)]
     session: libc::pid_t,
+    /// The record of the child and the lock that its descendants inherit, which go once the
+    /// group is stopped and none of it runs (decided in C4).
+    #[cfg(unix)]
+    record: Option<super::owner::ChildRecord>,
     #[cfg(windows)]
     job: windows::Job,
 }
@@ -222,7 +280,10 @@ impl Group {
             .ok_or_else(|| io::Error::other("the child ended before its group was known"))?;
         let session = libc::pid_t::try_from(id)
             .map_err(|_too_large| io::Error::other("a process ID out of range"))?;
-        Ok(Self { session })
+        Ok(Self {
+            session,
+            record: None,
+        })
     }
 
     #[cfg(windows)]
@@ -244,6 +305,9 @@ impl Group {
     fn stop(self) {
         #[cfg(unix)]
         unix::kill_group(self.session);
+        // Dropped after the kill, which then tells whether a descendant still runs.
+        #[cfg(unix)]
+        drop(self.record);
         #[cfg(windows)]
         drop(self.job);
     }
@@ -252,7 +316,8 @@ impl Group {
 #[cfg(unix)]
 #[expect(
     unsafe_code,
-    reason = "setsid, prctl, getppid and kill are system calls without a safe wrapper in std"
+    reason = "setsid, prctl, getppid, fcntl and kill are system calls without a safe wrapper in \
+              std"
 )]
 mod unix {
     use std::io;
@@ -288,6 +353,23 @@ mod unix {
         };
         // SAFETY: the closure runs in the forked child. It calls only setsid, prctl and getppid,
         // which are async-signal-safe, and reads errno; it neither allocates nor takes a lock.
+        unsafe { command.pre_exec(in_child) };
+    }
+
+    /// Has the child inherit the file descriptor `fd`, which this process opened close-on-exec:
+    /// the lock on it is then held while the child or any of its descendants runs (decided in
+    /// C4).
+    pub(super) fn inherit(command: &mut tokio::process::Command, fd: std::os::fd::RawFd) {
+        let in_child = move || {
+            // SAFETY: F_SETFD with 0 clears close-on-exec on `fd`, which the child has as the
+            // server's copy; it changes nothing else.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        };
+        // SAFETY: the closure runs in the forked child, and only calls fcntl, which is
+        // async-signal-safe, and reads errno.
         unsafe { command.pre_exec(in_child) };
     }
 
@@ -507,5 +589,93 @@ mod tests {
         let stat = String::from_utf8(output.stdout).expect("text");
         let (pid, session) = stat.trim().split_once(' ').expect("two fields");
         assert_eq!(pid, session, "{stat}");
+    }
+
+    /// A child is recorded while it runs, with its session and when it started, and once it has
+    /// ended with nothing of its group left, neither its record nor its lock stays (decided in
+    /// C4).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_is_recorded_while_it_runs() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let owner = super::super::owner::Owner::start(&super::super::cache::Cache::at(dir.path()));
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "sleep 0.5"]).stdin(Stdio::null());
+        prepare(&mut command);
+        let child = spawn_owned(command, Some(&owner)).await.expect("started");
+        let pid = child.child.id().expect("running");
+        let records = dir.path().join("procs/v1");
+        let record = records.join(format!("{}.{}.json", owner.id(), child.group.0));
+        let written: super::super::owner::Record =
+            serde_json::from_slice(&std::fs::read(&record).expect("recorded")).expect("a record");
+        assert_eq!(written.session, pid);
+        assert_eq!(written.started, super::super::process_id::started(pid));
+        assert!(written.started.is_some());
+        assert_eq!(
+            written.boot.as_ref(),
+            super::super::process_id::machine_and_boot().map(|(_, boot)| boot)
+        );
+        child.output().await.expect("ran");
+        let left: Vec<_> = std::fs::read_dir(&records)
+            .expect("the directory")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A descendant that leaves the child's session is not stopped with the group, but it holds
+    /// the lock that it inherited, so the record stays, for the sweep of a later server (decided
+    /// in C4).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_record_stays_while_a_descendant_runs() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let owner = super::super::owner::Owner::start(&super::super::cache::Cache::at(dir.path()));
+        let pid_file = dir.path().join("descendant");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                // The shell in the new session writes its own pid (`setsid` may fork first), and
+                // the child waits for it, so that the descendant has left the group before the
+                // group is stopped.
+                &format!(
+                    "setsid sh -c 'echo $$ > \"{0}\"; exec sleep 60' >/dev/null 2>&1 & \
+                     while [ ! -s '{0}' ]; do sleep 0.05; done",
+                    pid_file.display()
+                ),
+            ])
+            .stdin(Stdio::null());
+        prepare(&mut command);
+        let child = spawn_owned(command, Some(&owner)).await.expect("started");
+        let number = child.group.0;
+        child.output().await.expect("ran");
+        let read = || {
+            std::fs::read_to_string(&pid_file)
+                .ok()
+                .map(|pid| pid.trim().to_owned())
+                .filter(|pid| !pid.is_empty())
+        };
+        assert!(
+            wait_for(Duration::from_secs(10), || read().is_some()).await,
+            "the descendant started"
+        );
+        let descendant = read().expect("its pid");
+        let record = dir
+            .path()
+            .join(format!("procs/v1/{}.{number}.json", owner.id()));
+        let kept = record.exists();
+        let ran = alive(&descendant);
+        // Stopped here, as the sweep of C4c would.
+        let killed = std::process::Command::new("kill")
+            .args(["-9", &descendant])
+            .status()
+            .expect("kill runs");
+        assert!(
+            ran && killed.success(),
+            "{descendant} ran outside the group"
+        );
+        assert!(kept, "the record is kept while {descendant} runs");
     }
 }

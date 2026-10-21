@@ -32,6 +32,8 @@ pub mod metadata;
 pub mod owner;
 #[cfg(feature = "local")]
 pub mod packages;
+#[cfg(feature = "local")]
+pub mod process_id;
 pub mod process_lock;
 #[cfg(feature = "local")]
 pub mod project;

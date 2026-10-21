@@ -159,6 +159,136 @@ impl Owner {
     }
 }
 
+/// What a server keeps of a child while the child's group runs, on Unix (decided in C4).
+///
+/// That is a record of its session and when it started, and a lock that its descendants inherit,
+/// so that the lock is held while any of them runs, even past the server.
+///
+/// When the group is stopped, the lock is tried again: if it is free, nothing of the group runs,
+/// and both go; else the record stays, for the sweep of a later server (C4c). Windows has none:
+/// the Job Object stops the group when the server ends, and an inheritable handle would go to
+/// every child started meanwhile.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct ChildRecord {
+    /// The record, `procs/v<format>/<id>.<number>.json`.
+    record: PathBuf,
+    /// The lock file next to it, `<id>.<number>.lock`.
+    lock_path: PathBuf,
+    /// The lock, held by this server, until the group is stopped.
+    lock: Option<ProcessLock>,
+}
+
+/// What a record says of a child (decided in C4).
+#[cfg(unix)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Record {
+    /// The machine and the boot that the child ran in, if they could be read.
+    pub machine: Option<String>,
+    /// The boot.
+    pub boot: Option<String>,
+    /// The session of the child, which is its process ID: it leads a session of its own.
+    pub session: u32,
+    /// When the child started, as [`super::process_id::started`] tells.
+    pub started: Option<u64>,
+}
+
+#[cfg(unix)]
+impl Owner {
+    /// The directory of this version's records.
+    fn records(&self) -> PathBuf {
+        self.root
+            .join(RECORDS_DIR)
+            .join(format!("v{RECORDS_FORMAT}"))
+    }
+
+    /// The record of the child `number` that is about to start, with its lock, which this server
+    /// holds: the child is to inherit it ([`ChildRecord::inherited`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the OS could not lock this server's lock, or the lock of the child
+    /// cannot be made.
+    pub fn child_record(&self, number: u64) -> io::Result<ChildRecord> {
+        if !self.locked() {
+            return Err(io::Error::other(
+                "the cache cannot be locked, so the children are not recorded",
+            ));
+        }
+        let records = self.records();
+        fs::create_dir_all(&records)?;
+        let stem = format!("{}.{number}", self.id);
+        let lock_path = records.join(format!("{stem}.lock"));
+        let lock = process_lock::try_lock_at(&lock_path, LockMode::Exclusive)?
+            .ok_or_else(|| io::Error::other("the lock of a new child is held"))?;
+        Ok(ChildRecord {
+            record: records.join(format!("{stem}.json")),
+            lock_path,
+            lock: Some(lock),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl ChildRecord {
+    /// The file descriptor of the lock, which the child is to inherit.
+    #[must_use]
+    pub fn inherited(&self) -> Option<std::os::fd::RawFd> {
+        self.lock.as_ref().map(std::os::fd::AsRawFd::as_raw_fd)
+    }
+
+    /// Writes the record of the child `pid`, which has started.
+    pub fn started(&self, pid: u32) {
+        let (machine, boot) = super::process_id::machine_and_boot()
+            .cloned()
+            .map_or((None, None), |(machine, boot)| (Some(machine), Some(boot)));
+        let record = Record {
+            machine,
+            boot,
+            session: pid,
+            started: super::process_id::started(pid),
+        };
+        // Written whole, but not synced: after a crash, the boot differs, and the record is not
+        // used.
+        let temporary = super::cache::with_suffix(&self.record, ".new");
+        let written = serde_json::to_vec(&record)
+            .map_err(io::Error::other)
+            .and_then(|json| fs::write(&temporary, json))
+            .and_then(|()| fs::rename(&temporary, &self.record));
+        if let Err(error) = written {
+            tracing::warn!(path = %self.record.display(), %error, "a child could not be recorded");
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChildRecord {
+    /// The group has been stopped: the record and the lock go unless a descendant still holds it.
+    fn drop(&mut self) {
+        drop(self.lock.take());
+        // What was killed lets the lock go as it ends, a moment later, as does a child being
+        // started meanwhile, which holds a copy until it runs its program.
+        match process_lock::lock_blocking_at(
+            &self.lock_path,
+            LockMode::Exclusive,
+            Duration::from_millis(100),
+        ) {
+            Ok(Some(held)) => {
+                drop(fs::remove_file(&self.record));
+                drop(fs::remove_file(&self.lock_path));
+                drop(held);
+            },
+            Ok(None) => tracing::info!(
+                record = %self.record.display(),
+                "a descendant of a child that was stopped still runs, so its record is kept"
+            ),
+            Err(error) => {
+                tracing::debug!(%error, "whether a descendant of a child still runs cannot be told");
+            },
+        }
+    }
+}
+
 /// Removes the lock file of the server `id`, which `held` holds: nobody locks it again, as no
 /// other server has the id. On Windows, a file that is open cannot be removed, so it is closed
 /// first; a sweep that has just opened it meanwhile removes it then.
