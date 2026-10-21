@@ -449,6 +449,18 @@ pub struct ItemData<'a> {
     pub truncated: bool,
 }
 
+/// The path of the item `id` of the crate of `view` in it, `crate::a::Item`, from its definition
+/// path (requirement R-PR-2, decided in M2's D6). `None` for an item of another crate.
+pub(super) fn crate_path(view: &CrateView<'_>, id: Id) -> Option<Box<str>> {
+    let summary = view.summary(id).filter(|summary| summary.crate_id == 0)?;
+    let mut path = String::from("crate");
+    for segment in summary.path.iter().skip(1) {
+        path.push_str("::");
+        path.push_str(segment);
+    }
+    Some(path.into())
+}
+
 impl ItemData<'_> {
     /// The item as a list shows it: with its visibility only when it is not `pub` (decided in
     /// M2's D6).
@@ -606,7 +618,7 @@ pub fn get_item<'a>(
     let provenance = query.provenance();
     let with_root = with_root_name(view, request.name, request.path);
     let path = with_root.as_deref().unwrap_or(request.path);
-    let resolution = index.resolve(view, path);
+    let resolution = query.resolve(path);
     if request.follow
         && matches!(
             resolution,
@@ -781,7 +793,8 @@ impl<'a> Query<'a> {
             request,
             view,
             index: view.index(),
-            renderer: Renderer::new(view),
+            renderer: Renderer::new(view)
+                .public_only(!matches!(request.origin, Origin::Local { .. })),
             warnings: Vec::new(),
             hints: Vec::new(),
         }
@@ -1262,6 +1275,16 @@ impl<'a> Query<'a> {
         })
     }
 
+    /// What `path` resolves to: in a crate that is not a workspace member, its public items only
+    /// (requirement R-SH-5, decided in M2's D6).
+    pub(super) fn resolve(&self, path: &str) -> Resolution {
+        if self.is_member() {
+            self.index.resolve(self.view, path)
+        } else {
+            self.index.resolve_public(self.view, path)
+        }
+    }
+
     /// Whether the re-export of another crate's item at `path` is told hidden: in a workspace
     /// member, when it goes through an item of `#[doc(hidden)]` (decided in M2's D6).
     pub(super) fn hidden_reexport(&self, path: &str) -> bool {
@@ -1282,15 +1305,9 @@ impl<'a> Query<'a> {
             return path.joined();
         }
         if self.is_member()
-            && let Some(summary) = self.view.summary(id)
-            && summary.crate_id == 0
+            && let Some(path) = crate_path(self.view, id)
         {
-            let mut path = String::from("crate");
-            for segment in summary.path.iter().skip(1) {
-                path.push_str("::");
-                path.push_str(segment);
-            }
-            return path.into();
+            return path;
         }
         let path: Box<str> = self.view.summary(id).map_or_else(
             || {
@@ -1355,10 +1372,21 @@ impl<'a> Query<'a> {
         } else {
             return Box::default();
         };
-        let mut fields = self.signatures(fields);
-        if has_stripped_fields {
-            fields.push("/* private fields */".into());
+        // Another crate's fields that are not public or are hidden (decided in M2's D6).
+        let shown: Vec<Id> = fields
+            .iter()
+            .copied()
+            .filter(|&field| {
+                self.view
+                    .item(field)
+                    .is_none_or(|field| self.renderer.shows_field(field))
+            })
+            .collect();
+        let mut fields_text = self.signatures(&shown);
+        if has_stripped_fields || shown.len() < fields.len() {
+            fields_text.push("/* private fields */".into());
         }
+        let fields = fields_text;
         fields.into()
     }
 
@@ -1367,8 +1395,15 @@ impl<'a> Query<'a> {
         let ItemEnum::Enum(contents) = &item.inner else {
             return Box::default();
         };
-        let mut variants = self.signatures(&contents.variants);
-        if contents.has_stripped_variants {
+        // Another crate's hidden variants (decided in M2's D6).
+        let shown: Vec<Id> = contents
+            .variants
+            .iter()
+            .copied()
+            .filter(|&variant| self.is_member() || !self.index.is_hidden(variant))
+            .collect();
+        let mut variants = self.signatures(&shown);
+        if contents.has_stripped_variants || shown.len() < contents.variants.len() {
             variants.push("/* some variants omitted */".into());
         }
         variants.into()
@@ -2577,6 +2612,66 @@ pub(super) mod tests {
             target: None,
         })
         .err()
+    }
+
+    #[test]
+    fn another_crates_items_that_are_not_public_are_not_shown() {
+        // A build with private items, in which `lock` and the field `inner` are the crate's.
+        let private = |krate: &mut Crate| {
+            krate.includes_private = true;
+            for id in [Id(4), Id(6)] {
+                if let Some(item) = krate.index.get_mut(&id) {
+                    item.visibility = Visibility::Crate;
+                }
+            }
+        };
+        assert!(matches!(
+            followed("my_crate::Mutex::lock", private),
+            Some(GetItemError::NotFound)
+        ));
+        let mutex = at_detail("my_crate::Mutex", Detail::Normal, private);
+        assert_eq!(
+            mutex["data"]["fields"],
+            serde_json::json!(["/* private fields */"]),
+            "{mutex}"
+        );
+        // A module that is not public is not found, though what it has is, where it is public.
+        let private_module = |krate: &mut Crate| {
+            private(krate);
+            if let Some(module) = krate.index.get_mut(&Id(1)) {
+                module.visibility = Visibility::Crate;
+            }
+        };
+        assert!(matches!(
+            followed("my_crate::sync", private_module),
+            Some(GetItemError::NotFound)
+        ));
+        assert_eq!(
+            at_detail("my_crate::Mutex", Detail::Brief, private_module)["data"]["path"],
+            "my_crate::Mutex"
+        );
+        // A variant's fields are `Default`, as public as the enum.
+        let with_field = |krate: &mut Crate| {
+            private(krate);
+            let mut field = krate.index.get(&Id(4)).cloned().expect("a field");
+            (field.id, field.name, field.visibility) =
+                (Id(50), Some("0".into()), Visibility::Default);
+            krate.index.insert(Id(50), field);
+            if let Some(ItemEnum::Variant(variant)) =
+                krate.index.get_mut(&Id(9)).map(|item| &mut item.inner)
+            {
+                variant.kind = VariantKind::Tuple(vec![Some(Id(50))]);
+            }
+        };
+        let enumeration = at_detail("my_crate::E", Detail::Normal, with_field);
+        assert_eq!(enumeration["data"]["variants"][0], "A(u8)", "{enumeration}");
+        // The public ones are, as before, besides those that rustdoc left out.
+        let shown = at_detail("my_crate::Mutex", Detail::Normal, |_| {});
+        assert_eq!(
+            shown["data"]["fields"],
+            serde_json::json!(["pub inner: u8", "/* private fields */"]),
+            "{shown}"
+        );
     }
 
     #[test]

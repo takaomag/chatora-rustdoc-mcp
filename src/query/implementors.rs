@@ -21,7 +21,7 @@ use super::{
         with_root_name,
     },
     list_module::Page,
-    path_index::Resolution,
+    path_index::{Resolution, is_doc_hidden},
     view::CrateView,
 };
 
@@ -145,9 +145,12 @@ pub fn list_implementors<'a>(
     let ItemEnum::Trait(contents) = &item.inner else {
         return Err(GetItemError::NotFound);
     };
+    // Another crate's hidden items of the trait are not its API (decided in M2's D6).
+    let member = query.is_member();
     let items = contents
         .items
         .iter()
+        .filter(|&&id| member || !view.index().is_hidden(id))
         .filter_map(|&id| trait_item(view, id))
         .collect();
     let (mut entries, has_negative_impls) =
@@ -223,10 +226,15 @@ fn implementors_of(
         let ItemEnum::Impl(contents) = &impl_item.inner else {
             continue;
         };
-        // A type of this crate without a public path is not public API (requirement R-SH-5).
-        if let rustdoc_types::Type::ResolvedPath(path) = &contents.for_
+        if !query.is_member() && is_doc_hidden(impl_item) {
+            continue;
+        }
+        // A type of this crate without a public path or hidden is not public API (requirement
+        // R-SH-5), but in a workspace member, whose own code it is (decided in M2's D6).
+        if !query.is_member()
+            && let rustdoc_types::Type::ResolvedPath(path) = &contents.for_
             && view.item(path.id).is_some()
-            && view.index().canonical_path(path.id).is_none()
+            && (view.index().canonical_path(path.id).is_none() || view.index().is_hidden(path.id))
         {
             continue;
         }
@@ -266,7 +274,7 @@ fn find_trait(
         view.item(id)
             .is_some_and(|item| matches!(item.inner, ItemEnum::Trait(_)))
     };
-    let id = match view.index().resolve(view, path) {
+    let id = match query.resolve(path) {
         Resolution::Item(id) => id,
         Resolution::Ambiguous(ids) => {
             let traits: Vec<Id> = ids.iter().copied().filter(|&id| is_trait(id)).collect();

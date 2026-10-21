@@ -245,7 +245,7 @@ fn find_module(
     path: &str,
     follow: bool,
 ) -> Result<Id, GetItemError> {
-    let module = match view.index().resolve(view, path) {
+    let module = match query.resolve(path) {
         Resolution::Item(id) => id,
         Resolution::Ambiguous(ids) => {
             // A module and a macro (or a function) may have the same path.

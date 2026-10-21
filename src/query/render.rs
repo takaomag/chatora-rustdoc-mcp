@@ -49,6 +49,9 @@ pub struct Renderer<'a> {
     view: &'a CrateView<'a>,
     /// Forms that could not be rendered faithfully (requirement R-OUT-2).
     warnings: Vec<Cow<'static, str>>,
+    /// Whether the fields that are not public or are hidden are left out, as another crate sees
+    /// them, and not a workspace member's own (decided in M2's D6).
+    public_only: bool,
 }
 
 impl<'a> Renderer<'a> {
@@ -58,7 +61,24 @@ impl<'a> Renderer<'a> {
         Self {
             view,
             warnings: Vec::new(),
+            public_only: false,
         }
+    }
+
+    /// The same, leaving out the fields that are not public or are hidden, as another crate sees
+    /// them, when `public_only`.
+    #[must_use]
+    pub const fn public_only(mut self, public_only: bool) -> Self {
+        self.public_only = public_only;
+        self
+    }
+
+    /// Whether the field `field` is shown: not when only public fields are, and it is not public
+    /// or is hidden. A field of a variant is `Default`, as public as its enum.
+    pub(super) fn shows_field(&self, field: &Item) -> bool {
+        !self.public_only
+            || matches!(field.visibility, Visibility::Public | Visibility::Default)
+                && !self.view.index().is_hidden(field.id)
     }
 
     /// Whether the item `id` is restricted to the module that has it: private, as written without
@@ -361,7 +381,10 @@ impl<'a> Renderer<'a> {
             if position > 0 {
                 out.push_str(", ");
             }
-            match field.and_then(|id| self.view.item(id)) {
+            match field
+                .and_then(|id| self.view.item(id))
+                .filter(|field| self.shows_field(field))
+            {
                 Some(Item {
                     id,
                     visibility,
@@ -382,12 +405,18 @@ impl<'a> Renderer<'a> {
     fn push_struct_fields(&mut self, out: &mut String, fields: &[Id], has_stripped: bool) {
         out.push_str(" { ");
         let mut first = true;
+        let mut has_stripped = has_stripped;
         for field in fields {
+            let item = self.view.item(*field);
+            if item.is_some_and(|field| !self.shows_field(field)) {
+                has_stripped = true;
+                continue;
+            }
             if let Some(Item {
                 name: Some(name),
                 inner: ItemEnum::StructField(ty),
                 ..
-            }) = self.view.item(*field)
+            }) = item
             {
                 if !first {
                     out.push_str(", ");

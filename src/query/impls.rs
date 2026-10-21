@@ -18,11 +18,12 @@ use super::{
         Notes,
         Provenance,
         Query,
+        crate_path,
         kind_of,
         with_root_name,
     },
     list_module::Page,
-    path_index::{Resolution, impls_of},
+    path_index::{Resolution, impls_of, is_doc_hidden},
     view::CrateView,
 };
 
@@ -264,6 +265,10 @@ fn classify(view: &CrateView<'_>, query: &mut Query<'_>, item: &Item, ty: Id) ->
         let ItemEnum::Impl(contents) = &impl_item.inner else {
             continue;
         };
+        // Another crate's hidden `impl`s are not its API (decided in M2's D6).
+        if !query.is_member() && is_doc_hidden(impl_item) {
+            continue;
+        }
         let is_primitive = matches!(item.inner, ItemEnum::Primitive(_));
         let for_this = is_primitive
             || matches!(&contents.for_, Type::ResolvedPath(path) if path.id == ty)
@@ -283,7 +288,10 @@ fn classify(view: &CrateView<'_>, query: &mut Query<'_>, item: &Item, ty: Id) ->
         let Some(TraitOrigin {
             path: trait_path,
             krate: trait_crate,
-        }) = trait_id.map_or_else(|| Some(TraitOrigin::default()), |id| trait_origin(view, id))
+        }) = trait_id.map_or_else(
+            || Some(TraitOrigin::default()),
+            |id| trait_origin(view, id, query.is_member()),
+        )
         else {
             continue;
         };
@@ -407,7 +415,7 @@ pub(super) fn find_type(
             )
         })
     };
-    let id = match view.index().resolve(view, path) {
+    let id = match query.resolve(path) {
         Resolution::Item(id) => id,
         Resolution::Ambiguous(ids) => {
             let types: Vec<Id> = ids.iter().copied().filter(|&id| is_type(id)).collect();
@@ -489,15 +497,23 @@ pub(super) struct TraitOrigin {
 }
 
 /// The trait `id` as a response names it. `None` for a trait of this crate without a public
-/// path, which is not public API (std's `SpecExtend`; requirement R-TI-2).
-pub(super) fn trait_origin(view: &CrateView<'_>, id: Id) -> Option<TraitOrigin> {
+/// path, which is not public API (std's `SpecExtend`; requirement R-TI-2), or hidden, but in a
+/// workspace member, `member`, which shows them at their paths in the crate.
+pub(super) fn trait_origin(view: &CrateView<'_>, id: Id, member: bool) -> Option<TraitOrigin> {
     let Some(summary) = view.summary(id) else {
         return Some(TraitOrigin::default());
     };
     if summary.crate_id == 0 {
-        let canonical = view.index().canonical_path(id)?;
+        let index = view.index();
+        // In a workspace member, its traits without a public path too, and in another crate,
+        // not its hidden ones (decided in M2's D6).
+        let path = match index.canonical_path(id) {
+            Some(canonical) if member || !index.is_hidden(id) => canonical.joined(),
+            None if member => crate_path(view, id)?,
+            Some(_) | None => return None,
+        };
         return Some(TraitOrigin {
-            path: Some(canonical.joined()),
+            path: Some(path),
             krate: None,
         });
     }

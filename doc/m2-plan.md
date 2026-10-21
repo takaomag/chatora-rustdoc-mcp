@@ -1054,6 +1054,26 @@ Claude Code 2.1.304、Linux で測った。
   - テストを足した: `list_module` の単体テスト (hidden なモジュールと再公開を除き、hidden でない根の再公開の `Mutex` は残り、hidden なモジュールは `NotFound`)。stdio で、hidden な `impl` のメソッドと hidden な再公開に `hidden`、見えるパスのある item は hidden でなく正準パスがそのパス、glob の item が `recursive` の一覧に 1 度だけ
 - 残したもの: BM25 の統計は `restricted` の項目も数える (std・core・alloc では private と hidden が文書の数に入る。上位の順位はほぼ同じとレビューが確かめた)。std の公開パスの無い item も検索の索引に入る (member か分かるのは照会のときなので、アーカイブを作る時間と大きさが増える)。member の名前の `internal`・`_private` も点が半分になる (`penalized`)。crate 名を付けて引いた `crate::…` の item は Path の段に乗らない。形式 56 の `cfg_attr` の hidden は読めない。依存の hidden なフィールドと、依存の hidden な item を `get_item` で引く経路は D6b-2。説明文 (`search_items`・`list_module`・`crate_overview`) に private と hidden を書いていない (F4)
 
+**D6b-2 (メソッド・impl・実装者、依存の非公開を引かない。2026-10-21)**:
+
+- 解決 (`Query::resolve`): member でなければ `ArchivedPathIndex::resolve_public` で公開の item だけに解決する: 公開パスのある item、公開パスのある親の、`pub` のメンバー、または `Default` のメンバー (trait の item・variant・trait の impl の item) で、その trait がこの crate のものなら公開パスがあって hidden でないもの。メンバーは `impl` の組ごとに公開のものから探す (`find_member_where`)。定義パスで引けるのも公開パスのある item だけ (std の `alloc::vec::Vec` など)。docs.rs の crate と std の private な item、公開でないモジュールの中の `pub` な item を引くと `NotFound` (R-SH-5)。`get_item`・`list_module`・`list_impls`・`list_implementors` の型や trait の解決が通る
+- `trait_origin`: member では、公開パスの無い自分の trait も `crate::…` のパスで返す (`list_impls` と `list_methods` に private な trait の impl が出る)。member でなければ、hidden な自分の trait は返さない
+- `list_methods`: member でなければ、固有メソッドのうち `pub` でないものと hidden なもの、hidden な `impl` を除く。項目は `ItemData::listed` (`pub` でなければ `visibility`)
+- `list_impls`: member でなければ hidden な `impl` を除く
+- `list_implementors`: member では、公開パスの無い型の実装も出す。member でなければ hidden な型の実装も除く
+- フィールドと variant: member でなければ、`pub` でないか hidden なフィールドを `fields` とシグネチャ (tuple struct の `_`) から除いて「`/* private fields */`」とし、hidden な variant を除いて「`/* some variants omitted */`」とする (`Renderer::public_only`)。variant のフィールドは `Default` (enum と同じだけ公開) なので見せる
+- テスト: `get_item` の単体テスト (private を含むビルドで、crate の `lock` を定義パスで引くと `NotFound`、crate のフィールドは「`/* private fields */`」)。stdio で、member の `list_methods` に private なメソッド (`visibility: private`)、`list_impls` に `pub(crate)` の trait の impl、`list_implementors` に公開パスの無い型の実装
+- 依存の hidden な item は、`get_item` で正しいパスを指せば引ける (D6b の決定 4 の問いで示したとおり)
+- レビューで直したこと (レビューは be2aa1c と並べて std の JSON と試しの crate で比べた。std の `list_methods`・`list_impls`・`list_implementors` で減ったものは、下の 1 を除いてすべて private か hidden だった):
+  1. variant のフィールドがすべて隠れていた (`Option` の variants が `Some(_)`、`Cow` が `Borrowed(_)`。variant のフィールドは rustdoc では `Default` なのに `Public` だけを通していた): `Default` も通す。テストを足し、外すと落ちることを確かめた
+  2. 公開でないモジュールの中の `pub` な item が公開パスなしで引けた (`std::sys::cmath::erff`、`std::backtrace_rs::print::PrintFmt`、sealed の文言が「not public」と言う trait): 公開パスを求める
+  3. 公開パスの無い trait の impl の item が引けた (`std::fs::File::copy` が `SpecCopy::copy`、`Vec::spec_extend` が `ambiguous_path`): `Default` のメンバーは、その trait がこの crate のもので公開パスが無いか hidden なら除く
+  4. private な固有メソッドが同じ名前の公開の trait のメソッドを隠して `NotFound` になった: `impl` の組ごとに公開のものから探す
+  5. `list_implementors` が hidden な `impl` を除かなかった: 除く
+  6. hidden な trait の item (`PartialOrd::__chaining_*`、`Eq::assert_receiver_is_total_eq` など) が `list_methods` と `list_implementors` の `items` に出ていた (前からある): この crate の trait の hidden な item は、`impl` に書かれたものも提供されたものも除く
+  - テストを足した: 公開でないモジュールは引けず、そこから公開されたものは引けること、variant のフィールド
+- 残したもの: ほかの crate の hidden か非公開の trait の blanket impl (`core::mem::SizedTypeProperties` などを、alloc や std の型の `list_impls` が出す。ほかの crate の trait が hidden かは分からない。通常の docs.rs の JSON には無い)。core の中の型で `needs_use` が誤る (前からある)。`list_impls` の `has_private_fields` は hidden な `pub` のフィールドを数えない (`get_item` は「`/* private fields */`」にする)。member の `list_implementors` の型は `crate::` でなくソースの書き方。名前で書けない戻り値の型は、依存では引けなくなった (R-PR-2 の `unnameable` は未実装)。private な固有メソッドと同名の trait のメソッドのテストは無い
+
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
 - 利用者の指示で、デッドロックと止まって戻らない危険を、コード全体で監査した (サブエージェント、読むだけ。D4b のハングの後)。ロックの循環、ガードを持ったままの `.await` (clippy の `await_holding_lock` も `suspicious` の deny で効いている)、自分の結果を待つ形の循環は無かった。止まって長く戻らない箇所は次のとおり

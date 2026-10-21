@@ -1686,6 +1686,53 @@ fn a_members_private_and_hidden_items_are_searched_and_listed() {
     assert!(server.finish().success());
 }
 
+/// A workspace member's methods, impls and implementors have its private ones (decided in M2's
+/// D6).
+#[cfg(feature = "local")]
+#[test]
+fn a_members_other_lists_have_its_private_items() {
+    let project = demo_workspace();
+    std::fs::write(project.path().join("src/lib.rs"), VISIBILITIES).expect("written");
+    let mut server = Server::start_in(Some(project.path()));
+    built_item(
+        &mut server,
+        1,
+        &json!({ "crate": "demo", "path": "crate::rooted" }),
+    );
+    let mut ids = 100..;
+    let mut call = |tool: &str, arguments: Value| -> Value {
+        let id = ids.next().expect("an id");
+        server.send(&call_tool(id, tool, arguments));
+        server.response(id)["result"]["structuredContent"].clone()
+    };
+    let methods = call(
+        "list_methods",
+        json!({ "crate": "demo", "path": "crate::hidden::Hidden" }),
+    )
+    .to_string();
+    assert!(
+        methods.contains(r#""path":"crate::hidden::Hidden::secret""#)
+            && methods.contains(r#""visibility":"private""#),
+        "{methods}"
+    );
+    let impls = call(
+        "list_impls",
+        json!({ "crate": "demo", "path": "crate::hidden::Hidden" }),
+    )
+    .to_string();
+    assert!(impls.contains("crate::hidden::Act"), "{impls}");
+    let implementors = call(
+        "list_implementors",
+        json!({ "crate": "demo", "path": "crate::hidden::Act" }),
+    )
+    .to_string();
+    assert!(
+        implementors.contains(r#""type":"Hidden""#),
+        "{implementors}"
+    );
+    assert!(server.finish().success());
+}
+
 /// The result of `get_item` with `arguments`, called again while it answers `status: building`,
 /// with the ids from `first` on.
 #[cfg(feature = "local")]

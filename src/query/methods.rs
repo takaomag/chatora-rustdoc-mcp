@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 
-use rustdoc_types::{Id, Impl, Item, ItemEnum, Type};
+use rustdoc_types::{Id, Impl, Item, ItemEnum, Type, Visibility};
 use serde::Serialize;
 
 use super::{
@@ -23,7 +23,7 @@ use super::{
     },
     impls::{TraitOrigin, find_type, trait_origin},
     list_module::Page,
-    path_index::impls_of,
+    path_index::{impls_of, is_doc_hidden},
     view::CrateView,
 };
 
@@ -394,10 +394,21 @@ fn collect<'a>(
         if !for_this || contents.is_synthetic || contents.is_negative {
             continue;
         }
+        // Another crate's hidden `impl`s are not its API (decided in M2's D6).
+        if !query.is_member() && view.item(impl_id).is_some_and(is_doc_hidden) {
+            continue;
+        }
         let Some(trait_ref) = &contents.trait_ else {
             for &member in &contents.items {
-                if is_function(view, member)
-                    && let Some(data) = query.item_data(member, Some(ty))
+                // Another crate's methods that it does not show (requirement R-SH-5, decided in
+                // M2's D6).
+                let shown = query.is_member()
+                    || view.item(member).is_some_and(|method| {
+                        method.visibility == Visibility::Public && !view.index().is_hidden(member)
+                    });
+                if shown
+                    && is_function(view, member)
+                    && let Some(data) = query.item_data(member, Some(ty)).map(ItemData::listed)
                 {
                     collected.methods.push(Method {
                         data,
@@ -413,7 +424,7 @@ fn collect<'a>(
         let Some(TraitOrigin {
             path: trait_path,
             krate: trait_crate,
-        }) = trait_origin(view, trait_ref.id)
+        }) = trait_origin(view, trait_ref.id, query.is_member())
         else {
             continue;
         };
@@ -511,15 +522,27 @@ fn trait_methods<'a>(
         provided,
     };
     for &member in &contents.items {
-        if !is_function(view, member) {
+        // Another crate's hidden items of a trait are not its API (decided in M2's D6).
+        if !is_function(view, member) || !query.is_member() && view.index().is_hidden(member) {
             continue;
         }
         let name = view
             .item(member)
             .and_then(|item| item.name.as_deref())
             .unwrap_or_default();
+        // Nor one that the trait of this crate has hidden, written in the `impl`.
+        let hidden_in_trait = trait_items.is_some_and(|items| {
+            items.iter().any(|&id| {
+                view.item(id)
+                    .is_some_and(|item| item.name.as_deref() == Some(name))
+                    && view.index().is_hidden(id)
+            })
+        });
+        if !query.is_member() && hidden_in_trait {
+            continue;
+        }
         let provided = provided_in_trait(name);
-        if let Some(mut data) = query.item_data(member, Some(ty)) {
+        if let Some(mut data) = query.item_data(member, Some(ty)).map(ItemData::listed) {
             data.path = format!("{type_path}::{name}").into();
             collected.methods.push(method(data, provided));
         }
@@ -541,12 +564,18 @@ fn trait_methods<'a>(
                     .is_some_and(|item| item.name.as_deref() == Some(name.as_str()))
             })
         });
+        if !query.is_member() && in_trait.is_some_and(|id| view.index().is_hidden(id)) {
+            continue;
+        }
         let mut data = in_trait
             .and_then(|id| query.item_data(id, Some(trait_id)))
-            .unwrap_or_else(|| ItemData {
-                kind: "method",
-                ..ItemData::default()
-            });
+            .map_or_else(
+                || ItemData {
+                    kind: "method",
+                    ..ItemData::default()
+                },
+                ItemData::listed,
+            );
         data.path = format!("{type_path}::{name}").into();
         data.parent = None;
         collected.methods.push(method(data, Some(true)));

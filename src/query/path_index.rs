@@ -551,6 +551,68 @@ impl ArchivedPathIndex {
         self.lookup_definition(&key).unwrap_or(Resolution::NotFound)
     }
 
+    /// [`Self::resolve`], to the public items only: what another crate can use, as the lookups of
+    /// a crate that is not a workspace member show (requirement R-SH-5, decided in M2's D6).
+    ///
+    /// An item is public when it has a public path. A member is when its parent has one, and it
+    /// is `pub`, or, as an item of a trait, a variant or an item of an `impl` of a trait
+    /// (`Default`), when that trait, if it is of this crate, has a public path and is not hidden.
+    /// The members of each group of `impl`s are looked at in turn, so that a private one does not
+    /// keep a public one of the same name from being found.
+    #[must_use]
+    pub fn resolve_public(&self, view: &CrateView<'_>, path: &str) -> Resolution {
+        let Some(key) = normalize(path) else {
+            return Resolution::NotFound;
+        };
+        if let Some(resolution) = self.lookup_public(&key) {
+            return resolution;
+        }
+        let has_path = |id: Id| self.canonical_path(id).is_some();
+        if let Some((parent, member)) = key.rsplit_once("::")
+            && let Some(Resolution::Item(parent)) = self.lookup(parent)
+            && has_path(parent)
+        {
+            let found = find_member_where(view, parent, member, &|id| {
+                self.is_public_member(view, parent, id)
+            });
+            if found != Resolution::NotFound {
+                return found;
+            }
+        }
+        // A definition path of an item that has a public path, as `alloc::vec::Vec` in std.
+        let ids: Vec<Id> = self
+            .by_definition_path
+            .get(key.as_ref())
+            .map(|ids| {
+                ids.iter()
+                    .map(view::native)
+                    .filter(|&id| has_path(id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        match ids.as_slice() {
+            [] => Resolution::NotFound,
+            [id] => Resolution::Item(*id),
+            _ => Resolution::Ambiguous(ids.into()),
+        }
+    }
+
+    /// Whether `member` of `parent` is public ([`Self::resolve_public`]).
+    fn is_public_member(&self, view: &CrateView<'_>, parent: Id, member: Id) -> bool {
+        match view.item(member).map(|item| &item.visibility) {
+            Some(Visibility::Public) | None => true,
+            Some(Visibility::Default) => own_impls(view, parent)
+                .find(|(_, contents)| contents.items.contains(&member))
+                .and_then(|(_, contents)| contents.trait_.as_ref())
+                .is_none_or(|trait_| {
+                    view.summary(trait_.id)
+                        .is_none_or(|summary| summary.crate_id != 0)
+                        || self.canonical_path(trait_.id).is_some() && !self.is_hidden(trait_.id)
+                }),
+            Some(Visibility::Crate | Visibility::Restricted { .. }) => false,
+        }
+    }
+
     /// Where `path` goes on in another crate: the longest prefix of `path` that re-exports an
     /// item of another crate, and the path in that crate, its definition path followed by the rest
     /// of `path` (`std::vec::Vec` goes on as `alloc::vec::Vec`). `None` when no prefix is such a
@@ -944,14 +1006,25 @@ fn normalize(path: &str) -> Option<Cow<'_, str>> {
 /// Finds the member called `name` of `parent`: the variants of an enum, the items of a trait, or
 /// the items of the `impl`s of a type, first inherent ones, then trait ones, then blanket ones.
 fn find_member(view: &CrateView<'_>, parent: Id, name: &str) -> Resolution {
+    find_member_where(view, parent, name, &|_| true)
+}
+
+/// [`find_member`], among the members that `keep` takes.
+fn find_member_where(
+    view: &CrateView<'_>,
+    parent: Id,
+    name: &str,
+    keep: &dyn Fn(Id) -> bool,
+) -> Resolution {
     let own = view.item(parent).map_or(&[][..], own_members);
-    if let Some(found) = named(view, parent, own.iter(), name) {
+    if let Some(found) = named(view, parent, own.iter().filter(|&&id| keep(id)), name) {
         return found;
     }
     for kind in [ImplKind::Inherent, ImplKind::Trait, ImplKind::Blanket] {
         let members = own_impls(view, parent)
             .filter(|(_, contents)| ImplKind::of(contents) == kind)
-            .flat_map(|(_, contents)| contents.items.iter());
+            .flat_map(|(_, contents)| contents.items.iter())
+            .filter(|&&id| keep(id));
         if let Some(found) = named(view, parent, members, name) {
             return found;
         }
