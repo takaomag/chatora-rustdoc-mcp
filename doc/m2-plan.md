@@ -617,6 +617,41 @@ Claude Code 2.1.304、Linux で測った。
 - D1a (a13c883) の CI で、この文書の markdownlint が落ちていた (MD033・MD038): rustup の文言を書いたコードの中で、backtick の前に置いた逆斜線が、コードの区切りの対応を崩していた。二重の backtick で囲んだ
 - 揺れるテストの修正 (C4c のテスト): `what_cannot_be_told_for_sure_is_left` が全体のテストで一度落ちた。持ち主のロックを手放した直後に掃除を走らせるので、ほかのテストが同じ瞬間に起動した子が、exec するまでロックの fd の写しを持ち、掃除が持ち主を生きているとみなして記録を飛ばしていた (C1 で見つけた現象と同じ。製品では、掃除は次のサーバーの起動時なので当たらない)。テストの助け (`Owner::killed_for_test`) が、ロックが本当に外れるまで待つようにし、同じ形の owner のテストもこれを使う。それでも 12 回の繰り返しで 1 回落ちた: 掃除自身が、同じ持ち主の記録ごとにロックを取っては手放していたので、2 件目以降で同じことが起きて「不確か」が 1 件足りなかった。これは製品でも、掃除と同時に子を起動すると起こりうる (記録が次の起動まで残るだけ)。掃除が持ち主ごとに記録をまとめ、ロックを 1 度だけ取って全件を片付けるまで持つようにした。子の記録の片付けと work dir の片付けの間で手放すのは残る (そこで当たると work dir が次の起動まで残るだけ)
 
+**D2 の下調べと決定 (2026-10-21)**:
+
+- 下調べ (サブエージェント、読むだけ): 起動の形は R-WS-1 で決まっている。使える部品は `cargo::project_command`・`run_reporting`、`Owner::work_dirs` (キャッシュと同じファイルシステムなので rename で原子的に公開できる)、`toolchain::choose`・`check_target`・`same_toolchain`、`load::archive_of`、`Flights`、`project::project_target` (`--target` の判定)。足りないものは `Doing::Building`、`cargo` の直後の `+toolchain`、stdout の JSON の行ごとの読み取り (今の `Child::output_watching` は stdout をまとめて読む)、member の `PackageId` の引き方 (`ProjectPackage` は持たない)、`build.jobs`。M0 の B1 のスクリプトの `RUSTC_BOOTSTRAP` の値には、v0.18 で足した cdylib・staticlib・dylib と member の bin が入っていない。M0 で測っていないのは、proc-macro の member、cdylib だけの lib、`--` の後の `-o`
+- 利用者が 1 件ずつ決めたこと:
+  1. 専用の target dir: `<cache>/t/<12 桁>/` の下に `target/` (`CARGO_TARGET_DIR`) と `build/` (`CARGO_BUILD_BUILD_DIR`)。12 桁はワークスペースのルートの正規化したパスの SHA-256 の先頭。toolchain と target は鍵に入れない (cargo が中を分ける)
+  2. 使えない target dir (C4 の決定 5): 子の記録に使った target dir を足し、掃除が記録を「不確か」として残すとき、その dir に `unusable` の印を置く。ビルドは `<12 桁>`、`<12 桁>.1`、… のうち印の無い最初のものを使う。印の付いた dir は、記録が消えた後に GC が消す。ほかのプロセスは印を見て知る
+  3. `RUSTC_BOOTSTRAP` の値の上限 (Q-31): 3 OS 共通で 30,000 バイト。超えたら `RUSTC_BOOTSTRAP=1` に落とし、ログと応答の warnings に書く。依存が nightly 機能を有効にして壊れたときに member の名前だけで再試行するかは、D5 の失敗の扱いで決める
+  4. 同名の crate の上書き (Q-29): サーバーのロック `doc:<target dir>` を排他で取り、cargo の実行から JSON の移動・dep-info まで持つ。順は「鍵 → target dir (共有) → このロック → ビルドの枠」。移した JSON の crate 名・版・`target.triple` を頼んだものと照らす
+  5. D4 までの作り直し: member を引く呼び出しのたびにビルドする (同時の呼び出しは `Flights` でまとめる)。中身が同じ JSON は sha で引くのでアーカイブは作り直さない。置き場所は `<cache>/local/<ワークスペースの 12 桁>/<package id の 12 桁>/<triple>/<lib か bin-名前>/` に `<format>.json`・`.sha256`・来歴の `record.json` (D4 のダイジェストの層を後で差し込める形)
+  6. bin crate: パスの先頭を member の lib 名、次に bin 名と照らす。lib と bin が同名なら lib で、その bin は引けない (要るとわかったら引き方を足す)。ビルドするのは頼まれた target だけ
+  7. features: `-p <member>` だけで cargo の既定に任せる (1 つの member では通常のビルドと同じ組になると M0 の B3 で確かめた)。使われた組は `compiler-artifact` の `features` から `features_effective` に。通常の組の明示・複数 member の統合・`[package.metadata.docs.rs]` は D3
+  8. `--cfg docsrs`: 今から最後の rustdoc にだけ渡す (要件の既定)。外してやり直すのは D3
+  9. 期限に間に合わないビルド: `Flights` の共有の仕事にし、期限が来たら `status: building` (ロック待ちなら `waiting_for_lock`) を返して裏で続ける。`Doing::Building` を足す
+  10. ビルドの中で toolchain が入ったとき (D1 の決定 4): できた JSON の `format_version` を読む。古すぎれば `choose` をやり直して nightly で作り直し、新しすぎれば D1 の決定 2 に従う
+  11. `-j`: 設定 `build.jobs` を足し、既定は max(1, `available_parallelism` の半分)。既定の値は F5 で見直す
+- nightly でも `-Z fine-grain-locking`・`cargo doc --output-format json` は使わない (Q-17 で `cargo rustdoc` に決めてある)
+- D2 は 3 つに分ける: D2a (ビルドの計画: `RUSTC_BOOTSTRAP` の値、target dir の名前と印、`--lib`・`--bin`・`--target`・doc dir の決め方、`-j`、起動の組み立て。外のプロセスを走らせない)、D2b (走らせて公開する: stdout の JSON の読み取り、ロック、work dir から照らして原子的に公開、fixture のテスト)、D2c (問い合わせにつなぐ: `get_item` の member を `local_build_required` からビルドに、`status: building`、来歴、R-SEC-1 の stdout のテスト、Claude Code での試し)
+
+**D2a (ビルドの計画。2026-10-21)**:
+
+- `data::build` を足した。外のプロセスは走らせない
+  - `Bootstrap::of`: resolve の全パッケージの lib (`lib`・`rlib`・`dylib`・`cdylib`・`staticlib`)・proc-macro と、member の bin の crate 名 (`-` を `_` に) を辞書順にカンマでつなぐ。30,000 バイトを超えたら `1` (決定 3)。依存の bin・build script・test は入れない
+  - `TargetDir::of`: `<cache>/t/<ワークスペースのルートの SHA-256 の先頭 12 桁>` (印が付いていれば `.1`、`.2`、…)。`target()`・`build()`・`doc_dir()` (`--target` があれば `<target>/doc`、proc-macro は常に host の `doc`) (決定 1・2)
+  - `member_crate`: パスの先頭の名前を member の lib、次に member の bin と照らす (決定 6)
+  - `passes_target`: プロジェクトが `build.target` を設定しているとき、または host でない (host がわからない) とき `--target` を渡す (R-WS-1)
+  - `Plan::command`: R-WS-1 の形 (`--cfg docsrs`・`--document-private-items` を最後の rustdoc に。決定 8)。`RUSTC_BOOTSTRAP`・`CARGO_TARGET_DIR`・`CARGO_BUILD_BUILD_DIR` を設定する。`Plan::json` は出る JSON のパス
+  - 設定 `build.jobs` (既定は max(1, `available_parallelism` の半分)。決定 11)。起動時に、環境に `RUSTC_BOOTSTRAP` があればビルドでは置き換える旨をログに書く (R-WS-8)
+- `cargo::project_command` に、サーバーが選んだ toolchain を渡す引数を足した (`+<toolchain>` と `RUSTUP_AUTO_INSTALL=0`。D1 の決定 8)
+- `toolchain::check_target` が、`rustc -vV` の host を返す (`--target` の判定に使う)
+- 使えない target dir の印 (決定 2): 子の記録 (`procs/v1/`) に `target_dir` (`t/<名前>` の形。無ければ書かない。形式の版は変えない) を足した。ビルドの子は `child::spawn_building` で起動する (呼ぶのは D2b)。起動時の掃除が記録を「不確か」として残すとき、その dir に `unusable` を置く。記録の値は `t/` の下の英数字と `.` だけの名前のときだけ使い、キャッシュの外には書かない。印の付いた dir を消すのは F1 の GC
+- `cargo metadata` の target 名は、lib では `_` だが bin では `-` が残る (このリポジトリの bin `chatora-rustdoc-mcp` で確かめた)。`metadata::Target::name` の doc コメントが誤っていたので直した。`--bin` には元の名前を渡し、`RUSTC_BOOTSTRAP` と照合には `_` の形を使う
+- テスト: 値 (依存の bin・build script を除く、cdylib だけの依存を含む)、長すぎる値は `1`、lib が同名の bin より先、proc-macro、依存は引けない、印の付いた dir を飛ばす、`--target` の判定、proc-macro の doc dir、コマンドの引数と環境 (nightly・オフライン・`--bin`・`--target`、host 向けの lib)、子の記録の `target_dir`、掃除が印を置く・キャッシュの外を指す値には置かない
+- 前提を渡さないレビュー (サブエージェント) で確信を持てる誤りは無かった。弱い指摘から、長すぎる値のテストを、ほかの名前に頼らず上限を超えるようにした。D2b への申し送り: `-p` に渡す package id は `cargo metadata` のもの。cargo 1.77 より前は別の形式 (`name ver (path+…)`) で、`-p` には渡せない。プロジェクトの toolchain が古いと、その cargo の `cargo metadata` はこの形式を出すので、D2b で `name@version` に直すか、確かめる
+- D1b の CI (a323f43) は、Windows の `dropping_a_child_stops_its_grandchildren` (PowerShell で起動する孫が 30 秒以内に pid を書かなかった) だけ落ち、その job の再実行で通った。B1 からあるテストで、D1b は Windows の子の起動に触れていないので、揺れとみる
+
 ### 6.6 M2e
 
 (まだ無い)

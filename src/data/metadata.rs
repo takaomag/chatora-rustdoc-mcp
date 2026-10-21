@@ -68,7 +68,7 @@ pub struct Package {
 /// A target of a package.
 #[derive(Debug, Deserialize)]
 pub struct Target {
-    /// The crate name, with `_` for `-`.
+    /// The name: a lib's with `_` for `-`, as its crate's; a bin's as written, with any `-`.
     pub name: Box<str>,
     /// The kinds, as `lib`, `proc-macro`, `bin` or `custom-build`.
     pub kind: Box<[Box<str>]>,
@@ -524,7 +524,7 @@ impl Inner {
     /// Runs `cargo metadata` in `root` and reads its output, telling `stage` whether cargo waits
     /// for a lock or fetches (requirement R-OUT-9).
     async fn run_metadata(&self, root: &Path, stage: &Stage) -> Result<Metadata, CargoError> {
-        let mut command = cargo::project_command(root, self.offline);
+        let mut command = cargo::project_command(root, self.offline, None);
         command.args(["metadata", "--format-version", "1"]);
         let output = cargo::run_reporting(command, |activity| {
             stage.set(match activity {

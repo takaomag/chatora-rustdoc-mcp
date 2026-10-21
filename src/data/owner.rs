@@ -195,6 +195,8 @@ pub struct ChildRecord {
     lock_path: PathBuf,
     /// The lock, held by this server, until the group is stopped.
     lock: Option<ProcessLock>,
+    /// The target directory that the child builds in, if it builds, as [`Record::target_dir`].
+    target_dir: Option<String>,
 }
 
 /// What a record says of a child (decided in C4).
@@ -209,6 +211,11 @@ pub struct Record {
     pub session: u32,
     /// When the child started, as [`super::process_id::started`] tells.
     pub started: Option<u64>,
+    /// The target directory that the child builds in, if it builds: `t/<name>` in the cache,
+    /// which is marked as not to be used when what runs cannot be told for sure to be the
+    /// child's (decided in M2's D2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_dir: Option<String>,
 }
 
 #[cfg(unix)]
@@ -221,13 +228,14 @@ impl Owner {
     }
 
     /// The record of the child `number` that is about to start, with its lock, which this server
-    /// holds: the child is to inherit it ([`ChildRecord::inherited`]).
+    /// holds: the child is to inherit it ([`ChildRecord::inherited`]). `target_dir` is the target
+    /// directory in the cache that the child builds in, if it builds.
     ///
     /// # Errors
     ///
     /// Returns an error when the OS could not lock this server's lock, or the lock of the child
     /// cannot be made.
-    pub fn child_record(&self, number: u64) -> io::Result<ChildRecord> {
+    pub fn child_record(&self, number: u64, target_dir: Option<&Path>) -> io::Result<ChildRecord> {
         if !self.locked() {
             return Err(io::Error::other(
                 "the cache cannot be locked, so the children are not recorded",
@@ -239,10 +247,22 @@ impl Owner {
         let lock_path = records.join(format!("{stem}.lock"));
         let lock = process_lock::try_lock_at(&lock_path, LockMode::Exclusive)?
             .ok_or_else(|| io::Error::other("the lock of a new child is held"))?;
+        let target_dir = target_dir.and_then(|dir| {
+            let name = dir
+                .strip_prefix(self.root.join(super::build::TARGET_DIRS))
+                .ok()
+                .and_then(|name| name.to_str())
+                .filter(|name| is_target_dir_name(name));
+            if name.is_none() {
+                tracing::warn!(dir = %dir.display(), "a build's target directory is not one of the cache's, so it is not recorded");
+            }
+            name.map(|name| format!("{}/{name}", super::build::TARGET_DIRS))
+        });
         Ok(ChildRecord {
             record: records.join(format!("{stem}.json")),
             lock_path,
             lock: Some(lock),
+            target_dir,
         })
     }
 }
@@ -265,6 +285,7 @@ impl ChildRecord {
             boot,
             session: pid,
             started: super::process_id::started(pid),
+            target_dir: self.target_dir.clone(),
         };
         // Written whole, but not synced: after a crash, the boot differs, and the record is not
         // used.
@@ -446,7 +467,7 @@ fn settle_children(me: &Owner, until: Instant, swept: &mut Swept) -> bool {
                 finished = false;
                 break;
             }
-            match settle(&record, until) {
+            match settle(&me.root, &record, until) {
                 Settled::Ended => swept.child_records = swept.child_records.saturating_add(1),
                 Settled::Stopped(count) => {
                     swept.child_records = swept.child_records.saturating_add(1);
@@ -482,7 +503,7 @@ enum Settled {
 /// Settles the record at `record`: removes it, with its lock file, once nothing of the child runs,
 /// after stopping the descendants that are known for sure to be the child's (decided in C4).
 #[cfg(unix)]
-fn settle(record: &Path, until: Instant) -> Settled {
+fn settle(root: &Path, record: &Path, until: Instant) -> Settled {
     let lock_path = record.with_extension("lock");
     let remove = |held: ProcessLock| {
         drop(fs::remove_file(record));
@@ -498,6 +519,7 @@ fn settle(record: &Path, until: Instant) -> Settled {
         .and_then(|json| serde_json::from_slice(&json).ok());
     let Some(descendants) = read.as_ref().and_then(|read| descendants(read, &lock_path)) else {
         tracing::info!(record = %record.display(), "what still runs of a child of a server that has stopped cannot be told for sure to be its, so it is left");
+        mark_unusable(root, read.as_ref());
         return Settled::Unsure;
     };
     for pid in &descendants {
@@ -513,8 +535,52 @@ fn settle(record: &Path, until: Instant) -> Settled {
         Settled::Stopped(descendants.len())
     } else {
         tracing::info!(record = %record.display(), "a descendant of a child of a server that has stopped still runs outside its session, so the record is left");
+        mark_unusable(root, read.as_ref());
         Settled::Unsure
     }
+}
+
+/// Marks the target directory of the cache at `root` that the child of `record` built in, if it
+/// did, as not to be used: what still runs may hold cargo's lock there, and the next build uses
+/// another (decided in M2's D2).
+#[cfg(unix)]
+fn mark_unusable(root: &Path, record: Option<&Record>) {
+    let Some(name) = record
+        .and_then(|record| record.target_dir.as_deref())
+        .and_then(|dir| {
+            dir.strip_prefix(super::build::TARGET_DIRS)?
+                .strip_prefix('/')
+        })
+        .filter(|name| is_target_dir_name(name))
+    else {
+        return;
+    };
+    let dir = root.join(super::build::TARGET_DIRS).join(name);
+    if !dir.is_dir() {
+        return;
+    }
+    match fs::write(
+        dir.join(super::build::UNUSABLE),
+        "what a stopped server's build left running may still use this directory\n",
+    ) {
+        Ok(()) => {
+            tracing::info!(dir = %dir.display(), "a target directory is not to be used, as what a stopped server's build left running may still use it");
+        },
+        Err(error) => {
+            tracing::warn!(dir = %dir.display(), %error, "a target directory could not be marked as not to be used");
+        },
+    }
+}
+
+/// Whether `name` can name a target directory in the cache's `t/`: a name of one part, which
+/// leads nowhere else.
+#[cfg(unix)]
+fn is_target_dir_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.')
+        && !name.starts_with('.')
 }
 
 /// The processes that run as descendants of the child of `record`, when that can be told for

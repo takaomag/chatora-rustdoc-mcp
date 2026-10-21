@@ -165,7 +165,7 @@ async fn tree(
     edges: &str,
     extra: &[&str],
 ) -> Result<Vec<Line>, ScopeError> {
-    let mut command = cargo::project_command(root, offline);
+    let mut command = cargo::project_command(root, offline, None);
     command.args([
         "tree",
         "--workspace",

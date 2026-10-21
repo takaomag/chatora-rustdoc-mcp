@@ -413,10 +413,17 @@ pub enum Missing {
 /// the host, its `libcore`), so that cargo is not started to fail (requirement R-TG-1, decided in
 /// M2's D1).
 ///
+/// Returns the host of the toolchain, which tells whether a build passes `--target` (requirement
+/// R-WS-1), if rustc told it.
+///
 /// # Errors
 ///
 /// Returns what is missing.
-pub async fn check_target(rustc: &Path, root: &Path, target: &TargetTriple) -> Result<(), Missing> {
+pub async fn check_target(
+    rustc: &Path,
+    root: &Path,
+    target: &TargetTriple,
+) -> Result<Option<TargetTriple>, Missing> {
     let run = async |args: &[&str]| {
         tool::output_kept(root, tool::Place::Project, rustc, args)
             .await
@@ -441,7 +448,7 @@ pub async fn check_target(rustc: &Path, root: &Path, target: &TargetTriple) -> R
         lib.is_dir()
     };
     if found {
-        Ok(())
+        Ok(host.and_then(|host| host.parse().ok()))
     } else {
         Err(Missing::Target {
             target: target.clone(),
@@ -882,9 +889,10 @@ mod tests {
     async fn the_toolchain_here_builds_for_its_host() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let host = crate::data::target::host_target(dir.path()).await;
-        check_target(Path::new("rustc"), dir.path(), &host.triple)
+        let told = check_target(Path::new("rustc"), dir.path(), &host.triple)
             .await
             .expect("the host's standard library");
+        assert_eq!(told, Some(host.triple));
     }
 
     /// A project whose `rust-toolchain.toml` names a toolchain that is not installed is told so,
@@ -933,9 +941,10 @@ mod tests {
         std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755))
             .expect("made runnable");
         let host: TargetTriple = "x86_64-unknown-linux-gnu".parse().expect("a triple");
-        check_target(&rustc, dir.path(), &host)
+        let told = check_target(&rustc, dir.path(), &host)
             .await
             .expect("the host's libcore");
+        assert_eq!(told.as_ref(), Some(&host));
         let other: TargetTriple = "aarch64-apple-darwin".parse().expect("a triple");
         assert_eq!(
             check_target(&rustc, dir.path(), &other).await,

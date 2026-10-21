@@ -15,6 +15,7 @@
 use std::{
     collections::HashMap,
     io,
+    path::Path,
     process::Output,
     sync::{
         OnceLock,
@@ -160,7 +161,22 @@ static STARTER: OnceLock<io::Result<mpsc::Sender<Start>>> = OnceLock::new();
 /// Returns an error when the child cannot be started, or its group cannot be made, or the server
 /// is ending.
 pub(super) async fn spawn(command: tokio::process::Command) -> io::Result<Child> {
-    spawn_owned(command, super::owner::Owner::this()).await
+    spawn_owned(command, super::owner::Owner::this(), None).await
+}
+
+/// [`spawn`] for a build in `target_dir`, a target directory in the cache, which its record names
+/// (decided in M2's D2): a later server's sweep marks it as not to be used when what outlives the
+/// server cannot be told for sure to be the child's.
+///
+/// # Errors
+///
+/// As [`spawn`].
+#[expect(dead_code, reason = "the build of M2's D2b starts its children so")]
+pub(super) async fn spawn_building(
+    command: tokio::process::Command,
+    target_dir: &Path,
+) -> io::Result<Child> {
+    spawn_owned(command, super::owner::Owner::this(), Some(target_dir)).await
 }
 
 /// [`spawn`], recording the child for `owner`, if any, on Unix (requirement R-WS-6, decided in
@@ -176,6 +192,11 @@ async fn spawn_owned(
         expect(unused_variables, reason = "only Unix records children")
     )]
     owner: Option<&super::owner::Owner>,
+    #[cfg_attr(
+        not(unix),
+        expect(unused_variables, reason = "only Unix records children")
+    )]
+    target_dir: Option<&Path>,
 ) -> io::Result<Child> {
     let ending = || io::Error::other("the server is ending, so it starts nothing more");
     if STOPPING.load(Ordering::SeqCst) {
@@ -201,7 +222,7 @@ async fn spawn_owned(
         .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
     let number = NEXT_GROUP.fetch_add(1, Ordering::Relaxed);
     #[cfg(unix)]
-    let record = owner.and_then(|owner| match owner.child_record(number) {
+    let record = owner.and_then(|owner| match owner.child_record(number, target_dir) {
         Ok(record) => Some(record),
         Err(error) => {
             tracing::warn!(%error, "a child is started without its record");
@@ -472,7 +493,6 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use std::{
-        path::Path,
         process::Stdio,
         time::{Duration, Instant},
     };
@@ -604,9 +624,9 @@ mod tests {
         assert_eq!(pid, session, "{stat}");
     }
 
-    /// A child is recorded while it runs, with its session and when it started, and once it has
-    /// ended with nothing of its group left, neither its record nor its lock stays (decided in
-    /// C4).
+    /// A child is recorded while it runs, with its session, when it started and the target
+    /// directory that it builds in, and once it has ended with nothing of its group left, neither
+    /// its record nor its lock stays (decided in C4 and D2).
     #[cfg(unix)]
     #[tokio::test]
     async fn a_child_is_recorded_while_it_runs() {
@@ -615,7 +635,10 @@ mod tests {
         let mut command = tokio::process::Command::new("sh");
         command.args(["-c", "sleep 0.5"]).stdin(Stdio::null());
         prepare(&mut command);
-        let child = spawn_owned(command, Some(&owner)).await.expect("started");
+        let target_dir = dir.path().join("t/0123456789ab.1");
+        let child = spawn_owned(command, Some(&owner), Some(&target_dir))
+            .await
+            .expect("started");
         let pid = child.child.id().expect("running");
         let records = dir.path().join("procs/v1");
         let record = records.join(format!("{}.{}.json", owner.id(), child.group.0));
@@ -624,6 +647,7 @@ mod tests {
         assert_eq!(written.session, pid);
         assert_eq!(written.started, super::super::process_id::started(pid));
         assert!(written.started.is_some());
+        assert_eq!(written.target_dir.as_deref(), Some("t/0123456789ab.1"));
         assert_eq!(
             written.boot.as_ref(),
             super::super::process_id::machine_and_boot().map(|(_, boot)| boot)
@@ -661,7 +685,9 @@ mod tests {
             ])
             .stdin(Stdio::null());
         prepare(&mut command);
-        let child = spawn_owned(command, Some(&owner)).await.expect("started");
+        let child = spawn_owned(command, Some(&owner), None)
+            .await
+            .expect("started");
         let number = child.group.0;
         child.output().await.expect("ran");
         let read = || {
@@ -716,9 +742,13 @@ mod tests {
         };
         let root = Path::new(&root);
         let owner = super::super::owner::Owner::start(&super::super::cache::Cache::at(root));
-        let _child = spawn_owned(with_grandchild(&root.join("grandchild")), Some(&owner))
-            .await
-            .expect("started");
+        let _child = spawn_owned(
+            with_grandchild(&root.join("grandchild")),
+            Some(&owner),
+            None,
+        )
+        .await
+        .expect("started");
         tokio::time::sleep(Duration::from_secs(120)).await;
     }
 
@@ -786,7 +816,7 @@ mod tests {
         let mut command = tokio::process::Command::new("sleep");
         command.arg("60").stdin(Stdio::null());
         prepare(&mut command);
-        let other = spawn_owned(command, None).await.expect("started");
+        let other = spawn_owned(command, None, None).await.expect("started");
         let pid = other.child.id().expect("running");
         let since = process_id::started(pid).expect("its start");
         let (machine, boot) = process_id::machine_and_boot()
@@ -794,6 +824,8 @@ mod tests {
             .map_or((None, None), |(machine, boot)| (Some(machine), Some(boot)));
         let records = dir.path().join("procs/v1");
         std::fs::create_dir_all(&records).expect("made");
+        let target_dir = dir.path().join("t/0123456789ab");
+        std::fs::create_dir_all(&target_dir).expect("made");
         let mut held = Vec::new();
         // On Linux, a process that matches the record but has not the inherited lock open is
         // not the child's.
@@ -803,21 +835,26 @@ mod tests {
             boot: boot.clone(),
             session: pid,
             started: Some(since),
+            target_dir: None,
         });
         #[cfg(not(target_os = "linux"))]
         let matching: Option<Record> = None;
         for (number, record) in [
+            // The target directory that this one built in is not to be used.
             Record {
                 machine: machine.clone(),
                 boot: Some("another boot".to_owned()),
                 session: pid,
                 started: Some(since),
+                target_dir: Some("t/0123456789ab".to_owned()),
             },
+            // Nor anything that is not a target directory of the cache.
             Record {
                 machine,
                 boot,
                 session: pid,
                 started: Some(since.saturating_sub(1)),
+                target_dir: Some("t/../work".to_owned()),
             },
         ]
         .into_iter()
@@ -845,6 +882,8 @@ mod tests {
         assert_eq!(swept.unsure, held.len(), "{swept:?}");
         assert_eq!(swept.stopped, 0, "{swept:?}");
         assert!(running(&pid.to_string()), "left alone");
+        assert!(target_dir.join("unusable").exists(), "marked");
+        assert!(!dir.path().join("work/unusable").exists(), "not marked");
         drop(held);
         drop(other);
     }

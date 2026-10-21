@@ -79,12 +79,24 @@ impl GitFetchFailure {
 /// (requirement R-WS-2), and it never writes Cargo.lock (`--locked`, requirement R-VR-2).
 /// Offline, it does not reach the network, and rustup does not install a toolchain
 /// (requirements R-CA-7 and R-WS-7).
-pub(super) fn project_command(root: &Path, offline: bool) -> tokio::process::Command {
+///
+/// `toolchain` is one that the server chose instead of the project's, as `nightly`: it is passed
+/// as `+<toolchain>`, and rustup does not install it (requirement R-WS-8, decided in M2's D1).
+pub(super) fn project_command(
+    root: &Path,
+    offline: bool,
+    toolchain: Option<&str>,
+) -> tokio::process::Command {
     let programs = super::toolchain::Programs::this();
     let mut command = tokio::process::Command::new(programs.cargo());
     // That of the settings, and the project's toolchain: not that of `RUSTUP_TOOLCHAIN`
     // (decided in M2's D1).
     programs.prepare_cargo(&mut command);
+    if let Some(toolchain) = toolchain {
+        command
+            .arg(format!("+{toolchain}"))
+            .env("RUSTUP_AUTO_INSTALL", "0");
+    }
     command.arg("--locked");
     if offline {
         command.arg("--offline").env("RUSTUP_AUTO_INSTALL", "0");
@@ -376,7 +388,7 @@ mod lock_tests {
         .expect("written");
         fs::create_dir_all(&home).expect("made");
         let cargo = |args: &[&str]| {
-            let mut command = project_command(&project, true);
+            let mut command = project_command(&project, true, None);
             command.args(args).env("CARGO_HOME", &home);
             command
         };

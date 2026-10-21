@@ -78,7 +78,7 @@ async fn tree(
     target: &TargetTriple,
     edges: &str,
 ) -> Result<HashMap<PackageKey, BTreeSet<Box<str>>>, CargoError> {
-    let mut command = cargo::project_command(root, offline);
+    let mut command = cargo::project_command(root, offline, None);
     command.args([
         "tree",
         "--workspace",

@@ -2,6 +2,8 @@
 
 pub mod archive;
 #[cfg(feature = "local")]
+pub mod build;
+#[cfg(feature = "local")]
 pub mod build_scope;
 pub mod cache;
 #[cfg(feature = "local")]
