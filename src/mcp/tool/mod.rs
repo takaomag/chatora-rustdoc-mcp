@@ -3,6 +3,8 @@
 //! Each tool is a module with `NAME`, `definition()`, `parse_arguments()` when its arguments need
 //! checking, and `execute()`.
 
+#[cfg(feature = "local")]
+mod build_external_docs;
 mod call_log;
 #[cfg(test)]
 mod checks;
@@ -287,6 +289,9 @@ pub(super) fn docs_rs(network: &Network) -> Result<DocsRs, reqwest::Error> {
 /// Definitions of every tool, in the order `tools/list` returns them.
 pub(super) fn definitions() -> Vec<Tool> {
     let tools = vec![
+        // It builds what is outside the default project (requirement R-ARCH-4).
+        #[cfg(feature = "local")]
+        build_external_docs::definition(),
         crate_overview::definition(),
         get_item::definition(),
         // A project is needed, which only local features read (requirement R-ARCH-4).
@@ -316,9 +321,14 @@ pub(super) fn definitions() -> Vec<Tool> {
     tools
 }
 
-/// `tool` with the argument `refresh` (§6.4), which every tool takes with local features, as each
-/// may run cargo (requirement R-MCP-4).
+/// `tool` with the argument `refresh` (§6.4), which every query tool takes with local features, as
+/// each may run cargo (requirement R-MCP-4). `build_external_docs` does not: calling it again with
+/// the same arguments tries again (requirement R-WS-10).
 fn with_refresh(mut tool: Tool) -> Tool {
+    #[cfg(feature = "local")]
+    if tool.name == build_external_docs::NAME {
+        return tool;
+    }
     let mut schema = (*tool.input_schema).clone();
     if let Some(Value::Object(properties)) = schema.get_mut("properties") {
         properties.insert(
@@ -354,14 +364,25 @@ fn without_project(mut tool: Tool) -> Tool {
     tool
 }
 
-/// The annotations of every tool (requirement R-MCP-4). With local features, each may run cargo
-/// or rustc on the project (`cargo metadata`, `rustc -vV`, and builds from M2), whose settings
-/// can run any program, so none is read-only. Without them, none runs anything.
+/// The annotations of every query tool (requirement R-MCP-4). With local features, each may run
+/// cargo or rustc on the project (`cargo metadata`, `rustc -vV`, and builds from M2), whose
+/// settings can run any program, so none is read-only. Without them, none runs anything.
 fn annotations() -> ToolAnnotations {
     ToolAnnotations::new()
         .read_only(!cfg!(feature = "local"))
         .destructive(false)
         .idempotent(true)
+        .open_world(true)
+}
+
+/// The annotations of `build_external_docs` (requirement R-MCP-4): it builds, and calling it again
+/// with the same arguments does it again (requirement R-WS-10), so it is not idempotent.
+#[cfg(feature = "local")]
+fn external_annotations() -> ToolAnnotations {
+    ToolAnnotations::new()
+        .read_only(false)
+        .destructive(false)
+        .idempotent(false)
         .open_world(true)
 }
 
@@ -487,6 +508,15 @@ async fn dispatch(
     state: &Arc<ToolState>,
 ) -> Result<CallToolResult, ErrorData> {
     match request.name.as_ref() {
+        #[cfg(feature = "local")]
+        build_external_docs::NAME => {
+            match build_external_docs::parse_arguments(request.arguments.as_ref()) {
+                Ok(arguments) => {
+                    Ok(run_tool(build_external_docs::execute(arguments, Arc::clone(state))).await)
+                },
+                Err(error) => Ok(error.into_result()),
+            }
+        },
         get_item::NAME => match get_item::parse_arguments(request.arguments.as_ref()) {
             Ok(arguments) => Ok(run_tool(get_item::execute(arguments, Arc::clone(state))).await),
             Err(error) => Ok(error.into_result()),
@@ -795,10 +825,11 @@ mod tests {
         assert!(limit.enter().is_some());
     }
 
-    /// With local features, every tool takes `refresh`, as each may run cargo (§6.4); without
-    /// them, none does (requirement R-ARCH-3).
+    /// With local features, every query tool takes `refresh`, as each may run cargo (§6.4);
+    /// without them, none does (requirement R-ARCH-3). `build_external_docs` does not (requirement
+    /// R-WS-10).
     #[test]
-    fn every_tool_takes_refresh_with_local_features() {
+    fn every_query_tool_takes_refresh_with_local_features() {
         for tool in definitions() {
             let takes = tool
                 .input_schema
@@ -807,7 +838,9 @@ mod tests {
                 .is_some();
             assert_eq!(
                 takes,
-                cfg!(feature = "local") && tool.name != "sleep",
+                cfg!(feature = "local")
+                    && tool.name != "sleep"
+                    && tool.name != "build_external_docs",
                 "{}",
                 tool.name
             );

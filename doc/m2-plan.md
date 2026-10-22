@@ -1320,7 +1320,27 @@ Claude Code 2.1.304、Linux で測った。
 2. 名指しして `crate` なしの検索: member (`chatora-rustdoc-mcp`、private を含む) と直接依存 28 個の 29 個を範囲に検索した。空のキャッシュで初めの 3 回は member が `building` で `partial: true`、モデルは cargo のプロセスの終わりを待って呼び直し、29 個すべて `ok` になった
 3. 名指しして private な item: `visibility: private`、パスは `crate::query::local::Rebuilding` (D4d の試しの `pub(in ::x)` は D6 で直った)。モデルから、フィールドに可視性の印が無い (`pub struct` に private なフィールドが混ざるときに外から作れるかが分からない) と指摘があった
 4. 依存 (`tokio::sync::Mutex::lock`): Cargo.lock の版 (1.53.3) を docs.rs から 1 回で返した
-- モデルの使用量は 4 問で約 1.7 USD (利用者のアカウント)
+
+モデルの使用量は 4 問で約 1.7 USD (利用者のアカウント)。
+
+**M2e の下調べと決定 (2026-10-22)**:
+
+- 下調べ (サブエージェント、読むだけ): 外の記録を読み書きする部品は無い。「(in a later version)」の案内は project.rs (外の `project` の `no_record`)・local.rs (他の target・`build_unsupported`・docs.rs の組の warning) にある。流用できるのは `Plan`・`build::build`・`local_archive`・公開の置き場 (`local/v1`)・`failed.json`・`freshness::unchanged`・`process_lock`・`Flights`・`cargo::classify`。照会のツールの関所は `project::workspace`。無いもの: TOML の書き出し (toml の `display` feature)、`--locked` の無い cargo の入口、git の URL の検証と正規化、照会のツールの `git`・`rev`・`branch`・`tag`、外の workspace の `cargo metadata` の保存。ツールの annotations が全ツール共通で `idempotentHint: true`、`refresh` を全ツールに足している (外のツールは外す)。`lookup_target` は依存かを知る前にプロジェクトの `build.target` で target を決める (R-WS-5 の「依存でない crate は host」と食い違う)
+- 段の分け方 (聞かずに決めたこと): E1a (枠: 説明文・スキーマ・ツールごとの annotations・`refresh` を外す・local だけ・引数の検査・ビルドしない行)、E1b (外の記録と照会の経路: 鍵・置き場・記録・進行中のロック・失敗・`no_record`・`record_broken`・`building`)、E2a (依存でない crate と Cargo.lock に無い版)、E2b (名指しできない依存・features のやり直し・`offline_miss`・呼び直し)、E3a (git の URL の検証と正規化、照会のツールの git の引数)、E3b (git の仮のプロジェクト・解決の記録・短いハッシュ・`ref_ttl_expired`)、E4a (既定のプロジェクトの他の target)、E4b (外の workspace)
+- 利用者が決めたこと:
+  1. 記録の置き場: 本体 (JSON・ビルドの記録) は今の `local/v1` に置き、外の照会の鍵から引く索引だけを `ext/v1` に持つ (アーカイブ・鮮度・作り直し中・失敗の仕組みを使い回す。索引と本体の整合と掃除 (F1) が要る)
+  2. 仮のプロジェクトの target dir は、すべての仮のプロジェクトで 1 つを共有する
+  3. 仮のプロジェクトの toolchain は、置き場で rustup が選ぶ既定のもの、rustdoc JSON の形式が古ければ R-WS-8 の規則で nightly (Q-31)
+  4. 仮のプロジェクトの Cargo.toml は、toml の `display` feature を有効にして書き出す (Cargo.toml と Cargo.lock の変更は `cargo add` で E2a のとき)
+  5. 外の workspace のディレクトリが消えたら、記録のある root (と別名) なら古い記録を `stale: project_missing` で返し、記録の無いパスは `project_not_found`
+  6. git のテストは、`https://example.invalid/…` を渡し、隔離した git の設定の `url.insteadOf` で手元の `file://` の bare リポジトリに差し替える (cargo は git の CLI で取得させる。効くかは実測)
+  7. `branch`・`tag` で指した git の crate の解決は 1 日そのまま使い、過ぎたら `stale: ref_ttl_expired` と外のツールを呼び直す案内
+  8. git の短いハッシュは、7 文字以上の 16 進で記録した commit に前方一致が 1 つなら使い、複数なら `invalid_argument` に候補
+  9. `document_hidden_items` (R-AD-3) は M4 (`api_diff`) まで宣言しない (記録の鍵には hidden かを含めておく)
+  10. 既定のプロジェクトの member を `[package.metadata.docs.rs]` の組で作ることを、外のツールの入力の表に行を足して受ける (照会のツールの warning の案内と合わせる。要件を直す)
+  11. 依存でないと分かった crate は、`target` が無ければ docs.rs と外の記録を host の target で引き直す (R-WS-5)
+  12. 外の workspace を読むのは、crate を引くツール (`get_item` の系統)・`resolve_version`・`list_crates` まで。`crate` なしの `search_items` は後に回す
+  13. 進行中の印は要件の案 (Q-29) どおり: 外のツールは仮のプロジェクトを作る前から公開まで (枠を待つ間も) 鍵ごとの排他ロックを持ち、照会のツールは共有ロックの試し取りで覗く。git は要求の鍵 (URL と ref) と解決した commit の鍵の両方。合流した呼び直しは終わるのを待ってから解決し直す
 
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
@@ -1392,7 +1412,17 @@ Claude Code 2.1.304、Linux で測った。
 
 ### 6.6 M2e
 
-(まだ無い)
+**E1a (外のツールの枠。2026-10-22)**:
+
+- 作ったもの: `build_external_docs` (ローカル機能のある構成だけ。R-ARCH-4)。引数は `crate`・`version`・`project`・`target`。`git`・`rev`・`branch`・`tag` は E3a、`document_hidden_items` は M4 (決定 9) で宣言する。annotations はこのツールだけ `idempotentHint: false` (R-MCP-4)、`refresh` は持たせない (R-WS-10)。引数の検査: `crate` か `project` が要る、std・core・alloc などは配布物から引くので `invalid_argument` で `get_item` を案内、`crate` なしの `version` は `invalid_argument`。`get_item::parse_release` を `parse_crate`・`parse_project_and_target` に分けて使い回した
+- ビルドしない行: 既定のプロジェクトの workspace を、`target` なしか実際のビルド target (`build.target`、配列ならそのどれか) で指したら、ビルドせず `data.built: false`・`reason: query_tools_build` と、照会のツールに `project` を渡す hint を返す (cargo は起動しない)。workspace が無いパスは `project_not_found` (決定 5 の記録の無い場合)
+- 聞かずに決めたこと:
+  - まだビルドしない行 (依存でない crate・Cargo.lock に無い版・他の target・外の workspace・自前の std のプロジェクト・`crate` を付けた呼び出し) は、`docs_unavailable` (`reason: build_unsupported`) と「(in a later version)」で返す (照会のツールの案内と同じ書き方。公開は M2 の後)
+  - 依存を同じ target で指したときの「照会のツールがビルドする」行は E2b に回す (`-p` で名指しできるかの判定 (R-WS-5) が要り、名指しできなければ仮のプロジェクトで作るため)。docs.rs に JSON がある行は E2a
+  - `project` と `crate` を両方付けた呼び出しは、`crate` でその workspace の 1 つの member か依存に絞る形 (R-WS-10) として、E4 で扱う
+  - 出力スキーマは今の行の分だけにし、`status: building` の項目は E1b で足す。説明文は E2〜E4 で作るものまで書いた (まだの行は上のエラーで知らせる)
+  - real_data の自己検査 (R-QA-5): 説明文の 2 つの質問 (外の workspace は E4b、他の target は E4a) のケースを置き、答えられるまでは `later` の印で実データの実行から外す。引数の 4 つは `CheckedElsewhere` (stdio のテストが受けることを確かめる)。テストのクライアントは macOS・Windows で Linux の target を足すので、`project: "."` の基のケースはそこで失敗するため。E2a から実際のケースに戻す
+- レビュー (サブエージェント、読むだけ) の対応: (1) 自前の std を作るプロジェクトは「(in a later version)」でなく、照会のツールと同じ `target_unsupported` (R-TG-1。後の段でも作らない) (2) まだの行の suggestion を行ごとに (外の workspace と他の target に `get_item` を案内すると、照会のツールが外のツールへ戻す輪になる) (3) `target` の既定は、プロジェクトの crate ならビルド target、ほかの crate なら host (R-WS-5・決定 11) (4) hint の `project` を JSON で書く (Rust の Debug の形は JSON でない)、`list_crates` も案内 (5) `project` の説明に worktree の注意 (6) 相対パスの解き方を `project::project_path` に寄せた (7) テストの「プロセスを起動しない」の確かめをすべての呼び出しの後へ。残したもの: まだの行の `reason: build_unsupported` は R-WS-5 の意味 (名指しできない依存) と重なる (E2a・E2b で置き換わる)
 
 ### 6.7 M2f
 

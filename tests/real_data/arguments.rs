@@ -254,12 +254,33 @@ fn refresh_cases() -> Vec<Case> {
     .collect()
 }
 
+/// `build_external_docs` builds nothing before M2e's E2a, so its arguments do not change a result
+/// that worked yet: until then, a stdio test
+/// (`build_external_docs_builds_nothing_that_the_query_tools_build`) checks that it takes them.
+fn external_cases() -> Vec<Case> {
+    if !cfg!(feature = "local") {
+        return Vec::new();
+    }
+    ["crate", "version", "project", "target"]
+        .into_iter()
+        .map(|argument| {
+            case(
+                "build_external_docs",
+                argument,
+                json!({}),
+                Change::CheckedElsewhere,
+            )
+        })
+        .collect()
+}
+
 fn cases() -> Vec<Case> {
     let mut cases = item_cases();
     cases.extend(list_cases());
     cases.extend(type_cases());
     cases.extend(project_cases());
     cases.extend(refresh_cases());
+    cases.extend(external_cases());
     cases
 }
 

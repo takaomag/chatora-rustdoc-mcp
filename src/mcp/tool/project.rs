@@ -480,10 +480,7 @@ pub(super) fn workspace(
     project: Option<&Path>,
 ) -> Result<Option<(Workspace, ProjectFrom)>, Box<CallToolResult>> {
     if let Some(project) = project {
-        let path = match default {
-            Some(default) if project.is_relative() => default.dir.join(project),
-            Some(_) | None => project.to_path_buf(),
-        };
+        let path = project_path(default, project);
         let workspace = project::workspace_of(&path).map_err(|error| {
             Box::new(project_not_found(
                 &format!("{}: {}", path.display(), ErrorChain(&error)),
@@ -525,6 +522,16 @@ pub(super) fn workspace(
                 &candidates,
             )))
         },
+    }
+}
+
+/// The path that the argument `project` names: relative to the default project's directory unless
+/// absolute (§6.4).
+#[cfg(feature = "local")]
+pub(super) fn project_path(default: Option<&DefaultProject>, project: &Path) -> std::path::PathBuf {
+    match default {
+        Some(default) if project.is_relative() => default.dir.join(project),
+        Some(_) | None => project.to_path_buf(),
     }
 }
 

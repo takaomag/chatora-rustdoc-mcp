@@ -17,6 +17,8 @@ struct Question {
     answers: fn(&Value) -> bool,
     /// The question is about the project, which only a build with local features reads.
     local: bool,
+    /// The tool answers it in a later step of M2e, until when it is not asked.
+    later: bool,
 }
 
 const fn question(
@@ -31,6 +33,7 @@ const fn question(
         arguments,
         answers,
         local: false,
+        later: false,
     }
 }
 
@@ -230,6 +233,29 @@ fn questions() -> Vec<Question> {
             ..question
         }),
     );
+    // `build_external_docs` builds the other workspace from M2e's E4b, and the project's crates for
+    // another target from E4a.
+    questions.extend(
+        [
+            question(
+                "build_external_docs",
+                "what is the API of this other workspace?",
+                json!({ "project": "poc/m0a-a10" }),
+                |result| result["data"]["built"] == true,
+            ),
+            question(
+                "build_external_docs",
+                "which items does this crate have on Windows?",
+                json!({ "crate": "tokio", "target": "x86_64-pc-windows-msvc" }),
+                |result| result["data"]["built"] == true,
+            ),
+        ]
+        .map(|question| Question {
+            local: true,
+            later: true,
+            ..question
+        }),
+    );
     questions
 }
 
@@ -293,7 +319,7 @@ fn every_question_promised_is_answered() {
     let mut client = Client::start(Some(Path::new(env!("CARGO_MANIFEST_DIR"))), logs.path());
     let mut unanswered = Vec::new();
     for question in questions() {
-        if question.local && !cfg!(feature = "local") {
+        if (question.local && !cfg!(feature = "local")) || question.later {
             continue;
         }
         let answer = client.call(question.tool, &question.arguments);

@@ -539,8 +539,13 @@ fn tools_list_is_cacheable_and_not_paginated() {
         .iter()
         .map(|tool| &tool["name"])
         .collect();
-    // `list_crates` needs local features, and `sleep` is only in debug builds.
-    let mut expected = vec!["crate_overview", "get_item"];
+    // `build_external_docs` and `list_crates` need local features, and `sleep` is only in debug
+    // builds.
+    let mut expected = Vec::new();
+    if cfg!(feature = "local") {
+        expected.push("build_external_docs");
+    }
+    expected.extend(["crate_overview", "get_item"]);
     if cfg!(feature = "local") {
         expected.push("list_crates");
     }
@@ -572,6 +577,20 @@ fn tools_list_is_cacheable_and_not_paginated() {
         get_item["outputSchema"]["properties"]["status"]["enum"],
         json!(["building"])
     );
+    // Calling it again builds again, and so takes no `refresh` (requirements R-MCP-4 and R-WS-10).
+    if let Some(external) = result["tools"].as_array().and_then(|tools| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == "build_external_docs")
+    }) {
+        assert_eq!(external["annotations"]["idempotentHint"], false);
+        assert_eq!(external["annotations"]["readOnlyHint"], false);
+        assert!(
+            external["inputSchema"]["properties"]
+                .get("refresh")
+                .is_none()
+        );
+    }
     assert_eq!(result["ttlMs"], 3_600_000);
     assert_eq!(result["cacheScope"], "public");
     assert_eq!(server.response(2)["error"]["code"], -32602);
@@ -1002,7 +1021,8 @@ fn without_a_version_the_project_decides_it() {
 
 /// A project that builds its own std, with `build-std` and no `build.target`, builds for a target
 /// of its own too: its member is not built here, `target_unsupported`, without starting cargo for
-/// it (requirement R-TG-1, decided in M2's D7; it was built for the host since M2's D2).
+/// it (requirement R-TG-1, decided in M2's D7; it was built for the host since M2's D2). Nor does
+/// `build_external_docs` document it.
 #[cfg(feature = "local")]
 #[test]
 fn a_member_of_a_project_that_builds_its_own_std_is_not_built() {
@@ -1014,11 +1034,18 @@ fn a_member_of_a_project_that_builds_its_own_std_is_not_built() {
         "get_item",
         json!({ "crate": "demo", "path": "hello" }),
     ));
-    let result = server.response(1)["result"].clone();
-    assert_eq!(result["isError"], true, "{result}");
-    let error = text_json(&result);
-    assert_eq!(error["reason"], "target_unsupported", "{result}");
-    assert!(error.to_string().contains("build-std"), "{result}");
+    server.send(&call_tool(
+        2,
+        "build_external_docs",
+        json!({ "project": "." }),
+    ));
+    for id in [1, 2] {
+        let result = server.response(id)["result"].clone();
+        assert_eq!(result["isError"], true, "{result}");
+        let error = text_json(&result);
+        assert_eq!(error["reason"], "target_unsupported", "{result}");
+        assert!(error.to_string().contains("build-std"), "{result}");
+    }
     assert!(server.finish().success());
 }
 
@@ -2164,6 +2191,61 @@ fn a_build_dependency_is_built_for_the_host() {
             "{other}"
         );
     }
+    assert!(server.finish().success());
+}
+
+/// `build_external_docs` builds nothing for the default project for a target it builds for, which
+/// the query tools build themselves, and starts no process there; it checks its arguments, and a
+/// path without a workspace is `project_not_found` (requirement R-WS-10).
+#[cfg(all(unix, feature = "local"))]
+#[test]
+fn build_external_docs_builds_nothing_that_the_query_tools_build() {
+    let markers = TempDir::new().expect("a temporary directory");
+    let marker = markers.path().join("started");
+    let project = demo_workspace();
+    set_trap(project.path(), &marker);
+    let mut server = Server::start_in(Some(project.path()));
+    let host = host_triple();
+    let root = dunce::canonicalize(project.path()).expect("there");
+    let calls = [
+        json!({ "project": "." }),
+        json!({ "project": root.join("Cargo.toml"), "target": host }),
+    ];
+    for (id, arguments) in (1_u64..).zip(calls) {
+        server.send(&call_tool(id, "build_external_docs", arguments));
+        let response = server.response(id);
+        let content = &response["result"]["structuredContent"];
+        assert_eq!(content["data"]["built"], false, "{response}");
+        assert_eq!(content["data"]["reason"], "query_tools_build");
+        assert_eq!(
+            content["provenance"]["workspace"],
+            root.to_str().expect("UTF-8")
+        );
+        assert_eq!(content["provenance"]["target"], host.as_str());
+    }
+    let missing = markers.path().join("none");
+    let errors = [
+        (json!({}), "invalid_argument"),
+        (json!({ "crate": "std" }), "invalid_argument"),
+        (
+            json!({ "project": ".", "version": "1" }),
+            "invalid_argument",
+        ),
+        (json!({ "project": missing }), "project_not_found"),
+        // Builds come in a later version (M2e).
+        (
+            json!({ "project": ".", "target": "wasm32-unknown-unknown" }),
+            "docs_unavailable",
+        ),
+        (json!({ "crate": "rand@0.9.2" }), "docs_unavailable"),
+    ];
+    for (id, (arguments, code)) in (10_u64..).zip(errors) {
+        server.send(&call_tool(id, "build_external_docs", arguments));
+        let result = server.response(id)["result"].clone();
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(text_json(&result)["code"], code, "{result}");
+    }
+    assert!(!marker.exists(), "a process was started in the project");
     assert!(server.finish().success());
 }
 

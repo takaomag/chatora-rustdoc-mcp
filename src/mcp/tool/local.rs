@@ -376,7 +376,7 @@ pub(super) async fn dependency(
 /// The targets that the project at `root` builds for, which `what` may be built here for; or, as
 /// the project builds for a target of its own with its own std, `target_unsupported`, without
 /// starting cargo for it (requirement R-TG-1, decided in M2's D7).
-async fn targets_built(
+pub(super) async fn targets_built(
     state: &ToolState,
     root: &Path,
     what: &str,

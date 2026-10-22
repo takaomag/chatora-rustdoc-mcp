@@ -742,17 +742,42 @@ fn object(value: Value) -> JsonObject {
 pub(super) fn parse_release(
     arguments: Option<&JsonObject>,
 ) -> Result<ReleaseArguments, InvalidArgument> {
-    let argument = |name| arguments.and_then(|arguments| arguments.get(name));
-    let string = |name: &'static str, example| match argument(name) {
+    let Some((name, version)) = parse_crate(arguments)? else {
+        return Err(InvalidArgument::new("`crate` is required", CRATE_EXAMPLE));
+    };
+    let (project, target) = parse_project_and_target(arguments)?;
+    Ok(ReleaseArguments {
+        name,
+        version,
+        project,
+        target,
+        refresh: parse_refresh(arguments)?,
+    })
+}
+
+/// The string argument `name`, trimmed, or `None` when it is not given.
+fn string_argument<'a>(
+    arguments: Option<&'a JsonObject>,
+    name: &'static str,
+    example: &'static [&'static str],
+) -> Result<Option<&'a str>, InvalidArgument> {
+    match arguments.and_then(|arguments| arguments.get(name)) {
         Some(Value::String(value)) => Ok(Some(value.trim())),
         Some(_) => Err(InvalidArgument::new(
             format!("`{name}` must be a string"),
             example,
         )),
         None => Ok(None),
-    };
-    let Some(crate_argument) = string("crate", CRATE_EXAMPLE)? else {
-        return Err(InvalidArgument::new("`crate` is required", CRATE_EXAMPLE));
+    }
+}
+
+/// Checks `crate`, with the version in it or in `version` (requirement R-ARG-1): `None` when
+/// `crate` is not given.
+pub(super) fn parse_crate(
+    arguments: Option<&JsonObject>,
+) -> Result<Option<(CrateName, Option<VersionSpec>)>, InvalidArgument> {
+    let Some(crate_argument) = string_argument(arguments, "crate", CRATE_EXAMPLE)? else {
+        return Ok(None);
     };
     let (name, in_crate) = match crate_argument.split_once('@') {
         Some((name, version)) => (name, Some(version)),
@@ -769,7 +794,10 @@ pub(super) fn parse_release(
             InvalidArgument::new(format!("the version is not valid: {error}"), example)
         })
     };
-    let version = match (in_crate, string("version", VERSION_EXAMPLE)?) {
+    let version = match (
+        in_crate,
+        string_argument(arguments, "version", VERSION_EXAMPLE)?,
+    ) {
         (Some(in_crate), Some(argument)) => {
             let (in_crate, argument) = (
                 parse_version(in_crate, CRATE_EXAMPLE)?,
@@ -790,21 +818,22 @@ pub(super) fn parse_release(
         (None, Some(version)) => Some(parse_version(version, VERSION_EXAMPLE)?),
         (None, None) => None,
     };
-    let project = string("project", PROJECT_EXAMPLE)?.map(PathBuf::from);
-    let target = string("target", TARGET_EXAMPLE)?
+    Ok(Some((name, version)))
+}
+
+/// Checks `project` and `target` (requirement R-ARG-1).
+pub(super) fn parse_project_and_target(
+    arguments: Option<&JsonObject>,
+) -> Result<(Option<PathBuf>, Option<TargetTriple>), InvalidArgument> {
+    let project = string_argument(arguments, "project", PROJECT_EXAMPLE)?.map(PathBuf::from);
+    let target = string_argument(arguments, "target", TARGET_EXAMPLE)?
         .map(|target| {
             target.parse::<TargetTriple>().map_err(|error| {
                 InvalidArgument::new(format!("`target` is not valid: {error}"), TARGET_EXAMPLE)
             })
         })
         .transpose()?;
-    Ok(ReleaseArguments {
-        name,
-        version,
-        project,
-        target,
-        refresh: parse_refresh(arguments)?,
-    })
+    Ok((project, target))
 }
 
 /// Checks `refresh` (§6.4): `false` when it is not given.
@@ -843,15 +872,7 @@ pub(super) fn parse_arguments(
         target,
         refresh,
     } = parse_release(arguments)?;
-    let argument = |name| arguments.and_then(|arguments| arguments.get(name));
-    let string = |name: &'static str, example| match argument(name) {
-        Some(Value::String(value)) => Ok(Some(value.trim())),
-        Some(_) => Err(InvalidArgument::new(
-            format!("`{name}` must be a string"),
-            example,
-        )),
-        None => Ok(None),
-    };
+    let string = |name, example| string_argument(arguments, name, example);
     let Some(path) = string("path", PATH_EXAMPLE)? else {
         return Err(InvalidArgument::new("`path` is required", PATH_EXAMPLE));
     };
