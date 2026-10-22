@@ -2249,6 +2249,161 @@ fn build_external_docs_builds_nothing_that_the_query_tools_build() {
     assert!(server.finish().success());
 }
 
+/// Publishes in the cache at `cache` a build of `demo` at `version` for [`TARGET`], whose JSON is
+/// `json` but has the digest of `as_if`, as a build here does, and records it as
+/// `build_external_docs` does, under the key of the release; returns the key.
+#[cfg(feature = "local")]
+fn record_demo(
+    cache: &Path,
+    version: &str,
+    (json, as_if): (&[u8], &[u8]),
+) -> chatora_rustdoc_mcp::data::external::Key {
+    use chatora_rustdoc_mcp::data::{build, external};
+    let dir = cache.join(format!("local/v1/test/{version}/{TARGET}/lib"));
+    std::fs::create_dir_all(&dir).expect("made");
+    let format = rustdoc_types::FORMAT_VERSION;
+    let sha256 = sha256_hex(as_if);
+    std::fs::write(dir.join(format!("{format}.json")), json).expect("written");
+    std::fs::write(dir.join(format!("{format}.json.sha256")), &sha256).expect("written");
+    let record = json!({
+        "package": format!("registry+https://github.com/rust-lang/crates.io-index#demo@{version}"),
+        "crate_name": "demo",
+        "crate_version": version,
+        "format_version": format,
+        "target": TARGET,
+        "toolchain": "rustc 1.99.0 (aaaaaaaaa 2026-10-01)\nhost: x86_64-unknown-linux-gnu",
+        "built_at": "2026-10-22T00:00:00Z",
+        "bootstrap_all": false,
+        "cfg_docsrs": true,
+        "sha256": sha256,
+        "private": false,
+        "warnings": ["what its build warned of"],
+    });
+    std::fs::write(dir.join("record.json"), record.to_string()).expect("written");
+    let built = build::published(&dir).expect("published");
+    let key = demo_key(version);
+    let cache = Cache::at(cache);
+    let making = external::try_make(&cache, &key)
+        .expect("locked")
+        .expect("not held");
+    external::record(&cache, &key, &built, &making).expect("recorded");
+    key
+}
+
+/// The key of the record of `demo` at `version` for [`TARGET`].
+#[cfg(feature = "local")]
+fn demo_key(version: &str) -> chatora_rustdoc_mcp::data::external::Key {
+    chatora_rustdoc_mcp::data::external::Key::Release {
+        name: "demo".into(),
+        version: version.into(),
+        target: TARGET.into(),
+        hidden: false,
+    }
+}
+
+/// The JSON of [`demo_crate`] at `version`.
+#[cfg(feature = "local")]
+fn demo_json(version: &str) -> Vec<u8> {
+    let mut demo = demo_crate();
+    demo.crate_version = Some(version.to_owned());
+    serde_json::to_vec(&demo).expect("serializes")
+}
+
+/// The query tools read what `build_external_docs` recorded of a release that the project does not
+/// use, from the version given, without the crates.io index nor docs.rs; and tell a record being
+/// made, failed or broken, without building it (requirements R-WS-10 and R-MCP-3, decided in
+/// M2e's E1b).
+#[cfg(feature = "local")]
+#[test]
+fn the_records_of_build_external_docs_are_looked_up_in() {
+    use chatora_rustdoc_mcp::data::{build, external};
+    let mut server = Server::start();
+    let cache = server.cache.path().to_path_buf();
+    let json = demo_json("0.2.0");
+    record_demo(&cache, "0.2.0", (&json, &json));
+    let calls = [
+        (
+            "get_item",
+            json!({ "crate": "demo@0.2.0", "path": "hello", "target": TARGET }),
+        ),
+        (
+            "crate_overview",
+            json!({ "crate": "demo@0.2.0", "target": TARGET }),
+        ),
+    ];
+    for (id, (tool, arguments)) in (1_u64..).zip(calls) {
+        server.send(&call_tool(id, tool, arguments));
+        let response = server.response(id);
+        let content = &response["result"]["structuredContent"];
+        let provenance = &content["provenance"];
+        assert_eq!(provenance["source"], "local", "{tool}: {response}");
+        assert_eq!(provenance["recorded_by"], "build_external_docs");
+        assert_eq!(provenance["package_source"], "crates.io");
+        assert_eq!(provenance["version"], "0.2.0");
+        let warnings = content["warnings"].to_string();
+        assert!(warnings.contains("rustc 1.99.0"), "{response}");
+        assert!(warnings.contains("what its build warned of"), "{response}");
+    }
+    // Being made: the external tool holds the lock of the key.
+    let held = Cache::at(&cache);
+    let making = external::try_make(&held, &demo_key("0.3.0"))
+        .expect("locked")
+        .expect("not held");
+    server.send(&call_tool(
+        3,
+        "get_item",
+        json!({ "crate": "demo@0.3.0", "path": "hello", "target": TARGET }),
+    ));
+    let response = server.response(3);
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["status"], "building", "{response}");
+    assert_eq!(content["provenance"]["recorded_by"], "build_external_docs");
+    // Failed.
+    let failed = build::Failed::now(
+        None,
+        None,
+        false,
+        json!({ "code": "build_failed", "message": "it failed", "suggestions": [] }),
+    );
+    external::remember_failure(&held, &demo_key("0.3.0"), &failed, &making).expect("remembered");
+    drop(making);
+    // Broken: the index, or the JSON, which is not the one recorded.
+    let key = demo_key("0.4.0");
+    std::fs::create_dir_all(key.dir(&cache)).expect("made");
+    std::fs::write(key.dir(&cache).join("record.json"), "not JSON").expect("written");
+    record_demo(&cache, "0.5.0", (&demo_json("0.5.0"), b"another"));
+    let errors = [
+        ("0.3.0", "build_failed"),
+        ("0.4.0", "record_broken"),
+        ("0.5.0", "record_broken"),
+    ];
+    for (id, (version, what)) in (10_u64..).zip(errors) {
+        server.send(&call_tool(
+            id,
+            "get_item",
+            json!({ "crate": format!("demo@{version}"), "path": "hello", "target": TARGET }),
+        ));
+        let result = server.response(id)["result"].clone();
+        assert_eq!(result["isError"], true, "{version}: {result}");
+        let error = text_json(&result);
+        let told = if error["code"] == "build_failed" {
+            assert_eq!(error["failed_at"], failed.time.as_ref(), "{result}");
+            assert_eq!(error["retryable"], false, "{result}");
+            &error["code"]
+        } else {
+            &error["reason"]
+        };
+        assert_eq!(told, what, "{version}: {result}");
+        assert!(
+            error["suggestions"]
+                .to_string()
+                .contains("build_external_docs"),
+            "{result}"
+        );
+    }
+    assert!(server.finish().success());
+}
+
 /// The host's target, as `rustc -vV` tells it.
 #[cfg(feature = "local")]
 fn host_triple() -> String {

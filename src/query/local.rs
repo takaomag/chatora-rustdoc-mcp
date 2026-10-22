@@ -72,6 +72,9 @@ pub struct LocalBuilt {
     /// The build before, given while the member is built again, past the deadline of the call
     /// (requirements R-WS-4 and R-OUT-9, decided in M2's D4).
     pub stale: bool,
+    /// The tool that recorded it, `build_external_docs`, for a build that the external tool made
+    /// (decided in M2e's E1b); `None` for the builds of the query tools.
+    pub recorded_by: Option<&'static str>,
 }
 
 /// Why a member's crate could not be built and archived.
@@ -244,6 +247,7 @@ pub async fn rebuilding(cache: &Cache, wanted: &LocalWanted) -> Option<LocalBuil
         json,
         record,
         stale: true,
+        recorded_by: None,
     })
 }
 
@@ -1305,8 +1309,26 @@ async fn archive(
         json,
         record,
         stale: false,
+        recorded_by: None,
     })
 }
+
+/// The archive of `built`, which `build_external_docs` made and recorded (requirement R-WS-10,
+/// decided in M2e's E1b), with what it warned of when it was built.
+///
+/// # Errors
+///
+/// Returns an error when the JSON cannot be read, is no longer the one built, or cannot be
+/// archived.
+pub async fn recorded(cache: &Cache, built: Built) -> Result<LocalBuilt, LocalError> {
+    let warnings = built.record.warnings.clone();
+    let mut recorded = archive(cache, built, warnings).await?;
+    recorded.recorded_by = Some(RECORDED_BY);
+    Ok(recorded)
+}
+
+/// The tool that records builds for the query tools (requirement R-WS-10).
+pub const RECORDED_BY: &str = "build_external_docs";
 
 /// `warnings`, with what the response warns about how the build of `record` was made.
 fn warnings_of(record: &BuildRecord, mut warnings: Vec<Box<str>>) -> Vec<Box<str>> {

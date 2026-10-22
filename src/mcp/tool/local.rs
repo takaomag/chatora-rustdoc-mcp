@@ -708,7 +708,7 @@ pub(super) fn refresh_told(scope: &str, result: &CallToolResult) {
 }
 
 /// The tool error of a member's build that failed (requirement R-WS-7, decided in M2's D2).
-fn local_error(what: &str, error: &LocalError) -> CallToolResult {
+pub(super) fn local_error(what: &str, error: &LocalError) -> CallToolResult {
     let failed = |message: String, retryable: bool, suggestions: &[&str]| {
         json!({
             "code": "build_failed",

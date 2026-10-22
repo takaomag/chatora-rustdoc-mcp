@@ -11,14 +11,17 @@ use semver::Version;
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
-#[cfg(feature = "local")]
-use super::local::{self, LocalSource, Member};
 use super::{
     ErrorChain,
     InvalidArgument,
     ToolState,
     error_result,
     project::{self, InProject},
+};
+#[cfg(feature = "local")]
+use super::{
+    local::{self, LocalSource, Member},
+    recorded,
 };
 #[cfg(feature = "local")]
 use crate::data::{
@@ -365,6 +368,10 @@ struct Here {
     /// project builds for a target of its own, with its own std, and none was asked for
     /// (requirement R-TG-1, decided in M2's D7).
     docs_rs_default: bool,
+    /// Whether the release is one that the project does not use, asked for itself, not through a
+    /// re-export: `build_external_docs` may have recorded it, and builds it (requirement R-WS-10,
+    /// decided in M2e's E1b).
+    unused: bool,
 }
 
 impl Request {
@@ -571,6 +578,12 @@ pub(super) fn provenance_schema() -> Value {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "The features that cargo built a workspace member with.",
+            },
+            "recorded_by": {
+                "type": "string",
+                "enum": ["build_external_docs"],
+                "description": "The tool that built this here and recorded it: call it again to \
+                                build it again.",
             },
         },
         // Before the version is known, a response while it is fetched has no `version`, and may
@@ -1574,7 +1587,7 @@ async fn resolve(
     let checked_later = from_project.is_some() || same_release.is_some();
     #[cfg(not(feature = "local"))]
     let checked_later = false;
-    if !checked_later && let Some(version) = cached_exact(state, &name, &spec, lookup.docs_rs()) {
+    if !checked_later && let Some(version) = cached_version(state, &name, &spec, &lookup) {
         return Ok((
             cached_request(name, version, &path, lookup.triple, shape, until),
             warnings,
@@ -1727,8 +1740,12 @@ fn cached_request(
         hops: 0,
         index_fetched_at: None,
         until,
+        // Not the project's package, which a call for it checks later.
         #[cfg(feature = "local")]
-        here: Here::default(),
+        here: Here {
+            unused: true,
+            ..Here::default()
+        },
     }
 }
 
@@ -1845,7 +1862,10 @@ fn chosen_by(
             resolved_from,
             project_from: None,
             in_build: InBuild::default(),
-            here: Here::default(),
+            here: Here {
+                unused: true,
+                ..Here::default()
+            },
         },
     }
 }
@@ -1871,8 +1891,24 @@ fn chosen_by_argument(spec: &VersionSpec) -> (ResolvedFrom, Option<&'static str>
     (resolved_from, None, InBuild::default())
 }
 
-/// The exact version that `spec` names, if the JSON of `name` at it for `target` is cached: it is
-/// then taken without reading the crates.io index, so that it is found offline.
+/// The exact version that `spec` names, if the JSON of `name` at it for `lookup` is cached, or
+/// recorded by `build_external_docs` (decided in M2e's E1b): it is then taken without reading the
+/// crates.io index, so that it is found offline. Not for the project's package, which a call for
+/// it checks later.
+fn cached_version(
+    state: &ToolState,
+    name: &CrateName,
+    spec: &VersionSpec,
+    lookup: &project::LookupTarget,
+) -> Option<Version> {
+    let cached = cached_exact(state, name, spec, lookup.docs_rs());
+    #[cfg(feature = "local")]
+    let cached =
+        cached.or_else(|| recorded::recorded_exact(&state.cache, name, spec, &lookup.triple));
+    cached
+}
+
+/// The exact version that `spec` names, if the JSON of `name` at it for `target` is cached.
 fn cached_exact(
     state: &ToolState,
     name: &CrateName,
@@ -2220,6 +2256,22 @@ async fn look_up_release(
     if let Some(source) = arguments.here.local.take() {
         return look_up_member(state, arguments, source, warnings).await;
     }
+    // A release that the project does not use, which `build_external_docs` recorded (decided in
+    // M2e's E1b).
+    #[cfg(feature = "local")]
+    if arguments.here.unused {
+        let release = (&arguments.name, &arguments.version, &arguments.target);
+        let provenance = || local_provenance(&arguments, Some("crates.io"));
+        match recorded::recorded(state, release, provenance, &warnings).await {
+            recorded::Found::Built(built) => {
+                warnings.extend(built.archived.warnings.iter().cloned());
+                warnings.push(recorded::toolchain_warning(&built));
+                return look_up_member(state, arguments, LocalSource::Built(built), warnings).await;
+            },
+            recorded::Found::Response(result) => return *result,
+            recorded::Found::Missing => {},
+        }
+    }
     // The project's package that docs.rs has no JSON of, as it remembers, is built here before its
     // `.crate` is fetched (decided in M2's D7).
     #[cfg(feature = "local")]
@@ -2400,6 +2452,7 @@ async fn look_up_member(
             built_at: &record.built_at,
             features_requested: record.features_requested.as_deref(),
             features_effective: record.features_effective.as_deref(),
+            recorded_by: built.recorded_by,
         };
         let mut looked_up = look_up_in(&built.archived.mapped, &arguments, origin);
         if let (Some(built_at), Ok(response)) = (&built_before, &mut looked_up) {
@@ -2534,7 +2587,17 @@ async fn load_and_look_up(
             {
                 return Err(Unloaded::NoJson(Box::new(arguments), if_missing, why));
             }
-            return Err(response(archive_error(&state.cache, &arguments, &error)));
+            let result = archive_error(&state.cache, &arguments, &error);
+            // A release that the project does not use is built by the external tool (requirement
+            // R-WS-10).
+            #[cfg(feature = "local")]
+            if arguments.here.unused && no_json_why(&arguments, &error).is_some() {
+                return Err(response(recorded::with_suggestion(
+                    result,
+                    recorded::BUILD_IT,
+                )));
+            }
+            return Err(response(result));
         },
         Joined::Ended => return Err(response(stopped())),
         Joined::Going(doing) => return Err(response(building(&arguments, doing, warnings))),
@@ -4648,6 +4711,7 @@ mod tests {
                 built_at: some_str(),
                 features_requested: Some(&features),
                 features_effective: Some(&features),
+                recorded_by: Some("build_external_docs"),
             },
             warnings: Box::from(["x".into()]),
             data: ItemData {

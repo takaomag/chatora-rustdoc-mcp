@@ -1412,6 +1412,27 @@ Claude Code 2.1.304、Linux で測った。
 
 ### 6.6 M2e
 
+**E1b の下調べと決定 (2026-10-22)**:
+
+- 下調べ (サブエージェント、読むだけ): 照会のツールが外の記録を見る口は 5 つ。(a) 依存でない crate と Cargo.lock に無い版で docs.rs に JSON が無いとき (`load_and_look_up` の読み込みの失敗、`no_json`・`no_target_json` の手前。鍵の crate・版・target は cargo を起動せずに分かる) (b) 他の target (`local::other_target`) (c) 名指しできない依存 (`build_unsupported`) (d) 外の `project` (`project::workspace` の `no_record`。`explicit_found`・`explicit_member` はそこで黙って crates.io に落ちる) (e) git
+- 利用者が決めたこと: 外の記録から返す応答の provenance に `recorded_by: "build_external_docs"` を足す (`source` は要件どおり `local`。作り直すには外のツールを呼び直す、と分かるように。M2 の終わりに要件の §7.3 に足す)
+- 聞かずに決めたこと (要件か前の決定のとおり):
+  - E1b でつなぐのは (a) と共通の仕組みだけ。(b) は E4a、(c) は E2b、(d) は E4b、(e) は E3。「(in a later version)」の案内は、その行が作れるようになるまで残す
+  - 索引は `ext/v1/<種類>/<鍵のハッシュ>/record.json` (順序を決めた JSON の鍵 (`kind`・`crate`・`version`・`target`・`hidden`)、本体 (`local/v1`) の場所、本体の sha256、記録の時刻)。進行中の印は `ext:<鍵のハッシュ>` のロック (決定 13)、`building_reason` は `building`
+  - 照会のツールの読む順: 有効な記録を返す → 共有ロックが取れなければ `status: building` → 失敗の記録 (索引の置き場の `failed.json`、照会の鍵で) があれば `build_failed` (古さによらず、外のツールの呼び直しを案内) → 索引か元の JSON が壊れていれば `record_broken` (取り直さない。アーカイブは JSON から作り直す) → 無ければ今の `no_json` に外のツールの案内
+  - 完全一致の版は、docs.rs の前に外の索引を見る (オフラインでも効く)。依存でない crate の target を host にする決定 11 は E2a で作る側と合わせて入れる
+  - 照会のツールが読んだら最後に使った日時を更新する (R-CA-5。std の `used` と同じく 1 時間に 1 回)。re-export をたどるときは外の記録を読まない (R-WS-10)。照会のツールの `refresh` は外の失敗を解かない (R-WS-10・§6.4)
+  - テストの記録は、E2a が使う `data::external` の書き手で置く
+
+**E1b (外の記録と照会の経路。2026-10-22)**:
+
+- `data::external`: 鍵 `Key::Release` (crate の cache key・版・target・hidden) の JSON の SHA-256 の先頭 32 桁で置き場 `ext/v1/release/<digest>` とロック `ext:<digest>` を決める (テストで固定)。索引 `record.json` は鍵・本体 (`local/v1` の下の相対パス、`local` の外や `..` は受けない)・本体の sha256・記録の時刻。`read` は上の順で `Built`・`Building`・`Failed`・`Broken`・`Missing` を返し、見つけたら `used` を 1 時間に 1 回書く。`try_make` (置き場を作ってから排他ロック)・`record` (失敗の記録を消す)・`remember_failure` はロックを持つことを引数で求める
+- 照会のツール (`mcp::tool::recorded`): 完全一致の版で外の置き場があれば crates.io の index を読まずに版を決める (`cached_version`)。`look_up_release` で、プロジェクトのパッケージでないリリースは docs.rs の前に外の記録を見る (置き場のディレクトリが無ければスレッドも使わない)。見つけたら `query::local::recorded` でアーカイブし、`look_up_member` で引く (provenance は `source: local`・`package_source: crates.io`・`recorded_by`、warnings に記録した toolchain と「更新を見ていない」(R-MCP-3))。JSON が記録と違えば `record_broken`。docs.rs に JSON が無いときの `no_json` に外のツールの案内を足す
+- 決めたこと: 索引の記録の時刻と toolchain の warning の文面、`building` の応答にも `recorded_by`、`failed.json` は `build::FAILED` を使い回す
+- テスト: `data::external` の単体 4 件 (名前の固定・パスの検査・見つける/別の build/別の鍵・作成中/失敗/壊れた/記録で失敗を消す)、`no_json` の案内の単体、stdio の 1 件 (記録を `get_item`・`crate_overview` が読む、ロック中は building、失敗は `build_failed` に `failed_at`、壊れた索引と JSON の食い違いは `record_broken`。どれも index・docs.rs・cargo を使わない)
+
+- レビュー (サブエージェント、読むだけ) の対応: (1) 記録したビルドの warnings (docsrs なし・新しい形式など) を応答に載せる (2)(3) 外の記録を見るのは、プロジェクトのパッケージでなく re-export の行き先でもないリリースだけ (`Here.unused`。Cargo.lock を直に読んだ版や checksum の合わない同じリリースも外す)。`no_json` の案内も同じ条件 (4) 置き場のディレクトリだけ (ロックを取れなかった外のツールが残す) は記録とみなさない (`external::exists`: 索引・失敗の記録・作成中のどれか) (5) `try_make` の `None` は照会のツールの一瞬の試し取りでもありうる、と書いた (E2a は少し待って取り直す) (6) JSON が記録と違うときは、作成中ならその旨 (`building`)、でなければ `record_broken`。読めない形式などのエラーにも外のツールの呼び直しを案内 (7) `record`・`remember_failure` は、その鍵のロック (`Making`) でなければ断る (8) 外のツールの出力スキーマの `status: building` は E2a で足す (作るのが E2a から)。細かい直し: `being` の取得元の文字列、`NOTED` を const の Mutex に、provenance は作成中のときだけ作る。残したもの: re-export の行き先で外の記録を読まないことの結合テストは無い、`used` は `ext/` にあり本体は `local/v1` にあるので GC (F1) は両方をまとめて消す
+
 **E1a (外のツールの枠。2026-10-22)**:
 
 - 作ったもの: `build_external_docs` (ローカル機能のある構成だけ。R-ARCH-4)。引数は `crate`・`version`・`project`・`target`。`git`・`rev`・`branch`・`tag` は E3a、`document_hidden_items` は M4 (決定 9) で宣言する。annotations はこのツールだけ `idempotentHint: false` (R-MCP-4)、`refresh` は持たせない (R-WS-10)。引数の検査: `crate` か `project` が要る、std・core・alloc などは配布物から引くので `invalid_argument` で `get_item` を案内、`crate` なしの `version` は `invalid_argument`。`get_item::parse_release` を `parse_crate`・`parse_project_and_target` に分けて使い回した

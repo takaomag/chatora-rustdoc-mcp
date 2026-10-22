@@ -21,6 +21,8 @@ pub mod crate_name;
 pub mod dist;
 pub mod docs_rs;
 #[cfg(feature = "local")]
+pub mod external;
+#[cfg(feature = "local")]
 pub mod features;
 pub mod fetches;
 pub mod flight;

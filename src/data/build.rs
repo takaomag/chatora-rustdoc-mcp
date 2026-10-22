@@ -812,8 +812,9 @@ const fn documented_private() -> bool {
     true
 }
 
-/// The record of the last build that failed, where its JSON would be published.
-const FAILED: &str = "failed.json";
+/// The record of the last build that failed, where its JSON would be published, and of the
+/// external tool's that failed, by its key (`super::external`).
+pub const FAILED: &str = "failed.json";
 
 /// A build that failed, remembered where its JSON would be published (`failed.json`).
 ///

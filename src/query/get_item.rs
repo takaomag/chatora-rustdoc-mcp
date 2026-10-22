@@ -140,6 +140,9 @@ pub enum Origin<'a> {
         /// The features that cargo built it with, if its messages told them (requirement
         /// R-FT-3).
         features_effective: Option<&'a [Box<str>]>,
+        /// The tool that recorded it, `build_external_docs`, for a build that the external tool
+        /// made (decided in M2e's E1b).
+        recorded_by: Option<&'static str>,
     },
     /// The std of a nightly toolchain (requirement R-STD-1).
     Std {
@@ -220,6 +223,10 @@ pub struct Provenance<'a> {
     /// The features that cargo built a local build with (requirement R-FT-3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub features_effective: Option<&'a [Box<str>]>,
+    /// The tool that recorded a local build, `build_external_docs`, which makes it again (decided
+    /// in M2e's E1b).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorded_by: Option<&'static str>,
 }
 
 /// What the provenance tells of where the data came from, by its origin.
@@ -233,6 +240,7 @@ struct FromWhere<'a> {
     built_at: Option<&'a str>,
     features_requested: Option<&'a [Box<str>]>,
     features_effective: Option<&'a [Box<str>]>,
+    recorded_by: Option<&'static str>,
 }
 
 /// [`FromWhere`] of `origin`.
@@ -252,6 +260,7 @@ const fn from_where(origin: Origin<'_>) -> FromWhere<'_> {
             built_at: None,
             features_requested: None,
             features_effective: None,
+            recorded_by: None,
         },
         Origin::Local {
             package_source,
@@ -261,6 +270,7 @@ const fn from_where(origin: Origin<'_>) -> FromWhere<'_> {
             built_at,
             features_requested,
             features_effective,
+            recorded_by,
             ..
         } => FromWhere {
             source: Source::Local,
@@ -272,6 +282,7 @@ const fn from_where(origin: Origin<'_>) -> FromWhere<'_> {
             built_at: Some(built_at),
             features_requested,
             features_effective,
+            recorded_by,
         },
         Origin::Std {
             toolchain,
@@ -291,6 +302,7 @@ const fn from_where(origin: Origin<'_>) -> FromWhere<'_> {
             built_at: None,
             features_requested: None,
             features_effective: None,
+            recorded_by: None,
         },
     }
 }
@@ -916,6 +928,7 @@ impl<'a> Query<'a> {
             built_at,
             features_requested,
             features_effective,
+            recorded_by,
         } = from_where(self.request.origin);
         Provenance {
             source,
@@ -937,6 +950,7 @@ impl<'a> Query<'a> {
             built_at,
             features_requested,
             features_effective,
+            recorded_by,
         }
     }
 

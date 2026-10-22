@@ -779,6 +779,7 @@ fn request_of<'a>(
                     built_at: &record.built_at,
                     features_requested: record.features_requested.as_deref(),
                     features_effective: record.features_effective.as_deref(),
+                    recorded_by: built.recorded_by,
                 }
             },
             (Some(std), Some(toolchain)) => Origin::Std {

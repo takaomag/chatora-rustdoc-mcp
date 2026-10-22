@@ -1517,6 +1517,7 @@ mod tests {
             built_at: "2026-10-21T00:00:00Z",
             features_requested: None,
             features_effective: None,
+            recorded_by: None,
         };
         let (paths, _) = found_in(member, "lock", change);
         assert_eq!(

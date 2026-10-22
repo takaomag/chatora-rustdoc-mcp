@@ -19,6 +19,8 @@ mod list_module;
 #[cfg(feature = "local")]
 mod local;
 mod project;
+#[cfg(feature = "local")]
+mod recorded;
 mod resolve_version;
 mod search_across;
 mod search_items;
