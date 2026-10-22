@@ -1439,6 +1439,29 @@ Claude Code 2.1.304、Linux で測った。
   - 照会のツールが読んだら最後に使った日時を更新する (R-CA-5。std の `used` と同じく 1 時間に 1 回)。re-export をたどるときは外の記録を読まない (R-WS-10)。照会のツールの `refresh` は外の失敗を解かない (R-WS-10・§6.4)
   - テストの記録は、E2a が使う `data::external` の書き手で置く
 
+**E4b-1・E4b-2 (外の workspace の記録と外のツール。2026-10-22)**:
+
+- E4b-1 (データ): `data::external_workspace`。鍵 `Key::Workspace{workspace}` (`WorkspaceRecord`: cargo metadata の出力・Cargo.lock・入力 (`freshness::Inputs`)・ビルドの target・記録の時刻。`resolution()` で `Resolution` を作り直す) と `Key::WorkspaceTarget{workspace, target, hidden}` (`TargetRecord`: `cargo tree` の 2 つの出力 (`features::Trees`、`parse()` で `FeatureSets`) と package ごとの結果 `RecordedPackage{package, crate, outcome: Built{target}・DocsRs・Unnameable}`)。別名 `ext/v1/alias/<digest>` (`record_aliases`・`aliased_root`)。記録の読み書きの共通の部品 `external::{Read, read_file, write_file}` (鍵と一緒に `record` の欄に入れ子で書く。serde の flatten は `Inputs` の u128 を扱えない)。`Resolver::metadata_text` (cargo metadata の出力を文字列でも)、`features::trees`
+- E4b-2 (外のツール): `mcp::tool::external_workspace::outside`。workspace の記録のロックを持って cargo metadata (`--locked`)・Cargo.lock・入力・ビルドの target を記録し、別名 (引数のパス・root・member のディレクトリ) を書く。target (引数か先頭のビルドの target) の記録のロックを持って `cargo tree` とビルドの範囲 (`scope_until`) から package ごとの扱いを決めて記録し、member と crates.io でない依存を `Built::Elsewhere` で計画して一度に作る (`external_target::all_built`。proc macro も作る)。crates.io の依存は `docs_rs`、名指しできないものは `later` (決定 2)。応答は `data.members` と `data.dependencies`。`crate` と外の `project` はその crate だけ作る (記録は全体)
+- テスト: 単体 (鍵の名前・workspace と target の記録の読み書き・別名)、stdio の `build_external_docs_documents_a_workspace_outside_the_default_project` (host 向けで member と proc macro、wasm32-wasip1 向けで path の依存と crates.io の依存 `docs_rs`、`crate` で 1 つ)。照会のツールが記録を読むのは E4b-3
+
+**E4b の下調べと決定 (2026-10-22)**:
+
+- 下調べ (サブエージェント、読むだけ。要点は scratchpad の e4b-research.md): 外の workspace を断る関所は `project::workspace` の 1 か所 (`no_record`)。照会のツールは外の workspace で cargo を走らせない (要件 R-MCP-3) ので、版の解決・`enabled_in_project`・ビルドの target・依存の扱いをすべて記録から読む必要がある。`Metadata`・`FeatureSets` は serde でないが、cargo の出力の文字列から読み直せる (`features::parse`)。`member_for`・`dependency_for` の `Built::Elsewhere` は任意の workspace で動く。`recorded_apart` はプロジェクトの target の `Key::Target` を docs.rs の組の記録と読むので、E4b の member も docs.rs の組で作るのがそろう。real_data の `poc/m0a-a10` は bin だけで依存に C のビルドがあり、macOS・Windows では落ちうる
+- 利用者が決めたこと:
+  1. lib の無い member は bin を 1 つ文書化する (E4a と同じ。要件の「全 member の lib」を「lib、無ければ bin」に直す)
+  2. `-p` で名指しできない path・git の依存は「(in a later version)」のまま (既定のプロジェクトの同じ場合と一緒に後で)
+  3. real_data の問いは、`tests/fixtures/` に置く小さな純 Rust の workspace (自前の `[workspace]` と Cargo.lock) に向け、crate_overview で記録を読む問いも足す
+  4. (E4b-2 のレビューの後) 外の workspace の crates.io の依存は、docs.rs で引くのが基本で、`crate` と `project` で頼まれたら既定のプロジェクトの他の target (E4a) と同じく docs.rs を先に見て、無ければその workspace の中で作る。照会のツールは docs.rs に無いとき `{"crate": "<名前>@<版>", "project": …}` を案内する
+- 聞かずに決めたこと (下調べの推奨のとおり): 記録は cargo metadata の出力・Cargo.lock・target ごとの `cargo tree` (normal と normal,dev) の出力をそのまま残し、読むときに解析し直す。package ごとの結果の表 (作った `Key::Target`・docs.rs で引くもの・名指しできないもの・作らないもの・失敗) を target ごとに残す。member は docs.rs の組で (E4c の決定 4 と同じ)。別名は引数のパス・root・member のディレクトリ。応答は E4a と同じ一覧。段は E4b-1 (データ)・E4b-2 (外のツール)・E4b-3 (照会のツール)・E4b-4 (テストと real_data)
+
+**E4b-1・E4b-2 (外の workspace の記録と外のツール。2026-10-22)**:
+
+- データ (`data::external_workspace`): `Key::Workspace` に `WorkspaceRecord` (cargo metadata の出力・Cargo.lock・入力の digest・ビルドの target・記録の時刻)、`Key::WorkspaceTarget` に `TargetRecord` (計画の元の記録の時刻 `planned_from`・`cargo tree` の normal と normal,dev の出力・package ごとの結果 `built`・`docs_rs`・`unnameable`)。別名は `ext/v1/alias/<digest>` に、`.` と `..` を字面で除いたパスで。`Read` は見つかった・作成中・失敗・壊れた・無いを分ける。`Inputs` の u128 は serde の flatten で壊れるので、鍵と記録を `Filed` で包んで書く
+- 外のツール (`mcp::tool::external_workspace`): 記録と計画は (workspace, target) ごとの共有の仕事 (`ToolState.workspaces`) で、呼び出しの期限を過ぎても続け、`status: building` を返す。期限を過ぎて終わった結果は次の呼び出しに 1 回渡す (`handing_over`。記録し直す仕事が毎回期限を越えると終わらないため)。仕事は workspace の記録のロックを持って cargo metadata を記録し、target の記録のロックの中で cargo tree と範囲 (期限なしの `scope`) を見て計画を記録し、ロックを放してからビルドを始める (待たない)。呼び出しはそのビルドに期限まで加わる。member の proc macro は host で計画する。crates.io の依存は `-p` で名指しできなくても `docs_rs` (docs.rs にあるので)。`crate` で絞るときは版の指定も照合し、どれにも当たらなければ `crate_not_found`、crates.io の依存 1 つに当たれば決定 4 の経路。Cargo.lock が古い・無いときは `cargo generate-lockfile` を案内する (このサーバーは書かない)
+- テスト: stdio の `build_external_docs_documents_a_workspace_outside_the_default_project`、データの単体テスト (鍵・往復・別名)
+- レビュー (サブエージェント、読むだけ) の対応: (1) 記録と計画を共有の仕事に (期限を過ぎると cargo を途中で捨てていた) (2) `crate` の絞り込みを `later` の行と版にも (3) crates.io の依存の `crate` での頼み (決定 4) (4) `planned_from` (E4b-3 で古さを判じる) (5) crates.io を名指しできないものより先に分ける (6) proc macro の member を host で (7) Cargo.lock の案内 (8) 依存の解決が得られないときに黙って飛ばさずエラー (9 は E4b-3 へ: 結果の表が `built` で `Key::Target` の記録が無ければ `no_record`) (10) 別名の正規化、`DocsRs`・`Unnameable` の行の crate 名を lib 名に。残したもの: workspace の入力に member のソースのディレクトリと glob の member が入っていない、cargo metadata と cargo tree が記録と範囲の判定で 2 回ずつ走る、`cargo tree` の出力の UTF-8 の確かめは async の中のまま (数 MB でも 1 ms 程度)、Cargo.lock の無い workspace と同時の呼び出しのテストは E4b-4 で
+
 **E4c (member を docs.rs の組で。2026-10-22)**:
 
 - `Plan.by: BuiltBy {QueryTools, ExternalTool}`: 外のツールが既定のプロジェクトの中で作るもの (`Built::Elsewhere`) は照会のツールのビルドから離す。置き場 (`<lib|bin>.apart`) と flight の鍵 (`:apart`) を分け、target dir は `TargetDir::for_target`、docs.rs の組は範囲を確かめずに使い (決定 4。他の target のビルドも)、コンパイラのエラーでもプロジェクトの組に戻さず失敗として記録する (決定 3)

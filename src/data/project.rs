@@ -445,7 +445,7 @@ fn expand(
 }
 
 /// `path` with `.` dropped and `..` taken back, without looking at the file system.
-fn normalize(path: &Path) -> PathBuf {
+pub(super) fn normalize(path: &Path) -> PathBuf {
     let mut normal = PathBuf::new();
     for component in path.components() {
         match component {

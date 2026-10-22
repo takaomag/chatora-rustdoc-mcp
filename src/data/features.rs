@@ -64,20 +64,57 @@ pub(super) async fn read(
     offline: bool,
     target: &TargetTriple,
 ) -> Result<FeatureSets, CargoError> {
+    let trees = trees(root, offline, target).await?;
+    // As long as the dependencies are many: read off the async threads.
+    super::blocking(move || trees.parse())
+        .await
+        .map_err(CargoError::Unreadable)
+}
+
+/// What `cargo tree` prints of the feature sets of a workspace for a target, which a record keeps
+/// for the query tools to read again without running cargo (decided in M2e's E4b).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Trees {
+    /// Of the normal build: `cargo tree -e normal`.
+    pub normal: Box<str>,
+    /// Of the build with the dev-dependencies of the members: `cargo tree -e normal,dev`.
+    pub with_dev: Box<str>,
+}
+
+impl Trees {
+    /// The feature sets that they tell.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a line cannot be read.
+    pub fn parse(&self) -> io::Result<FeatureSets> {
+        Ok(FeatureSets {
+            normal: parse(&self.normal)?,
+            with_dev: parse(&self.with_dev)?,
+        })
+    }
+}
+
+/// What `cargo tree` prints of the feature sets of the workspace at `root` for `target`.
+///
+/// # Errors
+///
+/// Returns an error when `cargo tree` fails or prints what is not UTF-8.
+pub async fn trees(root: &Path, offline: bool, target: &TargetTriple) -> Result<Trees, CargoError> {
     // One after the other: both take cargo's locks.
     let normal = tree(root, offline, target, "normal").await?;
     let with_dev = tree(root, offline, target, "normal,dev").await?;
-    Ok(FeatureSets { normal, with_dev })
+    Ok(Trees { normal, with_dev })
 }
 
-/// Runs `cargo tree` over the workspace with the dependency kinds `edges`, and reads the feature
-/// set of each package.
+/// Runs `cargo tree` over the workspace with the dependency kinds `edges`, and returns what it
+/// prints of the feature set of each package.
 async fn tree(
     root: &Path,
     offline: bool,
     target: &TargetTriple,
     edges: &str,
-) -> Result<HashMap<PackageKey, BTreeSet<Box<str>>>, CargoError> {
+) -> Result<Box<str>, CargoError> {
     let mut command = cargo::project_command(root, offline, None);
     command.args([
         "tree",
@@ -103,14 +140,9 @@ async fn tree(
             stderr: cargo::stderr_tail(&output),
         });
     }
-    // As long as the dependencies are many: read off the async threads.
-    super::blocking(move || {
-        let text = String::from_utf8(output.stdout)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        parse(&text)
-    })
-    .await
-    .map_err(CargoError::Unreadable)
+    String::from_utf8(output.stdout)
+        .map(String::into_boxed_str)
+        .map_err(|error| CargoError::Unreadable(io::Error::new(io::ErrorKind::InvalidData, error)))
 }
 
 /// Where a line of the tree stands.

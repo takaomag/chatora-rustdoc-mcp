@@ -3531,6 +3531,79 @@ fn build_external_docs_documents_the_project_for_another_target() {
     assert!(server.finish().success());
 }
 
+/// `build_external_docs` documents a workspace outside the default project: it records what cargo
+/// resolves of it, and builds its members, the proc macro too, and its path dependency, for the
+/// target asked for, or the first it builds for; a dependency of crates.io is left to docs.rs. With
+/// `crate`, only that crate is built (decided in M2e's E4b).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn build_external_docs_documents_a_workspace_outside_the_default_project() {
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let outside = workspace_for_wasm(dir.path(), &registry);
+    let default = workspace_of("user");
+    let mut server = server_in_on(Some(default.path()), &registry, dir.path());
+    let status = |data: &Value, list: &str, name: &str| {
+        data[list]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["crate"] == name))
+            .map(|entry| entry["status"].clone())
+            .unwrap_or_default()
+    };
+    // For the first target that it builds for, the host's: no dependency for wasm.
+    let result = built_by_external(
+        &mut server,
+        1,
+        &json!({ "project": outside.display().to_string() }),
+    );
+    let data = &result["structuredContent"]["data"];
+    assert_eq!(data["built"], true, "{result}");
+    assert_eq!(status(data, "members", "app"), "built", "{result}");
+    assert_eq!(status(data, "members", "macros"), "built", "{result}");
+    assert_eq!(
+        status(data, "dependencies", "wasmonly"),
+        Value::Null,
+        "{result}"
+    );
+    let records = server.cache.path().join("ext/v1");
+    for kind in ["workspace", "workspace_target", "alias", "target"] {
+        assert!(records.join(kind).is_dir(), "{kind}: {result}");
+    }
+    if !has_other_target() {
+        assert!(server.finish().success());
+        return;
+    }
+    let for_wasm = json!({ "project": outside.display().to_string(), "target": OTHER_TARGET });
+    let result = built_by_external(&mut server, 100, &for_wasm);
+    let data = &result["structuredContent"]["data"];
+    assert_eq!(data["built"], true, "{result}");
+    assert_eq!(
+        status(data, "dependencies", "wasmonly"),
+        "built",
+        "{result}"
+    );
+    assert_eq!(
+        status(data, "dependencies", "fixture-wasmdep"),
+        "docs_rs",
+        "{result}"
+    );
+    // Only one crate of it.
+    let only = json!({
+        "crate": "wasmonly",
+        "project": outside.display().to_string(),
+        "target": OTHER_TARGET,
+    });
+    let result = built_by_external(&mut server, 200, &only);
+    let data = &result["structuredContent"]["data"];
+    assert_eq!(data["members"], json!([]), "{result}");
+    assert_eq!(
+        status(data, "dependencies", "wasmonly"),
+        "built",
+        "{result}"
+    );
+    assert!(server.finish().success());
+}
+
 /// Looks up in `server` the crates of the project of [`workspace_for_wasm`] at `project` that
 /// `build_external_docs` documented for [`OTHER_TARGET`], in its records: the proc macro is the
 /// project's build for the host; once the member changes, its record is stale (decided in M2e's

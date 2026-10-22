@@ -459,6 +459,20 @@ impl Resolver {
         with_included(files, root, self.shared.inner.cargo_home.clone()).await
     }
 
+    /// What `cargo metadata` prints in `root`, read and as it is: what `build_external_docs`
+    /// records of a workspace outside the default project, for the query tools, which run no cargo
+    /// there (decided in M2e's E4b). It is not kept, nor shared with other calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when cargo fails, or what it prints cannot be read.
+    pub async fn metadata_text(&self, root: &Path) -> Result<(Metadata, Box<str>), CargoError> {
+        self.shared
+            .inner
+            .metadata_and_text(root, &Stage::default())
+            .await
+    }
+
     /// Whether cargo is offline in the project at `root`: run with `--offline`, or with
     /// `net.offline` in the user's cargo settings (requirement R-WS-7).
     pub async fn offline_in(&self, root: &Path) -> bool {
@@ -961,6 +975,16 @@ impl Inner {
     /// Runs `cargo metadata` in `root` and reads its output, telling `stage` whether cargo waits
     /// for a lock or fetches (requirement R-OUT-9).
     async fn run_metadata(&self, root: &Path, stage: &Stage) -> Result<Metadata, CargoError> {
+        let (metadata, _) = self.metadata_and_text(root, stage).await?;
+        Ok(metadata)
+    }
+
+    /// [`Self::run_metadata`], with what cargo printed.
+    async fn metadata_and_text(
+        &self,
+        root: &Path,
+        stage: &Stage,
+    ) -> Result<(Metadata, Box<str>), CargoError> {
         let mut command = cargo::project_command(root, self.offline, None);
         command.args(["metadata", "--format-version", "1"]);
         let output =
@@ -973,12 +997,15 @@ impl Inner {
             });
         }
         // Megabytes for a large workspace: read off the async threads.
-        let metadata: Metadata =
-            blocking(move || serde_json::from_slice(&output.stdout).map_err(io::Error::other))
-                .await
-                .map_err(CargoError::Unreadable)?;
+        let (metadata, text) = blocking(move || {
+            let text = String::from_utf8(output.stdout).map_err(io::Error::other)?;
+            let metadata: Metadata = serde_json::from_str(&text).map_err(io::Error::other)?;
+            Ok((metadata, text.into_boxed_str()))
+        })
+        .await
+        .map_err(CargoError::Unreadable)?;
         if metadata.version == 1 {
-            Ok(metadata)
+            Ok((metadata, text))
         } else {
             Err(CargoError::Unreadable(io::Error::other(format!(
                 "format version {} instead of 1",

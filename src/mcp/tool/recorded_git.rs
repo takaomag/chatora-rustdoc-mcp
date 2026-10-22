@@ -286,7 +286,10 @@ fn commit_key(reference: &Key, commit: &str) -> Key {
             target: target.clone(),
             hidden: *hidden,
         },
-        Key::Release { .. } | Key::Target { .. } => reference.clone(),
+        Key::Release { .. }
+        | Key::Target { .. }
+        | Key::Workspace { .. }
+        | Key::WorkspaceTarget { .. } => reference.clone(),
     }
 }
 

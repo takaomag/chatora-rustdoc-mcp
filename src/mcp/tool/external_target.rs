@@ -84,12 +84,20 @@ pub(super) async fn project_crate(
             return None;
         },
         // Outside the default project (M2e's E4b), or not a workspace.
+        // Outside the default project: of all that it records of it, only the crate (decided in
+        // M2e's E4b).
         Err(result) if reason_of(&result) == Some("no_record") => {
-            return Some(super::build_external_docs::not_yet(
-                "a workspace outside the default project",
-                "for a crate from crates.io that it uses, call get_item with crate@version, which \
-                 reads docs.rs",
-            ));
+            let path = project::project_path(state.project.as_ref(), project?);
+            let Ok(workspace) = crate::data::project::workspace_of(&path) else {
+                return Some(*result);
+            };
+            let outside = super::external_workspace::outside(
+                Arc::clone(state),
+                (workspace, path),
+                target.cloned(),
+                Some((name.clone(), spec.cloned())),
+            );
+            return Some(outside.await);
         },
         Err(result) => return Some(*result),
     };
@@ -526,11 +534,12 @@ async fn make(
 }
 
 /// The `reason` of the tool error `result`, of those that tell a dependency not built for a
-/// target.
+/// target, or a workspace outside the default project.
 fn reason_of(result: &CallToolResult) -> Option<&'static str> {
     match body_of(result).get("reason").and_then(Value::as_str) {
         Some("build_unsupported") => Some("build_unsupported"),
         Some("no_json") => Some("no_json"),
+        Some("no_record") => Some("no_record"),
         Some(_) | None => None,
     }
 }
@@ -619,7 +628,7 @@ fn respond(
 }
 
 /// The package name and the version that `wanted` builds.
-fn package_of(wanted: &LocalWanted) -> (String, String) {
+pub(super) fn package_of(wanted: &LocalWanted) -> (String, String) {
     let version = wanted.plan.version.to_string();
     let name = wanted.plan.package.name_and_version().map_or_else(
         || wanted.plan.crate_name.to_string(),
@@ -693,28 +702,44 @@ pub(super) async fn members(
             Ok(Member::Unnameable { error, .. }) => return *error,
         }
     }
-    let entries = all_built(&state, &workspace, planned, until).await;
-    members_response((&workspace, project_from), &target, entries)
+    let entries = all_built(&state, (&workspace, true), planned, until).await;
+    members_response((&workspace, project_from), &target, &entries)
 }
 
 /// What became of the build of a member.
-struct Entry {
+#[derive(Debug, Clone)]
+pub(super) struct Entry {
     /// Its package name.
-    name: String,
+    pub(super) name: String,
     /// Its version.
-    version: String,
+    pub(super) version: String,
     /// `built`, `building`, `failed` or `query_tools_build`.
-    status: &'static str,
+    pub(super) status: &'static str,
     /// The error, when it failed.
-    error: Option<Arc<Value>>,
+    pub(super) error: Option<Arc<Value>>,
+}
+
+impl Entry {
+    /// It as the responses list it.
+    pub(super) fn to_json(&self) -> Value {
+        let mut entry = json!({
+            "crate": self.name,
+            "version": self.version,
+            "status": self.status,
+        });
+        if let (Some(error), Some(fields)) = (&self.error, entry.as_object_mut()) {
+            fields.insert("error".to_owned(), (**error).clone());
+        }
+        entry
+    }
 }
 
 /// The builds of `planned` in `workspace`, started at once and waited for together until
 /// `build.wait_secs` from now, within `until`: a proc macro, which the query tools build for the
-/// host whatever the target, is not built.
-async fn all_built(
+/// host whatever the target, is not built in the default project, `of_project`.
+pub(super) async fn all_built(
     state: &Arc<ToolState>,
-    workspace: &Workspace,
+    (workspace, of_project): (&Workspace, bool),
     planned: Vec<LocalWanted>,
     until: Instant,
 ) -> Vec<Entry> {
@@ -723,7 +748,7 @@ async fn all_built(
     for (order, wanted) in planned.into_iter().enumerate() {
         let (name, version) = package_of(&wanted);
         // A proc macro, which they build for the host whatever the target.
-        if wanted.plan.is_proc_macro() {
+        if of_project && wanted.plan.is_proc_macro() {
             entries.push((order, Entry {
                 name,
                 version,
@@ -763,27 +788,14 @@ async fn all_built(
 fn members_response(
     (workspace, project_from): (&Workspace, ProjectFrom),
     target: &TargetTriple,
-    entries: Vec<Entry>,
+    entries: &[Entry],
 ) -> CallToolResult {
     let root = workspace.root.display().to_string();
     let all_built = entries
         .iter()
         .all(|entry| matches!(entry.status, "built" | "query_tools_build"));
     let building = entries.iter().any(|entry| entry.status == "building");
-    let members: Vec<Value> = entries
-        .into_iter()
-        .map(|entry| {
-            let mut member = json!({
-                "crate": entry.name,
-                "version": entry.version,
-                "status": entry.status,
-            });
-            if let (Some(error), Some(fields)) = (&entry.error, member.as_object_mut()) {
-                fields.insert("error".to_owned(), (**error).clone());
-            }
-            member
-        })
-        .collect();
+    let members: Vec<Value> = entries.iter().map(Entry::to_json).collect();
     let mut hints = vec![format!(
         "look a member up with get_item, crate_overview or search_items, passing its crate and \
          {}",
@@ -873,16 +885,16 @@ mod tests {
             status,
             error: (status == "failed").then(|| Arc::new(json!({ "code": "build_failed" }))),
         };
-        let response = |entries| {
+        let response = |entries: &[Entry]| {
             members_response((&workspace, ProjectFrom::Argument), &target, entries)
                 .structured_content
                 .expect("structured")
         };
-        let all = response(vec![entry("a", "built"), entry("m", "query_tools_build")]);
+        let all = response(&[entry("a", "built"), entry("m", "query_tools_build")]);
         assert_eq!(all["data"]["built"], true);
         assert_eq!(all["data"]["members"][1]["status"], "query_tools_build");
         assert_eq!(all["hints"].as_array().map(Vec::len), Some(1));
-        let some = response(vec![entry("a", "failed"), entry("b", "building")]);
+        let some = response(&[entry("a", "failed"), entry("b", "building")]);
         assert_eq!(some["data"]["built"], false);
         assert_eq!(some["data"]["members"][0]["error"]["code"], "build_failed");
         assert!(some["data"]["members"][1].get("error").is_none());

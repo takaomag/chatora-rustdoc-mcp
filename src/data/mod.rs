@@ -23,6 +23,8 @@ pub mod docs_rs;
 #[cfg(feature = "local")]
 pub mod external;
 #[cfg(feature = "local")]
+pub mod external_workspace;
+#[cfg(feature = "local")]
 pub mod features;
 pub mod fetches;
 pub mod flight;

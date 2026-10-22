@@ -151,6 +151,26 @@ fn output_schema() -> JsonObject {
                             "required": ["crate", "version", "status"],
                         },
                     },
+                    "dependencies": {
+                        "type": "array",
+                        "description": "The dependencies of a workspace outside the default \
+                                        project that its build builds: each built, being built, \
+                                        failed (with its error), read from docs.rs when looked up \
+                                        (docs_rs), or not documented yet (later).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "crate": { "type": "string" },
+                                "version": { "type": "string" },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["built", "building", "failed", "docs_rs", "later"],
+                                },
+                                "error": { "type": "object" },
+                            },
+                            "required": ["crate", "version", "status"],
+                        },
+                    },
                 },
                 "required": ["built"],
             },
@@ -276,12 +296,15 @@ async fn workspace(
         Ok(workspace) => workspace,
         Err(error) => return project_not_found(&path, &error),
     };
+    // Outside the default project (decided in M2e's E4b).
     if !default.is_some_and(|default| default.contains(&workspace)) {
-        return not_yet(
-            "a workspace outside the default project",
-            "for a crate from crates.io that it uses, call get_item with crate@version, which \
-             reads docs.rs",
-        );
+        return super::external_workspace::outside(
+            Arc::clone(state),
+            (workspace, path),
+            target.cloned(),
+            None,
+        )
+        .await;
     }
     // A project that builds its own std is not documented here (requirement R-TG-1).
     let targets = match targets_built(state, &workspace.root, "the project's crates").await {

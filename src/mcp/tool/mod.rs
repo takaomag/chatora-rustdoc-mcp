@@ -15,6 +15,8 @@ mod external_build;
 mod external_git;
 #[cfg(feature = "local")]
 mod external_target;
+#[cfg(feature = "local")]
+mod external_workspace;
 mod get_item;
 #[cfg(feature = "local")]
 mod list_crates;
@@ -121,6 +123,11 @@ pub(super) struct ToolState {
     /// asked for (decided in M2e's E3).
     #[cfg(feature = "local")]
     pub(super) git_externals: Flights<external_git::SharedGit>,
+    /// The records of `build_external_docs` of workspaces outside the default project, and the
+    /// plans of their builds, by workspace and target (decided in M2e's E4b): what went on past a
+    /// deadline is handed to the next call, which would else record it again.
+    #[cfg(feature = "local")]
+    pub(super) workspaces: Flights<external_workspace::SharedPlanned>,
     /// The calls being handled, at most `limits.concurrent_calls` (requirement R-SEC-7).
     pub(super) calls: CallLimit,
     /// How long a call waits for work that goes on without it, such as fetching and indexing a

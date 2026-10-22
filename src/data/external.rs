@@ -94,6 +94,22 @@ pub enum Key {
         /// Whether it documents the hidden items.
         hidden: bool,
     },
+    /// A workspace outside the default project, as `cargo metadata` resolved it, which the query
+    /// tools read instead of running cargo there (decided in M2e's E4b).
+    Workspace {
+        /// The root of the workspace.
+        workspace: Box<str>,
+    },
+    /// What a workspace outside the default project builds for a target, and what was built of it
+    /// (decided in M2e's E4b).
+    WorkspaceTarget {
+        /// The root of the workspace.
+        workspace: Box<str>,
+        /// The target.
+        target: Box<str>,
+        /// Whether it documents the hidden items.
+        hidden: bool,
+    },
     /// What a ref of a git repository resolves to, for a crate in it (decided in M2e's E3).
     GitRef {
         /// The repository's URL, as its key.
@@ -119,6 +135,8 @@ impl Key {
             Self::Git { .. } => "git",
             Self::GitRef { .. } => "git_ref",
             Self::Target { .. } => "target",
+            Self::Workspace { .. } => "workspace",
+            Self::WorkspaceTarget { .. } => "workspace_target",
         }
     }
 
@@ -144,8 +162,14 @@ impl Key {
     }
 }
 
+/// The directory of the records of this format in the cache at `root`: `ext/v<format>`.
+#[must_use]
+pub fn records_dir(root: &Path) -> PathBuf {
+    root.join(EXT_DIR).join(format!("v{INDEX_FORMAT}"))
+}
+
 /// The first 32 hex digits of the SHA-256 of the JSON of `value`.
-fn digest_of(value: &impl Serialize) -> String {
+pub(super) fn digest_of(value: &impl Serialize) -> String {
     let text = serde_json::to_string(value).unwrap_or_default();
     let digest = cache::sha256_hex(text.as_bytes());
     digest.get(..32).unwrap_or(&digest).to_owned()
@@ -618,7 +642,10 @@ struct GitCrate<'a> {
 /// for each.
 fn commits_dir(root: &Path, key: &Key) -> Option<PathBuf> {
     let of = match key {
-        Key::Release { .. } | Key::Target { .. } => return None,
+        Key::Release { .. }
+        | Key::Target { .. }
+        | Key::Workspace { .. }
+        | Key::WorkspaceTarget { .. } => return None,
         Key::Git {
             url,
             name,
@@ -666,6 +693,112 @@ pub fn commits(cache: &Cache, key: &Key) -> Vec<Box<str>> {
         .collect();
     commits.sort_unstable();
     commits
+}
+
+/// A record in a file of the directory of its key, as the query tools find it (decided in M2e's
+/// E4b).
+#[derive(Debug)]
+pub enum Read<T> {
+    /// What it records.
+    Found(T),
+    /// It is being made: the external tool holds the lock of the key.
+    Building,
+    /// The external tool failed to make it, as this tells.
+    Failed(Box<Failed>),
+    /// It is broken, as this tells: the external tool makes it again.
+    Broken(String),
+    /// There is none.
+    Missing,
+}
+
+/// A record with the key that it is found by.
+#[derive(Debug, Serialize, Deserialize)]
+struct Filed<T> {
+    /// The key.
+    key: Key,
+    /// What it records: not flattened, which `serde` does for no `u128`, as the time of inputs.
+    record: T,
+}
+
+/// The record of `key` in its file `file`, without waiting, as [`read`] reads a record of a build.
+///
+/// The holder of the lock of the key, `making`, is not told that it is being made. It is noted as
+/// read when it is found (requirement R-CA-5).
+///
+/// It reads files, so it is for a blocking thread.
+#[must_use]
+pub fn read_file<T: serde::de::DeserializeOwned>(
+    cache: &Cache,
+    (key, file): (&Key, &str),
+    making: Option<&Making>,
+) -> Read<T> {
+    if let Some(making) = making
+        && let Err(error) = making.check(key)
+    {
+        return Read::Broken(error.to_string());
+    }
+    let dir = key.dir(cache.dir());
+    let read = match fs::read(dir.join(file)) {
+        Ok(text) => Some(
+            serde_json::from_slice::<Filed<T>>(&text)
+                .map_err(|error| format!("its {file} is not valid: {error}"))
+                .and_then(|filed| {
+                    if filed.key == *key {
+                        Ok(filed.record)
+                    } else {
+                        Err(format!("its {file} is of another key"))
+                    }
+                }),
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => Some(Err(format!("its {file} cannot be read: {error}"))),
+    };
+    let read = match read {
+        Some(Ok(value)) => {
+            note_use(&dir);
+            return Read::Found(value);
+        },
+        read => read,
+    };
+    if making.is_none() && being_made(cache, key) {
+        return Read::Building;
+    }
+    if let Some(failed) = build::failed(&dir) {
+        return Read::Failed(Box::new(failed));
+    }
+    match read {
+        Some(Err(why)) => Read::Broken(why),
+        Some(Ok(_)) | None => Read::Missing,
+    }
+}
+
+/// Writes `value` as the record of `key` in its file `file`, under the lock of the key
+/// (`making`), and forgets a failure to make it.
+///
+/// It writes files, so it is for a blocking thread.
+///
+/// # Errors
+///
+/// Returns an error when `making` is not the lock of `key`, or a file cannot be written.
+pub fn write_file<T: Serialize>(
+    cache: &Cache,
+    (key, file): (&Key, &str),
+    value: &T,
+    making: &Making,
+) -> io::Result<()> {
+    making.check(key)?;
+    let filed = Filed {
+        key: key.clone(),
+        record: value,
+    };
+    let dir = key.dir(cache.dir());
+    let path = dir.join(file);
+    cache.check_inside(&path)?;
+    cache::write_atomically(&path, &serde_json::to_vec_pretty(&filed)?)?;
+    match fs::remove_file(dir.join(build::FAILED)) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        Ok(()) | Err(_) => Ok(()),
+    }
 }
 
 /// The records noted as read, and when, in this process.
