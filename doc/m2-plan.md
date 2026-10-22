@@ -1218,6 +1218,25 @@ Claude Code 2.1.304、Linux で測った。
 - テストの待ちの上限 (`tests/stdio.rs` の `TIMEOUT`) を 5 秒から 30 秒に (利用者の了承)。D7a の CI の Windows と、手元でテストを並べたときに、最初の応答を 5 秒待って落ちた。上限なので、通るテストは長く待たない
 - 残したもの: `crate` なしの検索 (`search_across`) と `resolve_version` は D7d。戻した依存が lib を持たないとき (`local_build_required`) の理由の文言は crates.io の release のものではない (稀)
 
+**D7c の下調べと決定 (2026-10-22)**:
+
+- 下調べ: 要件 R-TG-1 は、独自の target (`build.target` が target の JSON 仕様、`[unstable] build-std`) のプロジェクトで、cargo を起動せずに `target_unsupported` を返し member は手元で作る方法を案内する、docs.rs の照会はその crate の docs.rs の既定の target に代えて実際の triple を provenance と warnings に示す (§ の決定 27)、と求める。今は `target` を省いた照会の target を host にして warning を付け (`project_target`)、D7b-1 の `build_targets` も host とみなすので、member と依存を host でビルドし、docs.rs も host の target で引く。D7c の「実際のビルド target と違う `target` ではビルドしない」は D7b-1 で済んだ
+- 実測 (cargo 1.99.1、オフライン): target の JSON 仕様でも `build-std` でも `cargo metadata` は動く。`cargo tree` は target の JSON 仕様では `-Zjson-target-spec` を求めて落ち、`build-std` では動く
+- 利用者が決めたこと:
+  1. 版の解決の `cargo metadata` は走らせる (ビルドも build script も走らない)。ビルド (`cargo rustdoc`) と `cargo tree` (feature の組・範囲) は走らせず、`enabled_in_project` は出さない (warning)。要件の「cargo を起動せずに」はビルドのことと読む
+  2. `target` を明示した照会は、docs.rs ではその target の JSON を引き (既定の target に代えるのは省いたときだけ)、member と依存のローカルビルドはどの target でも `target_unsupported` (プロジェクトはその target のためにビルドされていない。R-MCP-3 と同じ)
+- 段の分け方 (聞かずに決めたこと): D7c-1 (ビルドの `target_unsupported`)、D7c-2 (`target` を省いた docs.rs の照会を既定の target に。照会の target を省いたとも表せる形にするので、多くのツールに及ぶ)
+
+**D7c-1 (独自の target のプロジェクトはビルドしない。2026-10-22)**:
+
+- `CargoConfig::own_target`: 独自の target (`build.target` の target の JSON 仕様、`[unstable] build-std` なら `build.target` の target、無ければ `build-std`)。`build-std` だけで `build.target` が無いものも独自の target とする (前は host とみなしていた)
+- `project::build_targets` は `BuildTargets::These` か `OwnTarget` を返し、`targets_of` はエラーを独自の target と target でない値に分ける。`target` を省いた照会の target (`project_target`) は今までどおり host と warning (D7c-2 まで)
+- member と依存の計画 (`local::targets_built`): 独自の target なら、どの `target` でも cargo を起動せずに `docs_unavailable`・`reason: target_unsupported` (プロジェクトの terminal で文書化する案内。決定 2)
+- `cargo tree` (`Resolver` の feature の組) は独自の target では走らせず `FeaturesError::OwnTarget` (`enabled_in_project` を出さない旨の warning。決定 1)。`cargo metadata` は走らせる
+- テスト: `targets_of` の単体テスト (`build-std` だけ・target の JSON 仕様・target でない値)。stdio に、`build.target` が `my-target.json` のプロジェクトで member と path 依存が `target` の有無によらず `target_unsupported`、crates.io の依存は明示した target で docs.rs から引けて、プロジェクトのビルドを読まない warning が付くことを足した (`own_target` を外すと落ちる)。D2 からの「独自の target の member は host でビルドする」テストは、`build-std` だけ (`build.target` 無し) で `target_unsupported` になることを確かめる形に改めた
+- レビュー (サブエージェント) の指摘は低だけ。直したもの: `build.target` の値の前後の空白を落としてから判定する。文言を「its own std, for a target of its own or with build-std」に (`build-std` と通常の triple の組み合わせにも当てはまるように)。古い doc コメント (`sets_build_target`・`Member::NotForTarget`)。`targets_of` の単体テストに、target でない値と target の JSON 仕様が混ざる配列 (JSON 仕様が勝つ) と空の配列
+- 残したもの (記録だけ): 環境変数 `CARGO_UNSTABLE_BUILD_STD` は読まない (cargo が受けるかは未確認)。stable のプロジェクトでも `$CARGO_HOME` の設定に `build-std` があれば `target_unsupported` (R-TG-1 の文言どおり)。`.json` を付けずに `RUST_TARGET_PATH` で名指しする独自の target と、member のディレクトリだけに `.cargo/config.toml` がある構成は判定の外 (前者はビルドの前の検査で `toolchain_missing`)。`cargo tree` の範囲 (`read_scope`) には判定を置いていない (呼び出し元はどれも判定の後)。`CARGO_BUILD_TARGET` で JSON 仕様を足す経路・`list_crates` と `crate` なしの検索の結合テストは無い
+
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
 - 利用者の指示で、デッドロックと止まって戻らない危険を、コード全体で監査した (サブエージェント、読むだけ。D4b のハングの後)。ロックの循環、ガードを持ったままの `.await` (clippy の `await_holding_lock` も `suspicious` の deny で効いている)、自分の結果を待つ形の循環は無かった。止まって長く戻らない箇所は次のとおり

@@ -14,7 +14,7 @@ use semver::Version;
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
-use super::{ToolState, error_result, get_item, project};
+use super::{ToolState, error_result, get_item, project, project::BuildTargets};
 use crate::{
     data::{
         build::{self, Bootstrap, Plan, TargetDir},
@@ -109,8 +109,8 @@ pub(super) enum Member {
     /// reads the features of the project's build (`cargo tree`), as this says.
     Planning(Doing),
     /// A member's crate or a dependency, which is not built for the target asked for, as the
-    /// project does not build for it: the error to return (requirement R-MCP-3, decided in M2's
-    /// D7).
+    /// project does not build for it, or builds for a target of its own: the error to return
+    /// (requirements R-MCP-3 and R-TG-1, decided in M2's D7).
     NotForTarget(Box<CallToolResult>),
 }
 
@@ -152,9 +152,12 @@ pub(super) async fn member(
         return Ok(Member::Not);
     };
     let root = &workspace.root;
-    let targets = project::build_targets(state, root).await;
+    let what = format!("{} {}", package.name, package.version);
+    let targets = match targets_built(state, root, &what).await {
+        Ok(targets) => targets,
+        Err(error) => return Ok(Member::NotForTarget(error)),
+    };
     if !targets.contains(target) {
-        let what = format!("{} {}", package.name, package.version);
         return Ok(Member::NotForTarget(Box::new(other_target(
             &what, target, &targets,
         ))));
@@ -300,7 +303,10 @@ pub(super) async fn dependency(
     // For a target that the project builds for; or for the host, what the project's build builds
     // for the host, as a build or proc-macro dependency, by the scope of a target that it builds
     // for (requirement R-MCP-3, decided in M2's D7).
-    let targets = project::build_targets(state, &workspace.root).await;
+    let targets = match targets_built(state, &workspace.root, &what).await {
+        Ok(targets) => targets,
+        Err(error) => return Ok(Member::NotForTarget(error)),
+    };
     let host = state.host().await.triple.clone();
     let not_for_target = || {
         Ok(Member::NotForTarget(Box::new(other_target(
@@ -365,6 +371,32 @@ pub(super) async fn dependency(
         }),
         package: found.name.clone(),
     })
+}
+
+/// The targets that the project at `root` builds for, which `what` may be built here for; or, as
+/// the project builds for a target of its own with its own std, `target_unsupported`, without
+/// starting cargo for it (requirement R-TG-1, decided in M2's D7).
+async fn targets_built(
+    state: &ToolState,
+    root: &Path,
+    what: &str,
+) -> Result<Vec<TargetTriple>, Box<CallToolResult>> {
+    match project::build_targets(state, root).await {
+        BuildTargets::These(targets) => Ok(targets),
+        BuildTargets::OwnTarget(own) => Err(Box::new(error_result(&json!({
+            "code": "docs_unavailable",
+            "message": format!(
+                "{what} is not built here: the project builds its own std, for a target of its own \
+                 or with build-std ({own}), which this server does not document"
+            ),
+            "retryable": false,
+            "suggestions": [
+                "document it in the project's terminal as the project builds it, with `cargo doc` \
+                 and the project's settings",
+            ],
+            "reason": "target_unsupported",
+        })))),
+    }
 }
 
 /// `docs_unavailable` for `what`, which is not built here for `target`, as the project builds for

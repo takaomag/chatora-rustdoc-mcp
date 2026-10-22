@@ -48,6 +48,35 @@ pub struct CargoConfig {
     pub build_rustdoc: Option<Program>,
 }
 
+impl CargoConfig {
+    /// The target of its own that the project builds for with its own std, which this server
+    /// does not document (`target_unsupported`, requirement R-TG-1): a target JSON of
+    /// `build.target`, or with `[unstable] build-std` the target of `build.target`, or else
+    /// `build-std` itself. `None` for a project that builds for targets that this server
+    /// documents.
+    #[must_use]
+    pub fn own_target(&self) -> Option<String> {
+        let targets = self.build_target.as_ref().map_or(&[][..], BuildTarget::all);
+        if let Some(json) = targets.iter().find(|target| is_target_json(target)) {
+            return Some(json.clone());
+        }
+        self.build_std.then(|| {
+            targets
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "build-std".to_owned())
+        })
+    }
+}
+
+/// Whether `target`, of `build.target`, is the path of a target JSON.
+#[must_use]
+pub fn is_target_json(target: &str) -> bool {
+    Path::new(target.trim())
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+}
+
 /// A program that a setting of cargo names.
 ///
 /// It is a path, which cargo takes relative to the directory that holds the `.cargo` directory of

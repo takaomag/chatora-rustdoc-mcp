@@ -242,8 +242,8 @@ pub(super) async fn default_target(
 
 /// Whether the project at `root` sets `build.target` in cargo's settings (or `CARGO_BUILD_TARGET`):
 /// a build then passes `--target` even for the host, which cargo would else take from the setting
-/// (requirement R-WS-1). A target of its own counts: the build is for the host's then (decided in
-/// M2's D2).
+/// (requirement R-WS-1). A project that builds for a target of its own is not built here
+/// (decided in M2's D7).
 #[cfg(feature = "local")]
 pub(super) async fn sets_build_target(state: &ToolState, root: &Path) -> bool {
     read_cargo_config(state, root)
@@ -252,19 +252,40 @@ pub(super) async fn sets_build_target(state: &ToolState, root: &Path) -> bool {
 }
 
 /// The targets that the project at `root` builds for (requirement R-MCP-3): its `build.target`,
-/// all of several, or else the host's. A target of its own is not documented yet, and the host's
-/// is taken for it, as for a lookup without a target (decided in M2's B3b, until D7c); so is a
-/// setting that cannot be read, or that has a value that is not a target.
+/// all of several, or else the host's; or the target of its own, with its own std, which this
+/// server does not build for (requirement R-TG-1, decided in M2's D7). A setting that cannot be
+/// read, or that has a value that is not a target, is taken for the host's, as for a lookup
+/// without a target.
 #[cfg(feature = "local")]
-pub(super) async fn build_targets(state: &ToolState, root: &Path) -> Vec<TargetTriple> {
+pub(super) async fn build_targets(state: &ToolState, root: &Path) -> BuildTargets {
     let host = state.host().await.triple.clone();
     match read_cargo_config(state, root).await {
         Some(Ok(config)) => match targets_of(&config, &host) {
-            Ok(Some(targets)) => targets,
-            Ok(None) | Err(_) => vec![host],
+            Ok(Some(targets)) => BuildTargets::These(targets),
+            Err(TargetsError::OwnTarget(own)) => BuildTargets::OwnTarget(own),
+            Ok(None) | Err(TargetsError::NotATarget(_)) => BuildTargets::These(vec![host]),
         },
-        Some(Err(_)) | None => vec![host],
+        Some(Err(_)) | None => BuildTargets::These(vec![host]),
     }
+}
+
+/// The targets that a project builds for.
+#[cfg(feature = "local")]
+pub(super) enum BuildTargets {
+    /// These, which this server builds for.
+    These(Vec<TargetTriple>),
+    /// A target of its own, with its own std, as its settings name it.
+    OwnTarget(String),
+}
+
+/// Why the targets of `build.target` are not taken.
+#[cfg(feature = "local")]
+#[derive(Debug, PartialEq, Eq)]
+enum TargetsError {
+    /// The project builds for a target of its own, with its own std.
+    OwnTarget(String),
+    /// A value is not a target, as this tells.
+    NotATarget(String),
 }
 
 /// The cargo settings of the project at `root`, with `CARGO_BUILD_TARGET` of the server's
@@ -292,48 +313,30 @@ async fn read_cargo_config(
 fn targets_of(
     config: &CargoConfig,
     host: &TargetTriple,
-) -> Result<Option<Vec<TargetTriple>>, String> {
+) -> Result<Option<Vec<TargetTriple>>, TargetsError> {
+    if let Some(own) = config.own_target() {
+        return Err(TargetsError::OwnTarget(own));
+    }
     let Some(build_target) = &config.build_target else {
         return Ok(None);
     };
-    let Some(first) = build_target.first() else {
-        return Ok(None);
-    };
-    if config.build_std
-        || build_target
-            .all()
-            .iter()
-            .any(|target| is_target_json(target))
-    {
-        return Err(format!(
-            "the project builds for a target of its own ({first}) with its own std, which this \
-             server does not document yet, so the host's target is used"
-        ));
-    }
     build_target
         .all()
         .iter()
         .map(|target| {
+            let target = target.trim();
             if target == "host-tuple" {
                 return Ok(host.clone());
             }
             target.parse().map_err(|error| {
-                format!(
+                TargetsError::NotATarget(format!(
                     "build.target {target:?} of the project is not a target ({error}), so the \
                      host's is used"
-                )
+                ))
             })
         })
-        .collect::<Result<_, _>>()
-        .map(Some)
-}
-
-/// Whether `target`, of `build.target`, is the path of a target JSON.
-#[cfg(feature = "local")]
-fn is_target_json(target: &str) -> bool {
-    Path::new(target)
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|targets| (!targets.is_empty()).then_some(targets))
 }
 
 /// The project's `build.target`, as cargo's settings give it (Q-31), when it is a target this
@@ -365,7 +368,17 @@ async fn project_target(
     let host = state.host().await.triple.clone();
     let targets = match targets_of(&config, &host) {
         Ok(targets) => targets?,
-        Err(why) => {
+        Err(TargetsError::OwnTarget(own)) => {
+            warnings.push(
+                format!(
+                    "the project builds its own std, for a target of its own or with build-std \
+                     ({own}), which this server does not document yet, so the host's target is used"
+                )
+                .into(),
+            );
+            return None;
+        },
+        Err(TargetsError::NotATarget(why)) => {
             warnings.push(why.into());
             return None;
         },
@@ -646,6 +659,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(targets_of(&with(None, false), &host), Ok(None));
+        assert_eq!(targets_of(&with(several(&[]), false), &host), Ok(None));
         let found = targets_of(
             &with(several(&["host-tuple", "wasm32-unknown-unknown"]), false),
             &host,
@@ -663,21 +677,30 @@ mod tests {
             targets_of(&with(one.clone(), false), &host).map(|targets| targets.map(names)),
             Ok(Some(vec!["wasm32-unknown-unknown".to_owned()]))
         );
-        // The host's is used for each of these, with why.
-        for (config, why) in [
-            (with(one, true), "a target of its own"),
+        // A target of its own, with its own std (requirement R-TG-1).
+        for (config, own) in [
+            (with(one, true), "wasm32-unknown-unknown"),
+            (with(None, true), "build-std"),
             (
                 with(several(&["wasm32-unknown-unknown", "my.JSON"]), false),
-                "a target of its own",
+                "my.JSON",
             ),
-            (
-                with(several(&["wasm32-unknown-unknown", "no target"]), false),
-                "is not a target",
-            ),
+            // Before a value that is not a target, as cargo would not read the settings.
+            (with(several(&["no target", " x.json "]), false), " x.json "),
         ] {
-            let error = targets_of(&config, &host).expect_err("the host's");
-            assert!(error.contains(why), "{error}");
+            assert_eq!(
+                targets_of(&config, &host),
+                Err(TargetsError::OwnTarget(own.to_owned()))
+            );
         }
+        let not_a_target = targets_of(
+            &with(several(&["wasm32-unknown-unknown", "no target"]), false),
+            &host,
+        );
+        assert!(
+            matches!(&not_a_target, Err(TargetsError::NotATarget(why)) if why.contains("no target")),
+            "{not_a_target:?}"
+        );
     }
 
     /// A directory with a package `name` in it.

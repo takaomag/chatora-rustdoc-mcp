@@ -1000,40 +1000,25 @@ fn without_a_version_the_project_decides_it() {
     assert!(server.finish().success());
 }
 
-/// A project that builds for a target of its own, with a target JSON and `build-std`, has its
-/// member built for the host, with `--target`, which wins over its `build.target`, and a warning
-/// (decided in M2's D2, until D7). A stable cargo does not use `[unstable]`.
+/// A project that builds its own std, with `build-std` and no `build.target`, builds for a target
+/// of its own too: its member is not built here, `target_unsupported`, without starting cargo for
+/// it (requirement R-TG-1, decided in M2's D7; it was built for the host since M2's D2).
 #[cfg(feature = "local")]
 #[test]
-fn a_member_of_a_project_with_a_target_of_its_own_is_built_for_the_host() {
+fn a_member_of_a_project_that_builds_its_own_std_is_not_built() {
     let project = demo_workspace();
-    std::fs::write(
-        project.path().join("src/lib.rs"),
-        "/// Says hello.\npub fn hello() {}\n",
-    )
-    .expect("written");
-    set_cargo_settings(
-        project.path(),
-        "[build]\ntarget = \"my-target.json\"\n\n[unstable]\nbuild-std = [\"core\"]\n",
-    );
+    set_cargo_settings(project.path(), "[unstable]\nbuild-std = [\"core\"]\n");
     let mut server = Server::start_in(Some(project.path()));
-    let mut found = Value::Null;
-    for id in 1..20 {
-        server.send(&call_tool(
-            id,
-            "get_item",
-            json!({ "crate": "demo", "path": "hello" }),
-        ));
-        found = server.response(id)["result"].clone();
-        if found["structuredContent"]["status"] != "building" {
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-    assert_ne!(found["isError"], true, "{found}");
-    let found = &found["structuredContent"];
-    assert_eq!(found["provenance"]["source"], "local", "{found}");
-    assert!(warns(found, "of its own"), "{found}");
+    server.send(&call_tool(
+        1,
+        "get_item",
+        json!({ "crate": "demo", "path": "hello" }),
+    ));
+    let result = server.response(1)["result"].clone();
+    assert_eq!(result["isError"], true, "{result}");
+    let error = text_json(&result);
+    assert_eq!(error["reason"], "target_unsupported", "{result}");
+    assert!(error.to_string().contains("build-std"), "{result}");
     assert!(server.finish().success());
 }
 
@@ -3413,6 +3398,70 @@ fn a_release_that_docs_rs_has_no_json_of_is_built_here() {
         }
         assert!(server.finish().success());
     }
+}
+
+/// A project that builds for a target of its own, a target JSON, has its members and its path
+/// dependencies not built here, `target_unsupported`, whatever the target; a dependency of
+/// crates.io is read on docs.rs for the target given, without the features of the project's
+/// build, which `cargo tree` would read (requirement R-TG-1, decided in M2's D7).
+#[cfg(feature = "local")]
+#[test]
+fn a_project_for_a_target_of_its_own_is_not_built() {
+    // Added to the settings that the project has, as its vendored sources.
+    let own_target = |dir: &Path| {
+        let config = dir.join(".cargo/config.toml");
+        std::fs::create_dir_all(dir.join(".cargo")).expect("made");
+        let before = std::fs::read_to_string(&config).unwrap_or_default();
+        std::fs::write(
+            &config,
+            format!("[build]\ntarget = \"my-target.json\"\n\n{before}"),
+        )
+        .expect("written");
+    };
+    let dir = path_dependencies("3");
+    own_target(&dir.path().join("ws"));
+    let mut server = Server::start_in(Some(&dir.path().join("ws")));
+    for (id, arguments) in [
+        (1, json!({ "crate": "app", "path": "Shown" })),
+        (2, json!({ "crate": "libdep", "path": "Shown" })),
+        (
+            3,
+            json!({ "crate": "app", "path": "Shown", "target": TARGET }),
+        ),
+    ] {
+        server.send(&call_tool(id, "get_item", arguments.clone()));
+        let result = server.response(id)["result"].clone();
+        assert_eq!(result["isError"], true, "{arguments}: {result}");
+        let error = text_json(&result);
+        assert_eq!(
+            error["reason"], "target_unsupported",
+            "{arguments}: {result}"
+        );
+        assert!(error.to_string().contains("my-target.json"), "{result}");
+    }
+    assert!(server.finish().success());
+
+    let project = workspace_using_demo();
+    own_target(project.path());
+    let offline = [("CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE", "true")];
+    let mut server = Server::start_with(Some(project.path()), &offline);
+    write_old_demo_index(&server);
+    let found = built_item(
+        &mut server,
+        1,
+        &json!({ "crate": "demo", "path": "hello", "target": TARGET }),
+    );
+    assert_ne!(found["isError"], true, "{found}");
+    let found = &found["structuredContent"];
+    assert_eq!(found["provenance"]["target"], TARGET, "{found}");
+    assert!(found["data"].get("enabled_in_project").is_none(), "{found}");
+    assert!(
+        found["warnings"]
+            .to_string()
+            .contains("a target of its own"),
+        "{found}"
+    );
+    assert!(server.finish().success());
 }
 
 /// A search of the project's dependencies that finds nothing while they are still being fetched

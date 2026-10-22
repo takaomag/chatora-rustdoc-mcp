@@ -259,6 +259,13 @@ pub enum FeaturesError {
     /// `cargo tree` failed.
     #[error(transparent)]
     Cargo(#[from] CargoError),
+    /// The project builds for a target of its own, with its own std, which `cargo tree` is not
+    /// run for (requirement R-TG-1, decided in M2's D7).
+    #[error(
+        "the project builds its own std, for a target of its own or with build-std ({0}), which \
+         cargo tree is not run for"
+    )]
+    OwnTarget(String),
 }
 
 /// How long a failure of `cargo metadata` or `cargo tree` is given again without running cargo,
@@ -638,6 +645,9 @@ impl Shared {
         if let Resolution::CargoLockRaw { .. } = &*resolution {
             return Err(Arc::new(FeaturesError::NoMetadata));
         }
+        if let Some(own) = self.inner.own_target_in(&workspace.root).await {
+            return Err(Arc::new(FeaturesError::OwnTarget(own)));
+        }
         let kept = self.kept(workspace, &resolution).await;
         let offline = self.inner.offline_in(&workspace.root).await;
         let read = async {
@@ -882,6 +892,21 @@ impl Inner {
         })
         .await
         .unwrap_or(false)
+    }
+
+    /// The target of its own that the project at `root` builds for, if any
+    /// ([`cargo_config::CargoConfig::own_target`]), with `CARGO_BUILD_TARGET`, as cargo sees it.
+    async fn own_target_in(&self, root: &Path) -> Option<String> {
+        let (root, home) = (root.to_path_buf(), self.cargo_home.clone());
+        let env = std::env::var("CARGO_BUILD_TARGET").ok();
+        blocking(move || {
+            Ok(cargo_config::read(&root, home.as_deref(), env.as_deref())
+                .ok()
+                .and_then(|config| config.own_target()))
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Runs `cargo metadata` in `root` and reads its output, telling `stage` whether cargo waits
