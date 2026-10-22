@@ -232,7 +232,8 @@ impl FakeCrate {
         self
     }
 
-    /// Adds `text` to its Cargo.toml, after its features, as `[package.metadata.docs.rs]`.
+    /// Adds `text` to its Cargo.toml, after its features: any table, as `[package.metadata.docs.rs]`
+    /// or `[lib]`.
     #[must_use]
     #[cfg_attr(
         not(feature = "local"),

@@ -2422,6 +2422,17 @@ fn server_on(registry: &registry::FakeRegistry, dir: &Path) -> Server {
 /// [`server_on`], with the default project `project`.
 #[cfg(all(debug_assertions, feature = "local"))]
 fn server_in_on(project: Option<&Path>, registry: &registry::FakeRegistry, dir: &Path) -> Server {
+    server_with_on(project, registry, dir, &[])
+}
+
+/// [`server_in_on`], with more environment variables `env`.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn server_with_on(
+    project: Option<&Path>,
+    registry: &registry::FakeRegistry,
+    dir: &Path,
+    env: &[(&str, &str)],
+) -> Server {
     let cargo_home = dir.join("cargo-home");
     std::fs::create_dir_all(&cargo_home).expect("made");
     std::fs::write(cargo_home.join("config.toml"), registry.cargo_config()).expect("written");
@@ -2433,18 +2444,20 @@ fn server_in_on(project: Option<&Path>, registry: &registry::FakeRegistry, dir: 
         cargo_home.display().to_string(),
         gitconfig.display().to_string(),
     );
-    Server::start_with(project, &[
+    let mut all = vec![
         ("CHATORA_RUSTDOC_TEST_DOCS_RS_URL", base),
-        ("CHATORA_RUSTDOC_TEST_INDEX_URL", &index),
+        ("CHATORA_RUSTDOC_TEST_INDEX_URL", index.as_str()),
         ("CHATORA_RUSTDOC_TEST_STATIC_URL", base),
-        ("CARGO_HOME", &cargo_home),
-        ("GIT_CONFIG_GLOBAL", &gitconfig),
+        ("CARGO_HOME", cargo_home.as_str()),
+        ("GIT_CONFIG_GLOBAL", gitconfig.as_str()),
         ("GIT_CONFIG_NOSYSTEM", "1"),
         ("GIT_TERMINAL_PROMPT", "0"),
         ("RUSTUP_AUTO_INSTALL", "0"),
         ("NO_PROXY", "127.0.0.1"),
         ("no_proxy", "127.0.0.1"),
-    ])
+    ];
+    all.extend_from_slice(env);
+    Server::start_with(project, &all)
 }
 
 /// `build_external_docs` documents a release of crates.io that no project uses, which docs.rs has
@@ -2744,6 +2757,157 @@ fn build_external_docs_builds_a_dependency_that_cargo_cannot_name() {
     let data = &response["result"]["structuredContent"]["data"];
     assert_eq!(data["built"], false, "{response}");
     assert_eq!(data["reason"], "query_tools_build");
+    assert!(server.finish().success());
+}
+
+/// Calls `build_external_docs` with `arguments` as `id` on `server`, and then `get_item` with
+/// `lookup` from `id + 1` on, until it no longer tells `status: building`; returns its result.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn built_external(server: &mut Server, id: u64, arguments: &Value, lookup: &Value) -> Value {
+    server.send(&call_tool(id, "build_external_docs", arguments.clone()));
+    let response = server.response(id);
+    assert!(
+        response["result"]["structuredContent"]["data"]["built"] == true
+            || response["result"]["structuredContent"]["status"] == "building"
+            || response["result"]["isError"] == true,
+        "{response}"
+    );
+    let mut found = Value::Null;
+    for next in id.saturating_add(1)..id.saturating_add(90) {
+        server.send(&call_tool(next, "get_item", lookup.clone()));
+        found = server.response(next)["result"].clone();
+        if found["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    found
+}
+
+/// A release whose lib is a cdylib only is documented (the plan's test crate (e)).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn build_external_docs_builds_a_release_whose_lib_is_a_cdylib() {
+    use registry::{FakeCrate, FakeRegistry};
+    let registry = FakeRegistry::start();
+    registry.publish(
+        &FakeCrate::new("fixture-cdy", "0.1.0")
+            .manifest_tail("\n[lib]\ncrate-type = [\"cdylib\"]\n")
+            .file(
+                "src/lib.rs",
+                "#[unsafe(no_mangle)]\npub extern \"C\" fn exported() {}\n",
+            ),
+    );
+    let dir = TempDir::new().expect("a temporary directory");
+    let mut server = server_on(&registry, dir.path());
+    let found = built_external(
+        &mut server,
+        1,
+        &json!({ "crate": "fixture-cdy@0.1.0" }),
+        &json!({ "crate": "fixture-cdy@0.1.0", "path": "exported" }),
+    );
+    let content = &found["structuredContent"];
+    assert_eq!(
+        content["provenance"]["recorded_by"], "build_external_docs",
+        "{found}"
+    );
+    assert_eq!(content["data"]["kind"], "function", "{found}");
+    assert!(server.finish().success());
+}
+
+/// A build that fails for good is told by the query tools until `build_external_docs` is called
+/// again, which builds it again: what failed it, a file that its build script looks for, is not
+/// what its key is made of (requirement R-WS-10).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn build_external_docs_called_again_builds_what_failed_again() {
+    use registry::{FakeCrate, FakeRegistry};
+    let dir = TempDir::new().expect("a temporary directory");
+    let marker = dir.path().join("broken");
+    std::fs::write(&marker, "").expect("written");
+    let registry = FakeRegistry::start();
+    registry.publish(
+        &FakeCrate::new("fixture-flaky", "0.1.0")
+            .file(
+                "build.rs",
+                &format!(
+                    "fn main() {{ if std::path::Path::new({:?}).exists() {{ panic!(\"broken\") }} }}\n",
+                    marker.display().to_string()
+                ),
+            )
+            .file("src/lib.rs", "pub fn mended() {}\n"),
+    );
+    let mut server = server_on(&registry, dir.path());
+    let arguments = json!({ "crate": "fixture-flaky@0.1.0" });
+    let lookup = json!({ "crate": "fixture-flaky@0.1.0", "path": "mended" });
+    let failed = built_external(&mut server, 1, &arguments, &lookup);
+    assert_eq!(failed["isError"], true, "{failed}");
+    assert_eq!(text_json(&failed)["code"], "build_failed", "{failed}");
+    std::fs::remove_file(&marker).expect("removed");
+    // The query tools tell the failure, which they do not build again.
+    server.send(&call_tool(100, "get_item", lookup.clone()));
+    let told = server.response(100)["result"].clone();
+    assert_eq!(text_json(&told)["code"], "build_failed", "{told}");
+    let found = built_external(&mut server, 200, &arguments, &lookup);
+    let content = &found["structuredContent"];
+    assert_eq!(
+        content["provenance"]["recorded_by"], "build_external_docs",
+        "{found}"
+    );
+    assert!(server.finish().success());
+}
+
+/// Offline, a release whose `.crate` is not cached is `offline_miss` (requirement R-CA-7).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn build_external_docs_offline_tells_what_it_lacks() {
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let mut server = server_with_on(None, &registry, dir.path(), &[(
+        "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE",
+        "true",
+    )]);
+    let index = server
+        .cache
+        .path()
+        .join("index.crates.io/fi/xt/fixture-away");
+    std::fs::create_dir_all(index.parent().expect("a parent")).expect("made");
+    let line = json!({
+        "name": "fixture-away",
+        "vers": "0.1.0",
+        "deps": [],
+        "cksum": "0".repeat(64),
+        "features": {},
+        "yanked": false,
+    });
+    std::fs::write(&index, format!("{line}\n")).expect("written");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    std::fs::write(
+        index.with_file_name("fixture-away.meta.json"),
+        json!({ "etag": null, "last_modified": null, "fetched_at": now }).to_string(),
+    )
+    .expect("written");
+    server.send(&call_tool(
+        1,
+        "build_external_docs",
+        json!({ "crate": "fixture-away@0.1.0" }),
+    ));
+    let result = server.response(1)["result"].clone();
+    assert_eq!(result["isError"], true, "{result}");
+    let error = text_json(&result);
+    assert_eq!(error["code"], "offline_miss", "{result}");
+    // Of its `.crate`, past the index in the cache.
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("the .crate of fixture-away@0.1.0")),
+        "{result}"
+    );
+    // Nothing was asked of the network.
+    assert_eq!(registry.requests(), Vec::<String>::new());
     assert!(server.finish().success());
 }
 

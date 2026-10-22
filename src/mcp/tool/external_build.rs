@@ -666,13 +666,16 @@ async fn make(
     let making = take_lock(state, key, progress)
         .await
         .map_err(|why| Arc::new(failed_so(&what, &why, true)))?;
-    let refresh = match read_record(state, key).await {
-        Some(Recorded::Built(built, told)) => match recorded(&state.cache, *built, &told).await {
+    let (recorded_now, making) = read_record(state, key, making)
+        .await
+        .ok_or_else(|| Arc::new(body_of(&get_item::stopped())))?;
+    let refresh = match recorded_now {
+        Recorded::Built(built, told) => match recorded(&state.cache, *built, &told).await {
             Ok(built) => return Ok(Arc::new(built)),
             Err(_) => true,
         },
-        Some(Recorded::Failed(_) | Recorded::Broken(_)) => true,
-        Some(Recorded::Building | Recorded::Missing) | None => false,
+        Recorded::Failed(_) | Recorded::Broken(_) => true,
+        Recorded::Building | Recorded::Missing => false,
     };
     let (made, told) = with_a_set(state, (key, release, target), refresh, progress).await;
     let cache = state.cache.clone();
@@ -784,10 +787,11 @@ async fn with_a_set(
     (made, told)
 }
 
-/// The record of `key`, as it is now.
-async fn read_record(state: &ToolState, key: &Key) -> Option<Recorded> {
+/// The record of `key`, as it is now, for the holder of its lock, `making`, which it gives back;
+/// `None` when the task did not end (as the server shuts down, or a panic), which lets the lock go.
+async fn read_record(state: &ToolState, key: &Key, making: Making) -> Option<(Recorded, Making)> {
     let (cache, key) = (state.cache.clone(), key.clone());
-    crate::task::spawn_blocking(move || external::read(&cache, &key))
+    crate::task::spawn_blocking(move || (external::read_making(&cache, &key, &making), making))
         .await
         .ok()
 }

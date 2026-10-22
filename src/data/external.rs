@@ -145,6 +145,21 @@ pub enum Recorded {
 /// It reads files, so it is for a blocking thread.
 #[must_use]
 pub fn read(cache: &Cache, key: &Key) -> Recorded {
+    read_so(cache, key, true)
+}
+
+/// [`read`] for the holder of the lock of `key` (`making`), which is not told that it is being
+/// made: its own lock is. The lock of another key is told as a broken record.
+#[must_use]
+pub fn read_making(cache: &Cache, key: &Key, making: &Making) -> Recorded {
+    if let Err(error) = making.check(key) {
+        return Recorded::Broken(error.to_string());
+    }
+    read_so(cache, key, false)
+}
+
+/// [`read`], telling whether another makes it if `others`.
+fn read_so(cache: &Cache, key: &Key, others: bool) -> Recorded {
     let dir = key.dir(cache.dir());
     let index = match fs::read(dir.join(INDEX)) {
         Ok(index) => Some(built(cache, key, &index)),
@@ -155,7 +170,7 @@ pub fn read(cache: &Cache, key: &Key) -> Recorded {
         note_use(&dir);
         return Recorded::Built(Box::new(built), told);
     }
-    if being_made(cache, key) {
+    if others && being_made(cache, key) {
         return Recorded::Building;
     }
     if let Some(failed) = build::failed(&dir) {
@@ -501,6 +516,12 @@ mod tests {
             serde_json::json!({ "code": "build_failed" }),
         );
         remember_failure(&cache, &key, &failed, &making).expect("remembered");
+        // Its holder is told what is there, not its own lock.
+        assert!(matches!(read(&cache, &key), Recorded::Building));
+        assert!(matches!(
+            read_making(&cache, &key, &making),
+            Recorded::Failed(_)
+        ));
         drop(making);
         let Recorded::Failed(found) = read(&cache, &key) else {
             panic!("not failed");
