@@ -1990,6 +1990,26 @@ fn a_path_dependency_is_built_here_with_its_public_items() {
         followed["provenance"]["package_source"], "path",
         "{followed}"
     );
+    // The version given is the project's: its package, not the release of crates.io
+    // (requirement R-VR-1, decided in M2's D7).
+    let given = json!({ "crate": "libdep@0.1.0", "path": "Shown" });
+    let given = built_item(&mut server, 400, &given);
+    assert_eq!(
+        given["structuredContent"]["provenance"]["package_source"], "path",
+        "{given}"
+    );
+    assert!(given.to_string().contains("is the project's"), "{given}");
+    server.send(&call_tool(
+        500,
+        "resolve_version",
+        json!({ "crate": "libdep@0.1.0" }),
+    ));
+    let resolved = server.response(500)["result"]["structuredContent"].clone();
+    assert_eq!(resolved["provenance"]["source"], "project", "{resolved}");
+    assert!(
+        resolved.to_string().contains("is the project's"),
+        "{resolved}"
+    );
     assert!(server.finish().success());
 }
 
@@ -3271,6 +3291,8 @@ fn a_copy_of_a_crates_io_release_that_differs_is_built_here() {
         (1, json!({ "crate": "demo", "path": "Patched" })),
         (50, json!({ "crate": "patched_demo", "path": "Patched" })),
         (100, json!({ "crate": "app", "path": "Patched" })),
+        // The version given is the project's (requirement R-VR-1).
+        (150, json!({ "crate": "demo@0.1.0", "path": "Patched" })),
     ] {
         let found = built_item(&mut server, first, &arguments);
         assert_ne!(found["isError"], true, "{arguments}: {found}");
@@ -3294,6 +3316,9 @@ fn a_copy_of_a_crates_io_release_that_differs_is_built_here() {
                 .contains("differs from crates.io's"),
             "{found}"
         );
+        if arguments["crate"] == "demo@0.1.0" {
+            assert!(found.to_string().contains("is the project's"), "{found}");
+        }
     }
     let inside = built_item(
         &mut server,
@@ -3301,6 +3326,19 @@ fn a_copy_of_a_crates_io_release_that_differs_is_built_here() {
         &json!({ "crate": "demo", "path": "inside" }),
     );
     assert!(inside.to_string().contains("item_not_found"), "{inside}");
+    // By its lib's name too, the index is read by its package's; and with its version given.
+    for (id, krate) in [(300, "patched_demo"), (301, "demo@0.1.0")] {
+        server.send(&call_tool(id, "resolve_version", json!({ "crate": krate })));
+        let resolved = server.response(id)["result"]["structuredContent"].clone();
+        assert_eq!(
+            resolved["data"]["docs_rs_json"], "not_on_docs_rs",
+            "{resolved}"
+        );
+        assert!(
+            resolved.to_string().contains("differs from crates.io's"),
+            "{resolved}"
+        );
+    }
     assert!(server.finish().success());
 }
 

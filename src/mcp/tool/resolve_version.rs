@@ -60,8 +60,9 @@ pub(super) fn definition() -> Tool {
             "project": {
                 "type": "string",
                 "description": const_format::concatcp!("The workspace (its directory or Cargo.toml) whose Cargo.lock \
-                                decides the version when none is given. Defaults to the project \
-                                Claude Code was opened in.", super::PROJECT_IN_A_WORKTREE),
+                                decides the version when none is given, and whose package of an \
+                                exact version given is shown in place of crates.io's. Defaults to \
+                                the project Claude Code was opened in.", super::PROJECT_IN_A_WORKTREE),
             },
         },
         "required": ["crate"],
@@ -209,6 +210,29 @@ async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallTool
         ..
     } = arguments;
     let decided = match version {
+        // The project's package of the exact version given, if any (requirement R-VR-1, decided
+        // in M2's D7).
+        #[cfg(feature = "local")]
+        Some(VersionSpec::Exact(exact)) => {
+            let at = (&exact, &target);
+            let found = match get_item::explicit_found(
+                &state,
+                project.as_deref(),
+                &name,
+                at,
+                until,
+                &mut warnings,
+            )
+            .await
+            {
+                Ok(found) => found.map(|(found, _)| Box::new(found)),
+                Err(response) => return *response,
+            };
+            Decided {
+                spec: VersionSpec::Exact(exact),
+                found,
+            }
+        },
         Some(spec) => Decided {
             spec,
             #[cfg(feature = "local")]
@@ -245,9 +269,65 @@ async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallTool
     if let Some(found) = &decided.found
         && found.package.source != Source::CratesIo
     {
+        explicitly_the_projects(found, &mut warnings);
         return not_from_crates_io(found, &target, &warnings);
     }
     from_crates_io(&state, name, decided, &lookup, warnings).await
+}
+
+/// Warns that the project's package `found` of the exact version given is answered for, which
+/// may differ from the release of that name on crates.io (requirement R-VR-1, decided in M2's D7).
+#[cfg(feature = "local")]
+fn explicitly_the_projects(found: &Found, warnings: &mut Vec<Box<str>>) {
+    if found.resolved_from == ResolvedFrom::Explicit {
+        warnings.push(
+            format!(
+                "{} {} is the project's, which may differ from the release of that name on \
+                 crates.io",
+                found.package.name, found.package.version
+            )
+            .into(),
+        );
+    }
+}
+
+/// The name that the index has the project's package `found` of crates.io by, its package's; or
+/// the answer, when the index does not list its version, as a copy that docs.rs does not have, or
+/// when the index as last read does not and cannot be read again (requirement R-VR-2, decided in
+/// M2's D7).
+#[cfg(feature = "local")]
+async fn copy_in_project(
+    state: &ToolState,
+    found: &Found,
+    name: CrateName,
+    target: &TargetTriple,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<CrateName, Box<CallToolResult>> {
+    if found.package.source != Source::CratesIo {
+        return Ok(name);
+    }
+    let package_name = found.package.name.parse().unwrap_or(name);
+    match get_item::project_entry(state, &found.package, &package_name).await {
+        Ok(get_item::InIndex::Copy(DocsRsCheck::NotInIndex)) => {
+            explicitly_the_projects(found, warnings);
+            warnings.push(
+                format!(
+                    "the project's {}@{} is {}, so docs.rs does not have it",
+                    found.package.name,
+                    found.package.version,
+                    get_item::not_on_docs_rs(&found.package, DocsRsCheck::NotInIndex)
+                )
+                .into(),
+            );
+            Err(Box::new(not_from_crates_io(found, target, warnings)))
+        },
+        Ok(get_item::InIndex::Unlisted(entry)) => {
+            let what = format!("{} {}", entry.name, found.package.version);
+            Err(Box::new(get_item::stale_index_error(state, &what, &entry)))
+        },
+        // The index tells the rest, as before.
+        Ok(get_item::InIndex::Release(_) | get_item::InIndex::Copy(_)) | Err(_) => Ok(package_name),
+    }
 }
 
 /// The answer for a version on crates.io.
@@ -259,6 +339,16 @@ async fn from_crates_io(
     mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
     let target = &lookup.triple;
+    // By the package's name, read again past the cache when the index does not list its version
+    // (decided in M2's D7).
+    #[cfg(feature = "local")]
+    let name = match decided.found.as_deref() {
+        Some(found) => match copy_in_project(state, found, name, target, &mut warnings).await {
+            Ok(name) => name,
+            Err(response) => return *response,
+        },
+        None => name,
+    };
     let entry = match state.index.entry(&name).await {
         Ok(entry) => entry,
         Err(error) => return get_item::index_error(&state.cache, &name, &error),

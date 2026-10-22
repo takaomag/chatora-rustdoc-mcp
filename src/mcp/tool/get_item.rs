@@ -23,7 +23,7 @@ use super::{
 #[cfg(feature = "local")]
 use crate::data::{
     features::FeatureSets,
-    metadata::PackageId,
+    metadata::{self, PackageId},
     packages::{DocsRsCheck, Lookup as PackageLookup, PackageGraph, ProjectPackage, Source},
     project::Workspace,
 };
@@ -456,8 +456,9 @@ pub(super) fn definition() -> Tool {
             "project": {
                 "type": "string",
                 "description": const_format::concatcp!("The workspace (its directory or Cargo.toml) whose Cargo.lock \
-                                decides the version when none is given. Defaults to the project \
-                                Claude Code was opened in.", super::PROJECT_IN_A_WORKTREE),
+                                decides the version when none is given, and whose package of an \
+                                exact version given is shown in place of crates.io's. Defaults to \
+                                the project Claude Code was opened in.", super::PROJECT_IN_A_WORKTREE),
             },
             "path": {
                 "type": "string",
@@ -912,7 +913,7 @@ async fn member_in_project(
                 .map(Some)
         },
         (None, VersionSpec::Exact(version)) => {
-            explicit_member(
+            explicit_in_project(
                 state,
                 project,
                 name,
@@ -1045,7 +1046,7 @@ async fn copy_request(
 /// What the index tells of the project's package `package` of crates.io, the crate `name` there
 /// (requirement R-VR-2, decided in M2's D7).
 #[cfg(feature = "local")]
-enum InIndex {
+pub(super) enum InIndex {
     /// It is the release there, of this entry.
     Release(IndexEntry),
     /// It is not, as this tells.
@@ -1060,7 +1061,7 @@ enum InIndex {
 /// it may have been published since (requirement R-VR-2, decided in M2's D7). A crate that the
 /// index does not have at all is not the release, as of a private mirror.
 #[cfg(feature = "local")]
-async fn project_entry(
+pub(super) async fn project_entry(
     state: &ToolState,
     package: &ProjectPackage,
     name: &CrateName,
@@ -1165,6 +1166,226 @@ async fn entry_or_copy(
         },
         Err(error) => Err(Box::new(index_error(&state.cache, &package_name, &error))),
     }
+}
+
+/// The request for the crate `name` at the exact version `version` that the project that
+/// `project` names, or the default one, has (requirement R-VR-1, decided in M2's D7): a member's,
+/// built here; a copy of the release of crates.io, or a package not from crates.io, built here as
+/// a dependency, with a warning; or `None` for the release of crates.io, as asked. While cargo
+/// resolves the project, `status: building`, so that the answer does not change once it has.
+#[cfg(feature = "local")]
+async fn explicit_in_project(
+    state: &ToolState,
+    project: Option<&std::path::Path>,
+    name: &CrateName,
+    (version, path, target, shape): (&Version, &str, &TargetTriple, &Shape),
+    until: Instant,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<Option<Request>, Box<CallToolResult>> {
+    let explicit = (version, path, target, shape);
+    let found = explicit_found(state, project, name, (version, target), until, warnings).await?;
+    let Some((found, member)) = found else {
+        // None: the member at another version is told.
+        return explicit_member(state, project, name, explicit, until, warnings).await;
+    };
+    if member {
+        return explicit_found_member(state, &found, name, explicit, until, warnings).await;
+    }
+    let package = &found.package;
+    let check = if package.source == Source::CratesIo {
+        let package_name: CrateName = package.name.parse().unwrap_or_else(|_| name.clone());
+        match project_entry(state, package, &package_name).await {
+            Ok(InIndex::Copy(check)) => check,
+            // The release, or not known as the index cannot be read: as asked.
+            Ok(InIndex::Release(_) | InIndex::Unlisted(_)) | Err(_) => return Ok(None),
+        }
+    } else {
+        DocsRsCheck::NotCratesIo
+    };
+    let shape = (path, target, shape, check);
+    let request = copy_request(state, &found, name, shape, until, warnings).await?;
+    warnings.push(
+        format!(
+            "{name} {version} is the project's, built here, which may differ from the release of \
+             that name on crates.io"
+        )
+        .into(),
+    );
+    Ok(Some(request))
+}
+
+/// The request for the crate `name` of the workspace member `found`, of the exact version
+/// `version` given, built here, with a warning (requirement R-VR-1, decided in M2's D7): by its
+/// package, so that a lib's name or a bin finds it; or the error, as when `cargo metadata` failed,
+/// which does not leave the member to crates.io.
+#[cfg(feature = "local")]
+async fn explicit_found_member(
+    state: &ToolState,
+    found: &project::Found,
+    name: &CrateName,
+    (version, path, target, shape): (&Version, &str, &TargetTriple, &Shape),
+    until: Instant,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<Option<Request>, Box<CallToolResult>> {
+    let asked = local::Asked::Package {
+        name: &found.package.name,
+        version: &found.package.version,
+    };
+    let from = found.project_from;
+    match local::member(state, &found.workspace, (name, asked), target, until).await? {
+        Member::Is { wanted, package } => {
+            warnings.push(
+                format!(
+                    "{name} {version} is the workspace's member, built here, which may differ \
+                     from the release of that name on crates.io"
+                )
+                .into(),
+            );
+            Ok(Some(member_request(
+                &package,
+                wanted,
+                (name, path),
+                (target, shape),
+                (ResolvedFrom::Explicit, from, &found.workspace),
+                until,
+            )))
+        },
+        Member::Unknown(error) | Member::NotForTarget(error) => Err(error),
+        Member::Resolving(doing) => Err(Box::new(project::resolving_crate(
+            name,
+            target,
+            (doing, from),
+            warnings,
+        ))),
+        Member::Planning(doing) => Err(Box::new(project::planning_crate(
+            name,
+            target,
+            (doing, from),
+            warnings,
+        ))),
+        Member::OtherVersion(_) | Member::Not => Ok(None),
+    }
+}
+
+/// The project's package of the crate `name` at the exact version `version`, in the project that
+/// `project` names, or the default one, and whether it is a workspace member (requirement R-VR-1,
+/// decided in M2's D7): of several of that name and version, a member's, then the release of
+/// crates.io, then the one package not from crates.io, with a warning of the others. `None` when
+/// the project has none, or cannot be read; `status: building` for `target` while cargo resolves
+/// it, so that the answer does not change once it has.
+#[cfg(feature = "local")]
+pub(super) async fn explicit_found(
+    state: &ToolState,
+    project: Option<&std::path::Path>,
+    name: &CrateName,
+    (version, target): (&Version, &TargetTriple),
+    until: Instant,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<Option<(project::Found, bool)>, Box<CallToolResult>> {
+    // A project that cannot be read leaves the lookup to crates.io, as asked.
+    let Ok(Some((workspace, project_from))) = project::workspace(state.project.as_ref(), project)
+    else {
+        return Ok(None);
+    };
+    // Nor is cargo waited for when the project's Cargo.lock has no package of that name and
+    // version: a crate that the project does not use is looked up at once (a lib's name other
+    // than its package's is not told then).
+    if !metadata::lock_may_have(&workspace.root, name.as_str(), version).await {
+        return Ok(None);
+    }
+    let resolution = match state.resolver.resolve_until(&workspace, until).await {
+        Joined::Done(Ok(resolution)) => resolution,
+        Joined::Going(doing) => {
+            let from = (doing, project_from.as_str());
+            return Err(Box::new(project::resolving_crate(
+                name, target, from, warnings,
+            )));
+        },
+        Joined::Done(Err(_)) | Joined::Ended => return Ok(None),
+    };
+    let graph = PackageGraph::new(&resolution);
+    let Some(package) = explicit_package(&graph, name, version, warnings) else {
+        return Ok(None);
+    };
+    let member = graph.is_member(package);
+    let found = project::Found {
+        package: package.clone(),
+        resolved_from: ResolvedFrom::Explicit,
+        project_from: project_from.as_str(),
+        warnings: Vec::new(),
+        workspace,
+    };
+    Ok(Some((found, member)))
+}
+
+/// The package of the project `graph` of the crate `name` at `version`, by its package or its
+/// lib name, if any (requirement R-VR-1, decided in M2's D7): a member's, then the one from
+/// crates.io, then the one package not from crates.io. The others of that name and version are
+/// told in `warnings`.
+#[cfg(feature = "local")]
+fn explicit_package<'a>(
+    graph: &'a PackageGraph,
+    name: &CrateName,
+    version: &Version,
+    warnings: &mut Vec<Box<str>>,
+) -> Option<&'a ProjectPackage> {
+    let same: Vec<&ProjectPackage> = graph
+        .packages()
+        .iter()
+        .filter(|package| {
+            package.version == *version
+                && (same_crate_name(&package.name, name.as_str())
+                    || same_crate_name(&package.lib_name, name.as_str()))
+        })
+        .collect();
+    let elsewhere: Vec<&ProjectPackage> = same
+        .iter()
+        .copied()
+        .filter(|package| package.source != Source::CratesIo && !graph.is_member(package))
+        .collect();
+    let chosen = same
+        .iter()
+        .copied()
+        .find(|package| graph.is_member(package))
+        .or_else(|| {
+            same.iter()
+                .copied()
+                .find(|package| package.source == Source::CratesIo)
+        })
+        .or_else(|| elsewhere.first().copied().filter(|_| elsewhere.len() == 1));
+    let from = |other: &ProjectPackage| -> String {
+        if graph.is_member(other) {
+            "as a workspace member".to_owned()
+        } else if other.source == Source::CratesIo {
+            "from crates.io".to_owned()
+        } else {
+            not_on_docs_rs(other, DocsRsCheck::NotCratesIo).into_owned()
+        }
+    };
+    if chosen.is_none() && !same.is_empty() {
+        let all: Vec<String> = same.iter().map(|other| from(other)).collect();
+        warnings.push(
+            format!(
+                "the project has several packages of {name} {version} ({}), so the release of \
+                 that name on crates.io is looked up",
+                all.join("; ")
+            )
+            .into(),
+        );
+    }
+    for other in same
+        .iter()
+        .filter(|other| chosen.is_some_and(|chosen| chosen != **other))
+    {
+        let told = format!(
+            "the project has {} {} {} too",
+            other.name,
+            other.version,
+            from(other)
+        );
+        warnings.push(told.into());
+    }
+    chosen
 }
 
 /// The request for the crate `name` at the exact version that `explicit` gives, with the path,
@@ -1648,7 +1869,11 @@ fn cached_exact(
 /// The error for `what`, a version of the crate of `entry`, which the index, as last read, does
 /// not list, when it could not be read again (`entry.stale` tells why): the version may be newer
 /// (requirements R-CA-3 and R-CA-7).
-fn stale_index_error(state: &ToolState, what: &str, entry: &IndexEntry) -> CallToolResult {
+pub(super) fn stale_index_error(
+    state: &ToolState,
+    what: &str,
+    entry: &IndexEntry,
+) -> CallToolResult {
     let why = entry.stale.as_deref().unwrap_or_default();
     let message = format!("{what} is not in the crates.io index as last read: {why}");
     if state.index.is_offline() {
@@ -1712,8 +1937,8 @@ fn local_build_required(package: &ProjectPackage, check: DocsRsCheck) -> CallToo
         ),
         "retryable": false,
         "suggestions": [
-            "give the version, as crate@version, to read the crates.io release of that name on \
-             docs.rs, which may differ from the project's",
+            "to read the release of that name on crates.io, which may differ from the \
+             project's, give its version and, as \"project\", a directory outside the project",
         ],
         "reason": "local_build_required",
     }))

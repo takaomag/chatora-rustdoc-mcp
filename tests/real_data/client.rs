@@ -105,12 +105,21 @@ impl Client {
         response["result"].take()
     }
 
-    /// Calls `tool` with `arguments`. A result is checked against the tool's `outputSchema`.
+    /// Calls `tool` with `arguments`, with the target of the data if they name none (but for
+    /// std). A result is checked against the tool's `outputSchema`.
     pub(crate) fn call(&mut self, tool: &str, arguments: &Value) -> Answer {
-        let result = self.request(
-            "tools/call",
-            json!({ "name": tool, "arguments": arguments }),
-        );
+        let arguments = with_data_target(arguments);
+        let call = json!({ "name": tool, "arguments": arguments });
+        let mut result = self.request("tools/call", call.clone());
+        // While the work it needs goes on, as cargo resolving the project on a slow runner, the
+        // answer comes again (requirement R-OUT-9): within a few minutes.
+        for _ in 0..30 {
+            if result["structuredContent"]["status"] != "building" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            result = self.request("tools/call", call.clone());
+        }
         if result["isError"] == true {
             let mut error: Value = result["content"][0]["text"]
                 .as_str()
@@ -131,4 +140,33 @@ impl Client {
         drop(self.stdin.take());
         assert!(self.child.wait().expect("the server exits").success());
     }
+}
+
+/// The target of the data, which docs.rs builds most releases for alone since 2026-05-01: the
+/// same on every OS, so that the answers do not depend on the host's (decided in M2's D7). Which
+/// target a lookup without one takes is tested in `tests/stdio.rs`.
+const DATA_TARGET: &str = "x86_64-unknown-linux-gnu";
+
+/// `arguments` with `target` set to [`DATA_TARGET`] if they have none, but for a crate of std,
+/// which this server reads for the host from the Rust distribution on every OS.
+fn with_data_target(arguments: &Value) -> Value {
+    let mut arguments = arguments.clone();
+    let of_std = arguments
+        .get("crate")
+        .and_then(Value::as_str)
+        .map(|krate| krate.split('@').next().unwrap_or(krate))
+        .map(|name| name.to_ascii_lowercase().replace('-', "_"))
+        .is_some_and(|name| {
+            matches!(
+                name.as_str(),
+                "std" | "core" | "alloc" | "proc_macro" | "test"
+            )
+        });
+    if let Some(fields) = arguments.as_object_mut()
+        && !of_std
+        && !fields.contains_key("target")
+    {
+        fields.insert("target".to_owned(), json!(DATA_TARGET));
+    }
+    arguments
 }

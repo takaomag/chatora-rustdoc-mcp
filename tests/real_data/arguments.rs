@@ -14,7 +14,8 @@ use crate::{
 const TOKIO: &str = "tokio@1.53.3";
 const AXUM: &str = "axum@0.8.9";
 
-/// Another target than the host's, whose JSON is not in the test data.
+/// Another target than that of the test data (the client's `DATA_TARGET`), whose JSON is not in
+/// it.
 const OTHER_TARGET: &str = "x86_64-pc-windows-msvc";
 
 /// A workspace inside the default project (this package) that is not part of it.

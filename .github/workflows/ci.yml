@@ -73,7 +73,8 @@ jobs:
 
   # testdata/docs-rs-json.txt の docs.rs の JSON を取ってキャッシュし、実データのテスト (#[ignore]) を回す
   # (doc/m1-plan.md の P3)。一覧が変わらない限り、docs.rs から取り直さない。
-  # 3 つの OS で回す (doc/m2-plan.md の A4b)。照会の多くは target を省くので、ホストの target の文書を引く。
+  # 3 つの OS で回す (doc/m2-plan.md の A4b)。実データのテストは target を省いた照会に Linux の target を
+  # 足し、どの OS でも同じ文書を引く (D7d)。
   testdata:
     strategy:
       fail-fast: false
@@ -106,11 +107,10 @@ jobs:
       # 実データでの動作の検査 (tests/real_data): 決定性 (要件 R-ARCH-5)、引数ごとに値を変えると結果が
       # 変わること、説明文が約束する問いに答えられること (R-QA-5)。応答は outputSchema で検証する。
       # 上の testdata の JSON と std を使い、足りないもの (index、.crate など) はネットワークから取る。
-      # 照会の多くは target を省くので、ホストの target の文書を引く。docs.rs は 2026-05-01 以降の多くの
-      # リリースで Linux の target の JSON しか作らないので、macOS と Windows では no_target_json で落ちる。
-      # ローカルビルド (doc/m2-plan.md の D7) が入るまで Linux だけで回す (A4b)。
-      - if: runner.os == 'Linux'
-        run: cargo test --locked --release --test real_data -- --ignored
+      # docs.rs は 2026-05-01 以降の多くのリリースで Linux の target の JSON しか作らないので、テストの
+      # クライアントが target を省いた照会に Linux の target を足し、3 つの OS で同じデータを引く
+      # (std を除く。doc/m2-plan.md の D7d)。
+      - run: cargo test --locked --release --test real_data -- --ignored
 
   # toml の整形 (.taplo.toml) と Markdown の lint (.markdownlint.jsonc)。
   config-lint:

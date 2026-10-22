@@ -1042,6 +1042,22 @@ async fn read_inputs(root: &Path, files: Vec<PathBuf>) -> Option<Inputs> {
     .flatten()
 }
 
+/// Whether the Cargo.lock of the workspace at `root` may have the package `name` at `version`.
+///
+/// It is read directly, without waiting for `cargo metadata`, by the package's name, with `-` and
+/// `_` and the case not told apart. `true` when it cannot be read, as nothing then tells it has
+/// not (decided in M2's D7, for a version given, which waits for cargo only when it may).
+pub async fn lock_may_have(root: &Path, name: &str, version: &Version) -> bool {
+    let Ok((_, Ok(lock))) = read_lock(root).await else {
+        return true;
+    };
+    let normalized = |name: &str| name.replace('-', "_").to_ascii_lowercase();
+    let wanted = normalized(name);
+    lock.packages
+        .iter()
+        .any(|package| package.version == *version && normalized(&package.name) == wanted)
+}
+
 /// The text of the Cargo.lock of the workspace at `root`, and what it reads as.
 async fn read_lock(root: &Path) -> io::Result<(String, Result<CargoLock, toml::de::Error>)> {
     let path = root.join("Cargo.lock");
@@ -1068,6 +1084,22 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    #[tokio::test]
+    async fn the_lock_is_read_directly_for_a_package_of_a_version() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let version = |version: &str| Version::parse(version).expect("a version");
+        // Not readable: it may have it.
+        assert!(lock_may_have(dir.path(), "serde", &version("1.0.0")).await);
+        fs::write(
+            dir.path().join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"tokio-util\"\nversion = \"0.7.1\"\n",
+        )
+        .expect("written");
+        assert!(lock_may_have(dir.path(), "Tokio_Util", &version("0.7.1")).await);
+        assert!(!lock_may_have(dir.path(), "tokio-util", &version("0.7.2")).await);
+        assert!(!lock_may_have(dir.path(), "serde", &version("0.7.1")).await);
+    }
 
     #[test]
     fn a_package_id_of_either_format_tells_its_name_and_version() {

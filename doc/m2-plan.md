@@ -1255,6 +1255,36 @@ Claude Code 2.1.304、Linux で測った。
   - (7) 印 (`docs_rs_default`) をここでビルドする要求にも付けていた。docs.rs の照会だけに付ける
 - 残したもの: `resolve_version` と `list_crates` の provenance の `target` は host のまま (読む JSON が無い)。(8) `get_item` の cargo の解決中の応答には host の `target` が載り、`crate` なしの検索の解決中は省く (どちらもスキーマには合う)。`list_crates`・ビルド中の応答・refresh で既定の target の失敗を忘れることの結合テストは無い
 
+**D7d の下調べと決定 (2026-10-22)**:
+
+- `real_data` (tests/real_data) は、このリポジトリをプロジェクトにして testdata の版 (`clap@4.5.39` など、プロジェクトの依存でない) を target を省いて引くので、macOS・Windows では host の target の JSON が docs.rs に無く `no_target_json` になる。D7b-3 の戻しはプロジェクトの依存だけなので効かない。R-TG-1 は docs.rs で別の target の文書で代用しない
+- 利用者が決めたこと:
+  1. D7 の終わりの印「3 つの OS で `real_data` が通る」は、照会に Linux の target を明示して満たす。テストのクライアント (`tests/real_data/client.rs` の `with_data_target`) が、`target` の無い照会に `x86_64-unknown-linux-gnu` を足す (std の crate には足さない。std は配布物から host の target で読み、3 つの OS で通っている)。target の選び方は stdio のテストが守る。CI の `testdata` の job の `real_data` の Linux だけの条件を外した
+- 下調べ (サブエージェント、読むだけ): `crate` なしの検索は範囲が直接依存だけで member を含まず、crates.io でない依存は `unavailable`、crates.io の依存は照合しない。同じ workspace のビルドは target dir のロックで 1 つずつ。明示した版がプロジェクトの path・git・別レジストリの依存と同じ版なら crates.io の同名を warning 無しで返す (R-VR-1 に反する)、写しなら docs.rs の release を warning 付きで返す、`cargo metadata` の解決中は黙って crates.io。`resolve_version` は明示した版でプロジェクトを見ず、照合 (`project_entry`) も使わず、問い合わせの名前で index を引く
+- 段の分け方 (聞かずに決めたこと): D7d-1 (`real_data`・明示した版・`resolve_version`)、D7d-2 (`crate` なしの検索)
+- 利用者が決めたこと (続き):
+  2. R-VR-1 (明示した版がプロジェクトの版と同じならプロジェクトの取得元のものを返して warning) は、版を完全一致で書いたときだけ。semver の要件と latest は crates.io の版を決める問いなので今のまま
+  3. 同じ名前・同じ版の package が複数あるときは、member → crates.io の release (checksum が一致) → ひとつに決まる crates.io でない package の順に選び、ほかにもあることを warnings に書く
+  4. 版を明示した照会で `cargo metadata` が期限を過ぎて解決中なら `status: building` (答えを揺らさない。member も)
+  5. 「crate@version で crates.io の release を読める」の提案は消し、crates.io の同名を引くにはプロジェクトの外で引くよう案内する (引数は足さない)
+  6. `resolve_version`: プロジェクトの crates.io の package が写しなら `data.source` は crates.io のまま `docs_rs_json: not_on_docs_rs` と warning (index に無ければ `latest` などは省く)。明示した版が path・git・member と同じなら、今の `not_from_crates_io` の形 (`source: project` と warning)。スキーマは増やさない
+
+**D7d-1 (`real_data` を 3 つの OS で・明示した版・`resolve_version`。2026-10-22)**:
+
+- `real_data`: 決定 1 のとおり (テストのクライアントの `with_data_target`、CI の条件を外した)。手元は Linux なので効き目は CI の macOS・Windows で確かめる
+- 明示した版 (`get_item`、R-VR-1。決定 2〜5): 版を完全一致で書いたとき、`explicit_found` がプロジェクトを解決し (期限を過ぎて解決中なら `status: building`)、`explicit_package` が同じ名前 (package 名か lib 名) と版の package を member → crates.io の package → ひとつに決まる crates.io でない package の順に選び、ほかを warnings に書く。member は今までどおり (`explicit_member`)、crates.io の package は照合して写しならローカルでビルド (`copy_request`)、release なら docs.rs、crates.io でない package は依存としてローカルでビルドし、どれも「プロジェクトのもので crates.io の同名と違いうる」warning。プロジェクトに無ければ今までどおり (別の版の member は warning)
+- `local_build_required` の「crate@version で crates.io の release を読む」提案は、版を書いてもプロジェクトの外の `project` を渡すよう案内に変えた (決定 5)
+- `resolve_version` (決定 6): 完全一致の版も `explicit_found` でプロジェクトの package を探し、crates.io でない package と member は `source: project` の形と R-VR-1 の warning。Cargo.lock が決めた (または明示した) crates.io の package は package 名で照合し (`project_entry` を get_item から共有)、index に無い版なら `source: project`・`docs_rs_json: not_on_docs_rs`・理由の warning、index が古くて読めなければ `stale_index_error`、それ以外は index を package 名で読む (lib 名で引いても別の crate の index を読まない)
+- テスト: stdio の path 依存のテストに `libdep@0.1.0` を明示した `get_item` (`package_source: path` と R-VR-1 の warning) と `resolve_version` (`source: project`)。写しのテストに `demo@0.1.0` の `get_item` (写しのビルド) と lib 名 (`patched_demo`) の `resolve_version` (`not_on_docs_rs`)。明示した版の扱いを外すと両方、`resolve_version` を package 名で引くのをやめると写しのテストが落ちることを確かめた
+- レビュー (サブエージェント) の指摘と直し:
+  - (2) 版を明示した照会が、プロジェクトに無い crate でも `cargo metadata` の解決を待ち `status: building` になっていた (`resolve_version` は前はすぐ答えた)。待つ前に Cargo.lock を直に読み (`metadata::lock_may_have`)、その名前 (package 名、`-` と `_` と大小を区別しない) と版が無ければ待たずに crates.io へ (lib 名で引くときは R-VR-1 を当てない割り切り)。`real_data` のクライアントは `status: building` なら 5 秒おきに呼び直す (遅い runner で `cargo metadata` が期限を越えても揺れない)
+  - (3・5) 選んだ package が member なら、その package 名で引く (`explicit_found_member`)。Cargo.lock の直読みのとき path 依存が member とみなされて黙って crates.io に流れていたのは、`cargo metadata` の失敗を返すようになった。lib の無い member や同じ lib 名の member も選んだものを引く
+  - (4) 同じ名前・同じ版の crates.io でない package が複数で選べないとき、「too」ではなく「several packages …, so the release of that name on crates.io is looked up」と書く
+  - (7) 古いコメントと説明文 (ci.yml、`real_data` の `OTHER_TARGET` と determinism、`get_item`・`resolve_version` の `project` の説明に「完全一致の版のプロジェクトの package を crates.io のものの代わりに」)
+  - (8) `real_data` のクライアントの std の判定を、大小と `-` を区別しない形に
+  - (9) 写しのテストに、`demo@0.1.0` の R-VR-1 の warning と、`resolve_version` の `demo@0.1.0` (`not_on_docs_rs`)。`lock_may_have` の単体テスト
+- 残したもの: (1) lib 名と版で引いて release のとき、crates.io を lib 名で引く (前から。`resolve_version` は package 名で答えるので食い違う)。(6) 写しの経路で `copy_request` の warning と R-VR-1 の warning がほぼ重なる。明示した版で解決中の `status: building`・`cargo_lock_raw`・同名同版が複数の結合テストは無い。「プロジェクトの外の `project`」の案内で crates.io の release が引けることは、レビューでコードを追って確かめた (結合テストは無い。`refresh` はそのとき効かない)
+
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
 - 利用者の指示で、デッドロックと止まって戻らない危険を、コード全体で監査した (サブエージェント、読むだけ。D4b のハングの後)。ロックの循環、ガードを持ったままの `.await` (clippy の `await_holding_lock` も `suspicious` の deny で効いている)、自分の結果を待つ形の循環は無かった。止まって長く戻らない箇所は次のとおり
