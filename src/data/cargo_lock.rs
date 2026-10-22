@@ -1,6 +1,8 @@
 //! Cargo.lock read as data: the packages and their checksums, which `cargo metadata` does not
 //! report, and the fallback when `cargo metadata` fails (`cargo_lock_raw`, requirement R-VR-2).
 
+use std::collections::HashMap;
+
 use semver::Version;
 use serde::Deserialize;
 
@@ -23,8 +25,8 @@ pub struct LockedPackage {
     /// a path dependency and a workspace member.
     #[serde(default)]
     pub source: Option<Box<str>>,
-    /// The SHA-256 of the `.crate` file, for a registry package. Cargo.lock version 1, which kept
-    /// the checksums in a table of their own, has none here.
+    /// The SHA-256 of the `.crate` file, for a registry package. Cargo.lock version 1 keeps it in
+    /// a table of its own, `[metadata]`, which [`CargoLock::parse`] reads it from.
     #[serde(default)]
     pub checksum: Option<Box<str>>,
     /// The packages it depends on, as `name`, `name version` or `name version (source)`: only as
@@ -38,6 +40,10 @@ pub struct LockedPackage {
 struct File {
     #[serde(default)]
     package: Box<[LockedPackage]>,
+    /// Of Cargo.lock version 1: the checksums, as `"checksum <name> <version> (<source>)" =
+    /// "<sha256>"`, or `"<none>"` for a package without one.
+    #[serde(default)]
+    metadata: HashMap<Box<str>, Box<str>>,
 }
 
 impl CargoLock {
@@ -47,10 +53,25 @@ impl CargoLock {
     ///
     /// Returns an error when the text is not TOML in the form of a Cargo.lock.
     pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
-        let file: File = toml::from_str(text)?;
-        Ok(Self {
-            packages: file.package,
-        })
+        let File {
+            mut package,
+            metadata,
+        } = toml::from_str(text)?;
+        // Cargo.lock version 1 (decided in M2's D7).
+        for locked in &mut package {
+            if locked.checksum.is_some() {
+                continue;
+            }
+            let Some(source) = &locked.source else {
+                continue;
+            };
+            let key = format!("checksum {} {} ({source})", locked.name, locked.version);
+            locked.checksum = metadata
+                .get(key.as_str())
+                .filter(|checksum| &***checksum != "<none>")
+                .cloned();
+        }
+        Ok(Self { packages: package })
     }
 }
 
@@ -89,6 +110,41 @@ checksum = "0123"
         assert_eq!(app.dependencies.len(), 2);
         assert_eq!(serde.version, Version::new(1, 0, 229));
         assert_eq!(serde.checksum.as_deref(), Some("0123"));
+    }
+
+    #[test]
+    fn the_checksums_of_version_1_are_read_from_its_metadata() {
+        let lock = CargoLock::parse(
+            r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "serde 1.0.229 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "serde"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "none"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[metadata]
+"checksum serde 1.0.229 (registry+https://github.com/rust-lang/crates.io-index)" = "0123"
+"checksum none 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)" = "<none>"
+"#,
+        )
+        .expect("a Cargo.lock");
+        let [app, serde, none] = &*lock.packages else {
+            panic!("three packages: {lock:?}");
+        };
+        assert_eq!(app.checksum, None);
+        assert_eq!(serde.checksum.as_deref(), Some("0123"));
+        assert_eq!(none.checksum, None);
     }
 
     #[test]

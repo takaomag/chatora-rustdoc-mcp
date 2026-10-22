@@ -891,7 +891,8 @@ async fn in_member(
     // A git or another registry's package is no member, which a member of its name and version
     // must not be taken for (decided in M2's D7).
     if found.package.source != Source::Local {
-        return dependency_request(state, found, name, (path, target, shape), until).await;
+        let check = DocsRsCheck::NotCratesIo;
+        return dependency_request(state, found, name, (path, target, shape, check), until).await;
     }
     let asked = local::Asked::Package {
         name: &found.package.name,
@@ -922,7 +923,8 @@ async fn in_member(
         // A dependency that docs.rs does not have, built here, which may have the name of a member
         // at another version (decided in M2's D7).
         Member::OtherVersion(_) | Member::Not => {
-            dependency_request(state, found, name, (path, target, shape), until).await
+            let check = DocsRsCheck::NotCratesIo;
+            dependency_request(state, found, name, (path, target, shape, check), until).await
         },
     }
 }
@@ -934,7 +936,7 @@ async fn dependency_request(
     state: &ToolState,
     found: &project::Found,
     name: &CrateName,
-    (path, target, shape): (&str, &TargetTriple, &Shape),
+    (path, target, shape, check): (&str, &TargetTriple, &Shape, DocsRsCheck),
     until: Instant,
 ) -> Result<Request, Box<CallToolResult>> {
     match local::dependency(state, &found.workspace, &found.package, target, until).await? {
@@ -959,10 +961,155 @@ async fn dependency_request(
             (doing, found.project_from),
             &[],
         ))),
-        Member::OtherVersion(_) | Member::Not => Err(Box::new(local_build_required(
-            &found.package,
-            DocsRsCheck::NotCratesIo,
-        ))),
+        Member::OtherVersion(_) | Member::Not => {
+            Err(Box::new(local_build_required(&found.package, check)))
+        },
+    }
+}
+
+/// The request for the project's package `found` of crates.io, which docs.rs does not have, as
+/// `check` tells: built here as a dependency, with a warning that tells why (requirement R-VR-2,
+/// decided in M2's D7).
+#[cfg(feature = "local")]
+async fn copy_request(
+    state: &ToolState,
+    found: &project::Found,
+    name: &CrateName,
+    (path, target, shape, check): (&str, &TargetTriple, &Shape, DocsRsCheck),
+    until: Instant,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<Request, Box<CallToolResult>> {
+    let why = format!(
+        "{}@{} in the project is {}, so docs.rs does not have it",
+        found.package.name,
+        found.package.version,
+        not_on_docs_rs(&found.package, check)
+    );
+    let request = dependency_request(state, found, name, (path, target, shape, check), until)
+        .await
+        .map_err(|result| Box::new(told_why(*result, &why)))?;
+    warnings.push(format!("{why}, and it is built here").into());
+    Ok(request)
+}
+
+/// What the index tells of the project's package `package` of crates.io, the crate `name` there
+/// (requirement R-VR-2, decided in M2's D7).
+#[cfg(feature = "local")]
+enum InIndex {
+    /// It is the release there, of this entry.
+    Release(IndexEntry),
+    /// It is not, as this tells.
+    Copy(DocsRsCheck),
+    /// The index, as last read, as it could not be read again, does not list its version, which
+    /// may have been published since: the entry.
+    Unlisted(IndexEntry),
+}
+
+/// What the index tells of the project's package `package` of crates.io, the crate `name` there.
+/// When the index does not list its version, or the crate, it is read again past the cache, as
+/// it may have been published since (requirement R-VR-2, decided in M2's D7). A crate that the
+/// index does not have at all is not the release, as of a private mirror.
+#[cfg(feature = "local")]
+async fn project_entry(
+    state: &ToolState,
+    package: &ProjectPackage,
+    name: &CrateName,
+) -> Result<InIndex, IndexError> {
+    let entry = match state.index.entry(name).await {
+        Ok(entry) => entry,
+        Err(IndexError::NotFound) => match state.index.entry_fresh(name).await {
+            Ok(entry) => entry,
+            Err(IndexError::NotFound) => return Ok(InIndex::Copy(DocsRsCheck::NotInIndex)),
+            Err(error) => return Err(error),
+        },
+        Err(error) => return Err(error),
+    };
+    let entry = match package.docs_rs_check(&entry) {
+        DocsRsCheck::NotInIndex => state.index.entry_fresh(name).await?,
+        DocsRsCheck::Allowed
+        | DocsRsCheck::NotCratesIo
+        | DocsRsCheck::NoChecksum
+        | DocsRsCheck::ChecksumMismatch => entry,
+    };
+    Ok(match package.docs_rs_check(&entry) {
+        DocsRsCheck::Allowed => InIndex::Release(entry),
+        // As a version missing from an old index (requirement R-CA-3).
+        DocsRsCheck::NotInIndex if entry.stale.is_some() => InIndex::Unlisted(entry),
+        check @ (DocsRsCheck::NotCratesIo
+        | DocsRsCheck::NoChecksum
+        | DocsRsCheck::NotInIndex
+        | DocsRsCheck::ChecksumMismatch) => InIndex::Copy(check),
+    })
+}
+
+/// `result`, an error or the response while cargo works, with why docs.rs is not used, `why`, in
+/// its message or warnings (decided in M2's D7).
+#[cfg(feature = "local")]
+fn told_why(result: CallToolResult, why: &str) -> CallToolResult {
+    if let Some(mut response) = result.structured_content {
+        add_warnings(&mut response, &[why.into()]);
+        return CallToolResult::structured(response);
+    }
+    let body = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .and_then(|text| serde_json::from_str::<Map<String, Value>>(&text.text).ok());
+    let Some(mut body) = body else {
+        return result;
+    };
+    if let Some(message) = body.get("message").and_then(Value::as_str) {
+        let message = format!("{why}; {message}");
+        body.insert("message".to_owned(), json!(message));
+    }
+    error_result(&Value::Object(body))
+}
+
+/// The index entry of the crate `name`, or the error to return.
+async fn index_entry(
+    state: &ToolState,
+    name: &CrateName,
+) -> Result<IndexEntry, Box<CallToolResult>> {
+    state
+        .index
+        .entry(name)
+        .await
+        .map_err(|error| Box::new(index_error(&state.cache, name, &error)))
+}
+
+/// The index entry of the crate `name`; or, for the project's package `found` that is not the
+/// release of crates.io, the request for it built here (requirement R-VR-2, decided in M2's D7).
+#[cfg(feature = "local")]
+async fn entry_or_copy(
+    state: &ToolState,
+    from_project: Option<&project::Found>,
+    name: &CrateName,
+    (path, target, shape): (&str, &TargetTriple, &Shape),
+    until: Instant,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<Result<IndexEntry, Request>, Box<CallToolResult>> {
+    let Some(found) = from_project else {
+        return index_entry(state, name).await.map(Ok);
+    };
+    // By the package's name: a lib name or a rename may have found it (requirement R-PR-4).
+    let package_name: CrateName = found.package.name.parse().unwrap_or_else(|_| name.clone());
+    match project_entry(state, &found.package, &package_name).await {
+        Ok(InIndex::Release(entry)) => Ok(Ok(entry)),
+        Ok(InIndex::Copy(check)) => copy_request(
+            state,
+            found,
+            name,
+            (path, target, shape, check),
+            until,
+            warnings,
+        )
+        .await
+        .map(Err),
+        Ok(InIndex::Unlisted(entry)) => {
+            let what = format!("{} {}", entry.name, found.package.version);
+            Err(Box::new(stale_index_error(state, &what, &entry)))
+        },
+        Err(error) => Err(Box::new(index_error(&state.cache, &package_name, &error))),
     }
 }
 
@@ -1126,20 +1273,25 @@ async fn resolve(
             warnings,
         ));
     }
-    let entry = state
-        .index
-        .entry(&name)
-        .await
-        .map_err(|error| Box::new(index_error(&state.cache, &name, &error)))?;
-    warnings.extend(entry.stale.clone());
-    // docs.rs has the project's package only if it is the one on crates.io (requirement R-VR-2).
+    // docs.rs has the project's package only if it is the one on crates.io; else it is built here
+    // (requirement R-VR-2, decided in M2's D7).
     #[cfg(feature = "local")]
-    if let Some(found) = &from_project {
-        let check = found.package.docs_rs_check(&entry);
-        if check != DocsRsCheck::Allowed {
-            return Err(Box::new(local_build_required(&found.package, check)));
-        }
-    }
+    let entry = match entry_or_copy(
+        state,
+        from_project.as_deref(),
+        &name,
+        (&path, &target, &shape),
+        until,
+        &mut warnings,
+    )
+    .await?
+    {
+        Ok(entry) => entry,
+        Err(request) => return Ok((request, warnings)),
+    };
+    #[cfg(not(feature = "local"))]
+    let entry = index_entry(state, &name).await?;
+    warnings.extend(entry.stale.clone());
     let resolved = spec
         .resolve(&entry.versions)
         .map_err(|no_version| Box::new(version_not_found(state, &entry, &spec, &no_version)))?;
@@ -1374,6 +1526,33 @@ fn cached_exact(
 }
 
 /// `version_not_found` (§8), with the versions to suggest.
+/// The error for `what`, a version of the crate of `entry`, which the index, as last read, does
+/// not list, when it could not be read again (`entry.stale` tells why): the version may be newer
+/// (requirements R-CA-3 and R-CA-7).
+fn stale_index_error(state: &ToolState, what: &str, entry: &IndexEntry) -> CallToolResult {
+    let why = entry.stale.as_deref().unwrap_or_default();
+    let message = format!("{what} is not in the crates.io index as last read: {why}");
+    if state.index.is_offline() {
+        let suggestions = entry.name.parse::<CrateName>().map_or_else(
+            |_| Vec::new(),
+            |name| offline_suggestions(&state.cache, &name),
+        );
+        error_result(&json!({
+            "code": "offline_miss",
+            "message": message,
+            "retryable": false,
+            "suggestions": suggestions,
+        }))
+    } else {
+        error_result(&json!({
+            "code": "network_error",
+            "message": message,
+            "retryable": true,
+            "suggestions": ["try again in a while"],
+        }))
+    }
+}
+
 pub(super) fn version_not_found(
     state: &ToolState,
     entry: &IndexEntry,
@@ -1383,27 +1562,8 @@ pub(super) fn version_not_found(
     let name = &entry.name;
     // An index file read long ago may lack the version, which may be newer (requirements R-CA-3
     // and R-CA-7).
-    if let Some(stale) = &entry.stale {
-        let message = format!("{name} {spec} is not in the crates.io index as last read: {stale}");
-        return if state.index.is_offline() {
-            let suggestions = name.parse::<CrateName>().map_or_else(
-                |_| Vec::new(),
-                |name| offline_suggestions(&state.cache, &name),
-            );
-            error_result(&json!({
-                "code": "offline_miss",
-                "message": message,
-                "retryable": false,
-                "suggestions": suggestions,
-            }))
-        } else {
-            error_result(&json!({
-                "code": "network_error",
-                "message": message,
-                "retryable": true,
-                "suggestions": ["try again in a while"],
-            }))
-        };
+    if entry.stale.is_some() {
+        return stale_index_error(state, &format!("{name} {spec}"), entry);
     }
     error_result(&json!({
         "code": "version_not_found",
@@ -1419,20 +1579,16 @@ pub(super) fn version_not_found(
 }
 
 /// `docs_unavailable` with `reason: local_build_required`: the project's package is not the one
-/// on crates.io, and this server does not build it: a dependency without a lib, or a copy of a
-/// crates.io release yet (decided in M1, and in M2's D2 and D7, until D7b).
+/// on crates.io, as `check` tells, and this server does not build it, as it has no lib (decided
+/// in M1, and in M2's D2 and D7).
 #[cfg(feature = "local")]
 fn local_build_required(package: &ProjectPackage, check: DocsRsCheck) -> CallToolResult {
     let why = not_on_docs_rs(package, check);
-    let not_built = if check == DocsRsCheck::NotCratesIo {
-        "it has no lib that this server documents"
-    } else {
-        "this server does not build such a copy yet"
-    };
     error_result(&json!({
         "code": "docs_unavailable",
         "message": format!(
-            "{}@{} in the project is {why}, so docs.rs does not have it, and {not_built}",
+            "{}@{} in the project is {why}, so docs.rs does not have it, and it has no lib that \
+             this server documents",
             package.name, package.version
         ),
         "retryable": false,
@@ -2355,7 +2511,7 @@ async fn destination_request(
     warnings: &mut Vec<Box<str>>,
 ) -> Result<Request, Box<CallToolResult>> {
     #[cfg(feature = "local")]
-    if let Some(found) = in_project_destination(state, destination, origin).await {
+    if let Some(found) = in_project_destination(state, destination, origin, warnings).await {
         return found;
     }
     let (name, version, resolved_from, index_fetched_at) =
@@ -2435,6 +2591,7 @@ async fn in_project_destination(
     state: &ToolState,
     destination: &Destination,
     origin: &Request,
+    warnings: &mut Vec<Box<str>>,
 ) -> Option<Result<Request, Box<CallToolResult>>> {
     let in_build = in_project_build(state, destination, origin).await;
     // A glob of a member goes on into another member only (decided in M2's D6).
@@ -2460,14 +2617,30 @@ async fn in_project_destination(
         ))));
     }
     match in_build {
-        InProjectBuild::Release(request) => Some(Ok(*request)),
+        InProjectBuild::Release(request, package) => Some(
+            release_destination(state, (*request, &package), destination, origin, warnings).await,
+        ),
         // Another workspace member, or a dependency of the project that is not from crates.io,
         // built here (decided in M2's D6 and D7).
         InProjectBuild::Member(package, workspace) => Some(
-            built_here_destination(state, (&package, true), &workspace, destination, origin).await,
+            built_here_destination(
+                state,
+                (&package, true, DocsRsCheck::NotCratesIo),
+                &workspace,
+                destination,
+                origin,
+            )
+            .await,
         ),
         InProjectBuild::Dependency(package, workspace) => Some(
-            built_here_destination(state, (&package, false), &workspace, destination, origin).await,
+            built_here_destination(
+                state,
+                (&package, false, DocsRsCheck::NotCratesIo),
+                &workspace,
+                destination,
+                origin,
+            )
+            .await,
         ),
         // From a crate of docs.rs: not the crate of that name on crates.io, which it was built
         // with, and not a member.
@@ -2487,8 +2660,9 @@ async fn in_project_destination(
 /// The crate that the path goes on in, in the project's build.
 #[cfg(feature = "local")]
 enum InProjectBuild {
-    /// The request for it at its version there, a release of crates.io.
-    Release(Box<Request>),
+    /// The request for it at its version there, a release of crates.io, and the project's
+    /// package, which may be a copy of it.
+    Release(Box<Request>, Box<ProjectPackage>),
     /// It is a workspace member, of the workspace.
     Member(Box<ProjectPackage>, Box<Workspace>),
     /// It is a dependency of the project that is not from crates.io, of the workspace, from a
@@ -2589,26 +2763,81 @@ async fn in_project_build_of(
             package.name, package.version
         )));
     }
-    Some(InProjectBuild::Release(Box::new(Request {
-        name: package.name.parse().ok()?,
-        version: package.version.clone(),
-        project_from: origin.project_from,
-        path: destination.path.clone(),
-        resolved_from: origin.resolved_from,
-        target: origin.target.clone(),
-        shape: origin.shape.clone(),
-        checksum: package.checksum.clone(),
-        build: None,
-        in_build: InBuild {
-            workspace: Some(workspace.clone()),
-            sets: None,
-        },
-        hops: origin.hops.saturating_add(1),
-        // The version is the project's, not the index's.
-        index_fetched_at: None,
-        until: origin.until,
-        local: None,
-    })))
+    Some(InProjectBuild::Release(
+        Box::new(Request {
+            name: package.name.parse().ok()?,
+            version: package.version.clone(),
+            project_from: origin.project_from,
+            path: destination.path.clone(),
+            resolved_from: origin.resolved_from,
+            target: origin.target.clone(),
+            shape: origin.shape.clone(),
+            checksum: package.checksum.clone(),
+            build: None,
+            in_build: InBuild {
+                workspace: Some(workspace.clone()),
+                sets: None,
+            },
+            hops: origin.hops.saturating_add(1),
+            // The version is the project's, not the index's.
+            index_fetched_at: None,
+            until: origin.until,
+            local: None,
+        }),
+        Box::new(package.clone()),
+    ))
+}
+
+/// The request for the item that the path goes on to in the release of crates.io, `request`, when
+/// the project's package of it, `package`, is that release; else, from a crate built here, the
+/// request for the project's copy built here as a dependency; and from a crate of docs.rs, which
+/// was built with the release, the release, with a warning (requirement R-VR-2, decided in M2's
+/// D7).
+#[cfg(feature = "local")]
+async fn release_destination(
+    state: &ToolState,
+    (request, package): (Request, &ProjectPackage),
+    destination: &Destination,
+    origin: &Request,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<Request, Box<CallToolResult>> {
+    // When the index cannot be read, the release is taken, whose lookup tells why it fails.
+    let Ok(InIndex::Copy(check)) = project_entry(state, package, &request.name).await else {
+        return Ok(request);
+    };
+    let what = format!(
+        "{}@{} in the project is {}",
+        package.name,
+        package.version,
+        not_on_docs_rs(package, check)
+    );
+    let Some(workspace) = request
+        .in_build
+        .workspace
+        .clone()
+        .filter(|_| origin.local.is_some())
+    else {
+        warnings.push(
+            format!("{what}: the release on crates.io of its version is shown instead").into(),
+        );
+        // Not of the project's copy: its checksum, nor its build.
+        let mut request = request;
+        request.checksum = None;
+        request.in_build = InBuild::default();
+        return Ok(request);
+    };
+    let why = format!("{what}, so docs.rs does not have it");
+    let found = built_here_destination(
+        state,
+        (package, false, check),
+        &workspace,
+        destination,
+        origin,
+    )
+    .await
+    .map_err(|result| Box::new(told_why(*result, &why)))?;
+    warnings.push(format!("{why}, and it is built here").into());
+    Ok(found)
 }
 
 /// The request for the item that the path goes on to in `package`, a workspace member if
@@ -2618,7 +2847,7 @@ async fn in_project_build_of(
 #[cfg(feature = "local")]
 async fn built_here_destination(
     state: &ToolState,
-    (package, is_member): (&ProjectPackage, bool),
+    (package, is_member, check): (&ProjectPackage, bool, DocsRsCheck),
     workspace: &Workspace,
     destination: &Destination,
     origin: &Request,
@@ -2686,10 +2915,9 @@ async fn built_here_destination(
             false,
             &[],
         ))),
-        Member::OtherVersion(_) | Member::Not => Err(Box::new(local_build_required(
-            package,
-            DocsRsCheck::NotCratesIo,
-        ))),
+        Member::OtherVersion(_) | Member::Not => {
+            Err(Box::new(local_build_required(package, check)))
+        },
     }
 }
 

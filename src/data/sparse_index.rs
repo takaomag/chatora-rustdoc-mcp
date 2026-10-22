@@ -57,6 +57,9 @@ pub struct SparseIndex {
     ttl: Duration,
     /// The crates found missing from the index, by the name asked for, and when.
     missing: Arc<Mutex<HashMap<String, Instant>>>,
+    /// The crates read again from the index past the cache, by the name asked for, and when
+    /// ([`Self::entry_fresh`]).
+    rechecked: Arc<Mutex<HashMap<String, Instant>>>,
     /// Whether no request may be sent (`network.offline`, requirement R-CA-7).
     offline: bool,
 }
@@ -227,6 +230,7 @@ impl SparseIndex {
             cache,
             ttl: TTL,
             missing: Arc::default(),
+            rechecked: Arc::default(),
             offline: network.offline,
         })
     }
@@ -243,6 +247,7 @@ impl SparseIndex {
             cache,
             ttl,
             missing: Arc::default(),
+            rechecked: Arc::default(),
             offline: false,
         }
     }
@@ -270,9 +275,41 @@ impl SparseIndex {
         {
             return Err(IndexError::NotFound);
         }
+        self.entry_within(name, key, self.ttl).await
+    }
+
+    /// [`Self::entry`], read again from the index however fresh the cache is, and whether the
+    /// crate was found missing: once in [`TTL`] for a crate, and else as [`Self::entry`] reads
+    /// it. For a crate that the project has from crates.io at a version that the index did not
+    /// list, or not at all, which may have been published since (decided in M2's D7).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::entry`].
+    pub async fn entry_fresh(&self, name: &CrateName) -> Result<IndexEntry, IndexError> {
+        let key = name.as_str().to_ascii_lowercase();
+        let again = {
+            let mut rechecked = self.rechecked.lock();
+            rechecked.retain(|_, at| at.elapsed() < TTL);
+            rechecked.insert(key.clone(), Instant::now()).is_none()
+        };
+        if !again {
+            return self.entry(name).await;
+        }
+        self.missing.lock().remove(&key);
+        self.entry_within(name, key, Duration::ZERO).await
+    }
+
+    /// [`Self::entry`], with the files in the cache younger than `ttl` taken as they are.
+    async fn entry_within(
+        &self,
+        name: &CrateName,
+        key: String,
+        ttl: Duration,
+    ) -> Result<IndexEntry, IndexError> {
         let mut offline = false;
         for spelling in spellings(name) {
-            match self.entry_at(&spelling).await {
+            match self.entry_at(&spelling, ttl).await {
                 Err(IndexError::NotFound) => {},
                 Err(IndexError::Offline) => offline = true,
                 found => return found,
@@ -300,6 +337,10 @@ impl SparseIndex {
         {
             tracing::info!(%name, "that the crate is not in the index is forgotten, as asked");
         }
+        // And that it was read again a moment ago (decided in M2's D7).
+        self.rechecked
+            .lock()
+            .remove(&name.as_str().to_ascii_lowercase());
         // A file or two, removed here.
         for spelling in spellings(name) {
             let failure =
@@ -313,7 +354,7 @@ impl SparseIndex {
 
     /// The index entry at the lowercase `name`: the cached one while it is fresh, and else one
     /// fetched or confirmed with a conditional request.
-    async fn entry_at(&self, name: &str) -> Result<IndexEntry, IndexError> {
+    async fn entry_at(&self, name: &str, ttl: Duration) -> Result<IndexEntry, IndexError> {
         let body_path = self.cache.sparse_index_path(&index_path(name));
         let record_path = with_suffix(&body_path, ".meta.json");
         // Another call that wants the same file goes first, and this one then finds it fresh in
@@ -323,10 +364,7 @@ impl SparseIndex {
         let now = SystemTime::now();
         if let Some(cached) = &cached {
             let fetched_at = system_time(cached.record.fetched_at);
-            if now
-                .duration_since(fetched_at)
-                .is_ok_and(|age| age < self.ttl)
-            {
+            if now.duration_since(fetched_at).is_ok_and(|age| age < ttl) {
                 return parse_off(Arc::clone(&cached.body), fetched_at).await;
             }
         }
@@ -651,6 +689,57 @@ mod tests {
         // While fresh, the cache answers: the server serves no second response.
         let again = index.entry(&name("serde")).await.expect("cached");
         assert_eq!(again.versions, entry.versions);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_entry_is_read_again_once_in_the_ttl() {
+        let (index, requests, _dir) = index(
+            vec![
+                ok(SERDE_INDEX, "\"v1\""),
+                status("304 Not Modified"),
+                status("304 Not Modified"),
+            ],
+            TTL,
+        );
+        let first = index.entry(&name("serde")).await.expect("found");
+        // Past the cache, as fresh as it is: a conditional request.
+        let again = index.entry_fresh(&name("serde")).await.expect("confirmed");
+        assert_eq!(again.versions, first.versions);
+        let _first_request = requests.recv().expect("the first request");
+        let second_request = requests.recv().expect("the second request");
+        assert!(
+            second_request
+                .to_ascii_lowercase()
+                .contains("if-none-match: \"v1\""),
+            "{second_request}"
+        );
+        // Once in the TTL: the cache answers, fresh, and no third request is sent.
+        let cached = index.entry_fresh(&name("serde")).await.expect("cached");
+        assert_eq!(cached.versions, first.versions);
+        assert_eq!(cached.stale, None);
+        requests.try_recv().expect_err("no third request");
+        // Unless `refresh` forgets it.
+        index.forget(&name("serde"));
+        let again = index.entry_fresh(&name("serde")).await.expect("confirmed");
+        assert_eq!(again.stale, None);
+        requests.try_recv().expect("the third request");
+    }
+
+    #[tokio::test]
+    async fn a_crate_found_missing_is_asked_for_again_when_fresh() {
+        let (index, _requests, _dir) = index(
+            vec![status("404 Not Found"), ok(SERDE_INDEX, "\"v1\"")],
+            TTL,
+        );
+        assert!(matches!(
+            index.entry(&name("serde")).await,
+            Err(IndexError::NotFound)
+        ));
+        let found = index
+            .entry_fresh(&name("serde"))
+            .await
+            .expect("published since");
+        assert_eq!(found.versions.len(), 2);
     }
 
     #[tokio::test]

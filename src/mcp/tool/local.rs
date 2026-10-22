@@ -530,8 +530,8 @@ async fn docs_rs_of(
     Ok(asks)
 }
 
-/// The error when the project's package `name`, not from crates.io, cannot be built, as `cargo
-/// metadata` failed (requirements R-VR-2 and R-WS-7).
+/// The error when the project's package `name`, which docs.rs does not have, cannot be built, as
+/// `cargo metadata` failed (requirements R-VR-2 and R-WS-7).
 fn metadata_failed(name: &CrateName, because: &CargoError) -> CallToolResult {
     let failure = match because {
         CargoError::Failed { failure, .. } => *failure,
@@ -540,8 +540,8 @@ fn metadata_failed(name: &CrateName, because: &CargoError) -> CallToolResult {
     let mut body = json!({
         "code": failure.code(),
         "message": format!(
-            "{name} is not from crates.io, so its documentation is built here, but cargo metadata \
-             failed: {because}"
+            "docs.rs does not have {name} of the project, so its documentation is built here, but \
+             cargo metadata failed: {because}"
         ),
         // A failure that its messages do not tell apart may pass (requirement R-WS-7).
         "retryable": matches!(failure, Failure::Killed | Failure::Other),

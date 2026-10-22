@@ -1167,9 +1167,32 @@ Claude Code 2.1.304、Linux で測った。
   2. cargo 1.91 から `build.target` に書ける `"host-tuple"` (host の triple に置き換わる) を文字どおりの target として扱っていた (前からの `project_target` も)。`build.target` の解析を `targets_of` にまとめ、`host-tuple` を host にする。`build_targets`・`project_target`・`sets_build_target` は設定を同じ関数 (`read_cargo_config`) で読む
   3. 解析できない要素があるとき、判定 (残りを使う) と既定の target (host) が食い違った。`targets_of` は 1 つでも解析できなければ全体を host とみなす
   4. build-dependency・proc-macro の依存を host を明示して引くと止めていた。host が実際のビルド target でないときは、実際のビルド target (先頭) の範囲で host 用 (`ForHost`) のものだけ通す
-  5. 文言: target が 1 つのときの案内を「give <target> as "target"」に。同じ名前の変数が関数を隠していたのを改名
+  5. 文言: target が 1 つのときの案内を `give <target> as "target"` に。同じ名前の変数が関数を隠していたのを改名
   6. テスト: `targets_of` の単体テスト (配列・`host-tuple`・target JSON・build-std・target でない値)。stdio に、host を明示した host 用の依存、明示した版の member、host を明示した target 用の依存が止まること、`reason: no_json`・`retryable: false` を足した (1 の直しを外すと落ちることを確かめた)
 - 残したもの: 判定の host はキャッシュのディレクトリでの `rustc -vV` の host (R-TG-1・`default_target` と同じ)。プロジェクトの toolchain が別の host 向けのときと、`rustc -vV` が使えず代わりの値のときは食い違う (D7a の再レビューの残りと同じ)。stdio のテストのサーバーは、走らせる人の `CARGO_BUILD_TARGET` と `~/.cargo/config.toml` を引き継ぐ (前から)
+
+**D7b-2 (checksum の照合。2026-10-22)**:
+
+- 版を Cargo.lock が決めた crates.io の package (`resolve` の `entry_or_copy`): index と照合し (`project_entry`)、release でなければ (checksum の不一致・checksum 無し・index に無い版・crate が index に無い) 依存の計画 (`dependency_request`) でローカルにビルドし、理由を warnings に 1 行 (`copy_request`。決定 8)。lib の無いものは `local_build_required`。`cargo_lock_raw` は `cargo metadata` の失敗を返し、ビルドしない
+- index の読み直し (決定 6): index に版が無い、または crate が無いときは、`SparseIndex::entry_fresh` で TTL によらず条件付きの要求で 1 回読み直す (「無い」の記憶も消す)。同じ crate の読み直しは TTL (10 分) に 1 回で、その間は普通に読む。オフライン・通信の失敗は今のまま (キャッシュか `offline_miss`・`network_error`)
+- Cargo.lock の版 1 (決定 5): `[metadata]` の `"checksum <name> <version> (<source>)"` から checksum を読む (`<none>` は無し)
+- re-export の行き先 (決定 9): `InProjectBuild::Release` にプロジェクトの package を持たせ、`release_destination` で照合する。起点がここでビルドした crate なら写しを依存としてローカルでビルドし warning、起点が docs.rs の crate なら release のまま (docs.rs はそれでビルドした) で warning。index が読めなければ release のまま
+- 文言: `local_build_required` は lib の無い依存だけになった。`metadata_failed` は「not from crates.io」をやめ「docs.rs does not have」
+- テスト: stdio に、vendor で中身を変えた `demo` 0.1.0 (checksum が index と合わない、オフライン) を直接引いても member の re-export から引いても、依存としてローカルでビルドされ (`package_source: crates.io`・理由の warning)、private な関数は出ないことを足した (行き先の照合を外すと re-export の方が落ちることを確かめた)。単体テストに、Cargo.lock の版 1 の checksum、`entry_fresh` の 1 回だけの読み直しと、無かった crate の読み直し
+- レビュー (サブエージェント) の指摘と直し:
+  1. 照合する index を問い合わせの名前で引いていた。lib 名 (`md5` の `md-5`) や改名で引くと別の crate の index を読み、誤った理由の warning 付きでビルドしていた (前は誤った `local_build_required`)。プロジェクトの package 名で引く。stdio のテストに、vendor の `demo` の lib 名を `patched_demo` にして lib 名で引くことを足した (直しを外すと `offline_miss` で落ちる)
+  2. 起点が docs.rs の crate で行き先が合わない写しのとき、要求にプロジェクトの checksum と workspace が残り、`.crate` の取得が checksum の不一致で毎回失敗し、写しのビルドの組で `enabled_in_project` を付けていた。この分岐では checksum を外し (index の値で取り直す)、プロジェクトのビルドの組も付けない
+  3. 古い index (オフライン・通信の失敗) で版が無いことを「crates.io が載せていない」と断定してビルドしていた。前例 (R-CA-3、`version_not_found`) と決定 6 の「今のまま」に合わせ、`offline_miss`・`network_error` を返す (`InIndex::Unlisted`、`stale_index_error` を共有)。checksum の不一致は版が載っているので古い index でも照合できる
+  4. 写しの経路のエラー (`build_unsupported`・`no_json`・`metadata_failed` など) とビルド中の応答に docs.rs を使わない理由が出なかった。message の頭か warnings に付ける (`told_why`)
+  6. refresh (`SparseIndex::forget`) が読み直しの記録を消さず、10 分の間は読み直さなかった。消す
+  8. 文言: docs.rs が起点のときの warning を「crates.io の版を代わりに見せる」に。行き先の `local_build_required` に実際の理由 (check) を渡す。`metadata_failed` の doc コメント
+  9. テスト: `entry_fresh` のテストが 3 回目の要求が無いことを守っていなかった (サーバーが閉じて古いキャッシュに落ちても通った)。古くないことと要求が無いことを確かめ、refresh の後は読み直すことを足した
+- 残したもの:
+  - (5) 読み直しの記録は取り直しの前に付けるので、同じ crate の同時の呼び出しのうち後のものが、取り直しがキャッシュのロックを取る前に古いキャッシュを読むと、答えが割れうる (窓は短い)
+  - (7) `entry()` が今まさに取り直した直後でも、版が無ければもう 1 回条件付きの要求を出す。re-export の行き先ごとに index を読む (決定 9 のとおり、TTL 内はキャッシュ)
+  - (10) `resolve_version` は新しい照合を使わず、版が index に無いと `version_not_found`・crate が無いと `crate_not_found` (D7d で)
+  - 結合テストの無い経路: 版や crate が index に無い (オンラインの index のモックが要る)、読み直しで公開済みと分かり docs.rs に戻る、docs.rs を起点にした行き先の写し、`cargo_lock_raw` の写し
+  - `crate` なしの検索の照合は D7d (決定 10)。`list_crates` の `docs_rs_json` は checksum を見ずに `cached` を付ける (軽微)
 
 **止まる危険の監査と直し 1 (2026-10-21)**:
 

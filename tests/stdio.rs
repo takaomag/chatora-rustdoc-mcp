@@ -3242,6 +3242,82 @@ fn a_cancelled_call_tells_no_more_progress() {
     assert!(server.finish().success());
 }
 
+/// A copy of `demo` 0.1.0 of crates.io in the project, vendored with other contents and the lib
+/// `patched_demo`, whose checksum in Cargo.lock is not crates.io's, is built here as a dependency,
+/// its public items only: looked up by its package name and by its lib name, and by the re-export
+/// of a member (requirement R-VR-2, decided in M2's D7).
+#[cfg(feature = "local")]
+#[test]
+fn a_copy_of_a_crates_io_release_that_differs_is_built_here() {
+    let project = workspace_using_demo();
+    let write = |path: &str, contents: &str| {
+        std::fs::write(project.path().join(path), contents).expect("written");
+    };
+    write(
+        "vendor/demo/src/lib.rs",
+        "/// Patched here.\npub struct Patched;\n/// Not public.\nfn inside() {}\n",
+    );
+    write(
+        "vendor/demo/Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [lib]\nname = \"patched_demo\"\n",
+    );
+    write(
+        "vendor/demo/.cargo-checksum.json",
+        &json!({ "files": {}, "package": "0".repeat(63) + "1" }).to_string(),
+    );
+    write("src/lib.rs", "pub use patched_demo::Patched;\n");
+    std::fs::remove_file(project.path().join("Cargo.lock")).expect("removed");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(project.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let offline = [("CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE", "true")];
+    let mut server = Server::start_with(Some(project.path()), &offline);
+    write_old_demo_index(&server);
+    for (first, arguments) in [
+        (1, json!({ "crate": "demo", "path": "Patched" })),
+        (50, json!({ "crate": "patched_demo", "path": "Patched" })),
+        (100, json!({ "crate": "app", "path": "Patched" })),
+    ] {
+        let found = built_item(&mut server, first, &arguments);
+        assert_ne!(found["isError"], true, "{arguments}: {found}");
+        let found = &found["structuredContent"];
+        assert_eq!(
+            found["data"]["path"]
+                .as_str()
+                .map(|path| path.ends_with("Patched")),
+            Some(true),
+            "{found}"
+        );
+        assert_eq!(found["provenance"]["source"], "local", "{found}");
+        assert_eq!(
+            found["provenance"]["package_source"], "crates.io",
+            "{found}"
+        );
+        assert!(found.to_string().contains("Patched here."), "{found}");
+        assert!(
+            found["warnings"]
+                .to_string()
+                .contains("differs from crates.io's"),
+            "{found}"
+        );
+    }
+    let inside = built_item(
+        &mut server,
+        200,
+        &json!({ "crate": "demo", "path": "inside" }),
+    );
+    assert!(inside.to_string().contains("item_not_found"), "{inside}");
+    assert!(server.finish().success());
+}
+
 /// A search of the project's dependencies that finds nothing while they are still being fetched
 /// is `status: building`, not an answer that nothing matches; the next search finds the item
 /// (requirement R-OUT-9).
