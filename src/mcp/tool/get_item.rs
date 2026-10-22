@@ -22,6 +22,7 @@ use super::{
 use super::{
     local::{self, LocalSource, Member},
     recorded,
+    recorded_git::{self, GitOrigin},
 };
 #[cfg(feature = "local")]
 use crate::data::{
@@ -126,6 +127,12 @@ pub(super) struct Arguments {
         expect(dead_code, reason = "only local features declare and take it")
     )]
     refresh: bool,
+    /// The git repository of the crate, and its commit asked for (decided in M2e's E3b).
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(dead_code, reason = "only local features take it")
+    )]
+    git: Option<GitSpec>,
     /// How much to show, and for `list_module`, of what.
     shape: Shape,
 }
@@ -232,6 +239,7 @@ impl Arguments {
             path,
             target: release.target,
             refresh: release.refresh,
+            git: release.git,
             shape: Shape {
                 detail,
                 what: What::List(Box::new(listing)),
@@ -252,6 +260,7 @@ impl Arguments {
             project: release.project,
             target: release.target,
             refresh: release.refresh,
+            git: release.git,
             shape: Shape {
                 detail,
                 what: What::Search(Box::new(searching)),
@@ -278,6 +287,7 @@ impl Arguments {
             project: release.project,
             target: release.target,
             refresh: release.refresh,
+            git: release.git,
             shape: Shape {
                 detail: Detail::Normal,
                 what: What::Impls(Box::new(paging)),
@@ -300,6 +310,7 @@ impl Arguments {
             project: release.project,
             target: release.target,
             refresh: release.refresh,
+            git: release.git,
             shape: Shape {
                 detail,
                 what: What::Methods(Box::new(filter)),
@@ -316,6 +327,7 @@ impl Arguments {
             project: release.project,
             target: release.target,
             refresh: release.refresh,
+            git: release.git,
             shape: Shape {
                 detail,
                 what: What::Overview,
@@ -373,6 +385,9 @@ struct Here {
     /// re-export: `build_external_docs` may have recorded it, and builds it (requirement R-WS-10,
     /// decided in M2e's E1b).
     unused: bool,
+    /// What the response tells of the crate of a git repository that `build_external_docs`
+    /// recorded, when it is one (decided in M2e's E3b).
+    git: Option<Box<GitOrigin>>,
 }
 
 impl Request {
@@ -508,7 +523,7 @@ fn output_schema() -> JsonObject {
 /// The schema of `provenance`: `Provenance` in `query::get_item`.
 pub(super) fn provenance_schema() -> Value {
     let strings = json!({ "type": "array", "items": { "type": "string" } });
-    json!({
+    let mut schema = json!({
         "type": "object",
         "properties": {
             "source": { "type": "string", "enum": ["docs.rs", "std", "local"] },
@@ -524,6 +539,7 @@ pub(super) fn provenance_schema() -> Value {
                     "cargo_lock",
                     "cargo_lock_raw",
                     "reexport",
+                    "git",
                 ],
             },
             "project_from": {
@@ -565,9 +581,11 @@ pub(super) fn provenance_schema() -> Value {
             },
             "stale_reason": {
                 "type": "string",
-                "enum": ["rebuilding"],
+                "enum": ["rebuilding", "ref_ttl_expired"],
                 "description": "rebuilding: a workspace member is being built again, as what it \
-                                is made from changed; this is the build before, of built_at.",
+                                is made from changed; this is the build before, of built_at. \
+                                ref_ttl_expired: a branch or a tag of git was resolved more than \
+                                a day ago, at resolved_at.",
             },
             "features_requested": {
                 "type": "array",
@@ -593,7 +611,45 @@ pub(super) fn provenance_schema() -> Value {
         // have no `source` (requirement R-OUT-9); before docs.rs's JSON of the default target is
         // read, no `target` (decided in M2's D7).
         "required": ["crate"],
-    })
+    });
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        properties.extend(git_provenance_properties());
+    }
+    schema
+}
+
+/// The properties of the provenance of a crate of a git repository (decided in M2e's E3, (2)).
+pub(super) fn git_provenance_properties() -> Map<String, Value> {
+    let properties = json!({
+        "git": {
+            "type": "string",
+            "description": "The repository of a crate of git, normalized.",
+        },
+        "rev": {
+            "type": "string",
+            "description": "The commit of a crate of git: that its ref resolved to.",
+        },
+        "ref": {
+            "type": "string",
+            "description": "The ref asked for, in full (refs/heads/main), unless a hash; HEAD \
+                            for the default branch.",
+        },
+        "resolved_at": {
+            "type": "string",
+            "description": "When build_external_docs resolved the ref (RFC 3339).",
+        },
+        "plaintext": {
+            "type": "boolean",
+            "description": "The repository was fetched over http or git, which do not keep what \
+                            is fetched from being changed.",
+        },
+    });
+    match properties {
+        Value::Object(properties) => properties,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_) => {
+            Map::new()
+        },
+    }
 }
 
 /// The properties of `Conditions` in `query::get_item`, which a list's entries that are not items
@@ -762,7 +818,8 @@ pub(super) fn parse_release(
         return Err(InvalidArgument::new("`crate` is required", CRATE_EXAMPLE));
     };
     let (project, target) = parse_project_and_target(arguments)?;
-    if parse_git(arguments)?.is_some() {
+    let git = parse_git(arguments)?;
+    if git.is_some() {
         apart_from_git(version.as_ref(), project.as_deref())?;
         if std_crate(&name).is_some() {
             return Err(InvalidArgument::new(
@@ -777,6 +834,7 @@ pub(super) fn parse_release(
         project,
         target,
         refresh: parse_refresh(arguments)?,
+        git,
     })
 }
 
@@ -970,6 +1028,8 @@ pub(super) struct ReleaseArguments {
     pub(super) target: Option<TargetTriple>,
     /// Whether what failed is to be tried again (§6.4, decided in M2's D5).
     pub(super) refresh: bool,
+    /// The git repository of the crate, and its commit asked for (decided in M2e's E3b).
+    pub(super) git: Option<GitSpec>,
 }
 
 /// Checks the arguments (requirement R-ARG-1).
@@ -982,6 +1042,7 @@ pub(super) fn parse_arguments(
         project,
         target,
         refresh,
+        git,
     } = parse_release(arguments)?;
     let string = |name, example| string_argument(arguments, name, example);
     let Some(path) = string("path", PATH_EXAMPLE)? else {
@@ -1013,6 +1074,7 @@ pub(super) fn parse_arguments(
         path,
         target,
         refresh,
+        git,
         shape: Shape {
             detail,
             what: What::Item,
@@ -2377,6 +2439,12 @@ fn same_crate_name(a: &str, b: &str) -> bool {
 /// Looks the item up in the archive of the crate, or else loads the JSON of the crate and archives
 /// it first, on a blocking thread, since parsing a large crate takes a large part of a second.
 pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
+    // In the records of `build_external_docs`, which the query tools neither fetch nor build again:
+    // not the project's, which `refresh` is of (requirement R-WS-10, decided in M2e's E3b).
+    #[cfg(feature = "local")]
+    if let Some(git) = arguments.git.clone() {
+        return look_up_git(arguments, &git, state).await;
+    }
     // `refresh` is acted on once for the crate in the project, until a call for it ends (decided
     // in M2's D5).
     #[cfg(feature = "local")]
@@ -2389,6 +2457,58 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
     }
     #[cfg(not(feature = "local"))]
     look_up(arguments, state).await
+}
+
+/// Looks the item up in the crate of the repository and at the ref of `git` that
+/// `build_external_docs` recorded, for the target asked for, or else the host's: the crate is no
+/// package of the project (decided in M2e, 11).
+#[cfg(feature = "local")]
+async fn look_up_git(arguments: Arguments, git: &GitSpec, state: Arc<ToolState>) -> CallToolResult {
+    let until = state.until();
+    let target = match &arguments.target {
+        Some(target) => target.clone(),
+        None => state.host().await.triple.clone(),
+    };
+    let mut warnings = Vec::new();
+    if arguments.refresh {
+        warnings.push(recorded_git::NO_REFRESH.into());
+    }
+    let found =
+        match recorded_git::recorded_git(&state, (&arguments.name, git, &target), &mut warnings)
+            .await
+        {
+            Ok(found) => found,
+            Err(result) => return *result,
+        };
+    let path = in_lib(
+        &arguments.name,
+        &arguments.path,
+        &found.built.record.crate_name,
+    );
+    let request = Request {
+        name: found.package,
+        version: found.version,
+        project_from: None,
+        path,
+        resolved_from: ResolvedFrom::Git,
+        target,
+        shape: arguments.shape,
+        checksum: None,
+        build: None,
+        in_build: InBuild::default(),
+        hops: 0,
+        index_fetched_at: None,
+        until,
+        here: Here {
+            local: Some(LocalSource::Recorded {
+                built: found.built,
+                of_project: false,
+            }),
+            git: Some(Box::new(found.origin)),
+            ..Here::default()
+        },
+    };
+    look_up_release(&state, request, warnings).await
 }
 
 /// [`execute`], forgetting what failed first when `refresh`.
@@ -2736,6 +2856,10 @@ async fn look_up_member(
         let mut looked_up = look_up_in(&built.archived.mapped, &arguments, origin);
         if let (Some(built_at), Ok(response)) = (&built_before, &mut looked_up) {
             mark_rebuilding(response, built_at);
+        }
+        // Of a crate of git (decided in M2e's E3b).
+        if let (Some(git), Ok(response)) = (&arguments.here.git, &mut looked_up) {
+            git.mark(response);
         }
         (looked_up, arguments)
     });
@@ -3210,6 +3334,7 @@ async fn follow_into(
                 path: destination.path.clone(),
                 target: Some(origin.target.clone()),
                 refresh: false,
+                git: None,
                 shape: origin.shape.clone(),
             };
             Box::pin(execute_std(

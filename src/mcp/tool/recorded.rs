@@ -1,5 +1,6 @@
 //! The lookups in the records of `build_external_docs` (requirement R-WS-10, decided in M2e's
-//! E1b): of releases that the project does not use, which the query tools never build.
+//! E1b): of releases that the project does not use, and of crates of git repositories (M2e's
+//! E3b), which the query tools never build.
 //!
 //! They read the record and start nothing (requirement R-MCP-3).
 
@@ -12,6 +13,7 @@ use serde_json::{Map, Value, json};
 use super::{
     ToolState,
     error_result,
+    external_build,
     get_item::{being, building_response, shutting_down},
     local,
 };
@@ -78,6 +80,19 @@ pub(super) async fn recorded(
     warnings: &[Box<str>],
 ) -> Found {
     let key = key(name, version, target);
+    let what = format!("{name}@{version}");
+    recorded_as(state, (&key, &what, CALL_AGAIN), provenance, warnings).await
+}
+
+/// The record of `key`, of `what`, as [`recorded`] reads it: `call_again` tells how to make it
+/// again.
+pub(super) async fn recorded_as(
+    state: &ToolState,
+    (key, what, call_again): (&Key, &str, &str),
+    provenance: impl FnOnce() -> Map<String, Value>,
+    warnings: &[Box<str>],
+) -> Found {
+    let key = key.clone();
     // Most lookups have none, which a look at the directory tells without a thread.
     if !key.dir(state.cache.dir()).is_dir() {
         return Found::Missing;
@@ -90,7 +105,6 @@ pub(super) async fn recorded(
     let Ok(recorded) = read.await else {
         return Found::Response(Box::new(shutting_down()));
     };
-    let what = format!("{name}@{version}");
     let response = |result| Found::Response(Box::new(result));
     let building = |provenance: Map<String, Value>| {
         let mut provenance = provenance;
@@ -98,7 +112,7 @@ pub(super) async fn recorded(
         response(building_response(
             provenance,
             Doing::Building,
-            &being(&what, Doing::Building, "build_external_docs"),
+            &being(what, Doing::Building, "build_external_docs"),
             warnings,
         ))
     };
@@ -114,18 +128,18 @@ pub(super) async fn recorded(
                     if again.await.unwrap_or(false) {
                         building(provenance())
                     } else {
-                        response(broken(&what, &error.to_string()))
+                        response(broken(what, &error.to_string(), call_again))
                     }
                 },
                 Err(error) => response(with_suggestion(
-                    local::local_error(&what, &error),
-                    CALL_AGAIN,
+                    local::local_error(what, &error),
+                    call_again,
                 )),
             }
         },
         Recorded::Building => building(provenance()),
-        Recorded::Failed(failed) => response(failed_again(&failed)),
-        Recorded::Broken(why) => response(broken(&what, &why)),
+        Recorded::Failed(failed) => response(failed_again(&failed, call_again)),
+        Recorded::Broken(why) => response(broken(what, &why, call_again)),
         Recorded::Missing => Found::Missing,
     }
 }
@@ -152,8 +166,8 @@ const CALL_AGAIN: &str = "call build_external_docs again with the same crate, ve
                           to build it again";
 
 /// `build_failed` as the record of the external tool's build that failed tells, until it is called
-/// again (requirement R-WS-10): the query tools do not build it.
-fn failed_again(failed: &Failed) -> CallToolResult {
+/// again (requirement R-WS-10), as `call_again` tells: the query tools do not build it.
+pub(super) fn failed_again(failed: &Failed, call_again: &str) -> CallToolResult {
     let mut body = failed.body.clone();
     if let Some(fields) = body.as_object_mut() {
         fields.insert("retryable".to_owned(), json!(false));
@@ -161,28 +175,31 @@ fn failed_again(failed: &Failed) -> CallToolResult {
         let suggestions = fields
             .entry("suggestions")
             .or_insert_with(|| Value::Array(Vec::new()));
-        // Unless the body tells it already.
-        if let Value::Array(suggestions) = suggestions
-            && !suggestions.iter().any(|suggestion| {
+        if let Value::Array(suggestions) = suggestions {
+            // Its "the same arguments" are the external tool's, not the query's.
+            suggestions
+                .retain(|suggestion| suggestion.as_str() != Some(external_build::CALL_AGAIN));
+            // Unless the body tells it already.
+            if !suggestions.iter().any(|suggestion| {
                 suggestion
                     .as_str()
                     .is_some_and(|text| text.contains("build_external_docs"))
-            })
-        {
-            suggestions.push(json!(CALL_AGAIN));
+            }) {
+                suggestions.push(json!(call_again));
+            }
         }
     }
     error_result(&body)
 }
 
 /// `docs_unavailable` with `record_broken` for the record of `what`, as `why` tells: the query
-/// tools neither fetch nor build it again (requirement R-WS-10).
-fn broken(what: &str, why: &str) -> CallToolResult {
+/// tools neither fetch nor build it again (requirement R-WS-10); `call_again` makes it again.
+pub(super) fn broken(what: &str, why: &str, call_again: &str) -> CallToolResult {
     error_result(&json!({
         "code": "docs_unavailable",
         "message": format!("the record of {what} that build_external_docs made is broken: {why}"),
         "retryable": false,
-        "suggestions": [CALL_AGAIN],
+        "suggestions": [call_again],
         "reason": "record_broken",
     }))
 }

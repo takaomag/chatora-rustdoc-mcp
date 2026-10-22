@@ -77,18 +77,22 @@ pub(super) fn definition() -> Tool {
 /// ones is left out when it has no value.
 fn output_schema() -> JsonObject {
     let strings = json!({ "type": "array", "items": { "type": "string" } });
-    object(json!({
+    let mut schema = object(json!({
         "type": "object",
         "properties": {
             "provenance": {
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "enum": ["crates.io", "project"] },
+                    "source": {
+                        "type": "string",
+                        "enum": ["crates.io", "project", "local"],
+                        "description": "local: a crate of git that build_external_docs recorded.",
+                    },
                     "crate": { "type": "string" },
                     "version": { "type": "string" },
                     "resolved_from": {
                         "type": "string",
-                        "enum": ["explicit", "explicit_req", "latest", "cargo_lock", "cargo_lock_raw"],
+                        "enum": ["explicit", "explicit_req", "latest", "cargo_lock", "cargo_lock_raw", "git"],
                     },
                     "project_from": {
                         "type": "string",
@@ -100,6 +104,15 @@ fn output_schema() -> JsonObject {
                                         was older than it is trusted for, as offline.",
                     },
                     "target": { "type": "string" },
+                    "package_source": { "type": "string", "enum": ["git"] },
+                    "recorded_by": { "type": "string", "enum": ["build_external_docs"] },
+                    "stale": { "type": "boolean" },
+                    "stale_reason": {
+                        "type": "string",
+                        "enum": ["ref_ttl_expired"],
+                        "description": "A branch or a tag of git was resolved more than a day \
+                                        ago, at resolved_at.",
+                    },
                 },
                 // Before the version is known, a response while it is resolved has no `version`
                 // or `source` (requirement R-OUT-9).
@@ -127,9 +140,18 @@ fn output_schema() -> JsonObject {
                 },
                 "required": ["version", "source", "docs_rs_json"],
             },
+            "hints": strings,
         },
         "required": ["provenance", "data"],
-    }))
+    }));
+    if let Some(Value::Object(provenance)) = schema
+        .get_mut("properties")
+        .and_then(|properties| properties.get_mut("provenance"))
+        && let Some(Value::Object(properties)) = provenance.get_mut("properties")
+    {
+        properties.extend(get_item::git_provenance_properties());
+    }
+    schema
 }
 
 /// The object inside `value`, which is always an object here.
@@ -176,6 +198,11 @@ pub(super) async fn execute(arguments: ReleaseArguments, state: Arc<ToolState>) 
 
 /// [`execute`], forgetting what failed first when it asks for `refresh`.
 async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallToolResult {
+    // In the records of `build_external_docs`, which `refresh` is not of (decided in M2e's E3b).
+    #[cfg(feature = "local")]
+    if let Some(git) = &arguments.git {
+        return of_git(&arguments, git, &state).await;
+    }
     let until = state.until();
     if get_item::std_crate(&arguments.name).is_some() {
         return super::tool_error(
@@ -476,6 +503,54 @@ fn not_from_crates_io(
     )
 }
 
+/// The version of the crate of a git repository that `arguments` and `git` name, at the commit that
+/// `build_external_docs` resolved its ref to, for the target asked for or the host's (decided in
+/// M2e's E3b); or the response while it is made, its failure, or that it is not recorded.
+#[cfg(feature = "local")]
+async fn of_git(
+    arguments: &ReleaseArguments,
+    git: &get_item::GitSpec,
+    state: &ToolState,
+) -> CallToolResult {
+    let target = match &arguments.target {
+        Some(target) => target.clone(),
+        None => state.host().await.triple.clone(),
+    };
+    let mut warnings = Vec::new();
+    if arguments.refresh {
+        warnings.push(super::recorded_git::NO_REFRESH.into());
+    }
+    let found = match super::recorded_git::recorded_git(
+        state,
+        (&arguments.name, git, &target),
+        &mut warnings,
+    )
+    .await
+    {
+        Ok(found) => found,
+        Err(result) => return *result,
+    };
+    let version = found.version.to_string();
+    let mut response = response(
+        json!({
+            "source": "local",
+            "crate": found.package.as_str(),
+            "version": version,
+            "resolved_from": ResolvedFrom::Git,
+            "target": target.as_str(),
+            "recorded_by": crate::query::local::RECORDED_BY,
+        }),
+        json!({
+            "version": version,
+            "source": "git",
+            "docs_rs_json": "not_on_docs_rs",
+        }),
+        &warnings,
+    );
+    found.origin.mark(&mut response);
+    CallToolResult::structured(response)
+}
+
 /// Whether docs.rs has the rustdoc JSON of `name` at `version` for `target`: from the cache, or
 /// asked with `HEAD` (requirement R-TG-1).
 async fn json_status(
@@ -532,7 +607,12 @@ fn unknown_json(
 }
 
 /// The response, with the provenance's absent values left out.
-fn respond(mut provenance: Value, data: Value, warnings: &[Box<str>]) -> CallToolResult {
+fn respond(provenance: Value, data: Value, warnings: &[Box<str>]) -> CallToolResult {
+    CallToolResult::structured(response(provenance, data, warnings))
+}
+
+/// The structured content of [`respond`].
+fn response(mut provenance: Value, data: Value, warnings: &[Box<str>]) -> Value {
     if let Some(fields) = provenance.as_object_mut() {
         fields.retain(|_, value| !value.is_null());
     }
@@ -542,7 +622,7 @@ fn respond(mut provenance: Value, data: Value, warnings: &[Box<str>]) -> CallToo
         response.insert("warnings".into(), json!(warnings));
     }
     response.insert("data".into(), data);
-    CallToolResult::structured(Value::Object(response))
+    Value::Object(response)
 }
 
 #[cfg(test)]

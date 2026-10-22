@@ -735,6 +735,51 @@ pub fn rfc3339(time: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// The time that `text` writes as [`rfc3339`] does, `2026-10-20T01:02:03Z`; `None` for another
+/// form, or a time before the Unix epoch.
+#[must_use]
+pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
+    let bytes = text.as_bytes();
+    let separated = bytes.len() == 20
+        && [
+            (4, b'-'),
+            (7, b'-'),
+            (10, b'T'),
+            (13, b':'),
+            (16, b':'),
+            (19, b'Z'),
+        ]
+        .iter()
+        .all(|&(at, separator)| bytes.get(at) == Some(&separator));
+    if !separated {
+        return None;
+    }
+    let number = |from: usize, to: usize| -> Option<i64> {
+        let digits = text.get(from..to)?;
+        digits
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| digits.parse().ok())?
+    };
+    let (year, month, day) = (number(0, 4)?, number(5, 7)?, number(8, 10)?);
+    let (hour, minute, second) = (number(11, 13)?, number(14, 16)?, number(17, 19)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let days = std_json::days_from_civil(year, month, day)?;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)?;
+    UNIX_EPOCH.checked_add(Duration::from_secs(u64::try_from(seconds).ok()?))
+}
+
 /// Seconds since the Unix epoch, or 0 for a time before it.
 fn unix_seconds(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
@@ -1036,6 +1081,27 @@ mod tests {
         assert_eq!(at(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(at(1_709_164_799), "2024-02-28T23:59:59Z");
         assert_eq!(at(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn times_written_in_rfc_3339_are_read_back() {
+        for seconds in [0, 1_700_000_000, 1_709_164_799, 1_709_164_800] {
+            let time = system_time(seconds);
+            assert_eq!(parse_rfc3339(&rfc3339(time)), Some(time), "{seconds}");
+        }
+        for not in [
+            "",
+            "2024-02-29",
+            "2024-02-29T00:00:00",
+            "2024-02-29T00:00:00+09:00",
+            "2024-13-01T00:00:00Z",
+            "2024-02-29T24:00:00Z",
+            "+024-02-29T00:00:00Z",
+            "1969-12-31T23:59:59Z",
+            "２０２４-02-29T00:00:00Z",
+        ] {
+            assert_eq!(parse_rfc3339(not), None, "{not}");
+        }
     }
 
     #[tokio::test]

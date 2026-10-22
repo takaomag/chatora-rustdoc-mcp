@@ -283,9 +283,10 @@ fn external_cases() -> Vec<Case> {
     cases
 }
 
-/// `git`, `rev`, `branch` and `tag` look up a crate of a git repository, which comes in M2e's
-/// E3b: until then, a stdio test (`git_arguments_are_checked_and_told_to_come`) checks that the
-/// tools take them.
+/// `git`, `rev`, `branch` and `tag` look up a crate of a git repository that `build_external_docs`
+/// recorded (M2e's E3b), which real data has none of: stdio tests
+/// (`build_external_docs_builds_a_crate_of_a_git_repository` and
+/// `the_query_tools_look_up_a_crate_of_git_in_its_records`) check them on a repository of their own.
 fn git_cases() -> Vec<Case> {
     if !cfg!(feature = "local") {
         return Vec::new();

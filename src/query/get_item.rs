@@ -349,6 +349,9 @@ pub enum ResolvedFrom {
     /// The version that the crate which re-exports the item was built with on docs.rs, from its
     /// `html_root_url` (requirement R-PR-4).
     Reexport,
+    /// The version of a crate of a git repository at the commit that its ref resolved to, which
+    /// `build_external_docs` recorded (decided in M2e's E3b).
+    Git,
 }
 
 /// The conditions of an entry of a list that is not an item of its own, such as an `impl`.

@@ -501,7 +501,7 @@ fn days_before(date: &str, days: u32) -> Option<String> {
 
 /// The days since 1970-01-01 of a date in the proleptic Gregorian calendar (Howard Hinnant's
 /// algorithm), with checked arithmetic.
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+pub(super) fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     let year = if month <= 2 {
         year.checked_sub(1)?
     } else {

@@ -92,7 +92,7 @@ pub(super) fn definition() -> Tool {
 /// The schema of the structured content (requirement R-OUT-1).
 fn output_schema() -> JsonObject {
     let strings = json!({ "type": "array", "items": { "type": "string" } });
-    object(json!({
+    let mut schema = object(json!({
         "type": "object",
         "properties": {
             "provenance": {
@@ -113,25 +113,6 @@ fn output_schema() -> JsonObject {
                     "features_requested": strings,
                     "features_effective": strings,
                     "recorded_by": { "type": "string", "enum": ["build_external_docs"] },
-                    "git": {
-                        "type": "string",
-                        "description": "The repository of a crate of git, normalized.",
-                    },
-                    "rev": {
-                        "type": "string",
-                        "description": "The commit that the ref asked for resolved to.",
-                    },
-                    "ref": {
-                        "type": "string",
-                        "description": "The ref asked for, in full (refs/heads/main), unless \
-                                        a hash; HEAD for the default branch.",
-                    },
-                    "resolved_at": { "type": "string" },
-                    "plaintext": {
-                        "type": "boolean",
-                        "description": "The repository was fetched over http or git, which \
-                                        do not keep what is fetched from being changed.",
-                    },
                 },
                 "required": ["source"],
             },
@@ -157,7 +138,15 @@ fn output_schema() -> JsonObject {
             "hints": strings,
         },
         "required": ["provenance", "data"],
-    }))
+    }));
+    if let Some(Value::Object(provenance)) = schema
+        .get_mut("properties")
+        .and_then(|properties| properties.get_mut("provenance"))
+        && let Some(Value::Object(properties)) = provenance.get_mut("properties")
+    {
+        properties.extend(get_item::git_provenance_properties());
+    }
+    schema
 }
 
 /// The object inside `value`, which is always an object here.

@@ -1439,6 +1439,24 @@ Claude Code 2.1.304、Linux で測った。
   - 照会のツールが読んだら最後に使った日時を更新する (R-CA-5。std の `used` と同じく 1 時間に 1 回)。re-export をたどるときは外の記録を読まない (R-WS-10)。照会のツールの `refresh` は外の失敗を解かない (R-WS-10・§6.4)
   - テストの記録は、E2a が使う `data::external` の書き手で置く
 
+**E3b-2 (照会のツールで git の crate を引く。2026-10-22)**:
+
+- `mcp::tool::recorded_git`: `recorded_git` は ref なら解決の記録 (`Key::GitRef`) を、ハッシュなら記録のある commit (完全なハッシュは `Key::Git` を直に、短いものは一覧の前方一致で記録のあるものだけ、決定 2) を引き、無ければその短いハッシュの要求の鍵を読む (決定 3)。commit の記録は `recorded::recorded_as` (鍵と「呼び直す」の文面を取るように広げた) で読む。ref の応答は provenance に `git`・`ref`・`rev`・`resolved_at`・`plaintext`、期限内でも「解決し直すには外のツール」の hint、1 日を過ぎるか読めないか時計より 5 分以上先なら `stale: ref_ttl_expired` と warning (`data::parse_rfc3339` を足した)。外のツールが ref のロックを持つ間は、commit の記録が失敗・壊れた・無いでも作成中として `building`、ref が動いていて前の commit の記録があればそれを `stale: rebuilding` と `retry_after_secs` 付きで返す (決定 4。`Resolved.previous` を外のツールが書く)
+- 照会のツール: `ReleaseArguments`・`get_item::Arguments` に `git`、`get_item::execute` の頭で `look_up_git` (target を省けば host、`refresh` は warning を付けて効かせない)。`Request` は記録の build を `LocalSource::Recorded` で、`ResolvedFrom::Git`、`Here.git` の印を `look_up_member` で応答に付ける。`resolve_version` は `of_git` (`data.source: git`・`docs_rs_json: not_on_docs_rs`)。`dispatch` の「(in a later version)」を外した。出力スキーマに git の欄 (`git_provenance_properties`、外のツールと共有)・`resolved_from: git`・`stale_reason: ref_ttl_expired`。引数の説明は照会のツール向けと外のツール向けに分けた
+- 失敗の記録の「同じ引数で呼び直す」(外のツールの文面) は照会のツールでは誤解を招くので、外のツールに渡す引数を書いた案内に置き換える (crates.io のリリースも)
+- テスト: 単体 (期限・読めない時刻・時計の先・ハッシュは期限なし・印の付け方・`parse_rfc3339`)、stdio の 1 件 (照会の 8 ツールで branch の記録・短いハッシュ・期限切れ・記録の無い tag・失敗した branch・完全なハッシュ・曖昧な短いハッシュ・外のツールがロックを持つ間に前の commit を `rebuilding` で・ロックが外れたら新しい commit の失敗)、`git_arguments_are_checked_and_looked_up_in_the_records` は `no_record` を確かめる
+- レビュー (サブエージェント、読むだけ) の対応: (1) 作成し直し中の失敗・壊れた記録は `building` (2) 決定 4 (利用者が決めた) (3) 時計より先の `resolved_at` (4) 失敗の案内 (5) スレッドの合流の失敗を `no_record` にしない (6) 説明文 (tag と refs/ の rev も期限あり、`refresh` は効かない旨の warning、読めない時刻の文面)。残したもの: (7) git の warning は re-export で std に移った応答にも残る (E1b の記録と同じ)。`resolve_version` の期限切れ・ハッシュ、照会のツールの `plaintext` のテストは無い
+
+**E3b-2 の下調べと決定 (2026-10-22)**:
+
+- 下調べ (サブエージェント、読むだけ。要点は scratchpad の e3b2-research.md): 照会のツール 8 つは `parse_release` で `GitSpec` を作って捨て、`dispatch` の `git_later` で「(in a later version)」を返している。`ReleaseArguments` と `get_item::Arguments` に持たせ、`get_item::execute` の頭 (`refresh` の前) で分け、`recorded_dependency` と同じ形の `Request` (記録の build を `LocalSource::Recorded` で) にして `look_up_release` に渡せる。provenance の git の欄は `mark_rebuilding` と同じく応答の JSON に後から足す。時間を進めるテストの口は無いので、stdio のテストで `resolved.json` の `resolved_at` を書き換えて期限切れを作る。`get_item.md`・`search_items.md` は 2048 字の上限まで数字しか無いので、説明は引数の説明 (`GIT_ARGUMENTS`) に書く
+- 利用者が決めたこと:
+  1. 外のツールが ref を解決し直している最中は、前の解決の commit のデータをそのまま返す (stale になるのは 1 日の期限を過ぎたときだけ。`rebuilding` は付けない)
+  2. 短いハッシュの前方一致は、記録 (作成中・失敗を含む) のある commit だけで照合する (記録の無い commit が一覧に残っても曖昧にしない)。一致はあったがどれも記録が無ければ `no_record`
+  3. 記録のある commit に一致しない短いハッシュは、その短いハッシュを ref にした要求の鍵も読む (作成中なら `building`、失敗ならその失敗。どちらにも無ければ `no_record`)
+  4. (レビューの後) 外のツールの呼び直しで ref が新しい commit に動いたら、その commit の作成が終わるまで、前の commit のデータに `stale: rebuilding` と `retry_after_secs` を付けて返す (解決の記録に前の commit を残す)。新しい commit の作成が失敗したら、その失敗を返す
+- 聞かずに決めたこと (要件か下調べの推奨のとおり): 解決の記録が無ければ `docs_unavailable` (`reason: no_record`) と外のツールに渡す引数、ref の応答には期限内でも `resolved_at` と「解決し直すには外のツールを呼ぶ」の hint (R-MCP-3)、期限切れは `stale: true`・`stale_reason: ref_ttl_expired` と warning と hint (`retry_after_secs` は付けない)、読めない `resolved_at` は期限切れとみなす、40・64 桁のハッシュは `Key::Git` を直接読み、無ければ前方一致へ、ハッシュの要求に `resolved_at` は載せない、`git` と `refresh` は `refresh` を無視 (外の記録は照会のツールで取り直さない、R-WS-10)、target を省けば host (決定 11、`lookup_target` を通さない)、`resolve_version` は `data.source: git`・`docs_rs_json: not_on_docs_rs`、provenance は `source: local` と git の欄
+
 **E3b-1 (外のツールで git の crate を作る。2026-10-22)**:
 
 - `data::external`: 鍵 `Key::GitRef` (正規化した URL・ref の完全な名前 (`HEAD`・`refs/heads/…`・`refs/tags/…`・rev)・crate・target・hidden。置き場 `ext/v1/git_ref/<digest>`) と `Key::Git` (URL・コミット・crate・target・hidden。`ext/v1/git/<digest>`)。解決の記録 `resolved.json` (`Resolved`: コミット・リポジトリでの package 名・版・`resolved_at`) と `resolution`・`resolution_making`・`record_resolution`・`remember_resolution_failure`。crate ごとのコミットの一覧 `ext/v1/git_commits/<digest>/<commit>` (`commits`。短いハッシュ用、決定 8)。コミットはファイル名になるので、40 か 64 桁の小文字の 16 進だけ (`git_source::is_commit`) を書き・読む

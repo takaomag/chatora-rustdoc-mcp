@@ -132,7 +132,7 @@ pub(super) async fn crate_of_git(
 
 /// What the crate `name` of `git` is, for the messages: the repository as given, which has no
 /// password, and the ref.
-fn what_of(name: &CrateName, git: &GitSpec) -> String {
+pub(super) fn what_of(name: &CrateName, git: &GitSpec) -> String {
     format!(
         "{name} of {} at {}",
         git.url.as_given(),
@@ -255,6 +255,8 @@ async fn built(
 
 /// Records what the ref of `key` resolved to, `resolved`, under its lock (`making`), which it gives
 /// back with when it was resolved: that of the record before, if `keep_when` and there is one.
+/// The commit of the record before is kept as the previous one when the ref moved, else the
+/// previous one of that record (decided in M2e's E3b-2, 4).
 ///
 /// # Errors
 ///
@@ -268,11 +270,17 @@ async fn record_resolution(
 ) -> Result<(Box<str>, Making), tokio::task::JoinError> {
     let (cache, key) = (state.cache.clone(), key.clone());
     crate::task::spawn_blocking(move || {
-        if keep_when
-            && let external::Resolution::Resolved(before) =
-                external::resolution_making(&cache, &key, &making)
+        if let external::Resolution::Resolved(before) =
+            external::resolution_making(&cache, &key, &making)
         {
-            resolved.at = before.at;
+            resolved.previous = if before.commit == resolved.commit {
+                before.previous
+            } else {
+                Some(before.commit)
+            };
+            if keep_when {
+                resolved.at = before.at;
+            }
         }
         if let Err(error) = external::record_resolution(&cache, &key, &resolved, &making) {
             tracing::warn!(%error, "what a git ref resolved to could not be recorded");
@@ -451,6 +459,7 @@ async fn resolve_as(
         package: package.name.clone(),
         version: package.version.to_string().into(),
         at: crate::data::rfc3339(SystemTime::now()).into(),
+        previous: None,
     };
     Ok(Found {
         resolved,
@@ -502,7 +511,7 @@ fn git_failure(mut body: Value) -> Value {
 
 /// The arguments that look up the crate `name` of `git` for `target`, as the query tools take them:
 /// the ref as asked for, which they resolve as this call did.
-fn arguments(name: &str, git: &GitSpec, target: &TargetTriple) -> Value {
+pub(super) fn arguments(name: &str, git: &GitSpec, target: &TargetTriple) -> Value {
     let mut arguments = Map::new();
     arguments.insert("crate".to_owned(), json!(name));
     arguments.insert("git".to_owned(), json!(git.url.key()));
@@ -524,7 +533,7 @@ fn arguments(name: &str, git: &GitSpec, target: &TargetTriple) -> Value {
 
 /// The provenance of the crate of `git`: its repository, the ref asked for unless a hash, and
 /// whether it is fetched in plain text (decided in M2e's E3).
-fn git_provenance(provenance: &mut Map<String, Value>, git: &GitSpec) {
+pub(super) fn git_provenance(provenance: &mut Map<String, Value>, git: &GitSpec) {
     provenance.insert("package_source".to_owned(), json!("git"));
     provenance.insert("git".to_owned(), json!(git.url.key()));
     if !git.reference.is_hash() {
@@ -536,7 +545,7 @@ fn git_provenance(provenance: &mut Map<String, Value>, git: &GitSpec) {
 }
 
 /// What the response warns of a repository fetched in plain text (requirement R-SEC-4).
-const PLAINTEXT: &str = "the repository was fetched in plain text (http or git), so what was \
+pub(super) const PLAINTEXT: &str = "the repository was fetched in plain text (http or git), so what was \
                          fetched may have been changed on the way";
 
 /// The response for `made`, of the crate `name` of `git`, for `target` (its key): the arguments

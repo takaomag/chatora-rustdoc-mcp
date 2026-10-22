@@ -2934,7 +2934,13 @@ fn git_repository(dir: &Path) -> (PathBuf, PathBuf, String) {
          [package.metadata.docs.rs]\nfeatures = [\"extra\"]\n\n[features]\nextra = []\n",
     )
     .expect("written");
-    std::fs::write(work.join("src/lib.rs"), "pub fn first() {}\n").expect("written");
+    std::fs::write(
+        work.join("src/lib.rs"),
+        "pub fn first() {}\n#[cfg(feature = \"extra\")]\npub fn extra() {}\n\
+         pub struct Thing;\nimpl Thing {\n    pub fn new() -> Self {\n        Self\n    }\n}\n\
+         pub trait Shape {}\nimpl Shape for Thing {}\n",
+    )
+    .expect("written");
     git_in(&work, &gitconfig, &[
         "init",
         "--quiet",
@@ -3022,6 +3028,301 @@ fn looked_up_in_other_ways(server: &mut Server, (first, second): (&str, &str)) {
     let error = text_json(&result);
     assert_eq!(error["code"], "fetch_failed", "{result}");
     assert_eq!(error["reason"], "no_rev", "{result}");
+}
+
+/// The query tools look a crate of a git repository up in the records of `build_external_docs`: by
+/// its branch, at the commit that it last resolved to, which is stale after a day; by a short hash
+/// of a commit with a record; and tell what failed, and what is not recorded (requirement R-WS-10,
+/// decided in M2e, 7 and 8, and in M2e's E3b).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let (_work, _gitconfig, commit) = git_repository(dir.path());
+    let mut server = server_with_on(None, &registry, dir.path(), &[
+        ("CARGO_NET_GIT_FETCH_WITH_CLI", "true"),
+        ("CARGO_NET_RETRY", "0"),
+    ]);
+    let branch = json!({
+        "crate": "fixture-git",
+        "git": "https://example.invalid/dep",
+        "branch": "main",
+    });
+    let built = built_by_external(&mut server, 1, &branch);
+    assert_eq!(built["structuredContent"]["data"]["built"], true, "{built}");
+    let with = |more: Value| {
+        let mut arguments = branch.clone();
+        for (name, value) in more.as_object().expect("an object") {
+            arguments[name] = value.clone();
+        }
+        arguments
+    };
+    let tools = [
+        ("get_item", with(json!({ "path": "fixture_git::extra" }))),
+        ("crate_overview", with(json!({}))),
+        ("list_module", with(json!({}))),
+        ("list_methods", with(json!({ "path": "Thing" }))),
+        ("list_impls", with(json!({ "path": "Thing" }))),
+        ("list_implementors", with(json!({ "path": "Shape" }))),
+        ("search_items", with(json!({ "query": "first" }))),
+        ("resolve_version", with(json!({}))),
+    ];
+    for (id, (tool, arguments)) in (100_u64..).zip(tools) {
+        server.send(&call_tool(id, tool, arguments));
+        let result = server.response(id)["result"].clone();
+        assert_ne!(result["isError"], true, "{tool}: {result}");
+        let provenance = &result["structuredContent"]["provenance"];
+        assert_eq!(provenance["source"], "local", "{tool}: {result}");
+        assert_eq!(provenance["git"], "https://example.invalid/dep", "{tool}");
+        assert_eq!(provenance["rev"], commit, "{tool}: {result}");
+        assert_eq!(provenance["ref"], "refs/heads/main", "{tool}");
+        assert_eq!(provenance["resolved_from"], "git", "{tool}: {result}");
+        assert_eq!(provenance["recorded_by"], "build_external_docs", "{tool}");
+        assert!(provenance["resolved_at"].is_string(), "{tool}: {result}");
+        assert!(provenance.get("stale").is_none(), "{tool}: {result}");
+        assert!(
+            result["structuredContent"]["hints"]
+                .to_string()
+                .contains("to resolve it anew"),
+            "{tool}: {result}"
+        );
+    }
+    looked_up_by_hash_and_when_stale(&mut server, &commit);
+    looked_up_while_rebuilding(&mut server, &commit);
+    assert!(server.finish().success());
+}
+
+/// Asks `server`, which has the record of the branch `main` of [`git_repository`] at `commit`,
+/// for it by a short hash, past a day since it was resolved, for a tag not recorded, and for a
+/// branch that failed.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn looked_up_by_hash_and_when_stale(server: &mut Server, commit: &str) {
+    let item = |more: Value| {
+        let mut arguments = json!({
+            "crate": "fixture-git",
+            "git": "https://example.invalid/dep",
+            "path": "first",
+        });
+        for (name, value) in more.as_object().expect("an object") {
+            arguments[name] = value.clone();
+        }
+        arguments
+    };
+    // A short hash: no ref nor when it was resolved.
+    server.send(&call_tool(
+        200,
+        "get_item",
+        item(json!({ "rev": commit.get(..8).expect("a hash") })),
+    ));
+    let result = server.response(200)["result"].clone();
+    let provenance = &result["structuredContent"]["provenance"];
+    assert_eq!(provenance["rev"], commit, "{result}");
+    assert!(provenance.get("ref").is_none(), "{result}");
+    assert!(provenance.get("resolved_at").is_none(), "{result}");
+
+    // Resolved more than a day ago.
+    let resolved = chatora_rustdoc_mcp::data::external::Key::GitRef {
+        url: "https://example.invalid/dep".into(),
+        reference: "refs/heads/main".into(),
+        // Its cache key.
+        name: "fixture-git".into(),
+        target: host_triple().into(),
+        hidden: false,
+    }
+    .dir(server.cache.path())
+    .join("resolved.json");
+    let text = std::fs::read_to_string(&resolved).expect("read");
+    let mut record: Value = serde_json::from_str(&text).expect("JSON");
+    record["resolved_at"] = json!("2026-01-01T00:00:00Z");
+    std::fs::write(&resolved, record.to_string()).expect("written");
+    server.send(&call_tool(
+        201,
+        "get_item",
+        item(json!({ "branch": "main" })),
+    ));
+    let result = server.response(201)["result"].clone();
+    let content = &result["structuredContent"];
+    assert_eq!(content["provenance"]["stale"], true, "{result}");
+    assert_eq!(
+        content["provenance"]["stale_reason"], "ref_ttl_expired",
+        "{result}"
+    );
+    assert!(
+        content["warnings"]
+            .to_string()
+            .contains("more than a day ago"),
+        "{result}"
+    );
+    assert_eq!(content["data"]["path"], "fixture_git::first", "{result}");
+
+    // A tag that build_external_docs has not resolved.
+    server.send(&call_tool(202, "get_item", item(json!({ "tag": "v9" }))));
+    let result = server.response(202)["result"].clone();
+    let error = text_json(&result);
+    assert_eq!(error["reason"], "no_record", "{result}");
+    assert!(
+        error["suggestions"][0]
+            .to_string()
+            .contains(r#"\"tag\":\"v9\""#),
+        "{result}"
+    );
+
+    // A branch that it failed to resolve.
+    let failed = built_by_external(
+        server,
+        203,
+        &json!({
+            "crate": "fixture-git",
+            "git": "https://example.invalid/dep",
+            "branch": "nope",
+        }),
+    );
+    assert_eq!(text_json(&failed)["code"], "fetch_failed", "{failed}");
+    server.send(&call_tool(
+        300,
+        "get_item",
+        item(json!({ "branch": "nope" })),
+    ));
+    let result = server.response(300)["result"].clone();
+    let error = text_json(&result);
+    assert_eq!(error["code"], "fetch_failed", "{result}");
+    assert!(error["failed_at"].is_string(), "{result}");
+}
+
+/// Asks `server`, which has the record of the branch `main` of [`git_repository`] at `commit`,
+/// for it by its full hash; by a short hash that begins two commits with records; and by the
+/// branch while it moved to one of those, which `build_external_docs` builds, holding the lock of
+/// the ref, and once that failed (decided in M2e's E3b-2, 2 and 4).
+#[cfg(all(debug_assertions, feature = "local"))]
+fn looked_up_while_rebuilding(server: &mut Server, commit: &str) {
+    use chatora_rustdoc_mcp::data::external;
+    server.send(&call_tool(
+        400,
+        "get_item",
+        git_item(json!({ "rev": commit })),
+    ));
+    let result = server.response(400)["result"].clone();
+    assert_eq!(
+        result["structuredContent"]["provenance"]["rev"], commit,
+        "{result}"
+    );
+    let (one, _) = failed_commits(server);
+    server.send(&call_tool(
+        401,
+        "get_item",
+        git_item(json!({ "rev": "abcdef0" })),
+    ));
+    let result = server.response(401)["result"].clone();
+    let error = text_json(&result);
+    assert_eq!(error["code"], "invalid_argument", "{result}");
+    assert_eq!(
+        error["candidates"].as_array().map(Vec::len),
+        Some(2),
+        "{result}"
+    );
+
+    // The branch moved to one of them, which build_external_docs builds again.
+    let reference = external::Key::GitRef {
+        url: "https://example.invalid/dep".into(),
+        reference: "refs/heads/main".into(),
+        name: "fixture-git".into(),
+        target: host_triple().into(),
+        hidden: false,
+    };
+    let resolved = reference.dir(server.cache.path()).join("resolved.json");
+    let mut record: Value =
+        serde_json::from_str(&std::fs::read_to_string(&resolved).expect("read")).expect("JSON");
+    record["commit"] = json!(one);
+    record["previous"] = json!(commit);
+    record["resolved_at"] = json!(chatora_rustdoc_mcp::data::rfc3339(
+        std::time::SystemTime::now()
+    ));
+    std::fs::write(&resolved, record.to_string()).expect("written");
+    let making = external::try_make(&Cache::at(server.cache.path()), &reference)
+        .expect("locked")
+        .expect("not held");
+    let branch = git_item(json!({ "branch": "main" }));
+    server.send(&call_tool(402, "get_item", branch.clone()));
+    let result = server.response(402)["result"].clone();
+    let content = &result["structuredContent"];
+    assert_eq!(content["provenance"]["rev"], commit, "{result}");
+    assert_eq!(
+        content["provenance"]["stale_reason"], "rebuilding",
+        "{result}"
+    );
+    assert!(content["retry_after_secs"].is_number(), "{result}");
+    assert_eq!(content["data"]["path"], "fixture_git::first", "{result}");
+    drop(making);
+    // Built again, it failed.
+    server.send(&call_tool(403, "get_item", branch));
+    let result = server.response(403)["result"].clone();
+    let error = text_json(&result);
+    assert_eq!(error["code"], "build_failed", "{result}");
+    assert!(
+        error["suggestions"]
+            .to_string()
+            .contains(r#"\"branch\":\"main\""#),
+        "{result}"
+    );
+}
+
+/// Records in the cache of `server` two commits of the crate of [`git_repository`] that begin
+/// alike, whose builds failed, and returns them.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn failed_commits(server: &Server) -> (String, String) {
+    use chatora_rustdoc_mcp::data::{build::Failed, external};
+    let lists = std::fs::read_dir(server.cache.path().join("ext/v1/git_commits"))
+        .expect("listed")
+        .next()
+        .expect("one list")
+        .expect("an entry")
+        .path();
+    let failed = Failed::now(
+        None,
+        None,
+        false,
+        json!({ "code": "build_failed", "message": "the test's", "retryable": false }),
+    );
+    let (one, other) = (
+        format!("abcdef0{}", "1".repeat(33)),
+        format!("abcdef0{}", "2".repeat(33)),
+    );
+    for fake in [&one, &other] {
+        std::fs::write(lists.join(fake), "").expect("written");
+        let dir = external::Key::Git {
+            url: "https://example.invalid/dep".into(),
+            commit: fake.as_str().into(),
+            name: "fixture-git".into(),
+            target: host_triple().into(),
+            hidden: false,
+        }
+        .dir(server.cache.path());
+        std::fs::create_dir_all(&dir).expect("made");
+        std::fs::write(
+            dir.join("failed.json"),
+            serde_json::to_vec(&failed).expect("JSON"),
+        )
+        .expect("written");
+    }
+    (one, other)
+}
+
+/// The arguments of `get_item` for `first` in the crate of [`git_repository`], with `more`.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn git_item(more: Value) -> Value {
+    let mut arguments = json!({
+        "crate": "fixture-git",
+        "git": "https://example.invalid/dep",
+        "path": "first",
+    });
+    let Value::Object(more) = more else {
+        panic!("not an object: {more}");
+    };
+    for (name, value) in more {
+        arguments[name] = value;
+    }
+    arguments
 }
 
 /// A release whose lib is a cdylib only is documented (the plan's test crate (e)).
@@ -3163,12 +3464,12 @@ fn dir_of_record(server: &Server, name: &str, version: &str) -> PathBuf {
     .dir(server.cache.path())
 }
 
-/// `git`, `rev`, `branch` and `tag` are checked (requirement R-SEC-4), and the query tools read a
-/// crate of a git repository in a later version (M2e's E3b-2); credentials in the URL are not
-/// logged, and a `project` with a bidirectional control is not taken. Without local features,
-/// `git` is refused.
+/// `git`, `rev`, `branch` and `tag` are checked (requirement R-SEC-4), and the query tools look a
+/// crate of a git repository up in the records of `build_external_docs`, which has none of this one
+/// (decided in M2e's E3b); credentials in the URL are not logged, and a `project` with a
+/// bidirectional control is not taken. Without local features, `git` is refused.
 #[test]
-fn git_arguments_are_checked_and_told_to_come() {
+fn git_arguments_are_checked_and_looked_up_in_the_records() {
     let mut server = Server::start();
     // Every tool that takes it, as one of its dispatch.
     let tools = [
@@ -3191,8 +3492,11 @@ fn git_arguments_are_checked_and_told_to_come() {
         let error = text_json(&result);
         if cfg!(feature = "local") {
             assert_eq!(error["code"], "docs_unavailable", "{tool}: {result}");
+            assert_eq!(error["reason"], "no_record", "{tool}: {result}");
             assert!(
-                error["message"].to_string().contains("later version"),
+                error["suggestions"][0]
+                    .to_string()
+                    .contains("call build_external_docs with"),
                 "{tool}: {result}"
             );
         } else {

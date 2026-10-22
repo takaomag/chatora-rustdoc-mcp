@@ -421,6 +421,10 @@ pub struct Resolved {
     /// (decided in M2e, 7).
     #[serde(rename = "resolved_at")]
     pub at: Box<str>,
+    /// The commit that it resolved to before, when it moved: the query tools give that while the
+    /// new one is built (decided in M2e's E3b-2, 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<Box<str>>,
 }
 
 /// The file of what a ref resolved to: its key and that.
@@ -932,6 +936,7 @@ mod tests {
             package: "git-dep".into(),
             version: "0.3.0".into(),
             at: "2026-10-22T00:00:00Z".into(),
+            previous: None,
         };
         // Not of the lock of another key, nor a commit that is not a full hash.
         record_resolution(&cache, &commit, &resolved, &making).expect_err("another key");
