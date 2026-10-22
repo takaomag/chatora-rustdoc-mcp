@@ -89,7 +89,7 @@ impl FakeRegistry {
                 "kind": "normal",
             })).collect::<Vec<_>>(),
             "cksum": sha256_hex(&file),
-            "features": {},
+            "features": krate.features.iter().cloned().collect::<serde_json::Map<_, _>>(),
             "yanked": false,
             "v": 2,
         });
@@ -177,6 +177,8 @@ pub(crate) struct FakeCrate {
     version: String,
     /// The names and version requirements of its dependencies.
     dependencies: Vec<(String, String)>,
+    /// Its features, by name, with those that each enables.
+    features: Vec<(String, serde_json::Value)>,
     /// The files besides Cargo.toml, by path in the package.
     files: Vec<(String, String)>,
 }
@@ -188,6 +190,7 @@ impl FakeCrate {
             name: name.to_owned(),
             version: version.to_owned(),
             dependencies: Vec::new(),
+            features: Vec::new(),
             files: vec![("src/lib.rs".to_owned(), String::new())],
         }
     }
@@ -196,6 +199,20 @@ impl FakeCrate {
     #[must_use]
     pub(crate) fn dependency(mut self, name: &str, req: &str) -> Self {
         self.dependencies.push((name.to_owned(), req.to_owned()));
+        self
+    }
+
+    /// Adds the feature `name`, which enables the features `enables`.
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(
+            dead_code,
+            reason = "only the tests of local features build with features"
+        )
+    )]
+    pub(crate) fn feature(mut self, name: &str, enables: &[&str]) -> Self {
+        self.features.push((name.to_owned(), json!(enables)));
         self
     }
 
@@ -216,6 +233,12 @@ impl FakeCrate {
             self.dependencies
                 .iter()
                 .map(|(name, req)| format!("{name} = \"{req}\"\n")),
+        );
+        manifest.push_str("\n[features]\n");
+        manifest.extend(
+            self.features
+                .iter()
+                .map(|(name, enables)| format!("{name} = {enables}\n")),
         );
         manifest
     }

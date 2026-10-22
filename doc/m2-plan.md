@@ -1412,6 +1412,21 @@ Claude Code 2.1.304、Linux で測った。
 
 ### 6.6 M2e
 
+**E2a の下調べと決定 (2026-10-22)**:
+
+- 下調べ (サブエージェント、読むだけ): 今のローカルビルド (`Plan`・`LocalWanted`・`local_archive`・`Builder`) は、仮のプロジェクトの Cargo.lock を先に作れば、ほぼそのまま使える (`cargo::project_command` は常に `--locked`)。`Builder` の features の切り替えは `--no-default-features --features` で、依存には使えないので、仮のプロジェクトでは Cargo.toml に書く。toolchain は `toolchain::choose(仮のプロジェクト)` で、置き場で rustup が選ぶ既定になる (決定 3 に合う)。食い違い: 決定 2 (共有の target dir) と R-WS-8 (`RUSTC_BOOTSTRAP` の値を target dir ごとに固定)、`lookup_target` と決定 11、R-WS-7 の「仮のプロジェクトでは `cargo fetch` を `--locked` なしで」と Cargo.lock を先に作る形。テストの偽の crates.io (`tests/common/registry.rs`) は cargo には使えるが、サーバーの sparse index と static.crates.io を差し替える口は無い
+- 利用者が決めたこと:
+  - (1) 仮のプロジェクトの `RUSTC_BOOTSTRAP` は常に `1` (共有の target dir で値が変わらず作り直しが起きない。docs.rs も nightly で作るので、依存でない crate の文書はむしろ docs.rs に近い。既定のプロジェクトは今のまま crate 名。M2 の終わりに R-WS-8 に例外として書く)
+  - (2) features の組 (`[package.metadata.docs.rs]`) は、照会のツールと同じく `.crate` を先に取って読む (Cargo.toml も Cargo.lock も 1 回で作れる。テストのために static.crates.io を差し替える口を debug ビルドだけに足す)
+  - (3) docs.rs に JSON が無い yanked の版を完全一致で指されたら、ビルドせずに理由と yanked でない近い版を返す
+  - (4) E2a を E2a-1 (データ層: 仮のプロジェクトの Cargo.toml の書き出し、`--locked` なしで Cargo.lock を作る入口、共有の target dir、`RUSTC_BOOTSTRAP=1`、偽の crates.io でビルドする `tests/local` のテスト) と E2a-2 (ツールの流れ: 振り分け・docs.rs の確かめ・`.crate` の features・ロックと待ち・記録と失敗・応答とスキーマ・決定 11・stdio のテスト) に分ける。features のやり直し・`offline_miss`・呼び直しは計画どおり E2b
+- 聞かずに決めたこと (要件か前の決定のとおり):
+  - 仮のプロジェクトは鍵ごとに `ext/v1/release/<digest>/project` に置いて残す (記録と同じロックと GC (F1) の枠)。target dir はすべての仮のプロジェクトで 1 つ (決定 2)
+  - Cargo.lock は最初に 1 回だけ `--locked` なしで作り (オフラインなら `--offline`)、以後は今の `--locked` の経路を使う (呼び直しで作り直すと推移的な版が動いて鍵が変わるため)。R-WS-7 の文は M2 の終わりに合わせる
+  - docs.rs の確かめは照会のツールと同じ読み込みの経路 (形式と target まで分かる。`remembered_no_json` を近道に)。読める JSON があればビルドせず `reason: docs_rs`。ネットワークの失敗は `network_error`。確かめは有効な記録が無いときだけ
+  - 待ちは照会のツールと同じ (`build.wait_secs`、索引の作成中は呼び出しの期限まで。R-WS-10)。2 人目の呼び出しは終わるのを待って合流する (決定 13)。応答は `data` に照会の鍵 (`crate`・完全一致の `version`・`target`) と、照会のツールに渡す hint
+  - 決定 11 は E2a-2 で照会のツールの側にも入れる (`target` を渡されたかを持ち、プロジェクトが使わないリリースは渡されていなければ host)
+
 **E1b の下調べと決定 (2026-10-22)**:
 
 - 下調べ (サブエージェント、読むだけ): 照会のツールが外の記録を見る口は 5 つ。(a) 依存でない crate と Cargo.lock に無い版で docs.rs に JSON が無いとき (`load_and_look_up` の読み込みの失敗、`no_json`・`no_target_json` の手前。鍵の crate・版・target は cargo を起動せずに分かる) (b) 他の target (`local::other_target`) (c) 名指しできない依存 (`build_unsupported`) (d) 外の `project` (`project::workspace` の `no_record`。`explicit_found`・`explicit_member` はそこで黙って crates.io に落ちる) (e) git
@@ -1423,6 +1438,14 @@ Claude Code 2.1.304、Linux で測った。
   - 完全一致の版は、docs.rs の前に外の索引を見る (オフラインでも効く)。依存でない crate の target を host にする決定 11 は E2a で作る側と合わせて入れる
   - 照会のツールが読んだら最後に使った日時を更新する (R-CA-5。std の `used` と同じく 1 時間に 1 回)。re-export をたどるときは外の記録を読まない (R-WS-10)。照会のツールの `refresh` は外の失敗を解かない (R-WS-10・§6.4)
   - テストの記録は、E2a が使う `data::external` の書き手で置く
+
+**E2a-1 (仮のプロジェクトのデータ層。2026-10-22)**:
+
+- `data::temp_project`: 仮のプロジェクトの Cargo.toml (`toml` の `display` で書く。lib は `lib.rs`、依存はリリース 1 つを `=x.y.z`・`default-features = false`・docs.rs の組の features で、空の `[workspace]` で上の workspace に入らない。パッケージ名はリリースと重ならないもの)、`write` (同じ Cargo.toml なら Cargo.lock ごと残し、違えば Cargo.lock を消して書き直す)、`lock` (Cargo.lock が無ければ `cargo generate-lockfile`。`cargo::unlocked_command` は `--locked` を付けない唯一の入口)、`target_dir` (すべての仮のプロジェクトで 1 つ)、`plan` (cargo metadata から crates.io のそのリリースを探し、`RUSTC_BOOTSTRAP=1`・依存として公開の item だけ・docs.rs の `--cfg`)、`dir_in` (記録の置き場の `project/`)
+- `toml` に `display` を `cargo add` で足した (`toml_writer` 1.1.3 が増えた。cargo deny は通る)
+- テスト: 単体 3 件 (Cargo.toml の形・Cargo.lock を残す条件・共有の target dir)、`tests/local/external_build.rs` (偽の crates.io のリリースを仮のプロジェクトで作る: docs.rs の組の features と `--cfg`、`RUSTC_BOOTSTRAP=1`、2 つ目の仮のプロジェクトでは `RUSTC_BOOTSTRAP` を見る依存を作り直さない、作り直しで index を引き直さない)。偽の crates.io の `FakeCrate` に `[features]` を足した
+- レビュー (サブエージェント、読むだけ) の対応: (1) `plan` は「crates.io のそのリリースが無い」(`[patch.crates-io]` などで別の取得元になった) と「lib が無い」を `PlanError` で分ける。名前は `-`・`_` と大小を区別せずに照合 (2) `Release.name` を `CrateName` に (R-SEC-4 を型で)。features は並べ替えて重複を除き、同じリリースなら同じ Cargo.toml にして Cargo.lock を残す。仮のパッケージ名との重なりも正規化して比べる (4) edition は 2021 (resolver 2 は最新の版を選ぶので docs.rs に近く、古い cargo でも読める。2024 の resolver 3 は Cargo.lock を作った rustc に合う版を選ぶ) (5) `default` は `default-features = true` に写す (`default` を宣言しない crate にも効く) (6) `build::fetch` と同じ実行と振り分けを `build::run_fetching` にまとめた。Cargo.lock の有無の確かめも blocking に (7) テスト: `plan` の単体 (名前の正規化・別の取得元・lib 無し)、共有の target dir の意味のある比較
+- E2a-2 に回したもの: (3) 途中で切れたり古い cargo で読めない Cargo.lock は、`--locked` の cargo が `lockfile_outdated` などで落ちたら 1 回だけ作り直す。オンラインでの取得の失敗は `Failure::Other` になるので、外のツールの応答でどう返すかを決める (照会のツールの `cargo metadata`・`cargo fetch` の失敗と同じく retryable)。`$CARGO_HOME` の設定の `build.target` や自前の std (`CargoConfig::own_target`) も仮のプロジェクトに効くので、D7c と同じ確かめをする
 
 **E1b (外の記録と照会の経路。2026-10-22)**:
 

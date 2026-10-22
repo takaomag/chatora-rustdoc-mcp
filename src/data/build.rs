@@ -1111,6 +1111,20 @@ pub async fn fetch(plan: &Plan, on_doing: impl FnMut(Doing) + Send) -> Result<()
     if let Some(target) = &plan.target {
         command.arg("--target").arg(target.as_str());
     }
+    run_fetching(command, plan.offline, on_doing).await
+}
+
+/// Runs `command`, which fetches what a build needs, telling `on_doing` what cargo does, as its
+/// stderr tells.
+///
+/// # Errors
+///
+/// Returns why cargo failed, as [`BuildError::Fetch`], or could not run.
+pub(super) async fn run_fetching(
+    command: tokio::process::Command,
+    offline: bool,
+    on_doing: impl FnMut(Doing) + Send,
+) -> Result<(), BuildError> {
     let mut on_doing = on_doing;
     // Fetching that runs too long, or cannot be started, is no more lasting than its failure.
     let output = super::cargo::run_reporting(command, |activity| {
@@ -1125,7 +1139,7 @@ pub async fn fetch(plan: &Plan, on_doing: impl FnMut(Doing) + Send) -> Result<()
         Ok(())
     } else {
         Err(BuildError::Fetch {
-            failure: classify(&output, plan.offline),
+            failure: classify(&output, offline),
             stderr: stderr_tail(&output),
         })
     }

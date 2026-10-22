@@ -11,6 +11,8 @@
 
 #[cfg(feature = "local")]
 mod build_scope;
+#[cfg(feature = "local")]
+mod external_build;
 #[path = "../common/git.rs"]
 mod git;
 #[cfg(feature = "local")]

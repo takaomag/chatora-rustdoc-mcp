@@ -47,6 +47,8 @@ pub mod rustdoc_json;
 pub mod sparse_index;
 pub mod std_json;
 pub mod target;
+#[cfg(feature = "local")]
+pub mod temp_project;
 #[cfg(test)]
 pub(crate) mod test_http;
 #[cfg(feature = "local")]

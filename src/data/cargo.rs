@@ -124,6 +124,23 @@ pub(super) fn project_command(
     offline: bool,
     toolchain: Option<&str>,
 ) -> tokio::process::Command {
+    command_in(root, offline, toolchain, true)
+}
+
+/// [`project_command`] without `--locked`, which writes Cargo.lock: for the temporary projects of
+/// `build_external_docs`, whose Cargo.lock the server makes (requirement R-WS-5, decided in M2e's
+/// E2a), and nowhere else.
+pub(super) fn unlocked_command(root: &Path, offline: bool) -> tokio::process::Command {
+    command_in(root, offline, None, false)
+}
+
+/// [`project_command`], with `--locked` if `locked`.
+fn command_in(
+    root: &Path,
+    offline: bool,
+    toolchain: Option<&str>,
+    locked: bool,
+) -> tokio::process::Command {
     let programs = super::toolchain::Programs::this();
     let mut command = tokio::process::Command::new(programs.cargo());
     // That of the settings, and the project's toolchain: not that of `RUSTUP_TOOLCHAIN`
@@ -134,7 +151,9 @@ pub(super) fn project_command(
             .arg(format!("+{toolchain}"))
             .env("RUSTUP_AUTO_INSTALL", "0");
     }
-    command.arg("--locked");
+    if locked {
+        command.arg("--locked");
+    }
     if offline {
         command.arg("--offline").env("RUSTUP_AUTO_INSTALL", "0");
     }
