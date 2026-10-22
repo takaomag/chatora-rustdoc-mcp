@@ -64,6 +64,12 @@ impl FakeRegistry {
         }
     }
 
+    /// The URL of the registry, without a trailing `/`: the sparse index is under `/index`, and the
+    /// `.crate` files are where static.crates.io has them too.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// The `config.toml` of a cargo home that replaces crates.io with this registry.
     pub(crate) fn cargo_config(&self) -> String {
         format!(
@@ -95,12 +101,19 @@ impl FakeRegistry {
         });
         let index = format!("/index/{}", index_path(&krate.name));
         let download = format!("/dl/{}/{}/download", krate.name, krate.version);
+        // Where static.crates.io has it, for the server's client of it in the tests.
+        let on_static = format!(
+            "/crates/{name}/{name}-{version}.crate",
+            name = krate.name,
+            version = krate.version
+        );
         let mut state = self.state.lock();
         state
             .files
             .entry(index)
             .or_default()
             .extend_from_slice(format!("{line}\n").as_bytes());
+        state.files.insert(on_static, file.clone());
         state.files.insert(download, file);
         drop(state);
     }
@@ -179,6 +192,8 @@ pub(crate) struct FakeCrate {
     dependencies: Vec<(String, String)>,
     /// Its features, by name, with those that each enables.
     features: Vec<(String, serde_json::Value)>,
+    /// What its Cargo.toml has after its features.
+    manifest_tail: String,
     /// The files besides Cargo.toml, by path in the package.
     files: Vec<(String, String)>,
 }
@@ -191,6 +206,7 @@ impl FakeCrate {
             version: version.to_owned(),
             dependencies: Vec::new(),
             features: Vec::new(),
+            manifest_tail: String::new(),
             files: vec![("src/lib.rs".to_owned(), String::new())],
         }
     }
@@ -213,6 +229,17 @@ impl FakeCrate {
     )]
     pub(crate) fn feature(mut self, name: &str, enables: &[&str]) -> Self {
         self.features.push((name.to_owned(), json!(enables)));
+        self
+    }
+
+    /// Adds `text` to its Cargo.toml, after its features, as `[package.metadata.docs.rs]`.
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(dead_code, reason = "only the tests of local features build with it")
+    )]
+    pub(crate) fn manifest_tail(mut self, text: &str) -> Self {
+        self.manifest_tail.push_str(text);
         self
     }
 
@@ -240,6 +267,7 @@ impl FakeCrate {
                 .iter()
                 .map(|(name, enables)| format!("{name} = {enables}\n")),
         );
+        manifest.push_str(&self.manifest_tail);
         manifest
     }
 

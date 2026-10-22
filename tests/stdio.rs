@@ -11,6 +11,9 @@
     reason = "an integration test uses only some of the package's dependencies"
 )]
 
+#[cfg(feature = "local")]
+#[path = "common/registry.rs"]
+mod registry;
 #[path = "common/schema.rs"]
 mod schema;
 
@@ -2237,7 +2240,10 @@ fn build_external_docs_builds_nothing_that_the_query_tools_build() {
             json!({ "project": ".", "target": "wasm32-unknown-unknown" }),
             "docs_unavailable",
         ),
-        (json!({ "crate": "rand@0.9.2" }), "docs_unavailable"),
+        (
+            json!({ "project": ".", "crate": "demo" }),
+            "docs_unavailable",
+        ),
     ];
     for (id, (arguments, code)) in (10_u64..).zip(errors) {
         server.send(&call_tool(id, "build_external_docs", arguments));
@@ -2401,6 +2407,131 @@ fn the_records_of_build_external_docs_are_looked_up_in() {
             "{result}"
         );
     }
+    assert!(server.finish().success());
+}
+
+/// A server whose crates.io, its index, static.crates.io and docs.rs are `registry`, which has no
+/// rustdoc JSON, and whose cargo uses `registry` too, in a cargo home of `dir`, without the user's
+/// settings: for the builds of `build_external_docs`.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn server_on(registry: &registry::FakeRegistry, dir: &Path) -> Server {
+    let cargo_home = dir.join("cargo-home");
+    std::fs::create_dir_all(&cargo_home).expect("made");
+    std::fs::write(cargo_home.join("config.toml"), registry.cargo_config()).expect("written");
+    let gitconfig = dir.join("gitconfig");
+    std::fs::write(&gitconfig, "").expect("written");
+    let base = registry.base_url();
+    let index = format!("{base}/index");
+    let (cargo_home, gitconfig) = (
+        cargo_home.display().to_string(),
+        gitconfig.display().to_string(),
+    );
+    Server::start_with(None, &[
+        ("CHATORA_RUSTDOC_TEST_DOCS_RS_URL", base),
+        ("CHATORA_RUSTDOC_TEST_INDEX_URL", &index),
+        ("CHATORA_RUSTDOC_TEST_STATIC_URL", base),
+        ("CARGO_HOME", &cargo_home),
+        ("GIT_CONFIG_GLOBAL", &gitconfig),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("RUSTUP_AUTO_INSTALL", "0"),
+        ("NO_PROXY", "127.0.0.1"),
+        ("no_proxy", "127.0.0.1"),
+    ])
+}
+
+/// `build_external_docs` documents a release of crates.io that no project uses, which docs.rs has
+/// no JSON of, in a temporary project, with the features of its `[package.metadata.docs.rs]`, for
+/// the host, and records it: the query tools then read it. Called again, it builds nothing; a
+/// release that docs.rs has is not built (requirements R-WS-5 and R-WS-10, decided in M2e's E2a).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn build_external_docs_builds_a_release_that_no_project_uses() {
+    use registry::{FakeCrate, FakeRegistry};
+    let registry = FakeRegistry::start();
+    registry
+        .publish(&FakeCrate::new("fixture-leaf", "0.1.0").file("src/lib.rs", "pub fn leaf() {}\n"));
+    registry.publish(
+        &FakeCrate::new("fixture-far", "0.2.0")
+            .dependency("fixture-leaf", "0.1")
+            .feature("default", &[])
+            .feature("extra", &[])
+            .manifest_tail("\n[package.metadata.docs.rs]\nfeatures = [\"extra\"]\n")
+            .file(
+                "src/lib.rs",
+                "pub use fixture_leaf::leaf;\npub fn far() {}\n#[cfg(feature = \"extra\")]\n\
+                 pub fn extra() {}\n",
+            ),
+    );
+    // docs.rs has its JSON, in the server's cache.
+    registry.publish(&FakeCrate::new("demo", "0.1.0"));
+    let dir = TempDir::new().expect("a temporary directory");
+    let mut server = server_on(&registry, dir.path());
+    let host = host_triple();
+
+    server.send(&call_tool(
+        1,
+        "build_external_docs",
+        json!({ "crate": "fixture-far@0.2.0" }),
+    ));
+    let response = server.response(1);
+    let content = &response["result"]["structuredContent"];
+    assert!(
+        content["data"]["built"] == true || content["status"] == "building",
+        "{response}"
+    );
+    // The query tools tell it when it is built.
+    let lookup = json!({ "crate": "fixture-far@0.2.0", "path": "extra" });
+    let mut found = Value::Null;
+    for id in 10_u64..100 {
+        server.send(&call_tool(id, "get_item", lookup.clone()));
+        found = server.response(id)["result"].clone();
+        if found["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    let provenance = &found["structuredContent"]["provenance"];
+    assert_eq!(provenance["source"], "local", "{found}");
+    assert_eq!(provenance["recorded_by"], "build_external_docs");
+    assert_eq!(provenance["target"], host.as_str());
+    assert_eq!(
+        found["structuredContent"]["data"]["path"],
+        "fixture_far::extra"
+    );
+    // Its features are those that its `.crate` asks docs.rs for.
+    assert!(
+        registry
+            .requests()
+            .iter()
+            .any(|request| request == "GET /crates/fixture-far/fixture-far-0.2.0.crate"),
+        "{:?}",
+        registry.requests()
+    );
+
+    // Called again, it is recorded.
+    server.send(&call_tool(
+        2,
+        "build_external_docs",
+        json!({ "crate": "fixture-far@0.2.0" }),
+    ));
+    let response = server.response(2);
+    let data = &response["result"]["structuredContent"]["data"];
+    assert_eq!(data["built"], true, "{response}");
+    assert_eq!(data["crate"], "fixture-far");
+    assert_eq!(data["version"], "0.2.0");
+    assert_eq!(data["target"], host.as_str());
+
+    // docs.rs has it.
+    server.send(&call_tool(
+        3,
+        "build_external_docs",
+        json!({ "crate": "demo@0.1.0", "target": TARGET }),
+    ));
+    let response = server.response(3);
+    let data = &response["result"]["structuredContent"]["data"];
+    assert_eq!(data["built"], false, "{response}");
+    assert_eq!(data["reason"], "docs_rs");
     assert!(server.finish().success());
 }
 

@@ -254,24 +254,33 @@ fn refresh_cases() -> Vec<Case> {
     .collect()
 }
 
-/// `build_external_docs` builds nothing before M2e's E2a, so its arguments do not change a result
-/// that worked yet: until then, a stdio test
-/// (`build_external_docs_builds_nothing_that_the_query_tools_build`) checks that it takes them.
+/// `build_external_docs` with a release that the project does not use, whose JSON docs.rs has and
+/// the test data has (clap is not a dependency of this package): it builds nothing, and tells the
+/// release. `project` and `target` would build, which a stdio test
+/// (`build_external_docs_builds_nothing_that_the_query_tools_build`) and the local tests check.
 fn external_cases() -> Vec<Case> {
     if !cfg!(feature = "local") {
         return Vec::new();
     }
-    ["crate", "version", "project", "target"]
-        .into_iter()
-        .map(|argument| {
-            case(
-                "build_external_docs",
-                argument,
-                json!({}),
-                Change::CheckedElsewhere,
-            )
-        })
-        .collect()
+    let mut cases = each(
+        "build_external_docs",
+        &json!({ "crate": "clap@4.5.39" }),
+        vec![("crate", Change::Set(json!("clap@4.5.41")))],
+    );
+    cases.extend(each(
+        "build_external_docs",
+        &json!({ "crate": "clap", "version": "4.5.39" }),
+        vec![("version", Change::Set(json!("4.5.41")))],
+    ));
+    cases.extend(["project", "target"].into_iter().map(|argument| {
+        case(
+            "build_external_docs",
+            argument,
+            json!({}),
+            Change::CheckedElsewhere,
+        )
+    }));
+    cases
 }
 
 fn cases() -> Vec<Case> {

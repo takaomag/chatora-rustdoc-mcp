@@ -158,7 +158,14 @@ fn failed_again(failed: &Failed) -> CallToolResult {
         let suggestions = fields
             .entry("suggestions")
             .or_insert_with(|| Value::Array(Vec::new()));
-        if let Value::Array(suggestions) = suggestions {
+        // Unless the body tells it already.
+        if let Value::Array(suggestions) = suggestions
+            && !suggestions.iter().any(|suggestion| {
+                suggestion
+                    .as_str()
+                    .is_some_and(|text| text.contains("build_external_docs"))
+            })
+        {
             suggestions.push(json!(CALL_AGAIN));
         }
     }

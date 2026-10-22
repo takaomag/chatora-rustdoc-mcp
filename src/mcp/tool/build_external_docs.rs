@@ -2,8 +2,8 @@
 //! build themselves, and records it for them (requirement R-WS-10, §3 Q22). It needs local
 //! features, so a server without them does not offer it (requirement R-ARCH-4).
 //!
-//! This is its frame (M2's E1a): what it takes, and the rows of the table of requirement R-WS-10
-//! that build nothing. The builds come in the later steps of M2e.
+//! It builds a release of crates.io that the project does not use (`super::external_build`); the
+//! other rows of the table of requirement R-WS-10 come in the later steps of M2e.
 
 use std::{
     path::{Path, PathBuf},
@@ -82,7 +82,7 @@ pub(super) fn definition() -> Tool {
     }));
     Tool::new(NAME, DESCRIPTION, input_schema)
         .with_title("Build docs of code outside the project")
-        .with_raw_output_schema(Arc::new(output_schema()))
+        .with_raw_output_schema(Arc::new(super::with_building(output_schema())))
         .with_annotations(super::external_annotations())
 }
 
@@ -95,12 +95,22 @@ fn output_schema() -> JsonObject {
             "provenance": {
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "enum": ["project"] },
+                    "source": { "type": "string", "enum": ["project", "docs.rs", "local"] },
+                    "package_source": { "type": "string", "enum": ["crates.io"] },
                     "workspace": { "type": "string" },
-                    "project_from": { "type": "string", "enum": ["argument"] },
+                    "project_from": {
+                        "type": "string",
+                        "enum": ["argument", "claude_project_dir", "cwd"],
+                    },
+                    "crate": { "type": "string" },
+                    "version": { "type": "string" },
                     "target": { "type": "string" },
+                    "toolchain": { "type": "string" },
+                    "built_at": { "type": "string" },
+                    "features_effective": strings,
+                    "recorded_by": { "type": "string", "enum": ["build_external_docs"] },
                 },
-                "required": ["source", "target"],
+                "required": ["source"],
             },
             "warnings": strings,
             "data": {
@@ -109,10 +119,13 @@ fn output_schema() -> JsonObject {
                     "built": { "type": "boolean" },
                     "reason": {
                         "type": "string",
-                        "enum": ["query_tools_build"],
+                        "enum": ["query_tools_build", "docs_rs"],
                         "description": "Why nothing was built: the other tools build it \
-                                        themselves.",
+                                        themselves, or docs.rs has it.",
                     },
+                    "crate": { "type": "string" },
+                    "version": { "type": "string" },
+                    "target": { "type": "string" },
                 },
                 "required": ["built"],
             },
@@ -170,11 +183,20 @@ pub(super) fn parse_arguments(
 
 /// Runs the tool.
 pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
-    match (&arguments.krate, &arguments.project) {
-        (None, Some(project)) => workspace(&state, project, arguments.target.as_ref()).await,
-        (Some(_), _) | (None, None) => {
-            not_yet("a crate", "look it up with get_item, which reads docs.rs")
+    let Arguments {
+        krate,
+        project,
+        target,
+    } = arguments;
+    match (krate, project) {
+        (None, Some(project)) => workspace(&state, &project, target.as_ref()).await,
+        (Some((name, version)), None) => {
+            super::external_build::release(state, name, version, target).await
         },
+        (Some(_), Some(_)) | (None, None) => not_yet(
+            "a crate of a workspace",
+            "look it up with get_item, which reads docs.rs",
+        ),
     }
 }
 
@@ -262,7 +284,7 @@ fn project_not_found(path: &Path, error: &ProjectError) -> CallToolResult {
 
 /// `docs_unavailable` for `what`, which this tool documents in a later version (M2e), with what
 /// may do instead meanwhile.
-fn not_yet(what: &str, instead: &str) -> CallToolResult {
+pub(super) fn not_yet(what: &str, instead: &str) -> CallToolResult {
     error_result(&json!({
         "code": "docs_unavailable",
         "message": format!("documenting {what} is not supported yet (in a later version)"),

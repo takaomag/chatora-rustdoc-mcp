@@ -68,6 +68,7 @@ fn cargo_takes_dependencies_from_the_fake_registry() {
     let isolated = Isolated::new();
     let registry = FakeRegistry::start();
     isolated.write_cargo_config(&registry.cargo_config());
+    assert!(registry.cargo_config().contains(registry.base_url()));
     registry
         .publish(&FakeCrate::new("fixture-leaf", "0.1.0").file("src/lib.rs", "pub fn leaf() {}\n"));
     registry.publish(&FakeCrate::new("fixture-leaf", "0.2.0"));

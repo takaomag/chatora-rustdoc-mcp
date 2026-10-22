@@ -44,7 +44,7 @@ use crate::{
         docs_rs::FetchError,
         flight::{Doing, Joined},
         rustdoc_json::ParseError,
-        sparse_index::{IndexEntry, IndexError},
+        sparse_index::{IndexEntry, IndexError, IndexVersion},
         std_json::Chosen,
         target::TargetTriple,
         version::{NoVersion, VersionSpec},
@@ -1155,7 +1155,7 @@ fn told_why(result: CallToolResult, why: &str) -> CallToolResult {
 }
 
 /// The index entry of the crate `name`, or the error to return.
-async fn index_entry(
+pub(super) async fn index_entry(
     state: &ToolState,
     name: &CrateName,
 ) -> Result<IndexEntry, Box<CallToolResult>> {
@@ -1540,7 +1540,7 @@ fn member_request(
 async fn resolve(
     state: &ToolState,
     arguments: Arguments,
-    lookup: project::LookupTarget,
+    (lookup, unused_lookup): (project::LookupTarget, project::LookupTarget),
     mut warnings: Vec<Box<str>>,
     until: Instant,
 ) -> Result<(Request, Vec<Box<str>>), Box<CallToolResult>> {
@@ -1587,9 +1587,9 @@ async fn resolve(
     let checked_later = from_project.is_some() || same_release.is_some();
     #[cfg(not(feature = "local"))]
     let checked_later = false;
-    if !checked_later && let Some(version) = cached_version(state, &name, &spec, &lookup) {
+    if !checked_later && let Some(version) = cached_version(state, &name, &spec, &unused_lookup) {
         return Ok((
-            cached_request(name, version, &path, lookup.triple, shape, until),
+            cached_request(name, version, &path, unused_lookup.triple, shape, until),
             warnings,
         ));
     }
@@ -1625,10 +1625,32 @@ async fn resolve(
     // As published, for docs.rs and the cache, and as code writes it at the head of the path.
     let published: CrateName = entry.name.parse().unwrap_or(name);
     let path = with_lib_name(published.as_str(), &path);
-    let request = Request {
-        name: published,
-        version: resolved.version.version.clone(),
-        checksum: Some(resolved.version.checksum.clone()),
+    let target = if unused_here(&chosen) {
+        unused_lookup.triple
+    } else {
+        lookup.triple
+    };
+    let request = release_request(
+        (&entry, resolved.version),
+        (published, path),
+        chosen,
+        (target, shape, until),
+    );
+    Ok((request, warnings))
+}
+
+/// The request for the release `version` of the crate of `entry`, `name` as published, by `path`,
+/// chosen so, for `target`.
+fn release_request(
+    (entry, version): (&IndexEntry, &IndexVersion),
+    (name, path): (CrateName, Box<str>),
+    chosen: VersionChoice,
+    (target, shape, until): (TargetTriple, Shape, Instant),
+) -> Request {
+    Request {
+        name,
+        version: version.version.clone(),
+        checksum: Some(version.checksum.clone()),
         build: None,
         in_build: chosen.in_build,
         hops: 0,
@@ -1639,13 +1661,29 @@ async fn resolve(
         project_from: chosen.project_from,
         path,
         resolved_from: chosen.resolved_from,
-        target: lookup.triple,
+        target,
         shape,
         until,
         #[cfg(feature = "local")]
         here: chosen.here,
-    };
-    Ok((request, warnings))
+    }
+}
+
+/// Whether `chosen` is a release that the project does not use (decided in M2e's E1b).
+const fn unused_here(
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(
+            unused_variables,
+            reason = "without local features, nothing is the project's"
+        )
+    )]
+    chosen: &VersionChoice,
+) -> bool {
+    #[cfg(feature = "local")]
+    return chosen.here.unused;
+    #[cfg(not(feature = "local"))]
+    true
 }
 
 /// How the version of a release was chosen, and what of the project it is.
@@ -2199,18 +2237,62 @@ async fn look_up(
         arguments.project.as_deref(),
     )
     .await;
+    // A release that the project does not use is looked up for the host when no target is asked
+    // for: the project's target is not its (requirement R-WS-5, decided in M2e, 11).
+    #[cfg(feature = "local")]
+    let unused = if arguments.target.is_none() {
+        let host = state.host().await.triple.clone();
+        (target.triple != host || target.docs_rs_default).then_some((host, warnings.len()))
+    } else {
+        None
+    };
+    #[cfg(feature = "local")]
+    let project = arguments.project.clone();
+    #[cfg(not(feature = "local"))]
+    let unused: Option<(TargetTriple, usize)> = None;
+    // Not the project's: for the host, unless a target was asked for (decided in M2e, 11).
+    let unused_lookup = unused.as_ref().map_or_else(
+        || target.clone(),
+        |(host, _)| project::LookupTarget {
+            triple: host.clone(),
+            docs_rs_default: false,
+        },
+    );
     #[cfg_attr(
         not(feature = "local"),
         expect(unused_mut, reason = "only local features refresh the release")
     )]
-    let (mut arguments, warnings) =
-        match resolve(&state, arguments, target.clone(), warnings, until).await {
-            Ok(resolved) => resolved,
-            Err(error) => return *error,
-        };
+    let (mut arguments, mut warnings) = match resolve(
+        &state,
+        arguments,
+        (target.clone(), unused_lookup),
+        warnings,
+        until,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => return *error,
+    };
+    // Only when the project's packages tell it, so that the answer does not change once cargo
+    // has resolved them.
+    #[cfg(feature = "local")]
+    let for_host = arguments.here.unused
+        && unused.is_some()
+        && project::known_now(&state, project.as_deref()).await;
+    #[cfg(feature = "local")]
+    if arguments.here.unused && unused.is_some() && !for_host {
+        arguments.target = target.triple.clone();
+    }
+    #[cfg(not(feature = "local"))]
+    let for_host = false;
+    // What the project's target warned of is not of the host's.
+    if let (true, Some((_, told))) = (for_host, unused) {
+        warnings.drain(..told.min(warnings.len()));
+    }
     // Of a lookup on docs.rs, not of a crate built here (decided in M2's D7).
     #[cfg(feature = "local")]
-    if arguments.here.local.is_none() {
+    if arguments.here.local.is_none() && !for_host {
         arguments.here.docs_rs_default = target.docs_rs_default;
     }
     #[cfg(feature = "local")]
@@ -2774,9 +2856,19 @@ pub(super) fn building_response(
 
 /// The tool error when the archive of the crate of `arguments` could not be made (§8).
 fn archive_error(cache: &Cache, arguments: &Request, error: &ArchiveError) -> CallToolResult {
+    archive_error_of(cache, &arguments.name, &release(arguments), error)
+}
+
+/// [`archive_error`] for the archive of `release` (`name@version`) of the crate `name`.
+pub(super) fn archive_error_of(
+    cache: &Cache,
+    name: &CrateName,
+    release: &str,
+    error: &ArchiveError,
+) -> CallToolResult {
     match error {
-        ArchiveError::Load(error) => load_error(cache, arguments, error),
-        ArchiveError::Make(load::LoadError::Parse(error)) => parse_error(arguments, error),
+        ArchiveError::Load(error) => load_error_of(cache, name, release, error),
+        ArchiveError::Make(load::LoadError::Parse(error)) => parse_error(release, error),
         ArchiveError::Make(load::LoadError::Archive(error) | load::LoadError::Read(error)) => {
             kept_in_memory_error(error)
         },
@@ -3997,7 +4089,7 @@ fn finish(
             add_warnings(&mut response, warnings);
             CallToolResult::structured(response)
         },
-        Err(Failure::Parse(error)) => parse_error(arguments, &error),
+        Err(Failure::Parse(error)) => parse_error(&release(arguments), &error),
         Err(Failure::Item(error)) => item_error(arguments, &error),
         Err(Failure::Archive(error)) => kept_in_memory_error(&error),
         Err(Failure::Serialize(error)) => {
@@ -4197,11 +4289,6 @@ fn release(arguments: &Request) -> String {
     format!("{}@{}", arguments.name, arguments.version)
 }
 
-/// The tool error for JSON that could not be loaded (§8).
-fn load_error(cache: &Cache, arguments: &Request, error: &LoadError) -> CallToolResult {
-    load_error_of(cache, &arguments.name, &release(arguments), error)
-}
-
 /// The tool error for the JSON of `release` (`name@version`) that could not be loaded (§8).
 pub(super) fn load_error_of(
     cache: &Cache,
@@ -4331,8 +4418,7 @@ fn remembered_error(
 }
 
 /// The tool error for JSON that could not be parsed (§8).
-fn parse_error(arguments: &Request, error: &ParseError) -> CallToolResult {
-    let release = release(arguments);
+fn parse_error(release: &str, error: &ParseError) -> CallToolResult {
     tracing::warn!(%release, error = %ErrorChain(error), "rustdoc JSON could not be parsed");
     let message = format!(
         "rustdoc JSON of {release} could not be read: {}",

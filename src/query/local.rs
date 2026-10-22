@@ -144,12 +144,41 @@ pub async fn local_archive(
     wanted: LocalWanted,
     until: Instant,
 ) -> Joined<SharedLocal> {
-    let key = flight_key(&wanted);
-    let what = format!("{} {}", wanted.plan.crate_name, wanted.plan.version);
+    let (key, what) = (
+        flight_key(&wanted),
+        format!("{} {}", wanted.plan.crate_name, wanted.plan.version),
+    );
+    flights.join(&key, &what, until, work(cache, wanted)).await
+}
+
+/// [`local_archive`] without a deadline, telling `telling` what the work does: for work that
+/// waits for it, as that of `build_external_docs` (decided in M2e's E2a). `None` when the work
+/// ended without a result.
+pub async fn local_archive_telling(
+    flights: &Flights<SharedLocal>,
+    cache: &Cache,
+    wanted: LocalWanted,
+    telling: &Stage,
+) -> Option<SharedLocal> {
+    let (key, what) = (
+        flight_key(&wanted),
+        format!("{} {}", wanted.plan.crate_name, wanted.plan.version),
+    );
+    flights
+        .wait_telling(&key, &what, Some(telling), work(cache, wanted))
+        .await
+}
+
+/// The work that builds and archives what `wanted` names, in `cache`.
+fn work(
+    cache: &Cache,
+    wanted: LocalWanted,
+) -> impl FnOnce(Arc<Stage>) -> std::pin::Pin<Box<dyn Future<Output = SharedLocal> + Send>> + use<>
+{
     let cache = cache.clone();
     let table = table_key(&cache, &wanted);
-    flights
-        .join(&key, &what, until, async move |stage| {
+    move |stage| {
+        Box::pin(async move {
             // What the work found was built before is there while it works.
             let rebuilding = Rebuilding {
                 key: table,
@@ -160,7 +189,7 @@ pub async fn local_archive(
                 .map(Arc::new)
                 .map_err(Arc::new)
         })
-        .await
+    }
 }
 
 /// The key of what `wanted` names in [`REBUILDING`]: of the work, in the cache, as one process
@@ -1323,6 +1352,12 @@ async fn archive(
 pub async fn recorded(cache: &Cache, built: Built) -> Result<LocalBuilt, LocalError> {
     let warnings = built.record.warnings.clone();
     let mut recorded = archive(cache, built, warnings).await?;
+    // Every temporary project builds with it (decided in M2e's E2a), as docs.rs builds with a
+    // nightly: not what the warning is of.
+    recorded
+        .archived
+        .warnings
+        .retain(|warning| &**warning != BOOTSTRAP_ALL);
     recorded.recorded_by = Some(RECORDED_BY);
     Ok(recorded)
 }
@@ -1330,14 +1365,15 @@ pub async fn recorded(cache: &Cache, built: Built) -> Result<LocalBuilt, LocalEr
 /// The tool that records builds for the query tools (requirement R-WS-10).
 pub const RECORDED_BY: &str = "build_external_docs";
 
+/// What the response warns about a build with `RUSTC_BOOTSTRAP=1`.
+const BOOTSTRAP_ALL: &str = "the names of the project's crates were too many for RUSTC_BOOTSTRAP, \
+                             so it was 1: build scripts that look for nightly features may have \
+                             found them";
+
 /// `warnings`, with what the response warns about how the build of `record` was made.
 fn warnings_of(record: &BuildRecord, mut warnings: Vec<Box<str>>) -> Vec<Box<str>> {
     if record.bootstrap_all {
-        warnings.push(
-            "the names of the project's crates were too many for RUSTC_BOOTSTRAP, so it was 1: \
-             build scripts that look for nightly features may have found them"
-                .into(),
-        );
+        warnings.push(BOOTSTRAP_ALL.into());
     }
     // A dependency's build has no `--cfg` of its `rustdoc-args` (decided in M2's D7).
     if !record.cfg_docsrs && build::cfg_docsrs() && record.private {

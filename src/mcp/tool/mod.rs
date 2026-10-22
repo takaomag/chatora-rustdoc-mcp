@@ -9,6 +9,8 @@ mod call_log;
 #[cfg(test)]
 mod checks;
 mod crate_overview;
+#[cfg(feature = "local")]
+mod external_build;
 mod get_item;
 #[cfg(feature = "local")]
 mod list_crates;
@@ -105,6 +107,10 @@ pub(super) struct ToolState {
     /// next call, or handed to it when it has no key (decided in M2's D4).
     #[cfg(feature = "local")]
     pub(super) locals: Flights<crate::query::local::SharedLocal>,
+    /// The builds of `build_external_docs`, shared by the calls that want them at once, by the
+    /// key of their record (requirement R-WS-10, decided in M2e's E2a).
+    #[cfg(feature = "local")]
+    pub(super) externals: Flights<external_build::SharedExternal>,
     /// The calls being handled, at most `limits.concurrent_calls` (requirement R-SEC-7).
     pub(super) calls: CallLimit,
     /// How long a call waits for work that goes on without it, such as fetching and indexing a
@@ -280,12 +286,53 @@ const TEST_DOCS_RS_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_DOCS_RS_URL";
 /// Returns an error when the HTTP client cannot be set up.
 pub(super) fn docs_rs(network: &Network) -> Result<DocsRs, reqwest::Error> {
     #[cfg(debug_assertions)]
-    if test_tools()
-        && let Ok(base_url) = std::env::var(TEST_DOCS_RS_ENV_VAR)
-    {
+    if let Some(base_url) = test_url(TEST_DOCS_RS_ENV_VAR) {
         return DocsRs::with_base_url(&base_url, network);
     }
     DocsRs::new(network)
+}
+
+/// The environment variables that point the clients of the crates.io index and of
+/// static.crates.io of a debug build with the tool for testing at a fake crates.io of the tests,
+/// for the builds of `build_external_docs` (`tests/stdio.rs`). Like [`TEST_DOCS_RS_ENV_VAR`],
+/// they are not settings.
+#[cfg(debug_assertions)]
+const TEST_INDEX_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_INDEX_URL";
+#[cfg(debug_assertions)]
+const TEST_STATIC_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_STATIC_URL";
+
+/// The URL that the environment variable `name` gives a debug build with the tool for testing.
+#[cfg(debug_assertions)]
+fn test_url(name: &str) -> Option<String> {
+    test_tools().then(|| std::env::var(name).ok()).flatten()
+}
+
+/// The client of the crates.io index, caching in `cache`: of index.crates.io, or of the server of
+/// the tests that [`TEST_INDEX_ENV_VAR`] names in a debug build with the tool for testing.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be set up.
+pub(super) fn sparse_index(cache: Cache, network: &Network) -> Result<SparseIndex, reqwest::Error> {
+    #[cfg(debug_assertions)]
+    if let Some(base_url) = test_url(TEST_INDEX_ENV_VAR) {
+        return SparseIndex::with_base_url(cache, &base_url, network);
+    }
+    SparseIndex::new(cache, network)
+}
+
+/// The client of static.crates.io: of it, or of the server of the tests that
+/// [`TEST_STATIC_ENV_VAR`] names in a debug build with the tool for testing.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be set up.
+pub(super) fn static_crates(network: &Network) -> Result<StaticCrates, reqwest::Error> {
+    #[cfg(debug_assertions)]
+    if let Some(base_url) = test_url(TEST_STATIC_ENV_VAR) {
+        return StaticCrates::with_base_url(&base_url, network);
+    }
+    StaticCrates::new(network)
 }
 
 /// Definitions of every tool, in the order `tools/list` returns them.

@@ -535,6 +535,22 @@ pub(super) fn project_path(default: Option<&DefaultProject>, project: &Path) -> 
     }
 }
 
+/// Whether the packages of the project that `project` names, or else of the default project, are
+/// known now, as `cargo metadata` resolved them, without waiting: a release that a lookup did not
+/// find among them is then not the project's (decided in M2e, 11). Without a project, none uses
+/// it.
+#[cfg(feature = "local")]
+pub(super) async fn known_now(state: &ToolState, project: Option<&Path>) -> bool {
+    match workspace(state.project.as_ref(), project) {
+        Ok(None) => true,
+        Ok(Some((workspace, _))) => matches!(
+            state.resolver.resolve_until(&workspace, Instant::now()).await,
+            Joined::Done(Ok(resolution)) if matches!(&*resolution, Resolution::Metadata { .. })
+        ),
+        Err(_) => false,
+    }
+}
+
 /// `project_not_found` (§8), with the workspaces to choose from.
 #[cfg(feature = "local")]
 fn project_not_found(why: &str, candidates: &[String]) -> CallToolResult {

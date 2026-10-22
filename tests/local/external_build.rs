@@ -49,6 +49,8 @@ fn publish(registry: &FakeRegistry) {
             .dependency("fixture-watcher", "0.1")
             .feature("default", &[])
             .feature("extra", &[])
+            // What the server reads from the `.crate`, which this test does not.
+            .manifest_tail("\n[package.metadata.docs.rs]\nfeatures = [\"extra\"]\n")
             .file(
                 "src/lib.rs",
                 "pub fn far() {}\n#[cfg(feature = \"extra\")]\npub fn extra() {}\n\

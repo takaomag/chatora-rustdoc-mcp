@@ -35,10 +35,8 @@ use crate::{
     data::{
         Network,
         cache::{Cache, CacheError},
-        crate_file::StaticCrates,
         dist::{Dist, DistSettings},
         flight::Flights,
-        sparse_index::SparseIndex,
     },
 };
 
@@ -253,9 +251,10 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
             archives: Flights::default(),
             stds: Flights::default(),
             dist: Dist::new(&network, DistSettings::from_settings(settings))?,
-            index: SparseIndex::new(cache.clone(), &network)?,
+            index: tool::sparse_index(cache.clone(), &network)?,
             // The `.crate` files that cargo has fetched are read before static.crates.io is asked.
-            static_crates: StaticCrates::new(&network)?.with_cargo_home(crate::data::cargo_home()),
+            static_crates: tool::static_crates(&network)?
+                .with_cargo_home(crate::data::cargo_home()),
             // Found in the background below: rustc may be slow to start (requirement R-MCP-11).
             host: tokio::sync::OnceCell::new(),
             cache,
@@ -271,6 +270,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
             resolver: Resolver::new(network.offline),
             #[cfg(feature = "local")]
             locals: Flights::handing_over_only(crate::query::local::hands_over),
+            #[cfg(feature = "local")]
+            externals: Flights::default(),
             calls: tool::CallLimit::from_settings(settings),
             wait,
             #[cfg(feature = "local")]
