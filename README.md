@@ -41,7 +41,7 @@ Subagents that list their `tools` get no MCP tools unless you add `mcp__chatora-
 | `list_crates` | What the project depends on, at which versions, and why a crate is in the graph |
 | `resolve_version` | The latest release, the version the project uses, whether one exists or is yanked, and whether docs.rs has its JSON |
 | `crate_overview` | What a crate is and how it is organized: its modules, items and features |
-| `search_items` | Items by name, alias, documentation or path, in one crate or across the project's direct dependencies |
+| `search_items` | Items by name, alias, documentation or path, in one crate or across the workspace's crates and the project's direct dependencies |
 | `get_item` | One item: its signature, documentation, the features it needs, its stability, and where it is defined |
 | `list_module` | What a module has and re-exports, or a crate's whole public API |
 | `list_methods` | The methods that can be called on a type, and which need a `use` |

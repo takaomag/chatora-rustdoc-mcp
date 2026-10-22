@@ -1,9 +1,10 @@
-//! Searching several crates together: the project's direct dependencies when no crate is given,
-//! or std with alloc and core (requirements R-SR-2 and R-SR-5).
+//! Searching several crates together: the workspace's members and the project's direct
+//! dependencies when no crate is given, or std with alloc and core (requirements R-SR-2 and
+//! R-SR-5).
 //!
-//! The crates are loaded at once, up to a time limit (requirement R-ARCH-6). Those still being
-//! fetched or indexed then are left out of this answer, which says so (`partial`); their loading
-//! goes on, for the next call.
+//! The crates are loaded, or built here, at once, up to a time limit (requirement R-ARCH-6).
+//! Those still being fetched, indexed or built then are left out of this answer, which says so
+//! (`partial`); their loading goes on, for the next call.
 
 #[cfg(feature = "local")]
 use std::path::PathBuf;
@@ -15,6 +16,8 @@ use serde_json::{Map, Value, json};
 #[cfg(feature = "local")]
 use tokio::time::Instant;
 
+#[cfg(feature = "local")]
+use super::local::{self, Member as Planned};
 use super::{
     ErrorChain,
     ToolState,
@@ -42,9 +45,10 @@ use crate::{
     data::{
         features::FeatureSets,
         flight::Joined,
-        packages::{PackageGraph, Source},
+        packages::{PackageGraph, ProjectPackage, Source},
+        project::Workspace,
     },
-    query::load::ArchiveError,
+    query::{load::ArchiveError, local::LocalBuilt},
 };
 
 /// When to ask again for the crates still being fetched or indexed.
@@ -57,13 +61,26 @@ struct Member {
     outcome: Outcome,
 }
 
+impl Member {
+    /// The root of its paths: the name of its crate built here, which a lib's name may make other
+    /// than its package's, or else its name.
+    fn root(&self) -> &str {
+        #[cfg(feature = "local")]
+        if let Outcome::Built(built) = &self.outcome {
+            return &built.record.crate_name;
+        }
+        self.name.as_str()
+    }
+}
+
 /// How loading a crate of the scope fared.
 enum Outcome {
     /// Its archive, to search.
     Loaded(Arc<Mapped<Indexed>>),
     /// It could not be loaded: the code, the reason and whether trying again may help (§8).
     Failed(Value),
-    /// It was still being fetched or indexed, as this says, when the search stopped waiting.
+    /// It was still being fetched, indexed or built, as this says, when the search stopped
+    /// waiting.
     #[cfg_attr(
         not(feature = "local"),
         expect(
@@ -72,6 +89,27 @@ enum Outcome {
         )
     )]
     Going(Doing),
+    /// Built here, a workspace member's or a dependency's (decided in M2's D7).
+    #[cfg(feature = "local")]
+    Built(Arc<LocalBuilt>),
+}
+
+impl Outcome {
+    /// Whether it was built here (decided in M2's D7).
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(
+            clippy::unused_self,
+            reason = "without local features, nothing is built here"
+        )
+    )]
+    const fn is_built(&self) -> bool {
+        #[cfg(feature = "local")]
+        if let Self::Built(_) = self {
+            return true;
+        }
+        false
+    }
 }
 
 /// The features of the packages in the build of `workspace` for `target`, waited for until
@@ -79,7 +117,7 @@ enum Outcome {
 #[cfg(feature = "local")]
 async fn build_sets(
     state: &ToolState,
-    workspace: &crate::data::project::Workspace,
+    workspace: &Workspace,
     target: &TargetTriple,
     until: Instant,
     warnings: &mut Vec<Box<str>>,
@@ -126,8 +164,8 @@ async fn build_sets(
     }
 }
 
-/// Searches the project's direct dependencies that its normal build or its build with the
-/// dev-dependencies has for `target` (decided in M1 C4b; the workspace's own crates are M2).
+/// Searches the workspace's members and the project's direct dependencies that its normal build
+/// or its build with the dev-dependencies has for `target` (decided in M1 C4b and M2's D7).
 #[cfg(feature = "local")]
 pub(super) async fn dependencies(
     state: Arc<ToolState>,
@@ -174,53 +212,29 @@ pub(super) async fn dependencies(
     };
     let sets = build_sets(&state, &workspace, &target, until, &mut warnings).await;
     let graph = PackageGraph::new(&resolution);
-    let mut members = Vec::new();
-    let mut loads = Vec::new();
+    // The workspace's members (decided in M2's D7), and its direct dependencies.
+    let mut scope: Vec<(ProjectPackage, Kind)> = graph
+        .packages()
+        .iter()
+        .filter(|package| graph.is_member(package))
+        .map(|package| (package.clone(), Kind::Member))
+        .collect();
     for package in graph.direct_packages() {
         let built = sets.as_ref().is_none_or(|sets| {
             sets.normal(&package.name, &package.version).is_some()
                 || sets.with_dev(&package.name, &package.version).is_some()
         });
-        let Ok(name) = package.name.parse::<CrateName>() else {
-            continue;
-        };
-        if !built {
-            continue;
-        }
-        if package.source != Source::CratesIo {
-            members.push(Member {
-                name,
-                version: package.version.clone(),
-                outcome: Outcome::Failed(json!({
-                    "code": "docs_unavailable",
-                    "reason": "local_build_required",
-                    "retryable": false,
-                })),
-            });
-            continue;
-        }
-        let version = package.version.clone();
-        loads.push((name.clone(), version.clone()));
-        members.push(Member {
-            name,
-            version,
-            outcome: Outcome::Going(Doing::Fetching),
-        });
-    }
-    let loaded = load_all(&state, loads, docs_rs.as_ref(), until).await;
-    for member in &mut members {
-        if let Some(outcome) = loaded
-            .iter()
-            .position(|(name, version, _)| *name == member.name && *version == member.version)
-            .and_then(|at| loaded.get(at))
-        {
-            member.outcome = match &outcome.2 {
-                Outcome::Loaded(mapped) => Outcome::Loaded(Arc::clone(mapped)),
-                Outcome::Failed(failure) => Outcome::Failed(failure.clone()),
-                Outcome::Going(doing) => Outcome::Going(*doing),
+        if built {
+            let kind = if package.source == Source::CratesIo {
+                Kind::CratesIo
+            } else {
+                Kind::Dependency
             };
+            scope.push((package.clone(), kind));
         }
     }
+    let at = (&target, docs_rs.as_ref());
+    let members = project_all(&state, &workspace, scope, at, until, &mut warnings).await;
     let context = Context {
         target,
         docs_rs_default,
@@ -348,36 +362,205 @@ struct Context {
     searching: Searching,
 }
 
-/// Loads the archives of `releases` at once, waiting for them until `until`. Loading what has not
-/// finished then goes on, so that the next search has it.
+/// What a package of the scope of the search is to the project.
 #[cfg(feature = "local")]
-async fn load_all(
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    /// A workspace member, built here.
+    Member,
+    /// A dependency not from crates.io, built here.
+    Dependency,
+    /// A dependency from crates.io: its release on docs.rs, or built here if it is a copy, or if
+    /// docs.rs has no JSON of it (decided in M2's D7).
+    CratesIo,
+}
+
+/// Loads or builds the packages of `scope` of `workspace` at once, waiting for them until
+/// `until`, for `target`, whose JSON on docs.rs is of `docs_rs` (requirements R-SR-2 and R-SR-5,
+/// decided in M2's D7). What has not finished then goes on, so that the next search has it. A
+/// member that has no crate to search is left out.
+#[cfg(feature = "local")]
+async fn project_all(
     state: &Arc<ToolState>,
-    releases: Vec<(CrateName, Version)>,
-    target: Option<&TargetTriple>,
+    workspace: &Workspace,
+    scope: Vec<(ProjectPackage, Kind)>,
+    (target, docs_rs): (&TargetTriple, Option<&TargetTriple>),
     until: Instant,
-) -> Vec<(CrateName, Version, Outcome)> {
-    let handles: Vec<_> = releases
+    warnings: &mut Vec<Box<str>>,
+) -> Vec<Member> {
+    // By the package's name, which the features of the project's build go by, as `get_item`
+    // tells it; one that is not a crate's name is left out.
+    let handles: Vec<_> = scope
         .into_iter()
-        .map(|(name, version)| {
-            let (state, target) = (Arc::clone(state), target.cloned());
-            let (task_name, task_version) = (name.clone(), version.clone());
+        .filter_map(|(package, kind)| {
+            let name = package.name.parse::<CrateName>().ok()?;
+            let (state, workspace) = (Arc::clone(state), workspace.clone());
+            let (target, docs_rs) = (target.clone(), docs_rs.cloned());
+            let version = package.version.clone();
             // Aborted if the call is cancelled while it waits (requirement R-WS-6).
             let handle = super::AbortOnDrop::new(super::spawn(async move {
-                load_release(&state, &task_name, &task_version, target.as_ref(), until).await
+                let at = (&target, docs_rs.as_ref());
+                project_outcome(&state, &workspace, (&package, kind), at, until).await
             }));
-            (name, version, handle)
+            Some((name, version, handle))
         })
         .collect();
-    let mut outcomes = Vec::new();
+    let mut members = Vec::new();
+    let mut unchecked = Vec::new();
     for (name, version, handle) in handles {
-        let outcome = handle.await.unwrap_or_else(|error| {
+        let (outcome, checked) = handle.await.unwrap_or_else(|error| {
             tracing::error!(%error, "loading a crate to search did not finish");
-            Outcome::Failed(json!({ "code": "internal_error", "retryable": true }))
+            let failure = json!({ "code": "internal_error", "retryable": true });
+            (Some(Outcome::Failed(failure)), true)
         });
-        outcomes.push((name, version, outcome));
+        if !checked {
+            unchecked.push(format!("{name} {version}"));
+        }
+        if let Some(outcome) = outcome {
+            members.push(Member {
+                name,
+                version,
+                outcome,
+            });
+        }
     }
-    outcomes
+    // Once for all, as the index could not be read for them (decided in M2's D7).
+    if !unchecked.is_empty() {
+        warnings.push(
+            format!(
+                "whether the project's {} are the releases on crates.io is not known, as the \
+                 index could not be read: their JSON on docs.rs is searched",
+                unchecked.join(", ")
+            )
+            .into(),
+        );
+    }
+    members
+}
+
+/// How the search finds `package`, of `kind`, of `workspace`, for `target`, whose JSON on docs.rs
+/// is of `docs_rs`, waiting for it until `until`: `None` for a member that has no crate to search;
+/// and whether a package of crates.io was checked against the index (decided in M2's D7).
+#[cfg(feature = "local")]
+async fn project_outcome(
+    state: &ToolState,
+    workspace: &Workspace,
+    (package, kind): (&ProjectPackage, Kind),
+    (target, docs_rs): (&TargetTriple, Option<&TargetTriple>),
+    until: Instant,
+) -> (Option<Outcome>, bool) {
+    let dependency = async || {
+        let planned = local::dependency(state, workspace, package, target, until).await;
+        // Without a lib: none to search.
+        let failure = json!({
+            "code": "docs_unavailable",
+            "reason": "local_build_required",
+            "retryable": false,
+        });
+        Some(
+            planned_outcome(state, planned, until)
+                .await
+                .unwrap_or(Outcome::Failed(failure)),
+        )
+    };
+    match kind {
+        Kind::Member => {
+            let Ok(name) = package.lib_name.parse::<CrateName>() else {
+                return (None, true);
+            };
+            let asked = local::Asked::Package {
+                name: &package.name,
+                version: &package.version,
+            };
+            let planned = local::member(state, workspace, (&name, asked), target, until).await;
+            (planned_outcome(state, planned, until).await, true)
+        },
+        Kind::Dependency => (dependency().await, true),
+        Kind::CratesIo => {
+            let Ok(name) = package.name.parse::<CrateName>() else {
+                return (None, true);
+            };
+            // Within the call's deadline, past which it is not checked (requirement R-ARCH-6).
+            let checked =
+                tokio::time::timeout_at(until, get_item::project_entry(state, package, &name))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+            let unchecked = checked.is_none();
+            match checked {
+                Some(get_item::InIndex::Copy(_)) => (dependency().await, true),
+                Some(get_item::InIndex::Unlisted(entry)) => {
+                    let what = format!("{} {}", entry.name, package.version);
+                    let error = get_item::stale_index_error(state, &what, &entry);
+                    (Some(Outcome::Failed(failure_of(&error))), true)
+                },
+                Some(get_item::InIndex::Release(_)) | None => {
+                    match load_release(state, &name, &package.version, docs_rs, until).await {
+                        // docs.rs has no JSON of it: built here.
+                        Outcome::Failed(failure)
+                            if failure.get("reason").and_then(Value::as_str).is_some_and(
+                                |reason| matches!(reason, "no_json" | "no_target_json"),
+                            ) =>
+                        {
+                            (dependency().await, !unchecked)
+                        },
+                        outcome @ (Outcome::Loaded(_)
+                        | Outcome::Failed(_)
+                        | Outcome::Going(_)
+                        | Outcome::Built(_)) => (Some(outcome), !unchecked),
+                    }
+                },
+            }
+        },
+    }
+}
+
+/// The outcome of the build that `planned` plans, waited for until `until`, or why there is
+/// none: `None` for a crate that the package does not have (decided in M2's D7).
+#[cfg(feature = "local")]
+async fn planned_outcome(
+    state: &ToolState,
+    planned: Result<Planned, Box<CallToolResult>>,
+    until: Instant,
+) -> Option<Outcome> {
+    match planned {
+        Err(error) => Some(Outcome::Failed(failure_of(&error))),
+        Ok(Planned::Is { wanted, .. }) => {
+            // `build.wait_secs` from now, within the call's deadline (decided in M2's D3).
+            let until_built = Instant::now()
+                .checked_add(state.build_wait)
+                .map_or(until, |until_built| until_built.min(until));
+            let built = local::built(state, *wanted, (until_built, until), Map::new(), &[]).await;
+            Some(match built {
+                Ok(built) => Outcome::Built(built),
+                Err(result) => outcome_of(&result),
+            })
+        },
+        Ok(Planned::Unknown(error) | Planned::NotForTarget(error)) => {
+            Some(Outcome::Failed(failure_of(&error)))
+        },
+        Ok(Planned::Resolving(doing) | Planned::Planning(doing)) => Some(Outcome::Going(doing)),
+        Ok(Planned::Not | Planned::OtherVersion(_)) => None,
+    }
+}
+
+/// The outcome that `result`, the response of a build here, tells: still going, as its
+/// `building_reason` says, or failed.
+#[cfg(feature = "local")]
+fn outcome_of(result: &CallToolResult) -> Outcome {
+    let reason = result
+        .structured_content
+        .as_ref()
+        .filter(|response| response["status"] == "building")
+        .and_then(|response| response["building_reason"].as_str());
+    match reason {
+        Some("fetching") => Outcome::Going(Doing::Fetching),
+        Some("indexing") => Outcome::Going(Doing::Indexing),
+        Some("waiting_for_lock") => Outcome::Going(Doing::WaitingForLock),
+        Some("waiting_for_slot") => Outcome::Going(Doing::WaitingForSlot),
+        Some(_) => Outcome::Going(Doing::Building),
+        None => Outcome::Failed(failure_of(result)),
+    }
 }
 
 /// The archive of `name` at `version` for `target`: from the cache, or made from its JSON on
@@ -448,7 +631,7 @@ fn failure_of(result: &CallToolResult) -> Value {
         .and_then(|content| content.as_text())
         .and_then(|text| serde_json::from_str(&text.text).ok());
     let mut failure = Map::new();
-    for key in ["code", "reason", "retryable"] {
+    for key in ["code", "reason", "retryable", "retry_after_secs"] {
         if let Some(value) = body.as_ref().and_then(|body| body.get(key)) {
             failure.insert(key.to_owned(), value.clone());
         }
@@ -481,6 +664,8 @@ fn search_members(
         .iter()
         .filter_map(|member| match &member.outcome {
             Outcome::Loaded(mapped) => Some((member, CrateView::new(mapped.get()))),
+            #[cfg(feature = "local")]
+            Outcome::Built(built) => Some((member, CrateView::new(built.archived.mapped.get()))),
             Outcome::Failed(_) | Outcome::Going(_) => None,
         })
         .collect();
@@ -511,7 +696,8 @@ fn search_members(
             ]);
         },
     };
-    let (sources, failed, fetching) = sources(&found.provenances, members, context);
+    let (sources, failed, fetching, rebuilding) = sources(&found.provenances, members, context);
+    let broke = failed_here(&sources);
     if failed > 0 || fetching > 0 {
         warnings.insert(
             0,
@@ -526,9 +712,10 @@ fn search_members(
     }
     let mut response = Map::new();
     response.insert("provenance".to_owned(), provenance(context, sources));
-    // Nothing found while crates are still being loaded: the answer is still to come
-    // (requirement R-OUT-9).
-    let nothing_yet = fetching > 0 && found.page.total == 0;
+    // Nothing found while crates are still being loaded or built again: the answer is still to
+    // come (requirement R-OUT-9).
+    let to_come = fetching.saturating_add(rebuilding);
+    let nothing_yet = to_come > 0 && found.page.total == 0;
     if nothing_yet {
         response.insert("status".to_owned(), json!("building"));
         response.insert(
@@ -536,10 +723,10 @@ fn search_members(
             json!(building_reason(members)),
         );
     }
-    if failed > 0 || fetching > 0 {
+    if failed > 0 || to_come > 0 {
         response.insert("partial".to_owned(), json!(true));
     }
-    if fetching > 0 {
+    if to_come > 0 {
         response.insert("retry_after_secs".to_owned(), json!(RETRY_AFTER_SECS));
     }
     let mut all_warnings: Vec<Value> = warnings.iter().map(|warning| json!(warning)).collect();
@@ -557,8 +744,8 @@ fn search_members(
     );
     let hints = hints(
         &found.hints,
-        nothing_yet,
-        fetching > 0 && found.page.has_more,
+        (nothing_yet, to_come > 0 && found.page.has_more),
+        (broke, rebuilding),
     );
     if !hints.is_empty() {
         response.insert("hints".to_owned(), Value::Array(hints));
@@ -576,8 +763,24 @@ fn request_of<'a>(
     ItemRequest {
         name: &member.name,
         version: &member.version,
-        path: member.name.as_str(),
+        path: member.root(),
         origin: match (&context.std, toolchain) {
+            // Built here, a member's with its private items (decided in M2's D7).
+            #[cfg(feature = "local")]
+            _ if let Outcome::Built(built) = &member.outcome => {
+                let record = &built.record;
+                Origin::Local {
+                    private: record.private,
+                    package_source: (!record.private)
+                        .then(|| local::package_source(&record.package)),
+                    resolved_from: context.resolved_from,
+                    project_from: context.project_from,
+                    toolchain: record.toolchain.as_deref(),
+                    built_at: &record.built_at,
+                    features_requested: record.features_requested.as_deref(),
+                    features_effective: record.features_effective.as_deref(),
+                }
+            },
             (Some(std), Some(toolchain)) => Origin::Std {
                 toolchain,
                 std_from: std.chosen.json.source(),
@@ -593,7 +796,8 @@ fn request_of<'a>(
         detail: context.detail,
         project_features: project_features(context, member),
         follow: false,
-        target: (!context.docs_rs_default).then(|| context.target.as_str()),
+        target: (!context.docs_rs_default || member.outcome.is_built())
+            .then(|| context.target.as_str()),
     }
 }
 
@@ -611,10 +815,40 @@ fn provenance(context: &Context, sources: Vec<Value>) -> Value {
     Value::Object(provenance)
 }
 
+/// Whether a build here failed, as `sources` tell, which is kept until its cause is fixed
+/// (decided in M2's D5 and D7).
+fn failed_here(sources: &[Value]) -> bool {
+    sources.iter().any(|source| {
+        source["status"] == "failed"
+            && source["code"].as_str().is_some_and(|code| {
+                matches!(
+                    code,
+                    "build_failed" | "fetch_failed" | "toolchain_missing" | "toolchain_too_old"
+                )
+            })
+    })
+}
+
 /// The hints of the response: those of the search, and what to do when crates are still being
 /// loaded and nothing was found (`nothing_yet`) or there is a next page (`cursor_while_loading`).
-fn hints(found: &[Box<str>], nothing_yet: bool, cursor_while_loading: bool) -> Vec<Value> {
+fn hints(
+    found: &[Box<str>],
+    (nothing_yet, cursor_while_loading): (bool, bool),
+    (broke, rebuilding): (bool, usize),
+) -> Vec<Value> {
     let mut hints: Vec<Value> = found.iter().map(|hint| json!(hint)).collect();
+    if rebuilding > 0 {
+        hints.push(json!(format!(
+            "a crate whose source is stale is being built again, as what it is made from changed: \
+             call again in about {RETRY_AFTER_SECS} seconds for the new build"
+        )));
+    }
+    if broke {
+        hints.push(json!(
+            "for a crate whose status is failed, once the cause is fixed, call get_item with that \
+             crate and \"refresh\": true to build it again"
+        ));
+    }
     if nothing_yet {
         hints.push(json!(format!(
             "no item matched in the crates searched so far; call again in about \
@@ -633,13 +867,32 @@ fn hints(found: &[Box<str>], nothing_yet: bool, cursor_while_loading: bool) -> V
 /// Why the crates of `members` that are still being loaded are not in yet: `indexing` when any is
 /// being indexed, as that is the last step (requirement R-OUT-9).
 fn building_reason(members: &[Member]) -> &'static str {
-    let indexing = members
-        .iter()
-        .any(|member| matches!(member.outcome, Outcome::Going(Doing::Indexing)));
-    if indexing {
-        Doing::Indexing.as_str()
-    } else {
-        Doing::Fetching.as_str()
+    // What docs.rs is read for first, then what is built here (decided in M2's D7).
+    [
+        Doing::Indexing,
+        Doing::Fetching,
+        Doing::Building,
+        Doing::WaitingForSlot,
+        Doing::WaitingForLock,
+    ]
+    .into_iter()
+    .find(|doing| {
+        members
+            .iter()
+            .any(|member| matches!(&member.outcome, Outcome::Going(going) if going == doing))
+    })
+    .unwrap_or(Doing::Fetching)
+    .as_str()
+}
+
+/// Marks `source` as of the build before, while the crate is built again, to ask for again
+/// (requirements R-WS-9 and R-OUT-9, decided in M2's D4 and D7).
+#[cfg(feature = "local")]
+fn mark_stale(source: &mut Value) {
+    if let Some(fields) = source.as_object_mut() {
+        fields.insert("stale".to_owned(), json!(true));
+        fields.insert("stale_reason".to_owned(), json!("rebuilding"));
+        fields.insert("retry_after_secs".to_owned(), json!(RETRY_AFTER_SECS));
     }
 }
 
@@ -658,7 +911,7 @@ fn sources(
     provenances: &[crate::query::get_item::Provenance<'_>],
     members: &[Member],
     context: &Context,
-) -> (Vec<Value>, usize, usize) {
+) -> (Vec<Value>, usize, usize, usize) {
     let mut sources: Vec<Value> = Vec::new();
     for provenance in provenances {
         let mut source = serde_json::to_value(provenance).unwrap_or_default();
@@ -668,6 +921,13 @@ fn sources(
         sources.push(source);
     }
     let (mut failed, mut fetching) = (0_usize, 0_usize);
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(unused_mut, reason = "without local features, nothing is built again")
+    )]
+    let mut rebuilding = 0_usize;
+    // The sources of the crates searched come first, in the order of `members`.
+    let mut searched = 0_usize;
     for member in members {
         let mut source = Map::new();
         source.insert("crate".to_owned(), json!(member.name.as_str()));
@@ -676,14 +936,43 @@ fn sources(
             source.insert("target".to_owned(), json!(context.target.as_str()));
         }
         match &member.outcome {
-            Outcome::Loaded(_) => continue,
+            Outcome::Loaded(_) => {
+                searched = searched.saturating_add(1);
+                continue;
+            },
+            // The build before, while it is made again: to come too (decided in M2's D7, as M2's
+            // D4).
+            #[cfg(feature = "local")]
+            Outcome::Built(built) => {
+                if built.stale
+                    && let Some(source) = sources.get_mut(searched)
+                {
+                    mark_stale(source);
+                    rebuilding = rebuilding.saturating_add(1);
+                }
+                searched = searched.saturating_add(1);
+                continue;
+            },
             Outcome::Failed(failure) => {
                 failed = failed.saturating_add(1);
-                let status = if failure.get("reason") == Some(&json!("local_build_required")) {
-                    "unavailable"
-                } else {
-                    "failed"
-                };
+                // What cannot be documented here, rather than what failed to be (decided in
+                // M2's D7).
+                let unavailable =
+                    failure
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reason| {
+                            matches!(
+                                reason,
+                                "local_build_required"
+                                    | "build_unsupported"
+                                    | "target_unsupported"
+                                    | "scope_unknown"
+                                    | "no_json"
+                                    | "no_target_json"
+                            )
+                        });
+                let status = if unavailable { "unavailable" } else { "failed" };
                 source.insert("status".to_owned(), json!(status));
                 if let Some(failure) = failure.as_object() {
                     source.extend(failure.clone());
@@ -698,7 +987,7 @@ fn sources(
         }
         sources.push(Value::Object(source));
     }
-    (sources, failed, fetching)
+    (sources, failed, fetching, rebuilding)
 }
 
 /// The features that the project builds `member` with, for `enabled_in_project`.

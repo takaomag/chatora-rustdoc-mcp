@@ -2013,6 +2013,99 @@ fn a_path_dependency_is_built_here_with_its_public_items() {
     assert!(server.finish().success());
 }
 
+/// The search of `query` in the project's crates, called again from `first` until it is not
+/// `partial`, while its crates are loaded or built: the last answer.
+#[cfg(feature = "local")]
+fn searched_in_full(server: &mut Server, first: u64, query: &str) -> Value {
+    let mut searched = Value::Null;
+    for id in first..first.saturating_add(40) {
+        server.send(&call_tool(id, "search_items", json!({ "query": query })));
+        searched = server.response(id)["result"]["structuredContent"].clone();
+        if searched.get("partial").is_none() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    searched
+}
+
+/// The search of a project without `crate` searches its workspace members and its path
+/// dependency too, built here, the dependency's public items only, waiting while they are built
+/// (requirements R-SR-2 and R-SR-5, decided in M2's D7).
+#[cfg(feature = "local")]
+#[test]
+fn a_search_of_the_project_searches_its_members_and_dependencies_built_here() {
+    let dir = path_dependencies("3");
+    let mut server = Server::start_in(Some(&dir.path().join("ws")));
+    let searched = searched_in_full(&mut server, 1, "Shown");
+    assert!(searched.get("partial").is_none(), "{searched}");
+    let sources = searched["provenance"]["sources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let of = |krate: &str| {
+        sources
+            .iter()
+            .find(|source| source["crate"] == krate)
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert_eq!(of("app")["source"], "local", "{searched}");
+    assert_eq!(of("libdep")["package_source"], "path", "{searched}");
+    assert!(
+        searched["data"].to_string().contains("libdep::Shown"),
+        "{searched}"
+    );
+    // Not the dependency's private items.
+    server.send(&call_tool(
+        100,
+        "search_items",
+        json!({ "query": "kept_inside" }),
+    ));
+    let inside = server.response(100)["result"]["structuredContent"].clone();
+    assert_eq!(inside["data"]["items"], json!([]), "{inside}");
+    assert!(server.finish().success());
+}
+
+/// A member whose package's name has a `-`, unlike its lib's, is searched with the features of the
+/// project's build, which go by the package's name: its items are in the build (requirement
+/// R-FT-2, decided in M2's D7).
+#[cfg(feature = "local")]
+#[test]
+fn a_search_tells_a_members_items_in_the_build_by_its_package() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let write = |path: &str, text: &str| {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        std::fs::write(path, text).expect("written");
+    };
+    write(
+        "Cargo.toml",
+        "[package]\nname = \"dash-name\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write("src/lib.rs", "/// Shown here.\npub fn shown_here() {}\n");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = Server::start_in(Some(dir.path()));
+    let searched = searched_in_full(&mut server, 1, "shown_here");
+    let item = &searched["data"]["items"][0];
+    assert_eq!(item["path"], "dash_name::shown_here", "{searched}");
+    assert_ne!(item["enabled_in_project"], false, "{searched}");
+    assert_eq!(
+        searched["provenance"]["sources"][0]["crate"], "dash-name",
+        "{searched}"
+    );
+    assert!(server.finish().success());
+}
+
 /// With the feature resolver 1, a build dependency is built, for the host, which the project
 /// builds it for; a member or a dependency is not built for a target that the project does not
 /// build for (requirement R-MCP-3, decided in M2's D7).
@@ -3326,6 +3419,14 @@ fn a_copy_of_a_crates_io_release_that_differs_is_built_here() {
         &json!({ "crate": "demo", "path": "inside" }),
     );
     assert!(inside.to_string().contains("item_not_found"), "{inside}");
+    // The search of the project's dependencies finds it too, built here (decided in M2's D7).
+    let searched = searched_in_full(&mut server, 250, "Patched");
+    assert!(
+        searched["data"]
+            .to_string()
+            .contains("patched_demo::Patched"),
+        "{searched}"
+    );
     // By its lib's name too, the index is read by its package's; and with its version given.
     for (id, krate) in [(300, "patched_demo"), (301, "demo@0.1.0")] {
         server.send(&call_tool(id, "resolve_version", json!({ "crate": krate })));
@@ -3536,6 +3637,14 @@ fn a_project_for_a_target_of_its_own_is_not_built() {
         searched["provenance"]["sources"][0]["target"], "aarch64-unknown-linux-gnu",
         "{searched}"
     );
+    // Its member, which is not built for a target of its own, is told unavailable.
+    let member = searched["provenance"]["sources"]
+        .as_array()
+        .and_then(|sources| sources.iter().find(|source| source["crate"] == "app"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(member["status"], "unavailable", "{searched}");
+    assert_eq!(member["reason"], "target_unsupported", "{searched}");
     server.send(&call_tool(3, "resolve_version", json!({ "crate": "demo" })));
     let resolved = server.response(3)["result"]["structuredContent"].clone();
     assert_eq!(resolved["data"]["docs_rs_json"], "available", "{resolved}");
@@ -3570,13 +3679,13 @@ fn a_search_that_finds_nothing_while_crates_are_fetched_is_building() {
         id += 1;
         server.send(&call_tool(id, "search_items", arguments.clone()));
         let result = server.response(id)["result"].clone();
-        if result["structuredContent"].get("status").is_none() {
+        // Until the workspace's member, built here, is in too (decided in M2's D7).
+        if result["structuredContent"].get("partial").is_none() {
             break result;
         }
         assert!(Instant::now() < deadline, "still {result}");
     };
     let found = &found["structuredContent"];
-    assert!(found.get("partial").is_none(), "{found}");
     assert_eq!(found["data"]["items"][0]["path"], "demo::hello", "{found}");
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 }

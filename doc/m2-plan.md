@@ -1268,6 +1268,13 @@ Claude Code 2.1.304、Linux で測った。
   4. 版を明示した照会で `cargo metadata` が期限を過ぎて解決中なら `status: building` (答えを揺らさない。member も)
   5. 「crate@version で crates.io の release を読める」の提案は消し、crates.io の同名を引くにはプロジェクトの外で引くよう案内する (引数は足さない)
   6. `resolve_version`: プロジェクトの crates.io の package が写しなら `data.source` は crates.io のまま `docs_rs_json: not_on_docs_rs` と warning (index に無ければ `latest` などは省く)。明示した版が path・git・member と同じなら、今の `not_from_crates_io` の形 (`source: project` と warning)。スキーマは増やさない
+  7. `crate` なしの検索が起こすローカルビルドは、範囲の分を一度に共有の仕事として起こし、期限まで待って残りは `sources` に `building` (鮮度の合うものはロックを取らずにすぐ返る)
+  8. 検索でも、docs.rs に JSON の無い crates.io の依存と checksum の合わない写しをローカルビルドに戻す (D7b の決定とそろえる)
+  9. 範囲の member の crate は、すべての member の lib と、lib の無い member で bin が 1 つだけならその bin (`get_item` の `crate_of` と同じ規則)
+  10. ローカルビルドできない crate の `status`: 作れないと決まっているもの (`build_unsupported`・`target_unsupported`・他の target の `no_json`・`scope_unknown`・lib が無い) は `unavailable`、作ろうとして失敗したもの (`build_failed`・`toolchain_missing`・`cargo metadata` の失敗など) は `failed`
+  11. 検索の `refresh` は D5 のまま (workspace の失敗だけを忘れる)。失敗した source の suggestions で、その crate を `get_item` の `refresh` で引くよう案内する
+  12. 作り直し中の member は前回のビルドで検索し、その source に `stale: true`・`stale_reason: rebuilding` (D4c とそろえる)
+  13. 照合で index が読めない crates.io の依存は、release とみなして docs.rs で検索し warning (re-export の行き先と同じ)
 
 **D7d-1 (`real_data` を 3 つの OS で・明示した版・`resolve_version`。2026-10-22)**:
 
@@ -1283,7 +1290,28 @@ Claude Code 2.1.304、Linux で測った。
   - (7) 古いコメントと説明文 (ci.yml、`real_data` の `OTHER_TARGET` と determinism、`get_item`・`resolve_version` の `project` の説明に「完全一致の版のプロジェクトの package を crates.io のものの代わりに」)
   - (8) `real_data` のクライアントの std の判定を、大小と `-` を区別しない形に
   - (9) 写しのテストに、`demo@0.1.0` の R-VR-1 の warning と、`resolve_version` の `demo@0.1.0` (`not_on_docs_rs`)。`lock_may_have` の単体テスト
+- CI (aeb4ecc): 11 job すべて緑。macOS と Windows の `testdata` の job でも `real_data` の 4 件が通った (D7 の終わりの印の「3 つの OS で `real_data` が通る」を満たした)
 - 残したもの: (1) lib 名と版で引いて release のとき、crates.io を lib 名で引く (前から。`resolve_version` は package 名で答えるので食い違う)。(6) 写しの経路で `copy_request` の warning と R-VR-1 の warning がほぼ重なる。明示した版で解決中の `status: building`・`cargo_lock_raw`・同名同版が複数の結合テストは無い。「プロジェクトの外の `project`」の案内で crates.io の release が引けることは、レビューでコードを追って確かめた (結合テストは無い。`refresh` はそのとき効かない)
+
+**D7d-2 (`crate` なしの検索に workspace とローカルビルド。2026-10-22)**:
+
+- 範囲: workspace のすべての member と、今までどおりの直接依存 (feature の組で通常か dev のビルドに入るもの)。member は lib か、lib が無く bin が 1 つならその bin (決定 9。`local::member` の `crate_of`)。それ以外の member は範囲に入れない
+- package ごとの仕事 (`project_outcome`) を一度に起こして期限まで待つ (`project_all`、決定 7): member は `local::member`、crates.io でない依存は `local::dependency` (lib が無ければ `local_build_required`)、crates.io の依存は照合し (`project_entry`)、写しなら依存としてビルド、index に無く古い index しか読めなければ `stale_index_error`、release か照合できなければ docs.rs (照合できないときは warning。決定 13)、docs.rs に JSON が無ければ (`no_json`・`no_target_json`) 依存としてビルド (決定 8)。ビルドは `local::built` の結果を検索の `Outcome` に写す (成功は新しい `Built`、ビルド中の応答は `Going`、エラーは `Failed`)
+- 照会: `Built` は `Origin::Local` (member は private、依存は公開だけと `package_source`) で検索する。作り直し中の前回のビルドは、その source に `stale: true`・`stale_reason: rebuilding` (決定 12)
+- `status` (決定 10): `local_build_required`・`build_unsupported`・`target_unsupported`・`scope_unknown`・`no_json`・`no_target_json` は `unavailable`、ほかの失敗は `failed`。`failed` があれば、原因を直した後に `get_item` の `refresh` で引くよう hints で案内する (決定 11)。応答の `building_reason` は docs.rs の索引・取得、ビルド、枠の待ち、ロックの待ちの順に選ぶ
+- テスト: stdio に、path 依存のプロジェクトの `crate` なしの検索が member (`source: local`) と path 依存 (`package_source: path`) を範囲に入れ、依存の private な関数は出ないこと (member を外すと落ちる)。写しのテストに、検索で写しがビルドされて見つかること。独自の target のテストに、member が `unavailable`・`target_unsupported`。検索を `partial` が消えるまで呼び直す補助 `searched_in_full`
+- レビュー (サブエージェント) の指摘と直し:
+  - (1、高) member と crates.io でない依存の名前に lib 名を使っていたので、package 名で引く feature の組が当たらず、`-` を含む package 名や `[lib] name` の違う crate の item がすべて `enabled_in_project: false` になり、`sources` の `crate` も lib 名だった。名前は `get_item` と同じく package 名にし、照会の root は、ここでビルドしたものなら JSON の crate 名 (`Member::root`)。stdio のテストに、package 名 `dash-name` の member の検索 (lib 名に戻すと落ちる)
+  - (2) 作り直し中の crate を「まだ来る」側に数えず、`partial`・`retry_after_secs` が付かず、それだけを探して 0 件なら「無い」と答えていた。作り直し中も数え、source にも `retry_after_secs`、hints に呼び直す案内 (R-SR-5・R-OUT-9)
+  - (3) crates.io の依存の照合で index を期限なしに読んでいた。呼び出しの期限で包み、過ぎたら照合できないときと同じく docs.rs で warning
+  - (4) 既存のテスト (`a_search_that_finds_nothing_while_crates_are_fetched_is_building`) は、member のビルドが終わる前に `status` が消えると `partial` で落ちうる。`partial` が消えるまで呼び直す
+  - (5) refresh の案内が docs.rs の失敗にも出ていた。ローカルビルドの失敗 (`build_failed`・`fetch_failed`・`toolchain_missing`・`toolchain_too_old`) だけにする
+  - (6) 照合できない warning が crate ごとに並んでいた。1 行にまとめる
+  - (8) 名前を読めない crate も仕事を起こしていた。起こす前に読む
+  - (9) stale の印を名前と版で探していたので、同じ名前・版の source が 2 つあると取り違えた。検索した順の位置で付ける
+  - (10) 古い説明文 (search_items.md・README・search_across と search_items のコメント)。説明文には「workspace の crate (private も) と直接依存」(2048 文字に収めた)
+  - (12) `failure_of` が `retry_after_secs` を落としていた。残す
+- 残したもの: (7) ローカルビルドの warning (docsrs なし・新しい形式など) を検索では出さない (docs.rs の分も前から出していない)。(11) 検索のたびに範囲のビルドを一度に起こし `build.wait_secs` まで待つので、member の編集直後は検索が最大 10 秒待ってから stale を返し、その間の `get_item` は同じ workspace のビルドのロックの後ろに並びうる (決定 7 のとおり)。作り直し中の `stale` の検索・index が読めないとき・`cargo_lock_raw`・member の間の path 依存の結合テストは無い。`search.scope` の設定 (R-SR-2) は計画に無く未実装
 
 **止まる危険の監査と直し 1 (2026-10-21)**:
 

@@ -43,7 +43,7 @@ pub(super) enum SearchArguments {
         /// Whether what failed is to be tried again (§6.4).
         refresh: bool,
     },
-    /// The project's direct dependencies (requirement R-SR-2).
+    /// The workspace's members and the project's direct dependencies (requirement R-SR-2).
     Dependencies {
         project: Option<PathBuf>,
         target: Option<TargetTriple>,
@@ -424,7 +424,7 @@ pub(super) async fn execute(arguments: SearchArguments, state: Arc<ToolState>) -
     }
 }
 
-/// Searches the project's direct dependencies.
+/// Searches the workspace's members and the project's direct dependencies.
 #[cfg(feature = "local")]
 async fn dependencies(
     state: Arc<ToolState>,
