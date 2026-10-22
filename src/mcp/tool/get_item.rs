@@ -571,8 +571,10 @@ pub(super) fn provenance_schema() -> Value {
             "features_requested": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "The features that a workspace member was built with, as in the \
-                                build of the whole workspace, with no default features besides.",
+                "description": "The features asked for in a build here: of a workspace member, \
+                                those of the build of the whole workspace, with no default \
+                                features besides; of a release that build_external_docs built, \
+                                those of its [package.metadata.docs.rs], or default.",
             },
             "features_effective": {
                 "type": "array",

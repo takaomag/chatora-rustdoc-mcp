@@ -835,6 +835,11 @@ pub struct Failed {
     pub at: u64,
     /// The body of the error that was returned.
     pub body: serde_json::Value,
+    /// Whether the compiler's errors failed it, which the features of `[package.metadata.docs.rs]`
+    /// may cause, of the documented crate or a dependency ([`BuildError::is_compiler_error`]):
+    /// a temporary project is then built with the default features (decided in M2e's E2b).
+    #[serde(default)]
+    pub compiler_errors: bool,
 }
 
 impl Failed {
@@ -854,6 +859,7 @@ impl Failed {
             time: super::rfc3339(now).into(),
             at: super::unix_seconds(now),
             body,
+            compiler_errors: false,
         }
     }
 
@@ -1064,6 +1070,20 @@ pub enum BuildError {
 }
 
 impl BuildError {
+    /// Whether the compiler's errors failed it, of the documented crate or a dependency: not
+    /// fetching, the lock, or a toolchain that cannot build it (decided in M2's D3).
+    #[must_use]
+    pub const fn is_compiler_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed {
+                failure: Failure::Other | Failure::TooOld,
+                errors,
+                ..
+            } if !errors.is_empty()
+        )
+    }
+
     /// Whether trying again may work, so that the failure is not kept but for a moment
     /// (requirement R-WS-7).
     ///

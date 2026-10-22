@@ -93,6 +93,19 @@ impl Key {
     }
 }
 
+/// What a record tells of its build besides it, for the responses (decided in M2e's E2b).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Told {
+    /// The features that it was built with, as asked for: those of its `[package.metadata.docs.rs]`,
+    /// as docs.rs builds it, or its default features when those broke the build (requirements
+    /// R-WS-5 and R-FT-3). `None` in a record before M2e's E2b.
+    #[serde(default)]
+    pub features_requested: Option<Vec<Box<str>>>,
+    /// What the responses warn about how it was built, as when those features broke it.
+    #[serde(default)]
+    pub warnings: Vec<Box<str>>,
+}
+
 /// The index of a record: its key, and the build that it is of.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Index {
@@ -104,13 +117,16 @@ struct Index {
     sha256: Box<str>,
     /// When it was recorded, in RFC 3339.
     recorded_at: Box<str>,
+    /// What it tells of the build.
+    #[serde(default, flatten)]
+    told: Told,
 }
 
 /// What the record of a key is, as the query tools find it (decided in M2e's E1b).
 #[derive(Debug)]
 pub enum Recorded {
-    /// The build that it records.
-    Built(Box<Built>),
+    /// The build that it records, and what it tells of it.
+    Built(Box<Built>, Told),
     /// It is being made: the external tool holds the lock of the key.
     Building,
     /// The external tool failed to make it, as this tells.
@@ -135,9 +151,9 @@ pub fn read(cache: &Cache, key: &Key) -> Recorded {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => Some(Err(format!("its index cannot be read: {error}"))),
     };
-    if let Some(Ok(built)) = index {
+    if let Some(Ok((built, told))) = index {
         note_use(&dir);
-        return Recorded::Built(Box::new(built));
+        return Recorded::Built(Box::new(built), told);
     }
     if being_made(cache, key) {
         return Recorded::Building;
@@ -151,8 +167,9 @@ pub fn read(cache: &Cache, key: &Key) -> Recorded {
     }
 }
 
-/// The build that the index `index` of `key` records, or why it is broken.
-fn built(cache: &Cache, key: &Key, index: &[u8]) -> Result<Built, String> {
+/// The build that the index `index` of `key` records, with what it tells of it, or why it is
+/// broken.
+fn built(cache: &Cache, key: &Key, index: &[u8]) -> Result<(Built, Told), String> {
     let index: Index = serde_json::from_slice(index)
         .map_err(|error| format!("its index is not valid: {error}"))?;
     if index.key != *key {
@@ -168,7 +185,7 @@ fn built(cache: &Cache, key: &Key, index: &[u8]) -> Result<Built, String> {
             published.display()
         ));
     }
-    Ok(built)
+    Ok((built, index.told))
 }
 
 /// The directory of a published build at `relative` in the cache at `root`, if it is one: under
@@ -259,8 +276,8 @@ pub fn try_make(cache: &Cache, key: &Key) -> io::Result<Option<Making>> {
     }))
 }
 
-/// Records `built`, published in the cache `cache`, as what `key` names, and forgets a failure
-/// of it, under the lock of the key (`making`).
+/// Records `built`, published in the cache `cache`, as what `key` names, with what the record
+/// tells of it, `told`, and forgets a failure of it, under the lock of the key (`making`).
 ///
 /// It writes files, so it is for a blocking thread.
 ///
@@ -268,7 +285,12 @@ pub fn try_make(cache: &Cache, key: &Key) -> io::Result<Option<Making>> {
 ///
 /// Returns an error when `making` is not the lock of `key`, `built` is not in the cache, or the
 /// index cannot be written.
-pub fn record(cache: &Cache, key: &Key, built: &Built, making: &Making) -> io::Result<()> {
+pub fn record(
+    cache: &Cache,
+    key: &Key,
+    (built, told): (&Built, &Told),
+    making: &Making,
+) -> io::Result<()> {
     making.check(key)?;
     let published = built.json.parent().unwrap_or(&built.json);
     let relative = published
@@ -293,6 +315,7 @@ pub fn record(cache: &Cache, key: &Key, built: &Built, making: &Making) -> io::R
         published: relative.into(),
         sha256: built.record.sha256.clone(),
         recorded_at: super::rfc3339(SystemTime::now()).into(),
+        told: told.clone(),
     };
     let dir = key.dir(cache.dir());
     let path = dir.join(INDEX);
@@ -406,11 +429,11 @@ mod tests {
         assert!(matches!(read(&cache, &key), Recorded::Missing));
         let built = publish(dir.path(), b"{}");
         let making = try_make(&cache, &key).expect("locked").expect("not held");
-        record(&cache, &key, &built, &making).expect("recorded");
+        record(&cache, &key, (&built, &Told::default()), &making).expect("recorded");
         // Being made again.
-        assert!(matches!(read(&cache, &key), Recorded::Built(_)));
+        assert!(matches!(read(&cache, &key), Recorded::Built(..)));
         drop(making);
-        let Recorded::Built(found) = read(&cache, &key) else {
+        let Recorded::Built(found, _) = read(&cache, &key) else {
             panic!("not found");
         };
         assert_eq!(found.record.sha256, built.record.sha256);
@@ -451,8 +474,13 @@ mod tests {
             target: "x86_64-unknown-linux-gnu".into(),
             hidden: false,
         };
-        record(&cache, &other, &publish(dir.path(), b"{}"), &making)
-            .expect_err("the lock of another key");
+        record(
+            &cache,
+            &other,
+            (&publish(dir.path(), b"{}"), &Told::default()),
+            &making,
+        )
+        .expect_err("the lock of another key");
         drop(making);
         assert!(key.dir(dir.path()).is_dir());
         assert!(!exists(&cache, &key));
@@ -486,10 +514,41 @@ mod tests {
         // A record forgets the failure.
         let making = try_make(&cache, &key).expect("locked").expect("not held");
         remember_failure(&cache, &key, &failed, &making).expect("remembered");
-        record(&cache, &key, &publish(dir.path(), b"{}"), &making).expect("recorded");
+        record(
+            &cache,
+            &key,
+            (&publish(dir.path(), b"{}"), &Told::default()),
+            &making,
+        )
+        .expect("recorded");
         drop(making);
         assert!(!key.dir(dir.path()).join(build::FAILED).exists());
-        assert!(matches!(read(&cache, &key), Recorded::Built(_)));
+        assert!(matches!(read(&cache, &key), Recorded::Built(..)));
+    }
+
+    /// The index of a server before M2e's E2b, without what it tells, is read.
+    #[test]
+    fn an_index_without_what_it_tells_is_read() {
+        let index: Index = serde_json::from_value(serde_json::json!({
+            "key": tokio_key(),
+            "published": "local/v1/w/p/t/lib",
+            "sha256": "0",
+            "recorded_at": "2026-10-22T00:00:00Z",
+        }))
+        .expect("an index");
+        assert_eq!(index.told, Told::default());
+        let told = Told {
+            features_requested: Some(vec!["full".into()]),
+            warnings: vec!["w".into()],
+        };
+        let text = serde_json::to_value(Index {
+            told: told.clone(),
+            ..index
+        })
+        .expect("JSON");
+        assert_eq!(text["features_requested"], serde_json::json!(["full"]));
+        let read: Index = serde_json::from_value(text).expect("an index");
+        assert_eq!(read.told, told);
     }
 
     #[test]

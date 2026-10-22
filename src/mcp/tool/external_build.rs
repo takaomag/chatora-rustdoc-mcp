@@ -7,7 +7,7 @@
 //! record is (decided in M2e, 13). A call waits for it as the query tools wait for a build, and
 //! then returns `status: building` while it goes on; the query tools find the record.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use rmcp::model::CallToolResult;
 use serde_json::{Map, Value, json};
@@ -29,7 +29,7 @@ use crate::{
         crate_file,
         crate_name::CrateName,
         docs_rs::FetchError,
-        external::{self, Key, Making, Recorded},
+        external::{self, Key, Making, Recorded, Told},
         flight::{Doing, Joined, Stage},
         metadata::{CargoError, Resolution},
         packages::{DocsRsCheck, PackageGraph},
@@ -37,7 +37,7 @@ use crate::{
         rustdoc_json::ParseError,
         sparse_index::IndexEntry,
         target::TargetTriple,
-        temp_project::{self, Release},
+        temp_project::{self, Release, Set},
         version::VersionSpec,
     },
     query::{
@@ -129,6 +129,7 @@ pub(super) async fn release(
     let release = Release {
         cfgs: Box::default(),
         features: vec!["default".into()],
+        asks_features: false,
         name: published,
         version,
     };
@@ -205,10 +206,10 @@ async fn whole_record(state: &ToolState, key: &Key) -> Option<LocalBuilt> {
     let read = crate::task::spawn_blocking(move || external::read(&cache, &key))
         .await
         .ok()?;
-    let Recorded::Built(built) = read else {
+    let Recorded::Built(built, told) = read else {
         return None;
     };
-    recorded(&state.cache, *built).await.ok()
+    recorded(&state.cache, *built, &told).await.ok()
 }
 
 /// What docs.rs has of a release.
@@ -311,8 +312,25 @@ async fn with_docs_rs_features(
     };
     match crate_file::docs_rs_build(&contents, &release.name, &release.version) {
         Ok(build) => {
-            release.features = build.features.into_vec();
+            // Only those that it declares, which cargo takes for a dependency.
+            let (features, undeclared): (Vec<_>, Vec<_>) = build
+                .features
+                .iter()
+                .cloned()
+                .partition(|feature| build.declared.contains(feature));
+            if !undeclared.is_empty() {
+                warnings.push(
+                    format!(
+                        "the features {} of the [package.metadata.docs.rs] of {what} are not \
+                         features that it declares, so they are left out",
+                        undeclared.join(", ")
+                    )
+                    .into(),
+                );
+            }
+            release.features = features;
             release.cfgs = build.rustdoc_cfg;
+            release.asks_features = build.asks_features;
         },
         Err(error) => warnings.push(
             format!(
@@ -424,8 +442,14 @@ fn going(
 enum Unmade {
     /// It stopped, as the server shuts down: not remembered.
     Stopped,
-    /// It failed, as the body of the error tells, which is remembered.
-    Failed(Value),
+    /// It failed, as the body of the error tells, which is remembered; with the compiler's errors,
+    /// which the features may cause, if `compiler`.
+    Failed {
+        /// The body of the error.
+        body: Value,
+        /// Whether the compiler's errors failed it ([`Failed::compiler_errors`]).
+        compiler: bool,
+    },
 }
 
 /// The work that documents `release` for `target` and records it as `key`, telling `progress` what
@@ -446,14 +470,14 @@ async fn make(
         .await
         .map_err(|why| Arc::new(failed_so(&what, &why, true)))?;
     let refresh = match read_record(state, key).await {
-        Some(Recorded::Built(built)) => match recorded(&state.cache, *built).await {
+        Some(Recorded::Built(built, told)) => match recorded(&state.cache, *built, &told).await {
             Ok(built) => return Ok(Arc::new(built)),
             Err(_) => true,
         },
         Some(Recorded::Failed(_) | Recorded::Broken(_)) => true,
         Some(Recorded::Building | Recorded::Missing) | None => false,
     };
-    let made = build_in_temporary_project(state, (key, release, target), refresh, progress).await;
+    let (made, told) = with_a_set(state, (key, release, target), refresh, progress).await;
     let cache = state.cache.clone();
     let key = key.clone();
     match made {
@@ -463,24 +487,26 @@ async fn make(
                 record: built.record.clone(),
                 rebuilt: Vec::new(),
             };
+            let recording = told.clone();
             let written = crate::task::spawn_blocking(move || {
-                external::record(&cache, &key, &to_record, &making)
+                external::record(&cache, &key, (&to_record, &recording), &making)
             })
             .await;
             if let Ok(Err(error)) | Err(error) = written.map_err(std::io::Error::other) {
                 tracing::warn!(%error, "an external record could not be written");
             }
-            recorded(&state.cache, Built {
+            let built = Built {
                 json: built.json.clone(),
                 record: built.record.clone(),
                 rebuilt: Vec::new(),
-            })
-            .await
-            .map(Arc::new)
-            .map_err(|error| Arc::new(failed_so(&what, &error.to_string(), true)))
+            };
+            recorded(&state.cache, built, &told)
+                .await
+                .map(Arc::new)
+                .map_err(|error| Arc::new(failed_so(&what, &error.to_string(), true)))
         },
         Err(Unmade::Stopped) => Err(Arc::new(body_of(&get_item::stopped()))),
-        Err(Unmade::Failed(body)) => {
+        Err(Unmade::Failed { body, .. }) => {
             let transient = body.get("retryable") == Some(&Value::Bool(true));
             let failed = Failed::now(None, None, transient, body.clone());
             let remembered = crate::task::spawn_blocking(move || {
@@ -493,6 +519,72 @@ async fn make(
             Err(Arc::new(body))
         },
     }
+}
+
+/// `release` built for `target` in the temporary project of `key` with the features that docs.rs
+/// builds it with, or else, as the compiler's errors with those broke it, with its default
+/// features (decided in M2e's E2b); with what its record tells. `refresh` forgets the failures of
+/// the builds before.
+async fn with_a_set(
+    state: &ToolState,
+    (key, release, target): (&Key, Release, TargetTriple),
+    refresh: bool,
+    progress: &Stage,
+) -> (Result<Arc<LocalBuilt>, Unmade>, Told) {
+    let requested = release.features.clone();
+    let as_docs_rs = (key, release.clone(), target.clone());
+    let made = build_in_temporary_project(state, as_docs_rs, Set::DocsRs, refresh, progress).await;
+    let docs_rs: BTreeSet<&str> = requested.iter().map(|feature| &**feature).collect();
+    // Not when it asks for none, or for the default ones, which would build the same.
+    let fell_back = matches!(made, Err(Unmade::Failed { compiler: true, .. }))
+        && release.asks_features
+        && docs_rs != BTreeSet::from(["default"]);
+    if !fell_back {
+        let told = Told {
+            features_requested: Some(requested),
+            warnings: Vec::new(),
+        };
+        return (made, told);
+    }
+    let asked = requested.join(", ");
+    tracing::info!(release = %release.name, "the features of [package.metadata.docs.rs] broke the build, so it is built with the default features");
+    let default = Release {
+        features: vec!["default".into()],
+        ..release
+    };
+    let made = build_in_temporary_project(
+        state,
+        (key, default, target),
+        Set::Default,
+        refresh,
+        progress,
+    )
+    .await;
+    // What failed with its default features failed with those first.
+    let made = made.map_err(|unmade| match unmade {
+        Unmade::Failed { mut body, compiler } => {
+            if let Some(Value::String(message)) = body.get_mut("message") {
+                *message = format!(
+                    "{message}; with the features of [package.metadata.docs.rs] ({asked}), the \
+                     compiler failed first"
+                );
+            }
+            Unmade::Failed { body, compiler }
+        },
+        Unmade::Stopped => Unmade::Stopped,
+    });
+    let told = Told {
+        features_requested: Some(vec!["default".into()]),
+        warnings: vec![
+            format!(
+                "built with its default features, as those of [package.metadata.docs.rs] \
+                 ({asked}) broke the build: the documentation may differ from what docs.rs would \
+                 show"
+            )
+            .into(),
+        ],
+    };
+    (made, told)
 }
 
 /// The record of `key`, as it is now.
@@ -525,18 +617,22 @@ async fn take_lock(state: &ToolState, key: &Key, progress: &Stage) -> Result<Mak
     }
 }
 
-/// Writes the temporary project of `release` in the directory of the record of `key`, makes its
-/// Cargo.lock, and builds and archives the release in it for `target`, forgetting a failure of
-/// the build if `refresh`; or why not.
+/// Writes the temporary project of `release` that builds with `set` in the directory of the record
+/// of `key`, makes its Cargo.lock, and builds and archives the release in it for `target`,
+/// forgetting a failure of the build if `refresh`; or why not.
 async fn build_in_temporary_project(
     state: &ToolState,
     (key, release, target): (&Key, Release, TargetTriple),
+    set: Set,
     refresh: bool,
     progress: &Stage,
 ) -> Result<Arc<LocalBuilt>, Unmade> {
     let what = format!("{}@{}", release.name, release.version);
-    let failed = |why: &str| Unmade::Failed(failed_so(&what, why, false));
-    let dir = temp_project::dir_in(&key.dir(state.cache.dir()));
+    let failed = |why: &str| Unmade::Failed {
+        body: failed_so(&what, why, false),
+        compiler: false,
+    };
+    let dir = temp_project::dir_in(&key.dir(state.cache.dir()), set);
     let (written, wanted) = (dir.clone(), release.clone());
     crate::task::spawn_blocking(move || temp_project::write(&written, &wanted))
         .await
@@ -558,7 +654,10 @@ async fn build_in_temporary_project(
     let offline = state.resolver.offline_in(&root).await;
     let resolution = resolved(state, &workspace, (&what, offline), progress)
         .await
-        .map_err(Unmade::Failed)?;
+        .map_err(|body| Unmade::Failed {
+            body,
+            compiler: false,
+        })?;
     let Resolution::Metadata { metadata, .. } = &*resolution else {
         return Err(failed("cargo metadata did not resolve it"));
     };
@@ -587,9 +686,10 @@ async fn build_in_temporary_project(
     match local_archive_telling(&state.locals, &state.cache, wanted, progress).await {
         Some(Ok(built)) => Ok(built),
         Some(Err(error)) if matches!(*error, LocalError::Stopped) => Err(Unmade::Stopped),
-        Some(Err(error)) => Err(Unmade::Failed(external_body(body_of(&local::local_error(
-            &what, &error,
-        ))))),
+        Some(Err(error)) => Err(Unmade::Failed {
+            body: external_body(body_of(&local::local_error(&what, &error))),
+            compiler: matches!(&*error, LocalError::Failed { failed, .. } if failed.compiler_errors),
+        }),
         None => Err(Unmade::Stopped),
     }
 }
@@ -747,6 +847,9 @@ fn built_response(
         provenance.insert("toolchain".to_owned(), json!(toolchain));
     }
     provenance.insert("built_at".to_owned(), json!(record.built_at));
+    if let Some(features) = &record.features_requested {
+        provenance.insert("features_requested".to_owned(), json!(features));
+    }
     if let Some(features) = &record.features_effective {
         provenance.insert("features_effective".to_owned(), json!(features));
     }

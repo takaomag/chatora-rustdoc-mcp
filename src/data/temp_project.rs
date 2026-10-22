@@ -45,6 +45,9 @@ pub struct Release {
     /// The names of the `--cfg` of its `rustdoc-args`, which its rustdoc gets with `--cfg docsrs`
     /// (decided in M2's D3).
     pub cfgs: Box<[Box<str>]>,
+    /// Whether its `[package.metadata.docs.rs]` asks for features: only then may they break the
+    /// build where the default features would not (decided in M2e's E2b).
+    pub asks_features: bool,
 }
 
 /// The `Cargo.toml` of a temporary project that documents `release`: a lib of its own, which
@@ -221,10 +224,27 @@ pub fn plan(
     })
 }
 
-/// The directory of the temporary project in the directory of a record, `record_dir`.
+/// The features that a temporary project builds a release with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Set {
+    /// Those that docs.rs builds it with (requirement R-FT-1).
+    DocsRs,
+    /// Its default features, as those of docs.rs broke its build (decided in M2e's E2b).
+    Default,
+}
+
+/// The directory of the temporary project that builds with `set` in the directory of a record,
+/// `record_dir`.
+///
+/// There is one for each, with a Cargo.lock of its own, made once (decided in M2e's E2b). What
+/// failed with the features of docs.rs is remembered in its own, and not tried again until what it
+/// is made from changes.
 #[must_use]
-pub fn dir_in(record_dir: &Path) -> PathBuf {
-    record_dir.join("project")
+pub fn dir_in(record_dir: &Path, set: Set) -> PathBuf {
+    record_dir.join(match set {
+        Set::DocsRs => "project",
+        Set::Default => "project-default",
+    })
 }
 
 #[cfg(test)]
@@ -237,6 +257,7 @@ mod tests {
             version: Version::new(1, 2, 3),
             features: features.iter().map(|&feature| feature.into()).collect(),
             cfgs: Box::default(),
+            asks_features: false,
         }
     }
 
@@ -283,7 +304,7 @@ mod tests {
     #[test]
     fn its_cargo_lock_is_kept_while_its_manifest_is_the_same() {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        let project = dir_in(dir.path());
+        let project = dir_in(dir.path(), Set::DocsRs);
         write(&project, &release("tokio", &["default"])).expect("written");
         fs::write(project.join("Cargo.lock"), "locked").expect("written");
         write(&project, &release("tokio", &["default"])).expect("written");

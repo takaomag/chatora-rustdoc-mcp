@@ -72,7 +72,7 @@ async fn build_release(cache: &Cache, release: &Release) -> (Built, build::Plan)
         target: "host".into(),
         hidden: false,
     };
-    let dir = temp_project::dir_in(&key.dir(cache.dir()));
+    let dir = temp_project::dir_in(&key.dir(cache.dir()), temp_project::Set::DocsRs);
     let written = dir.clone();
     let release_copy = release.clone();
     tokio::task::spawn_blocking(move || temp_project::write(&written, &release_copy))
@@ -122,6 +122,7 @@ async fn a_release_that_no_project_uses_is_built_in_a_temporary_project() {
         version: Version::new(0, 2, 0),
         features: vec!["default".into(), "extra".into()],
         cfgs: Box::from(["far_cfg".into()]),
+        asks_features: true,
     };
     let (built, plan) = build_release(&cache, &far).await;
     assert!(
@@ -146,6 +147,7 @@ async fn a_release_that_no_project_uses_is_built_in_a_temporary_project() {
         version: Version::new(0, 1, 0),
         features: Vec::new(),
         cfgs: Box::default(),
+        asks_features: false,
     };
     let (near_built, near_plan) = build_release(&cache, &near).await;
     assert!(items(&near_built).contains("near"));

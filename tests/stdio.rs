@@ -2292,7 +2292,8 @@ fn record_demo(
     let making = external::try_make(&cache, &key)
         .expect("locked")
         .expect("not held");
-    external::record(&cache, &key, &built, &making).expect("recorded");
+    external::record(&cache, &key, (&built, &external::Told::default()), &making)
+        .expect("recorded");
     key
 }
 
@@ -2533,6 +2534,113 @@ fn build_external_docs_builds_a_release_that_no_project_uses() {
     assert_eq!(data["built"], false, "{response}");
     assert_eq!(data["reason"], "docs_rs");
     assert!(server.finish().success());
+}
+
+/// A release whose features of `[package.metadata.docs.rs]` break its build is built with its
+/// default features, which its record and the query tools tell; built again, it is so at once
+/// (decided in M2e's E2b).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn build_external_docs_falls_back_to_the_default_features() {
+    use registry::{FakeCrate, FakeRegistry};
+    let registry = FakeRegistry::start();
+    registry.publish(
+        &FakeCrate::new("fixture-touchy", "0.1.0")
+            .feature("default", &[])
+            .feature("broken", &[])
+            .manifest_tail("\n[package.metadata.docs.rs]\nfeatures = [\"broken\"]\n")
+            .file(
+                "src/lib.rs",
+                "pub fn fine() {}\n#[cfg(feature = \"broken\")]\ncompile_error!(\"broken\");\n",
+            ),
+    );
+    let dir = TempDir::new().expect("a temporary directory");
+    let mut server = server_on(&registry, dir.path());
+    server.send(&call_tool(
+        1,
+        "build_external_docs",
+        json!({ "crate": "fixture-touchy@0.1.0" }),
+    ));
+    let response = server.response(1);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let lookup = json!({ "crate": "fixture-touchy@0.1.0", "path": "fine" });
+    let mut found = Value::Null;
+    for id in 10_u64..100 {
+        server.send(&call_tool(id, "get_item", lookup.clone()));
+        found = server.response(id)["result"].clone();
+        if found["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    let content = &found["structuredContent"];
+    assert_eq!(
+        content["provenance"]["recorded_by"], "build_external_docs",
+        "{found}"
+    );
+    assert_eq!(
+        content["provenance"]["features_requested"],
+        json!(["default"])
+    );
+    let fell_back = "built with its default features, as those of [package.metadata.docs.rs] \
+                     (broken, default) broke the build";
+    assert!(
+        content["warnings"].to_string().contains(fell_back),
+        "{found}"
+    );
+    // Recorded again, it begins with the default features, as the build before broke: the
+    // failure kept is not made again.
+    let failures = failures_in(server.cache.path());
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    let record = dir_of_record(&server, "fixture-touchy", "0.1.0").join("record.json");
+    std::fs::remove_file(record).expect("removed");
+    server.send(&call_tool(
+        2,
+        "build_external_docs",
+        json!({ "crate": "fixture-touchy@0.1.0" }),
+    ));
+    let response = server.response(2);
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["data"]["built"], true, "{response}");
+    assert!(
+        content["warnings"].to_string().contains(fell_back),
+        "{response}"
+    );
+    assert_eq!(failures_in(server.cache.path()), failures);
+    assert!(server.finish().success());
+}
+
+/// The failures of builds kept in the cache at `cache`, with when each was written.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn failures_in(cache: &Path) -> Vec<(PathBuf, String)> {
+    let mut found = Vec::new();
+    let mut dirs = vec![cache.join("local")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.file_name().is_some_and(|name| name == "failed.json") {
+                let failed: Value =
+                    serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("JSON");
+                found.push((path, failed["time"].as_str().unwrap_or_default().to_owned()));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The directory of the record of `name` at `version` for the host in the server's cache.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn dir_of_record(server: &Server, name: &str, version: &str) -> PathBuf {
+    chatora_rustdoc_mcp::data::external::Key::Release {
+        name: name.into(),
+        version: version.into(),
+        target: host_triple().into(),
+        hidden: false,
+    }
+    .dir(server.cache.path())
 }
 
 /// The host's target, as `rustc -vV` tells it.
@@ -3402,26 +3510,69 @@ fn warns(response: &Value, part: &str) -> bool {
     })
 }
 
-/// Without `target`, a lookup is for the project's `build.target`, the first of several, which
-/// the response tells (requirement R-TG-1). The JSON for it is in the cache, on every OS.
+/// Without `target`, a lookup of what the project uses is for the project's `build.target`, the
+/// first of several, which the response tells (requirement R-TG-1). The JSON for it is in the
+/// cache, on every OS. A release that the project does not use is looked up for the host (decided
+/// in M2e, 11).
 #[cfg(feature = "local")]
 #[test]
 fn the_build_target_of_the_project_is_the_target_of_a_lookup() {
-    // Not `demo`, whose member would be built instead (decided in M2's D2).
-    let project = workspace_of("user");
-    set_cargo_settings(
-        project.path(),
-        &format!("[build]\ntarget = [\"{TARGET}\", \"wasm32-unknown-unknown\"]\n"),
-    );
-    let mut server = Server::start_in(Some(project.path()));
+    // A dependency on `demo`, from a vendor directory, offline.
+    let project = workspace_using_demo();
+    let settings = project.path().join(".cargo/config.toml");
+    let mut config = std::fs::read_to_string(&settings).expect("read");
+    config.push_str("\n[build]\ntarget = [\"");
+    config.push_str(TARGET);
+    config.push_str("\", \"wasm32-unknown-unknown\"]\n");
+    std::fs::write(&settings, config).expect("written");
+    let mut server = Server::start_with(Some(project.path()), &[(
+        "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE",
+        "true",
+    )]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    write_demo_index(&server, now);
     server.send(&call_tool(
         1,
         "get_item",
         json!({ "crate": "demo@0.1.0", "path": "hello" }),
     ));
-    let found = server.response(1)["result"]["structuredContent"].clone();
-    assert_eq!(found["provenance"]["target"], TARGET, "{found}");
+    let response = server.response(1);
+    let found = response["result"]["structuredContent"].clone();
+    assert_eq!(found["provenance"]["target"], TARGET, "{response}");
     assert!(warns(&found, "several targets"), "{found}");
+    assert!(server.finish().success());
+}
+
+/// A release that the project does not use, looked up without `target`, is for the host, not for
+/// the project's `build.target`, once the project's packages are known (decided in M2e, 11). Where
+/// the host is the target of the JSON in the cache, as on Linux.
+#[cfg(feature = "local")]
+#[test]
+fn a_release_that_the_project_does_not_use_is_looked_up_for_the_host() {
+    if host_triple() != TARGET {
+        return;
+    }
+    // Not `demo`, whose member would be built instead (decided in M2's D2).
+    let project = workspace_of("user");
+    set_cargo_settings(
+        project.path(),
+        "[build]\ntarget = \"wasm32-unknown-unknown\"\n",
+    );
+    let mut server = Server::start_in(Some(project.path()));
+    // Once cargo has resolved the project.
+    server.send(&call_tool(1, "list_crates", json!({})));
+    assert_eq!(server.response(1)["result"]["isError"], false);
+    server.send(&call_tool(
+        2,
+        "get_item",
+        json!({ "crate": "demo@0.1.0", "path": "hello" }),
+    ));
+    let found = server.response(2)["result"]["structuredContent"].clone();
+    assert_eq!(found["provenance"]["target"], TARGET, "{found}");
+    assert!(!warns(&found, "wasm32"), "{found}");
     assert!(server.finish().success());
 }
 

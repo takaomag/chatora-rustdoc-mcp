@@ -21,6 +21,7 @@ use crate::data::{
     cache::{self, Cache},
     cargo::{Failure, GitFetchFailure, RunError},
     child,
+    external::Told,
     flight::{Doing, Flights, Joined, Stage},
     freshness,
     metadata::PackageId,
@@ -514,12 +515,13 @@ impl Builder<'_> {
             Ok(built) => return Ok(built),
             Err(error) => error,
         };
-        let failed = build::Failed::now(
+        let mut failed = build::Failed::now(
             fresh.as_ref().map(|fresh| fresh.key.clone()),
             toolchain.as_deref(),
             error.is_transient(),
             failure_body(plan, &error),
         );
+        failed.compiler_errors = error.is_compiler_error();
         // Not a build that the server stopped, as it ends (requirement R-WS-7), nor one of sources
         // that changed since its key was taken, as while an agent edits them: undone, they would
         // be found failed.
@@ -592,14 +594,10 @@ impl Builder<'_> {
         }
         // The features of `[package.metadata.docs.rs]` may break it, the documented crate or a
         // dependency, as the compiler's errors tell; not what fetching or the lock tells.
-        let compiler_failed = matches!(
-            &built,
-            Err(BuildError::Failed {
-                failure: Failure::Other | Failure::TooOld,
-                errors,
-                ..
-            }) if !errors.is_empty()
-        );
+        let compiler_failed = built
+            .as_ref()
+            .err()
+            .is_some_and(BuildError::is_compiler_error);
         if docs_rs.is_some() && compiler_failed {
             tracing::info!(package = %plan.package.0, "the build failed with the features of [package.metadata.docs.rs], so it is tried with the project's");
             // With `--cfg docsrs` as it began, which did not break it: it failed without it too.
@@ -1343,15 +1341,22 @@ async fn archive(
 }
 
 /// The archive of `built`, which `build_external_docs` made and recorded (requirement R-WS-10,
-/// decided in M2e's E1b), with what it warned of when it was built.
+/// decided in M2e's E1b).
+///
+/// It has what it warned of when it was built, and what its record tells, `told`: the features
+/// asked for, and what else to warn about (decided in M2e's E2b).
 ///
 /// # Errors
 ///
 /// Returns an error when the JSON cannot be read, is no longer the one built, or cannot be
 /// archived.
-pub async fn recorded(cache: &Cache, built: Built) -> Result<LocalBuilt, LocalError> {
-    let warnings = built.record.warnings.clone();
+pub async fn recorded(cache: &Cache, built: Built, told: &Told) -> Result<LocalBuilt, LocalError> {
+    let mut warnings = built.record.warnings.clone();
+    warnings.extend(told.warnings.iter().cloned());
     let mut recorded = archive(cache, built, warnings).await?;
+    if let Some(features) = &told.features_requested {
+        recorded.record.features_requested = Some(features.clone());
+    }
     // Every temporary project builds with it (decided in M2e's E2a), as docs.rs builds with a
     // nightly: not what the warning is of.
     recorded

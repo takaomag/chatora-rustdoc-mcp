@@ -107,6 +107,7 @@ fn output_schema() -> JsonObject {
                     "target": { "type": "string" },
                     "toolchain": { "type": "string" },
                     "built_at": { "type": "string" },
+                    "features_requested": strings,
                     "features_effective": strings,
                     "recorded_by": { "type": "string", "enum": ["build_external_docs"] },
                 },

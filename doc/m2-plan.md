@@ -1439,6 +1439,23 @@ Claude Code 2.1.304、Linux で測った。
   - 照会のツールが読んだら最後に使った日時を更新する (R-CA-5。std の `used` と同じく 1 時間に 1 回)。re-export をたどるときは外の記録を読まない (R-WS-10)。照会のツールの `refresh` は外の失敗を解かない (R-WS-10・§6.4)
   - テストの記録は、E2a が使う `data::external` の書き手で置く
 
+**E2b-1 (features のやり直し。2026-10-22)**:
+
+- 仮のプロジェクトは features の組ごとのディレクトリ (`temp_project::Set`: `project` は docs.rs の組、`project-default` は既定の組)。docs.rs の組のビルドがコンパイラのエラー (文書化する crate か依存。`BuildError::is_compiler_error`、照会のツールの D3 の判定と同じ) で落ちたら、docs.rs の組が `default` だけでない限り既定の組で作る。取得・ロック・オフラインの失敗ではやり直さない。`build::Failed` に `compiler_errors` (serde の既定は false) を足し、仮のプロジェクトの失敗の記録に残すので、記録が無くなって作り直すときは docs.rs の組を試さずにすぐ既定の組へ (外の記録が失敗か壊れているときの呼び直しは `refresh` で docs.rs の組から)
+- 外の記録の索引に `Told` (要求した組 `features_requested` と、応答の warnings。serde の既定で、前の索引も読める) を足し、照会のツールの応答と外のツールの応答の provenance に `features_requested`、既定の組で作ったときは warning
+- テスト: stdio の 1 件 (docs.rs の組で `compile_error!` になるリリースが既定の組で作られ、`get_item` が `features_requested` と warning を返す、記録を消して作り直しても既定の組)、索引の前の形を読む単体
+- レビュー (サブエージェント、読むだけ) の対応: (1) やり直すのは `[package.metadata.docs.rs]` が features を求めるとき (`asks_features`) だけ (求めない crate は docs.rs の組と既定の組が同じビルドになる) (2) docs.rs の組は crate が宣言する features に絞り、外したものは warning (宣言の無い名前や `x/y` は依存の features として cargo が受けず、Cargo.lock の作成で一時的な失敗に見えていた) (3)(4) provenance の `features_requested` は実際に使った組 (やり直したら `["default"]`、R-WS-5 の「使った組」)、docs.rs の組は warning に書く。`Told.features_requested` は `Option` (前の記録は `None`、空の組は `[]`)。出力スキーマの説明も外のツールの記録を含めて直した (5) 両方の組で落ちたら、docs.rs の組で先に落ちた旨をメッセージに (7) warning の文面 (既定の組の方が多い組もあるので「ドキュメントが docs.rs と違いうる」)。テスト: 2 回目に docs.rs の組の失敗の記録が書き直されないこと (作り直さない) を確かめる。残したもの: (6) 外の記録が失敗のときの呼び直しは、両方の組の失敗の記録を解いて docs.rs の組から (決めたとおり。一時的な失敗のあとも docs.rs の組から作り直す)
+- E2a-2 (364a6e3) の CI は macOS・Windows の check で `the_build_target_of_the_project_is_the_target_of_a_lookup` が落ちた: プロジェクトが使わない `demo@0.1.0` を `target` なしで引くので、決定 11 で host (Linux 以外) になり、キャッシュに JSON が無い。テストの意図 (R-TG-1) はプロジェクトが使う crate のことなので、`demo` に依存するプロジェクト (vendor、オフライン) で確かめるように直し、決定 11 のテスト (使わないリリースは `build.target` が wasm32 でも host で引く。host が Linux のときだけ) を足した
+
+**E2b の下調べと決定 (2026-10-22)**:
+
+- 下調べ (サブエージェント、読むだけ): 名指しできない依存は `local::dependency` の分類 (`scope_until`・`Buildable`) をそのまま使える。R-WS-5 は仮のプロジェクトを crate@version だけに依存させ、プロジェクトの features の組や Cargo.lock は求めていない。features のやり直しは、仮のプロジェクトでは `--features` が使えないので Cargo.toml を替える。`build::Failed` には「文書化する crate のコンパイルエラー」の印が無い。外のツールの失敗の suggestions は照会のツールのもの (`refresh`・プロジェクトの端末) だった (E2a-2 のレビュー対応で直した)。cdylib だけの lib を依存として `-p` で文書化できるかは確かめていない
+- 利用者が決めたこと:
+  - (1) 名指しできない依存は、依存でない crate と同じく crate@version だけに依存する仮のプロジェクトで docs.rs の組 (壊れたら既定の組) で作り、記録の鍵も同じ (`Key::Release`)。プロジェクトのビルドと features が違いうる旨を warning に。照会のツールは `build_unsupported` の代わりにその記録を読む (写しは除く)
+  - (2) features のやり直しは組ごとにディレクトリを分ける (`project` と `project-default`。それぞれ Cargo.lock を 1 回だけ作り、docs.rs の組の失敗の記録が「壊れた」の記憶になる)
+  - (3) E2b で外のツールが作るのは crates.io の依存だけ。path・git・別のレジストリの名指しできない依存は「まだ」のまま (git は E3)
+- 聞かずに決めたこと: 呼び直しで失敗を解くのは外の記録が失敗か壊れているときだけ、`offline_miss` は決定的な失敗として覚える (どちらも E2a-2 のレビュー対応で入れた)。版を省いた依存は Cargo.lock の版 (複数なら `invalid_argument` と候補。R-WS-10)、target はプロジェクトのビルド target。ビルドは最大 4 回 (docs.rs の組で docsrs あり・なし、既定の組で同じ 2 回)。分け方: E2b-1 features のやり直し (`build::Failed` に文書化する crate のコンパイルエラーの印、外の索引に要求した組とやり直しの印、provenance の `features_requested`)、E2b-2 名指しできない依存 (外のツールの振り分け・版と target の既定・照会のツールの側の `local::dependency`・`get_item`・`search_across`)、E2b-3 cdylib だけの lib・呼び直し・オフラインのテスト
+
 **E2a-2 (外のツールの流れ。2026-10-22)**:
 
 - `mcp::tool::external_build::release`: crates.io の index で版を決め、yanked なら断る (決定 3。yanked でない近い版を候補に)。既定のプロジェクトが同じ名前と版のパッケージを持つ (member・依存・Cargo.lock の何か) なら、まだの行 (E2b・E4a) として断る。`target` が無ければ host (決定 11)。記録が有効ならビルドせずそれを返す (呼び直しは失敗だけを解く)。docs.rs を照会のツールと同じ読み込みで確かめ、読める JSON があれば `built: false`・`reason: docs_rs`。オフラインで分からなければ warning を付けて作る。`.crate` の `[package.metadata.docs.rs]` で features と `--cfg` を決める (読めなければ既定の組と warning)

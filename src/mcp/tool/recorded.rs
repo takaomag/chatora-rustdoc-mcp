@@ -103,22 +103,25 @@ pub(super) async fn recorded(
         ))
     };
     match recorded {
-        Recorded::Built(built) => match crate::query::local::recorded(&state.cache, *built).await {
-            Ok(built) => Found::Built(Arc::new(built)),
-            // The JSON is not the one recorded: being made again, as the external tool may have
-            // published another meanwhile, or else broken.
-            Err(LocalError::Load(LoadError::Read(error))) => {
-                let again = crate::task::spawn_blocking(move || external::being_made(&cache, &key));
-                if again.await.unwrap_or(false) {
-                    building(provenance())
-                } else {
-                    response(broken(&what, &error.to_string()))
-                }
-            },
-            Err(error) => response(with_suggestion(
-                local::local_error(&what, &error),
-                CALL_AGAIN,
-            )),
+        Recorded::Built(built, told) => {
+            match crate::query::local::recorded(&state.cache, *built, &told).await {
+                Ok(built) => Found::Built(Arc::new(built)),
+                // The JSON is not the one recorded: being made again, as the external tool may have
+                // published another meanwhile, or else broken.
+                Err(LocalError::Load(LoadError::Read(error))) => {
+                    let again =
+                        crate::task::spawn_blocking(move || external::being_made(&cache, &key));
+                    if again.await.unwrap_or(false) {
+                        building(provenance())
+                    } else {
+                        response(broken(&what, &error.to_string()))
+                    }
+                },
+                Err(error) => response(with_suggestion(
+                    local::local_error(&what, &error),
+                    CALL_AGAIN,
+                )),
+            }
         },
         Recorded::Building => building(provenance()),
         Recorded::Failed(failed) => response(failed_again(&failed)),
