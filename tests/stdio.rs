@@ -2436,22 +2436,34 @@ fn server_with_on(
     let cargo_home = dir.join("cargo-home");
     std::fs::create_dir_all(&cargo_home).expect("made");
     std::fs::write(cargo_home.join("config.toml"), registry.cargo_config()).expect("written");
+    // One that the test wrote is kept.
     let gitconfig = dir.join("gitconfig");
-    std::fs::write(&gitconfig, "").expect("written");
+    if !gitconfig.exists() {
+        std::fs::write(&gitconfig, "").expect("written");
+    }
+    // libgit2 reads the git config of the home, not `GIT_CONFIG_GLOBAL`.
+    let home = dir.join("home");
+    std::fs::create_dir_all(home.join(".config")).expect("made");
     let base = registry.base_url();
     let index = format!("{base}/index");
-    let (cargo_home, gitconfig) = (
+    let (cargo_home, gitconfig, xdg_config) = (
         cargo_home.display().to_string(),
         gitconfig.display().to_string(),
+        home.join(".config").display().to_string(),
     );
+    let home = home.display().to_string();
     let mut all = vec![
         ("CHATORA_RUSTDOC_TEST_DOCS_RS_URL", base),
         ("CHATORA_RUSTDOC_TEST_INDEX_URL", index.as_str()),
         ("CHATORA_RUSTDOC_TEST_STATIC_URL", base),
         ("CARGO_HOME", cargo_home.as_str()),
+        ("HOME", home.as_str()),
+        ("XDG_CONFIG_HOME", xdg_config.as_str()),
         ("GIT_CONFIG_GLOBAL", gitconfig.as_str()),
         ("GIT_CONFIG_NOSYSTEM", "1"),
         ("GIT_TERMINAL_PROMPT", "0"),
+        ("GCM_INTERACTIVE", "never"),
+        ("SSH_ASKPASS_REQUIRE", "never"),
         ("RUSTUP_AUTO_INSTALL", "0"),
         ("NO_PROXY", "127.0.0.1"),
         ("no_proxy", "127.0.0.1"),
@@ -2784,6 +2796,234 @@ fn built_external(server: &mut Server, id: u64, arguments: &Value, lookup: &Valu
     found
 }
 
+/// Runs git with `args` in `dir`, with the git config `gitconfig` alone, and returns its stdout.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn git_in(dir: &Path, gitconfig: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", gitconfig)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("UTF-8")
+}
+
+/// Calls `build_external_docs` with `arguments` from `id` on, until it no longer tells `status:
+/// building`; returns its result.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn built_by_external(server: &mut Server, id: u64, arguments: &Value) -> Value {
+    let mut result = Value::Null;
+    for next in id..id.saturating_add(60) {
+        server.send(&call_tool(next, "build_external_docs", arguments.clone()));
+        result = server.response(next)["result"].clone();
+        if result["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    result
+}
+
+/// `build_external_docs` documents a crate of a git repository at the commit that its branch,
+/// tag or rev resolves to, with the features of its `[package.metadata.docs.rs]`, and resolves a
+/// branch anew on each call; a short hash, the commit that it names; a name with `_` for `-`, the
+/// package. A package that the repository does not have is `crate_not_found`, and a branch that it
+/// does not have `fetch_failed`. A repository fetched in plain text is told so (requirements
+/// R-WS-5, R-WS-10 and R-SEC-4, decided in M2e's E3).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn build_external_docs_builds_a_crate_of_a_git_repository() {
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let (work, gitconfig, first) = git_repository(dir.path());
+    // The git CLI reads `GIT_CONFIG_GLOBAL` (decided in M2e, 6).
+    // Without retries, which only wait before the same failure.
+    let mut server = server_with_on(None, &registry, dir.path(), &[
+        ("CARGO_NET_GIT_FETCH_WITH_CLI", "true"),
+        ("CARGO_NET_RETRY", "0"),
+    ]);
+    let branch = json!({
+        "crate": "fixture_git",
+        "git": "https://example.invalid/dep.git",
+        "branch": "main",
+    });
+    let result = built_by_external(&mut server, 1, &branch);
+    let content = &result["structuredContent"];
+    assert_eq!(content["data"]["built"], true, "{result}");
+    assert_eq!(content["data"]["rev"], first, "{result}");
+    let provenance = &content["provenance"];
+    assert_eq!(provenance["source"], "local");
+    assert_eq!(provenance["package_source"], "git");
+    assert_eq!(provenance["git"], "https://example.invalid/dep");
+    assert_eq!(provenance["ref"], "refs/heads/main");
+    assert_eq!(provenance["rev"], first);
+    assert_eq!(provenance["crate"], "fixture-git");
+    assert_eq!(provenance["version"], "0.3.0");
+    assert_eq!(
+        provenance["features_requested"],
+        json!(["extra"]),
+        "{result}"
+    );
+    assert_eq!(provenance["recorded_by"], "build_external_docs");
+    assert!(provenance["resolved_at"].is_string(), "{result}");
+    assert!(provenance.get("plaintext").is_none(), "{result}");
+    assert!(
+        content["hints"][0]
+            .as_str()
+            .is_some_and(|hint| hint.contains(r#""branch":"main""#)),
+        "{result}"
+    );
+
+    // The branch moves: it is resolved anew.
+    std::fs::write(
+        work.join("src/lib.rs"),
+        "pub fn first() {}\npub fn second() {}\n",
+    )
+    .expect("written");
+    git_in(&work, &gitconfig, &[
+        "commit",
+        "--quiet",
+        "--all",
+        "--message=second",
+    ]);
+    let second = git_in(&work, &gitconfig, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    git_in(&work, &gitconfig, &[
+        "push",
+        "--quiet",
+        "../dep.git",
+        "main",
+    ]);
+    let result = built_by_external(&mut server, 100, &branch);
+    assert_eq!(
+        result["structuredContent"]["data"]["rev"], second,
+        "{result}"
+    );
+    looked_up_in_other_ways(&mut server, (&first, &second));
+    assert!(server.finish().success());
+}
+
+/// Makes in `dir` a git repository of the package `fixture-git`, whose `[package.metadata.docs.rs]`
+/// asks for its feature `extra`, with a commit on `main` tagged `v1`, and a bare clone of it, which
+/// `https://example.invalid/dep` and `http://example.invalid/dep` fetch with the git config that it
+/// writes (decided in M2e, 6). Returns the repository, the git config and the commit.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn git_repository(dir: &Path) -> (PathBuf, PathBuf, String) {
+    let gitconfig = dir.join("gitconfig");
+    std::fs::write(&gitconfig, "").expect("written");
+    let work = dir.join("work");
+    std::fs::create_dir_all(work.join("src")).expect("made");
+    std::fs::write(
+        work.join("Cargo.toml"),
+        "[package]\nname = \"fixture-git\"\nversion = \"0.3.0\"\nedition = \"2021\"\n\n\
+         [package.metadata.docs.rs]\nfeatures = [\"extra\"]\n\n[features]\nextra = []\n",
+    )
+    .expect("written");
+    std::fs::write(work.join("src/lib.rs"), "pub fn first() {}\n").expect("written");
+    git_in(&work, &gitconfig, &[
+        "init",
+        "--quiet",
+        "--initial-branch=main",
+    ]);
+    git_in(&work, &gitconfig, &["add", "--all"]);
+    git_in(&work, &gitconfig, &["commit", "--quiet", "--message=first"]);
+    let first = git_in(&work, &gitconfig, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    git_in(&work, &gitconfig, &["tag", "v1"]);
+    git_in(dir, &gitconfig, &[
+        "clone", "--quiet", "--bare", "work", "dep.git",
+    ]);
+    let bare = dir.join("dep.git").display().to_string().replace('\\', "/");
+    let bare = if bare.starts_with('/') {
+        format!("file://{bare}")
+    } else {
+        format!("file:///{bare}")
+    };
+    // The longest that matches is used: not `.git` twice.
+    std::fs::write(
+        &gitconfig,
+        format!(
+            "[url \"{bare}\"]\n\tinsteadOf = https://example.invalid/dep.git\n\
+             \tinsteadOf = https://example.invalid/dep\n\tinsteadOf = http://example.invalid/dep\n"
+        ),
+    )
+    .expect("written");
+    (work, gitconfig, first)
+}
+
+/// Asks `server` for the crate of [`git_repository`] by a short hash of its `first` commit and by
+/// its tag, by the default branch in plain text, which is at its `second`, and for what the
+/// repository does not have.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn looked_up_in_other_ways(server: &mut Server, (first, second): (&str, &str)) {
+    // A short hash of the first commit, and the crate's name as its package spells it.
+    let short = json!({
+        "crate": "fixture-git",
+        "git": "https://example.invalid/dep",
+        "rev": first.get(..8).expect("a hash"),
+    });
+    let result = built_by_external(server, 200, &short);
+    let built_at = result["structuredContent"]["provenance"]["built_at"].clone();
+    let provenance = &result["structuredContent"]["provenance"];
+    assert_eq!(provenance["rev"], first, "{result}");
+    assert!(provenance.get("ref").is_none(), "{result}");
+    // A tag of the same commit, whose build it shares.
+    let tag = json!({ "crate": "fixture-git", "git": "https://example.invalid/dep", "tag": "v1" });
+    let result = built_by_external(server, 250, &tag);
+    let provenance = &result["structuredContent"]["provenance"];
+    assert_eq!(provenance["rev"], first, "{result}");
+    assert_eq!(provenance["ref"], "refs/tags/v1", "{result}");
+    assert_eq!(provenance["built_at"], built_at, "the same build: {result}");
+
+    // In plain text, told so.
+    let plain = json!({ "crate": "fixture-git", "git": "http://example.invalid/dep" });
+    let result = built_by_external(server, 300, &plain);
+    let content = &result["structuredContent"];
+    assert_eq!(content["provenance"]["plaintext"], true, "{result}");
+    assert_eq!(content["provenance"]["ref"], "HEAD", "{result}");
+    assert_eq!(content["data"]["rev"], second, "{result}");
+    assert!(
+        content["warnings"].to_string().contains("plain text"),
+        "{result}"
+    );
+
+    // What the repository does not have.
+    let missing = json!({ "crate": "fixture-nothere", "git": "https://example.invalid/dep" });
+    let result = built_by_external(server, 400, &missing);
+    assert_eq!(result["isError"], true, "{result}");
+    let error = text_json(&result);
+    assert_eq!(error["code"], "crate_not_found", "{result}");
+    assert!(
+        error["message"].to_string().contains("fixture_nothere"),
+        "both spellings: {result}"
+    );
+    let no_branch = json!({
+        "crate": "fixture-git",
+        "git": "https://example.invalid/dep",
+        "branch": "nope",
+    });
+    let result = built_by_external(server, 500, &no_branch);
+    let error = text_json(&result);
+    assert_eq!(error["code"], "fetch_failed", "{result}");
+    assert_eq!(error["reason"], "no_rev", "{result}");
+}
+
 /// A release whose lib is a cdylib only is documented (the plan's test crate (e)).
 #[cfg(all(debug_assertions, feature = "local"))]
 #[test]
@@ -2923,9 +3163,10 @@ fn dir_of_record(server: &Server, name: &str, version: &str) -> PathBuf {
     .dir(server.cache.path())
 }
 
-/// `git`, `rev`, `branch` and `tag` are checked (requirement R-SEC-4), and a crate of a git
-/// repository comes in a later version (M2e's E3b); credentials in the URL are not logged, and a
-/// `project` with a bidirectional control is not taken. Without local features, `git` is refused.
+/// `git`, `rev`, `branch` and `tag` are checked (requirement R-SEC-4), and the query tools read a
+/// crate of a git repository in a later version (M2e's E3b-2); credentials in the URL are not
+/// logged, and a `project` with a bidirectional control is not taken. Without local features,
+/// `git` is refused.
 #[test]
 fn git_arguments_are_checked_and_told_to_come() {
     let mut server = Server::start();
@@ -2939,12 +3180,8 @@ fn git_arguments_are_checked_and_told_to_come() {
         ("list_implementors", json!({ "path": "foo::Baz" })),
         ("search_items", json!({ "query": "bar" })),
         ("resolve_version", json!({})),
-        ("build_external_docs", json!({})),
     ];
     for (id, (tool, mut arguments)) in (1_u64..).zip(tools) {
-        if tool == "build_external_docs" && !cfg!(feature = "local") {
-            continue;
-        }
         arguments["crate"] = json!("foo");
         arguments["git"] = json!("ssh://git@example.invalid/owner/foo");
         arguments["branch"] = json!("main");

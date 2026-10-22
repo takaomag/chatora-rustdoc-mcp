@@ -6,6 +6,11 @@
 //! The query tools read the records, and start nothing for them (requirement R-MCP-3). While the
 //! external tool makes the record of a key, it holds the lock of the key, which the query tools
 //! try in shared mode to tell that it is being made (Q-29, decided in M2e, 13).
+//!
+//! A crate of a git repository has two: what the ref asked for resolves to, by the ref
+//! ([`Key::GitRef`]), and the build of the commit ([`Key::Git`]), which every ref that resolves to
+//! it shares. The commits of a crate are listed too, for the query tools to find one by a short
+//! hash (decided in M2e, 8).
 
 use std::{
     fs,
@@ -20,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     build::{self, Built, Failed},
     cache::{self, Cache},
+    git_source,
     process_lock::{self, LockMode, ProcessLock},
 };
 
@@ -59,6 +65,35 @@ pub enum Key {
         /// before M4.
         hidden: bool,
     },
+    /// A crate of a git repository at a commit (decided in M2e's E3).
+    Git {
+        /// The repository's URL, as its key ([`super::git_source::GitUrl::key`]).
+        url: Box<str>,
+        /// The full hash of the commit.
+        commit: Box<str>,
+        /// The crate, by its cache key.
+        #[serde(rename = "crate")]
+        name: Box<str>,
+        /// The target it is documented for.
+        target: Box<str>,
+        /// Whether it documents the hidden items.
+        hidden: bool,
+    },
+    /// What a ref of a git repository resolves to, for a crate in it (decided in M2e's E3).
+    GitRef {
+        /// The repository's URL, as its key.
+        url: Box<str>,
+        /// The ref, named in full ([`super::git_source::GitRef::full_name`]).
+        #[serde(rename = "ref")]
+        reference: Box<str>,
+        /// The crate, by its cache key.
+        #[serde(rename = "crate")]
+        name: Box<str>,
+        /// The target it is documented for.
+        target: Box<str>,
+        /// Whether it documents the hidden items.
+        hidden: bool,
+    },
 }
 
 impl Key {
@@ -66,14 +101,14 @@ impl Key {
     const fn kind(&self) -> &'static str {
         match self {
             Self::Release { .. } => "release",
+            Self::Git { .. } => "git",
+            Self::GitRef { .. } => "git_ref",
         }
     }
 
     /// The first 32 hex digits of the SHA-256 of its JSON.
     fn digest(&self) -> String {
-        let text = serde_json::to_string(self).unwrap_or_default();
-        let digest = cache::sha256_hex(text.as_bytes());
-        digest.get(..32).unwrap_or(&digest).to_owned()
+        digest_of(self)
     }
 
     /// The directory of its record in the cache at `root`:
@@ -91,6 +126,13 @@ impl Key {
     pub fn lock_key(&self) -> String {
         format!("ext:{}", self.digest())
     }
+}
+
+/// The first 32 hex digits of the SHA-256 of the JSON of `value`.
+fn digest_of(value: &impl Serialize) -> String {
+    let text = serde_json::to_string(value).unwrap_or_default();
+    let digest = cache::sha256_hex(text.as_bytes());
+    digest.get(..32).unwrap_or(&digest).to_owned()
 }
 
 /// What a record tells of its build besides it, for the responses (decided in M2e's E2b).
@@ -363,6 +405,245 @@ pub fn remember_failure(
     cache::write_atomically(&path, &serde_json::to_vec_pretty(failed)?)
 }
 
+/// The file of what a ref resolves to, in the directory of its [`Key::GitRef`].
+const RESOLVED: &str = "resolved.json";
+
+/// What a ref of a git repository resolved to, for a crate in it (decided in M2e's E3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolved {
+    /// The full hash of the commit.
+    pub commit: Box<str>,
+    /// The name of the crate's package, as the repository spells it.
+    pub package: Box<str>,
+    /// Its version at the commit.
+    pub version: Box<str>,
+    /// When it was resolved, in RFC 3339: what a branch or a tag resolves to may move since
+    /// (decided in M2e, 7).
+    #[serde(rename = "resolved_at")]
+    pub at: Box<str>,
+}
+
+/// The file of what a ref resolved to: its key and that.
+#[derive(Debug, Serialize, Deserialize)]
+struct ResolvedFile {
+    /// The key, the same as the one it is found by.
+    key: Key,
+    /// What the ref resolved to.
+    #[serde(flatten)]
+    resolved: Resolved,
+}
+
+/// What the record of a ref is, as [`resolution`] finds it.
+#[derive(Debug)]
+pub enum Resolution {
+    /// What it resolved to.
+    Resolved(Resolved),
+    /// It is being resolved, or the commit built: the external tool holds the lock of the key.
+    Building,
+    /// The external tool failed to resolve it, as this tells.
+    Failed(Box<Failed>),
+    /// It is broken, as this tells: the external tool resolves it again.
+    Broken(String),
+    /// There is none.
+    Missing,
+}
+
+/// What the ref of `key`, a [`Key::GitRef`], resolved to in `cache`, without waiting.
+///
+/// Else it is whether it is being resolved, failed or is broken (decided in M2e's E3). It is
+/// noted as read when it is found (requirement R-CA-5).
+///
+/// It reads files, so it is for a blocking thread.
+#[must_use]
+pub fn resolution(cache: &Cache, key: &Key) -> Resolution {
+    resolution_so(cache, key, true)
+}
+
+/// [`resolution`] for the holder of the lock of `key` (`making`), as [`read_making`].
+#[must_use]
+pub fn resolution_making(cache: &Cache, key: &Key, making: &Making) -> Resolution {
+    if let Err(error) = making.check(key) {
+        return Resolution::Broken(error.to_string());
+    }
+    resolution_so(cache, key, false)
+}
+
+/// [`resolution`], telling whether another resolves it if `others`.
+fn resolution_so(cache: &Cache, key: &Key, others: bool) -> Resolution {
+    let dir = key.dir(cache.dir());
+    let read = match fs::read(dir.join(RESOLVED)) {
+        Ok(text) => Some(
+            serde_json::from_slice::<ResolvedFile>(&text)
+                .map_err(|error| format!("what it resolved to is not valid: {error}"))
+                .and_then(|file| {
+                    if file.key != *key {
+                        Err("what it resolved to is of another key".to_owned())
+                    } else if !git_source::is_commit(&file.resolved.commit) {
+                        Err("what it resolved to is not a commit".to_owned())
+                    } else {
+                        Ok(file.resolved)
+                    }
+                }),
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => Some(Err(format!("what it resolved to cannot be read: {error}"))),
+    };
+    if let Some(Ok(resolved)) = read {
+        note_use(&dir);
+        return Resolution::Resolved(resolved);
+    }
+    if others && being_made(cache, key) {
+        return Resolution::Building;
+    }
+    if let Some(failed) = build::failed(&dir) {
+        return Resolution::Failed(Box::new(failed));
+    }
+    match read {
+        Some(Err(why)) => Resolution::Broken(why),
+        Some(Ok(_)) | None => Resolution::Missing,
+    }
+}
+
+/// Records what the ref of `key`, a [`Key::GitRef`], resolved to, `resolved`, and forgets a
+/// failure to resolve it, under the lock of the key (`making`); and lists the commit among those
+/// of the crate ([`commits`]).
+///
+/// It writes files, so it is for a blocking thread.
+///
+/// # Errors
+///
+/// Returns an error when `making` is not the lock of `key`, `key` is not of a ref, the commit is
+/// not a full hash, or a file cannot be written.
+pub fn record_resolution(
+    cache: &Cache,
+    key: &Key,
+    resolved: &Resolved,
+    making: &Making,
+) -> io::Result<()> {
+    making.check(key)?;
+    let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidInput, why.to_owned());
+    let Some(commits) = commits_dir(cache.dir(), key) else {
+        return Err(invalid("the key is not of a ref"));
+    };
+    // The commit names a file.
+    if !git_source::is_commit(&resolved.commit) {
+        return Err(invalid("what the ref resolved to is not a commit"));
+    }
+    let file = ResolvedFile {
+        key: key.clone(),
+        resolved: resolved.clone(),
+    };
+    let dir = key.dir(cache.dir());
+    let path = dir.join(RESOLVED);
+    cache.check_inside(&path)?;
+    cache::write_atomically(&path, &serde_json::to_vec_pretty(&file)?)?;
+    let listed = commits.join(&*resolved.commit);
+    cache.check_inside(&listed)?;
+    fs::create_dir_all(&commits)?;
+    fs::write(listed, b"")?;
+    match fs::remove_file(dir.join(build::FAILED)) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        Ok(()) | Err(_) => Ok(()),
+    }
+}
+
+/// Remembers that resolving the ref of `key`, a [`Key::GitRef`], failed, as `failed` tells, under
+/// the lock of the key (`making`).
+///
+/// What it resolved to before is forgotten, unless the failure may pass ([`Failed::transient`]):
+/// the query tools then tell the failure of a branch deleted since, not its old commit.
+///
+/// It writes files, so it is for a blocking thread.
+///
+/// # Errors
+///
+/// Returns an error when `making` is not the lock of `key`, or a file cannot be removed or
+/// written.
+pub fn remember_resolution_failure(
+    cache: &Cache,
+    key: &Key,
+    failed: &Failed,
+    making: &Making,
+) -> io::Result<()> {
+    making.check(key)?;
+    if !failed.transient {
+        match fs::remove_file(key.dir(cache.dir()).join(RESOLVED)) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            Ok(()) | Err(_) => {},
+        }
+    }
+    remember_failure(cache, key, failed, making)
+}
+
+/// The repository and the crate of a [`Key::Git`] or a [`Key::GitRef`], which key its commits.
+#[derive(Serialize)]
+struct GitCrate<'a> {
+    /// The repository's URL, as its key.
+    url: &'a str,
+    /// The crate, by its cache key.
+    #[serde(rename = "crate")]
+    name: &'a str,
+    /// The target.
+    target: &'a str,
+    /// Whether the hidden items are documented.
+    hidden: bool,
+}
+
+/// The directory that lists the commits resolved for the crate of `key`, a [`Key::Git`] or a
+/// [`Key::GitRef`], in the cache at `root`: `ext/v<format>/git_commits/<digest>`, with a file
+/// for each.
+fn commits_dir(root: &Path, key: &Key) -> Option<PathBuf> {
+    let of = match key {
+        Key::Release { .. } => return None,
+        Key::Git {
+            url,
+            name,
+            target,
+            hidden,
+            ..
+        }
+        | Key::GitRef {
+            url,
+            name,
+            target,
+            hidden,
+            ..
+        } => GitCrate {
+            url,
+            name,
+            target,
+            hidden: *hidden,
+        },
+    };
+    Some(
+        root.join(EXT_DIR)
+            .join(format!("v{INDEX_FORMAT}"))
+            .join("git_commits")
+            .join(digest_of(&of)),
+    )
+}
+
+/// The commits that refs resolved to for the crate of `key`, a [`Key::Git`] or a
+/// [`Key::GitRef`], in `cache`, sorted: those whose records the query tools find by a short hash
+/// (decided in M2e, 8).
+///
+/// It reads a directory, so it is for a blocking thread.
+#[must_use]
+pub fn commits(cache: &Cache, key: &Key) -> Vec<Box<str>> {
+    let Some(dir) = commits_dir(cache.dir(), key) else {
+        return Vec::new();
+    };
+    let mut commits: Vec<Box<str>> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| git_source::is_commit(name))
+        .map(String::into_boxed_str)
+        .collect();
+    commits.sort_unstable();
+    commits
+}
+
 /// The records noted as read, and when, in this process.
 static NOTED: Mutex<Vec<(PathBuf, Instant)>> = Mutex::new(Vec::new());
 
@@ -570,6 +851,144 @@ mod tests {
         assert_eq!(text["features_requested"], serde_json::json!(["full"]));
         let read: Index = serde_json::from_value(text).expect("an index");
         assert_eq!(read.told, told);
+    }
+
+    const COMMIT: &str = "9a41be9f3db7140981e276cfc1fdb993ed8ae07f";
+
+    fn git_keys(target: &str) -> (Key, Key) {
+        let commit = Key::Git {
+            url: "https://example.invalid/dep".into(),
+            commit: COMMIT.into(),
+            name: "git_dep".into(),
+            target: target.into(),
+            hidden: false,
+        };
+        let reference = Key::GitRef {
+            url: "https://example.invalid/dep".into(),
+            reference: "refs/heads/main".into(),
+            name: "git_dep".into(),
+            target: target.into(),
+            hidden: false,
+        };
+        (commit, reference)
+    }
+
+    #[test]
+    fn the_names_of_a_key_of_git_do_not_change() {
+        let (commit, reference) = git_keys("x86_64-unknown-linux-gnu");
+        assert_eq!(
+            serde_json::to_string(&commit).expect("JSON"),
+            format!(
+                r#"{{"kind":"git","url":"https://example.invalid/dep","commit":"{COMMIT}","crate":"git_dep","target":"x86_64-unknown-linux-gnu","hidden":false}}"#
+            )
+        );
+        assert_eq!(
+            serde_json::to_string(&reference).expect("JSON"),
+            r#"{"kind":"git_ref","url":"https://example.invalid/dep","ref":"refs/heads/main","crate":"git_dep","target":"x86_64-unknown-linux-gnu","hidden":false}"#
+        );
+        assert!(commit.dir(Path::new("/c")).starts_with("/c/ext/v1/git"));
+        assert!(
+            reference
+                .dir(Path::new("/c"))
+                .starts_with("/c/ext/v1/git_ref")
+        );
+        // The commit and the ref list the commits of one crate.
+        assert_eq!(
+            commits_dir(Path::new("/c"), &commit),
+            commits_dir(Path::new("/c"), &reference)
+        );
+        assert!(commits_dir(Path::new("/c"), &tokio_key()).is_none());
+    }
+
+    #[test]
+    fn what_a_ref_resolved_to_is_recorded_with_its_commit_listed() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let (commit, reference) = git_keys("x86_64-unknown-linux-gnu");
+        assert!(matches!(
+            resolution(&cache, &reference),
+            Resolution::Missing
+        ));
+        let making = try_make(&cache, &reference)
+            .expect("locked")
+            .expect("not held");
+        assert!(matches!(
+            resolution(&cache, &reference),
+            Resolution::Building
+        ));
+        let failed = Failed::now(
+            None,
+            None,
+            false,
+            serde_json::json!({ "code": "crate_not_found" }),
+        );
+        remember_failure(&cache, &reference, &failed, &making).expect("remembered");
+        assert!(matches!(
+            resolution_making(&cache, &reference, &making),
+            Resolution::Failed(_)
+        ));
+        let resolved = Resolved {
+            commit: COMMIT.into(),
+            package: "git-dep".into(),
+            version: "0.3.0".into(),
+            at: "2026-10-22T00:00:00Z".into(),
+        };
+        // Not of the lock of another key, nor a commit that is not a full hash.
+        record_resolution(&cache, &commit, &resolved, &making).expect_err("another key");
+        let short = Resolved {
+            commit: "9a41be9f".into(),
+            ..resolved.clone()
+        };
+        record_resolution(&cache, &reference, &short, &making).expect_err("not a commit");
+        record_resolution(&cache, &reference, &resolved, &making).expect("recorded");
+        drop(making);
+        let Resolution::Resolved(found) = resolution(&cache, &reference) else {
+            panic!("not resolved");
+        };
+        assert_eq!(found, resolved);
+        assert!(!reference.dir(dir.path()).join(build::FAILED).exists());
+        assert_eq!(commits(&cache, &commit), vec![Box::from(COMMIT)]);
+        // Of another target, none.
+        let (other, _) = git_keys("x86_64-pc-windows-msvc");
+        assert_eq!(commits(&cache, &other), Vec::<Box<str>>::new());
+        // Of another key.
+        let (_, moved) = git_keys("x86_64-pc-windows-msvc");
+        fs::create_dir_all(moved.dir(dir.path())).expect("made");
+        fs::copy(
+            reference.dir(dir.path()).join(RESOLVED),
+            moved.dir(dir.path()).join(RESOLVED),
+        )
+        .expect("copied");
+        let Resolution::Broken(why) = resolution(&cache, &moved) else {
+            panic!("not broken");
+        };
+        assert!(why.contains("another key"), "{why}");
+
+        // A failure that may pass keeps what it resolved to; one that does not, as a branch
+        // deleted since, forgets it.
+        let making = try_make(&cache, &reference)
+            .expect("locked")
+            .expect("not held");
+        let transient = Failed::now(None, None, true, serde_json::json!({ "code": "x" }));
+        remember_resolution_failure(&cache, &reference, &transient, &making).expect("remembered");
+        assert!(matches!(
+            resolution_making(&cache, &reference, &making),
+            Resolution::Resolved(_)
+        ));
+        let lasting = Failed::now(
+            None,
+            None,
+            false,
+            serde_json::json!({ "code": "fetch_failed" }),
+        );
+        remember_resolution_failure(&cache, &reference, &lasting, &making).expect("remembered");
+        drop(making);
+        assert!(matches!(
+            resolution(&cache, &reference),
+            Resolution::Failed(_)
+        ));
+        // The commit stays listed, for its record.
+        assert_eq!(commits(&cache, &commit), vec![Box::from(COMMIT)]);
     }
 
     #[test]

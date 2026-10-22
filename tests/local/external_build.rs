@@ -66,9 +66,12 @@ fn publish(registry: &FakeRegistry) {
 
 /// Documents `release` in its temporary project in `cache`, as `build_external_docs` does.
 async fn build_release(cache: &Cache, release: &Release) -> (Built, build::Plan) {
+    let temp_project::Origin::CratesIo(version) = &release.origin else {
+        panic!("not a release of crates.io");
+    };
     let key = Key::Release {
         name: release.name.cache_key().into(),
-        version: release.version.to_string().into(),
+        version: version.to_string().into(),
         target: "host".into(),
         hidden: false,
     };
@@ -119,7 +122,7 @@ async fn a_release_that_no_project_uses_is_built_in_a_temporary_project() {
     // With the features and the `--cfg` that docs.rs builds it with.
     let far = Release {
         name: "fixture-far".parse().expect("a crate name"),
-        version: Version::new(0, 2, 0),
+        origin: temp_project::Origin::CratesIo(Version::new(0, 2, 0)),
         features: vec!["default".into(), "extra".into()],
         cfgs: Box::from(["far_cfg".into()]),
         asks_features: true,
@@ -144,7 +147,7 @@ async fn a_release_that_no_project_uses_is_built_in_a_temporary_project() {
     // dependency that watches `RUSTC_BOOTSTRAP` is not built again.
     let near = Release {
         name: "fixture-near".parse().expect("a crate name"),
-        version: Version::new(0, 1, 0),
+        origin: temp_project::Origin::CratesIo(Version::new(0, 1, 0)),
         features: Vec::new(),
         cfgs: Box::default(),
         asks_features: false,

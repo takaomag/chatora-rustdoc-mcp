@@ -2,8 +2,9 @@
 //! build themselves, and records it for them (requirement R-WS-10, §3 Q22). It needs local
 //! features, so a server without them does not offer it (requirement R-ARCH-4).
 //!
-//! It builds a release of crates.io that the project does not use (`super::external_build`); the
-//! other rows of the table of requirement R-WS-10 come in the later steps of M2e.
+//! It builds a release of crates.io that the project does not use (`super::external_build`), and a
+//! crate of a git repository (`super::external_git`); the other rows of the table of requirement
+//! R-WS-10 come in the later steps of M2e.
 
 use std::{
     path::{Path, PathBuf},
@@ -98,7 +99,7 @@ fn output_schema() -> JsonObject {
                 "type": "object",
                 "properties": {
                     "source": { "type": "string", "enum": ["project", "docs.rs", "local"] },
-                    "package_source": { "type": "string", "enum": ["crates.io"] },
+                    "package_source": { "type": "string", "enum": ["crates.io", "git"] },
                     "workspace": { "type": "string" },
                     "project_from": {
                         "type": "string",
@@ -112,6 +113,25 @@ fn output_schema() -> JsonObject {
                     "features_requested": strings,
                     "features_effective": strings,
                     "recorded_by": { "type": "string", "enum": ["build_external_docs"] },
+                    "git": {
+                        "type": "string",
+                        "description": "The repository of a crate of git, normalized.",
+                    },
+                    "rev": {
+                        "type": "string",
+                        "description": "The commit that the ref asked for resolved to.",
+                    },
+                    "ref": {
+                        "type": "string",
+                        "description": "The ref asked for, in full (refs/heads/main), unless \
+                                        a hash; HEAD for the default branch.",
+                    },
+                    "resolved_at": { "type": "string" },
+                    "plaintext": {
+                        "type": "boolean",
+                        "description": "The repository was fetched over http or git, which \
+                                        do not keep what is fetched from being changed.",
+                    },
                 },
                 "required": ["source"],
             },
@@ -129,6 +149,8 @@ fn output_schema() -> JsonObject {
                     "crate": { "type": "string" },
                     "version": { "type": "string" },
                     "target": { "type": "string" },
+                    "git": { "type": "string" },
+                    "rev": { "type": "string" },
                 },
                 "required": ["built"],
             },
@@ -203,13 +225,11 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
         target,
         git,
     } = arguments;
-    if git.is_some() {
-        return not_yet(
-            "a crate of a git repository",
-            "look the crate up on docs.rs, without `git`",
-        );
-    }
     match (krate, project) {
+        // `parse_arguments` takes `git` only with a crate without a version (decided in M2e's E3).
+        (Some((name, _)), None) if let Some(git) = git => {
+            super::external_git::crate_of_git(state, name, git, target).await
+        },
         (None, Some(project)) => workspace(&state, &project, target.as_ref()).await,
         (Some((name, version)), None) => {
             super::external_build::release(state, name, version, target).await

@@ -1,9 +1,10 @@
 //! The temporary projects of `build_external_docs` (requirement R-WS-5, decided in M2e's E2a).
 //!
-//! A temporary project depends on one release of crates.io and on nothing else, so that cargo
-//! documents the release in a workspace of its own: not in the user's project, whose Cargo.lock
-//! does not have it. The server writes its Cargo.toml and makes its Cargo.lock once; the builds
-//! then run as those of the default project do, with `--locked`.
+//! A temporary project depends on one release of crates.io, or one crate of a git repository
+//! (decided in M2e's E3), and on nothing else, so that cargo documents it in a workspace of its
+//! own: not in the user's project, whose Cargo.lock does not have it. The server writes its
+//! Cargo.toml and makes its Cargo.lock once; the builds then run as those of the default project
+//! do, with `--locked`.
 
 use std::{
     collections::BTreeSet,
@@ -20,7 +21,8 @@ use super::{
     crate_name::CrateName,
     external::EXT_DIR,
     flight::Doing,
-    metadata::Metadata,
+    git_source::GitRef,
+    metadata::{Metadata, Package},
     packages::Source,
     target::TargetTriple,
 };
@@ -31,13 +33,14 @@ const PACKAGE: &str = "chatora-rustdoc-temporary";
 /// The name of the package of a temporary project for a release of [`PACKAGE`] itself.
 const OTHER_PACKAGE: &str = "chatora-rustdoc-temporary-project";
 
-/// A release of crates.io to document in a temporary project.
+/// A release of crates.io, or a crate of a git repository, to document in a temporary project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
-    /// The name of its package, as the crates.io index spells it: cargo takes no other.
+    /// The name of its package, as the crates.io index or the repository spells it: cargo takes
+    /// no other.
     pub name: CrateName,
-    /// Its exact version.
-    pub version: Version,
+    /// Where it comes from.
+    pub origin: Origin,
     /// The features to build it with, as docs.rs does, by the names that its
     /// `[package.metadata.docs.rs]` asks for ([`super::crate_file::DocsRsBuild::features`]):
     /// `default` among them unless it says otherwise (requirement R-FT-1).
@@ -50,9 +53,37 @@ pub struct Release {
     pub asks_features: bool,
 }
 
-/// The `Cargo.toml` of a temporary project that documents `release`: a lib of its own, which
-/// depends on the release at its exact version with its features and no others, in a workspace of
-/// its own.
+/// Where a release to document comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// crates.io, at this exact version.
+    CratesIo(Version),
+    /// A git repository (decided in M2e's E3).
+    Git {
+        /// Its URL as given, which cargo fetches.
+        url: Box<str>,
+        /// The commit asked for.
+        reference: GitRef,
+    },
+}
+
+impl Release {
+    /// What it is, for the messages: `name@version`, or the crate of a repository at a ref.
+    #[must_use]
+    pub fn what(&self) -> String {
+        match &self.origin {
+            Origin::CratesIo(version) => format!("{}@{version}", self.name),
+            Origin::Git { url, reference } => {
+                format!("{} of {url} at {}", self.name, reference.full_name())
+            },
+        }
+    }
+}
+
+/// The `Cargo.toml` of a temporary project that documents `release`.
+///
+/// It is a lib of its own, which depends on the release at its exact version, or the crate at the
+/// ref of its repository, with its features and no others, in a workspace of its own.
 ///
 /// The same release gives the same text, whatever the order of its features, so that the
 /// Cargo.lock made for it is kept ([`write()`]). It is of edition 2021, whose resolver takes the
@@ -73,7 +104,26 @@ pub fn manifest(release: &Release) -> String {
     // `default` as `default-features`, which a crate without such a feature takes too.
     let features: BTreeSet<&str> = release.features.iter().map(|feature| &**feature).collect();
     let mut dependency = toml::Table::new();
-    dependency.insert("version".to_owned(), format!("={}", release.version).into());
+    match &release.origin {
+        Origin::CratesIo(version) => {
+            dependency.insert("version".to_owned(), format!("={version}").into());
+        },
+        Origin::Git { url, reference } => {
+            dependency.insert("git".to_owned(), (**url).into());
+            match reference {
+                GitRef::DefaultBranch => {},
+                GitRef::Rev(rev) => {
+                    dependency.insert("rev".to_owned(), (**rev).into());
+                },
+                GitRef::Branch(branch) => {
+                    dependency.insert("branch".to_owned(), (**branch).into());
+                },
+                GitRef::Tag(tag) => {
+                    dependency.insert("tag".to_owned(), (**tag).into());
+                },
+            }
+        },
+    }
     dependency.insert(
         "default-features".to_owned(),
         features.contains("default").into(),
@@ -165,9 +215,9 @@ pub fn target_dir(cache: &Path) -> TargetDir {
 /// Why a temporary project has no plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PlanError {
-    /// The release is not among its packages as one of crates.io: the cargo settings may patch
-    /// crates.io (`[patch.crates-io]`) with another source.
-    #[error("cargo did not resolve the release from crates.io in the temporary project")]
+    /// The release is not among its packages as one of crates.io, or of a git repository: the
+    /// cargo settings may patch its source (`[patch.crates-io]`) with another.
+    #[error("cargo did not resolve the release from its source in the temporary project")]
     NotFound,
     /// The release has no lib to document.
     #[error("the release has no lib to document")]
@@ -199,8 +249,7 @@ pub fn plan(
                 .name
                 .parse::<CrateName>()
                 .is_ok_and(|name| name.cache_key() == release.name.cache_key())
-                && package.version == release.version
-                && Source::parse(package.source.as_deref()) == Source::CratesIo
+                && from_origin(package, &release.origin)
                 && !metadata.workspace_members.contains(&package.id)
         })
         .ok_or(PlanError::NotFound)?;
@@ -222,6 +271,32 @@ pub fn plan(
         features: None,
         document_private: false,
     })
+}
+
+/// Whether `package` is of `origin`: the release of crates.io, or a package of a git repository at
+/// the commit, when one is asked for.
+fn from_origin(package: &Package, origin: &Origin) -> bool {
+    match (origin, Source::parse(package.source.as_deref())) {
+        (Origin::CratesIo(version), Source::CratesIo) => package.version == *version,
+        (Origin::Git { reference, .. }, Source::Git(source)) => match reference {
+            GitRef::Rev(rev) if reference.is_hash() => source
+                .rsplit_once('#')
+                .is_some_and(|(_, commit)| commit.starts_with(&**rev)),
+            GitRef::DefaultBranch | GitRef::Rev(_) | GitRef::Branch(_) | GitRef::Tag(_) => true,
+        },
+        (Origin::CratesIo(_) | Origin::Git { .. }, _) => false,
+    }
+}
+
+/// The commit that cargo resolved the git `package` to, from the end of its source: `None` for
+/// another source, or one that is not a full hash.
+#[must_use]
+pub fn commit_of(package: &Package) -> Option<&str> {
+    let Source::Git(_) = Source::parse(package.source.as_deref()) else {
+        return None;
+    };
+    let (_, commit) = package.source.as_deref()?.rsplit_once('#')?;
+    super::git_source::is_commit(commit).then_some(commit)
 }
 
 /// The features that a temporary project builds a release with.
@@ -254,7 +329,7 @@ mod tests {
     fn release(name: &str, features: &[&str]) -> Release {
         Release {
             name: name.parse().expect("a crate name"),
-            version: Version::new(1, 2, 3),
+            origin: Origin::CratesIo(Version::new(1, 2, 3)),
             features: features.iter().map(|&feature| feature.into()).collect(),
             cfgs: Box::default(),
             asks_features: false,
@@ -299,6 +374,54 @@ mod tests {
             let table: toml::Table = toml::from_str(&other).expect("TOML");
             assert_eq!(table["package"]["name"].as_str(), Some(OTHER_PACKAGE));
         }
+    }
+
+    #[test]
+    fn the_manifest_of_a_crate_of_git_depends_on_the_ref() {
+        let of = |reference: GitRef| {
+            let release = Release {
+                origin: Origin::Git {
+                    url: "https://example.invalid/dep.git".into(),
+                    reference,
+                },
+                ..release("git-dep", &["extra"])
+            };
+            let table: toml::Table = toml::from_str(&manifest(&release)).expect("TOML");
+            table["dependencies"]["git-dep"]
+                .as_table()
+                .expect("a table")
+                .clone()
+        };
+        let dependency = of(GitRef::Branch("main".into()));
+        assert_eq!(
+            dependency["git"].as_str(),
+            Some("https://example.invalid/dep.git")
+        );
+        assert_eq!(dependency["branch"].as_str(), Some("main"));
+        assert!(!dependency.contains_key("version"));
+        assert_eq!(dependency["default-features"].as_bool(), Some(false));
+        assert_eq!(of(GitRef::Tag("v1".into()))["tag"].as_str(), Some("v1"));
+        assert_eq!(
+            of(GitRef::Rev("abcdef0".into()))["rev"].as_str(),
+            Some("abcdef0")
+        );
+        let default = of(GitRef::DefaultBranch);
+        assert!(
+            ["rev", "branch", "tag"]
+                .iter()
+                .all(|key| !default.contains_key(*key))
+        );
+        let release = Release {
+            origin: Origin::Git {
+                url: "https://example.invalid/dep".into(),
+                reference: GitRef::Branch("main".into()),
+            },
+            ..release("git-dep", &[])
+        };
+        assert_eq!(
+            release.what(),
+            "git-dep of https://example.invalid/dep at refs/heads/main"
+        );
     }
 
     #[test]
@@ -364,6 +487,56 @@ mod tests {
             plan_of(&bin, "tokio-util").expect_err("no lib"),
             PlanError::NoLib
         );
+    }
+
+    #[test]
+    fn the_plan_of_a_crate_of_git_is_of_its_commit() {
+        const COMMIT: &str = "9a41be9f3db7140981e276cfc1fdb993ed8ae07f";
+        let source = format!("git+https://example.invalid/dep?rev={COMMIT}#{COMMIT}");
+        let found = metadata("git-dep", &source, &["lib"]);
+        let plan_of = |metadata: &Metadata, reference: GitRef| {
+            let release = Release {
+                origin: Origin::Git {
+                    url: "https://example.invalid/dep".into(),
+                    reference,
+                },
+                ..release("git_dep", &[])
+            };
+            plan(
+                (Path::new("/p"), metadata),
+                &release,
+                None,
+                (Path::new("/c"), false),
+            )
+        };
+        let plan = plan_of(&found, GitRef::Rev(COMMIT.into())).expect("a plan");
+        assert_eq!(&*plan.crate_name, "git_dep");
+        plan_of(&found, GitRef::Branch("main".into())).expect("a plan of the branch");
+        assert_eq!(
+            plan_of(&found, GitRef::Rev("0".repeat(40).into())).expect_err("another commit"),
+            PlanError::NotFound
+        );
+        let crates_io = metadata(
+            "git-dep",
+            "registry+https://github.com/rust-lang/crates.io-index",
+            &["lib"],
+        );
+        assert_eq!(
+            plan_of(&crates_io, GitRef::DefaultBranch).expect_err("not of git"),
+            PlanError::NotFound
+        );
+        assert_eq!(
+            commit_of(found.packages.first().expect("a package")),
+            Some(COMMIT)
+        );
+        assert_eq!(
+            commit_of(crates_io.packages.first().expect("a package")),
+            None
+        );
+        let short = metadata("git-dep", "git+https://example.invalid/dep#9a41be9", &[
+            "lib",
+        ]);
+        assert_eq!(commit_of(short.packages.first().expect("a package")), None);
     }
 
     #[test]

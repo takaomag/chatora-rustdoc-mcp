@@ -11,6 +11,8 @@ mod checks;
 mod crate_overview;
 #[cfg(feature = "local")]
 mod external_build;
+#[cfg(feature = "local")]
+mod external_git;
 mod get_item;
 #[cfg(feature = "local")]
 mod list_crates;
@@ -111,6 +113,10 @@ pub(super) struct ToolState {
     /// key of their record (requirement R-WS-10, decided in M2e's E2a).
     #[cfg(feature = "local")]
     pub(super) externals: Flights<external_build::SharedExternal>,
+    /// The builds of `build_external_docs` of crates of git repositories, by the key of the ref
+    /// asked for (decided in M2e's E3).
+    #[cfg(feature = "local")]
+    pub(super) git_externals: Flights<external_git::SharedGit>,
     /// The calls being handled, at most `limits.concurrent_calls` (requirement R-SEC-7).
     pub(super) calls: CallLimit,
     /// How long a call waits for work that goes on without it, such as fetching and indexing a
@@ -407,9 +413,14 @@ fn with_git(mut tool: Tool) -> Tool {
     if !properties.contains_key("crate") || tool.name == "list_crates" {
         return tool;
     }
-    for (name, description) in GIT_ARGUMENTS {
+    for &(name, description) in GIT_ARGUMENTS {
+        let description = if name == "git" && tool.name == "build_external_docs" {
+            GIT_TO_BUILD
+        } else {
+            description
+        };
         properties.insert(
-            (*name).to_owned(),
+            name.to_owned(),
             json!({ "type": "string", "description": description }),
         );
     }
@@ -434,6 +445,11 @@ const GIT_ARGUMENTS: &[(&str, &str)] = &[
     ),
     ("tag", "With `git`: the tag."),
 ];
+
+/// What `git` is to `build_external_docs`, which documents the crate.
+const GIT_TO_BUILD: &str = "The URL of a git repository (https://, ssh://, http:// or git://) \
+                            that the crate is in, to document the crate at the commit that rev, \
+                            branch or tag names. Takes no version.";
 
 /// The end of every tool's description of `project` (doc/m2-plan.md §5, P5): the server sees only
 /// the directory that Claude Code was opened in, not the worktree of a subagent, so one that works

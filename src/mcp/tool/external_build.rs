@@ -37,7 +37,7 @@ use crate::{
         rustdoc_json::ParseError,
         sparse_index::IndexEntry,
         target::TargetTriple,
-        temp_project::{self, Release, Set},
+        temp_project::{self, Origin, Release, Set},
         version::VersionSpec,
     },
     query::{
@@ -153,16 +153,20 @@ pub(super) async fn release(
         features: vec!["default".into()],
         asks_features: false,
         name: published,
-        version,
+        origin: Origin::CratesIo(version.clone()),
     };
-    let release =
-        match with_docs_rs_features(&state, release, &resolved.version.checksum, &mut warnings)
-            .await
-        {
-            Ok(release) => release,
-            Err(result) => return *result,
-        };
-    built(&state, key, release, target, warnings, until).await
+    let release = match with_docs_rs_features(
+        &state,
+        (release, &version),
+        &resolved.version.checksum,
+        &mut warnings,
+    )
+    .await
+    {
+        Ok(release) => release,
+        Err(result) => return *result,
+    };
+    built(&state, key, (release, version), target, warnings, until).await
 }
 
 /// What the response warns about a dependency of the project built here as the release alone.
@@ -482,20 +486,15 @@ async fn on_docs_rs(
 /// cannot be read leaves the default features, with a warning.
 async fn with_docs_rs_features(
     state: &ToolState,
-    mut release: Release,
+    (mut release, version): (Release, &semver::Version),
     checksum: &str,
     warnings: &mut Vec<Box<str>>,
 ) -> Result<Release, Box<CallToolResult>> {
     let read = state
         .static_crates
-        .crate_file(
-            &state.cache,
-            &release.name,
-            &release.version,
-            Some(checksum),
-        )
+        .crate_file(&state.cache, &release.name, version, Some(checksum))
         .await;
-    let what = format!("{}@{}", release.name, release.version);
+    let what = release.what();
     let contents = match read {
         Ok(Some(contents)) => contents,
         Ok(None) => return Err(Box::new(crate_failed(state, &what, "it is not there"))),
@@ -507,28 +506,8 @@ async fn with_docs_rs_features(
             )));
         },
     };
-    match crate_file::docs_rs_build(&contents, &release.name, &release.version) {
-        Ok(build) => {
-            // Only those that it declares, which cargo takes for a dependency.
-            let (features, undeclared): (Vec<_>, Vec<_>) = build
-                .features
-                .iter()
-                .cloned()
-                .partition(|feature| build.declared.contains(feature));
-            if !undeclared.is_empty() {
-                warnings.push(
-                    format!(
-                        "the features {} of the [package.metadata.docs.rs] of {what} are not \
-                         features that it declares, so they are left out",
-                        undeclared.join(", ")
-                    )
-                    .into(),
-                );
-            }
-            release.features = features;
-            release.cfgs = build.rustdoc_cfg;
-            release.asks_features = build.asks_features;
-        },
+    match crate_file::docs_rs_build(&contents, &release.name, version) {
+        Ok(build) => as_docs_rs(&mut release, &build, warnings),
         Err(error) => warnings.push(
             format!(
                 "the manifest in the .crate of {what} could not be read ({}), so it is built \
@@ -539,6 +518,35 @@ async fn with_docs_rs_features(
         ),
     }
     Ok(release)
+}
+
+/// Sets on `release` the features and the `--cfg` that docs.rs builds it with, as `build`, from
+/// its manifest, tells (requirement R-FT-1): only the features that it declares, which cargo takes
+/// for a dependency, warning of the others.
+pub(super) fn as_docs_rs(
+    release: &mut Release,
+    build: &crate_file::DocsRsBuild,
+    warnings: &mut Vec<Box<str>>,
+) {
+    let (features, undeclared): (Vec<_>, Vec<_>) = build
+        .features
+        .iter()
+        .cloned()
+        .partition(|feature| build.declared.contains(feature));
+    if !undeclared.is_empty() {
+        warnings.push(
+            format!(
+                "the features {} of the [package.metadata.docs.rs] of {} are not features that \
+                 it declares, so they are left out",
+                undeclared.join(", "),
+                release.what()
+            )
+            .into(),
+        );
+    }
+    release.features = features;
+    release.cfgs.clone_from(&build.rustdoc_cfg);
+    release.asks_features = build.asks_features;
 }
 
 /// The error when the `.crate` of `what` could not be had from static.crates.io, as `why` tells:
@@ -568,12 +576,12 @@ fn crate_failed(state: &ToolState, what: &str, why: &str) -> CallToolResult {
 async fn built(
     state: &Arc<ToolState>,
     key: Key,
-    release: Release,
+    (release, version): (Release, semver::Version),
     target: TargetTriple,
     warnings: Vec<Box<str>>,
     until: Instant,
 ) -> CallToolResult {
-    let what = format!("{}@{}", release.name, release.version);
+    let what = release.what();
     let until_built = Instant::now()
         .checked_add(state.build_wait)
         .map_or(until, |until_built| until_built.min(until));
@@ -599,7 +607,7 @@ async fn built(
         Joined::Done(Ok(built)) => built_response(&built, looked_up, &warnings),
         Joined::Done(Err(body)) => error_result(&body),
         Joined::Ended => get_item::stopped(),
-        Joined::Going(doing) => going(looked_up, &release.version, doing, &warnings),
+        Joined::Going(doing) => going(looked_up, &version, doing, &warnings),
     }
 }
 
@@ -655,20 +663,20 @@ enum Unmade {
 /// It holds the lock of the key throughout. A record made meanwhile by another server is taken as
 /// it is; a failure or a broken record is forgotten, and so is the failure of the build in the
 /// temporary project, which is made again (requirement R-WS-10).
-async fn make(
+pub(super) async fn make(
     state: &ToolState,
     key: &Key,
     release: Release,
     target: TargetTriple,
     progress: &Stage,
 ) -> SharedExternal {
-    let what = format!("{}@{}", release.name, release.version);
+    let what = release.what();
     let making = take_lock(state, key, progress)
         .await
         .map_err(|why| Arc::new(failed_so(&what, &why, true)))?;
     let (recorded_now, making) = read_record(state, key, making)
         .await
-        .ok_or_else(|| Arc::new(body_of(&get_item::stopped())))?;
+        .ok_or_else(|| Arc::new(stopped_body()))?;
     let refresh = match recorded_now {
         Recorded::Built(built, told) => match recorded(&state.cache, *built, &told).await {
             Ok(built) => return Ok(Arc::new(built)),
@@ -705,7 +713,7 @@ async fn make(
                 .map(Arc::new)
                 .map_err(|error| Arc::new(failed_so(&what, &error.to_string(), true)))
         },
-        Err(Unmade::Stopped) => Err(Arc::new(body_of(&get_item::stopped()))),
+        Err(Unmade::Stopped) => Err(Arc::new(stopped_body())),
         Err(Unmade::Failed { body, .. }) => {
             let transient = body.get("retryable") == Some(&Value::Bool(true));
             let failed = Failed::now(None, None, transient, body.clone());
@@ -798,7 +806,11 @@ async fn read_record(state: &ToolState, key: &Key, making: Making) -> Option<(Re
 
 /// The lock of `key`, waited for while another server makes its record (decided in M2e, 13), at
 /// most [`OTHER_MAKES_FOR`]; or why it could not be taken.
-async fn take_lock(state: &ToolState, key: &Key, progress: &Stage) -> Result<Making, String> {
+pub(super) async fn take_lock(
+    state: &ToolState,
+    key: &Key,
+    progress: &Stage,
+) -> Result<Making, String> {
     let started = Instant::now();
     loop {
         let (cache, tried) = (state.cache.clone(), key.clone());
@@ -828,18 +840,20 @@ async fn build_in_temporary_project(
     refresh: bool,
     progress: &Stage,
 ) -> Result<Arc<LocalBuilt>, Unmade> {
-    let what = format!("{}@{}", release.name, release.version);
+    let what = release.what();
     let failed = |why: &str| Unmade::Failed {
         body: failed_so(&what, why, false),
         compiler: false,
     };
     let dir = temp_project::dir_in(&key.dir(state.cache.dir()), set);
     let (written, wanted) = (dir.clone(), release.clone());
-    crate::task::spawn_blocking(move || temp_project::write(&written, &wanted))
-        .await
-        .map_err(|error| failed(&error.to_string()))?
-        .map_err(|error| failed(&error.to_string()))?;
-    let workspace = workspace_of(&dir).map_err(|error| failed(&error.to_string()))?;
+    let workspace = crate::task::spawn_blocking(move || {
+        temp_project::write(&written, &wanted)?;
+        workspace_of(&written).map_err(std::io::Error::other)
+    })
+    .await
+    .map_err(|error| failed(&error.to_string()))?
+    .map_err(|error| failed(&error.to_string()))?;
     let root = workspace.root.clone();
     // The user's cargo settings apply to it too, which may build their own std, before cargo runs
     // (decided in M2's D7).
@@ -957,12 +971,20 @@ async fn resolved(
 
 /// The body of the error of cargo for `what`, as `failure` classifies it, which may work when
 /// tried again if `transient` (requirement R-WS-7), as `why` tells.
-fn cargo_failure(what: &str, failure: Option<Failure>, transient: bool, why: &str) -> Value {
+pub(super) fn cargo_failure(
+    what: &str,
+    failure: Option<Failure>,
+    transient: bool,
+    why: &str,
+) -> Value {
     let mut body = failed_so(what, why, transient);
     if let Some(failure) = failure
         && let Some(fields) = body.as_object_mut()
     {
         fields.insert("code".to_owned(), json!(failure.code()));
+        if let Failure::GitFetch(reason) = failure {
+            fields.insert("reason".to_owned(), json!(reason.as_str()));
+        }
         if matches!(failure, Failure::OfflineMiss | Failure::LockfileOutdated) {
             fields.insert("retryable".to_owned(), json!(false));
         }
@@ -972,7 +994,7 @@ fn cargo_failure(what: &str, failure: Option<Failure>, transient: bool, why: &st
 
 /// `body`, an error of a build, with what to do of this tool: not what the query tools tell, as
 /// `refresh` or the project's terminal (requirement R-WS-10).
-fn external_body(mut body: Value) -> Value {
+pub(super) fn external_body(mut body: Value) -> Value {
     let offline = body.get("code") == Some(&json!("offline_miss"));
     if let Some(fields) = body.as_object_mut() {
         let mut suggestions: Vec<Value> = match fields.remove("suggestions") {
@@ -980,7 +1002,9 @@ fn external_body(mut body: Value) -> Value {
                 .into_iter()
                 .filter(|suggestion| {
                     suggestion.as_str().is_some_and(|text| {
-                        !text.contains("refresh") && !text.contains("project's terminal")
+                        !text.contains("refresh")
+                            && !text.contains("project's terminal")
+                            && text != CALL_AGAIN
                     })
                 })
                 .collect(),
@@ -998,13 +1022,17 @@ fn external_body(mut body: Value) -> Value {
 }
 
 /// What calls this tool again, which builds again what failed (requirement R-WS-10).
-const CALL_AGAIN: &str = "call build_external_docs again with the same arguments to try again";
+pub(super) const CALL_AGAIN: &str =
+    "call build_external_docs again with the same arguments to try again";
 
-/// Removes the Cargo.lock of the temporary project at `root`, which cargo could not read.
-async fn remove_lock(root: &std::path::Path) {
+/// Removes the Cargo.lock of the temporary project at `root`, if it has one: cargo could not read
+/// it, or it is made anew.
+pub(super) async fn remove_lock(root: &std::path::Path) {
     let lock = root.join("Cargo.lock");
     let removed = crate::task::spawn_blocking(move || std::fs::remove_file(lock)).await;
-    if let Ok(Err(error)) = removed {
+    if let Ok(Err(error)) = removed
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
         tracing::warn!(%error, "the Cargo.lock of a temporary project could not be removed");
     }
 }
@@ -1019,9 +1047,14 @@ fn body_of(result: &CallToolResult) -> Value {
         .unwrap_or_else(|| json!({ "code": "build_failed", "message": "the build failed" }))
 }
 
+/// The body of the error when the work stopped without a result.
+pub(super) fn stopped_body() -> Value {
+    body_of(&get_item::stopped())
+}
+
 /// The body of `build_failed` for `what`, as `why` tells, which may work when tried again if
 /// `retryable`.
-fn failed_so(what: &str, why: &str, retryable: bool) -> Value {
+pub(super) fn failed_so(what: &str, why: &str, retryable: bool) -> Value {
     json!({
         "code": "build_failed",
         "message": format!("the documentation of {what} could not be built: {why}"),
@@ -1044,17 +1077,7 @@ fn built_response(
     provenance.insert("crate".to_owned(), json!(name.as_str()));
     provenance.insert("version".to_owned(), json!(record.crate_version));
     provenance.insert("target".to_owned(), json!(target.as_str()));
-    if let Some(toolchain) = record.toolchain.as_deref().and_then(|t| t.lines().next()) {
-        provenance.insert("toolchain".to_owned(), json!(toolchain));
-    }
-    provenance.insert("built_at".to_owned(), json!(record.built_at));
-    if let Some(features) = &record.features_requested {
-        provenance.insert("features_requested".to_owned(), json!(features));
-    }
-    if let Some(features) = &record.features_effective {
-        provenance.insert("features_effective".to_owned(), json!(features));
-    }
-    provenance.insert("recorded_by".to_owned(), json!(RECORDED_BY));
+    built_provenance(&mut provenance, built);
     let mut warnings: Vec<Box<str>> = warnings.to_vec();
     warnings.extend(built.archived.warnings.iter().cloned());
     let release = format!("{name}@{}", record.crate_version);
@@ -1080,6 +1103,23 @@ fn built_response(
         )]),
     );
     CallToolResult::structured(Value::Object(response))
+}
+
+/// Adds to `provenance` what the record of `built` tells: the toolchain, when it was built, and
+/// its features; and that this tool recorded it.
+pub(super) fn built_provenance(provenance: &mut Map<String, Value>, built: &LocalBuilt) {
+    let record = &built.record;
+    if let Some(toolchain) = record.toolchain.as_deref().and_then(|t| t.lines().next()) {
+        provenance.insert("toolchain".to_owned(), json!(toolchain));
+    }
+    provenance.insert("built_at".to_owned(), json!(record.built_at));
+    if let Some(features) = &record.features_requested {
+        provenance.insert("features_requested".to_owned(), json!(features));
+    }
+    if let Some(features) = &record.features_effective {
+        provenance.insert("features_effective".to_owned(), json!(features));
+    }
+    provenance.insert("recorded_by".to_owned(), json!(RECORDED_BY));
 }
 
 /// The response when docs.rs has rustdoc JSON of `name` at `version` for `target` that this

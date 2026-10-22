@@ -342,7 +342,7 @@ pub fn classify(output: &Output, offline: bool) -> Failure {
     } else if has("attempting to make an HTTP request, but --offline was specified")
         || has("you are in the offline mode (--offline)")
         // The same words as a misspelt crate name when online.
-        || (offline && has("no matching package named"))
+        || (offline && no_such_package(&stderr))
     {
         Failure::OfflineMiss
     } else if let Some(reason) = git_fetch_failure(&stderr) {
@@ -355,6 +355,21 @@ pub fn classify(output: &Output, offline: bool) -> Failure {
     } else {
         Failure::Other
     }
+}
+
+/// Whether cargo's `stderr` says that no package of the name depended on was found: offline, as
+/// it was not fetched; else, as the registry or the git repository has none (decided in M2e's
+/// E3).
+#[must_use]
+pub fn no_such_package(stderr: &str) -> bool {
+    stderr.contains("no matching package named")
+}
+
+/// Whether cargo's `stderr` says that no package named `name` was found: not another, as a
+/// dependency of the package depended on (decided in M2e's E3).
+#[must_use]
+pub fn no_package_named(stderr: &str, name: &str) -> bool {
+    stderr.contains(&format!("no matching package named `{name}` found"))
 }
 
 /// The git fetch failure that `stderr` reports, in the words that libgit2 and the git CLI use
@@ -442,6 +457,12 @@ mod tests {
             classify("error: no matching package named `serde` found", false),
             Failure::Other
         );
+        // The package depended on, not a dependency of it.
+        let missing_dependency = "error: no matching package named `bar` found\nlocation searched: \
+                                  crates.io index\nrequired by package `foo v0.1.0 (https://x/r)`";
+        assert!(no_package_named(missing_dependency, "bar"));
+        assert!(!no_package_named(missing_dependency, "foo"));
+        assert!(!no_package_named(missing_dependency, "ba"));
         assert_eq!(
             classify(
                 "error: failed to get `x` as a dependency\n  revision 0123abc not found",

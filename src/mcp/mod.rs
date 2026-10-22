@@ -272,6 +272,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
             locals: Flights::handing_over_only(crate::query::local::hands_over),
             #[cfg(feature = "local")]
             externals: Flights::default(),
+            #[cfg(feature = "local")]
+            git_externals: Flights::default(),
             calls: tool::CallLimit::from_settings(settings),
             wait,
             #[cfg(feature = "local")]

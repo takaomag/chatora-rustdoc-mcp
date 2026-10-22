@@ -286,6 +286,35 @@ impl GitRef {
             },
         }
     }
+
+    /// The ref as git names it in full, which keys the commit it resolves to: `HEAD` for the
+    /// default branch, `refs/heads/<branch>`, `refs/tags/<tag>`, or the rev.
+    #[must_use]
+    pub fn full_name(&self) -> String {
+        match self {
+            Self::DefaultBranch => "HEAD".to_owned(),
+            Self::Rev(rev) => rev.to_string(),
+            Self::Branch(branch) => format!("refs/heads/{branch}"),
+            Self::Tag(tag) => format!("refs/tags/{tag}"),
+        }
+    }
+
+    /// Whether it names a commit by its hash, which the repository cannot move to another
+    /// commit, as it can a branch, a tag or a ref (requirement R-WS-10).
+    #[must_use]
+    pub fn is_hash(&self) -> bool {
+        matches!(self, Self::Rev(rev) if rev.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+}
+
+/// Whether `commit` is the full hash of a commit, as cargo writes it: 40 hex digits in lower case,
+/// or 64 for a repository of SHA-256.
+#[must_use]
+pub fn is_commit(commit: &str) -> bool {
+    matches!(commit.len(), 40 | 64)
+        && commit
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Whether `name` is a ref name that git takes, as `git check-ref-format` tells it (requirement
@@ -501,6 +530,43 @@ mod tests {
             GitRef::parse(None, Some("main"), Some("v1")),
             Err(GitRefError::Several)
         );
+    }
+
+    #[test]
+    fn a_ref_is_named_in_full_and_a_hash_does_not_move() {
+        let named = |rev, branch, tag| {
+            let reference = GitRef::parse(rev, branch, tag).expect("taken");
+            (reference.full_name(), reference.is_hash())
+        };
+        assert_eq!(named(None, None, None), ("HEAD".to_owned(), false));
+        assert_eq!(
+            named(Some("ABCDEF0"), None, None),
+            ("abcdef0".to_owned(), true)
+        );
+        assert_eq!(
+            named(Some("refs/pull/1/head"), None, None),
+            ("refs/pull/1/head".to_owned(), false)
+        );
+        assert_eq!(
+            named(None, Some("main"), None),
+            ("refs/heads/main".to_owned(), false)
+        );
+        assert_eq!(
+            named(None, None, Some("v1")),
+            ("refs/tags/v1".to_owned(), false)
+        );
+        let sha1 = "9a41be9f3db7140981e276cfc1fdb993ed8ae07f";
+        assert!(is_commit(sha1));
+        assert!(is_commit(&"a".repeat(64)));
+        for not in [
+            "9a41be9f",
+            "",
+            "../x",
+            &sha1.to_ascii_uppercase(),
+            &format!("{sha1}0"),
+        ] {
+            assert!(!is_commit(not), "{not}");
+        }
     }
 
     #[test]
