@@ -45,6 +45,10 @@ pub struct WorkspaceRecord {
     pub lock: Box<str>,
     /// The files that `cargo metadata` resolved it from, as they were (requirement R-WS-4).
     pub inputs: Inputs,
+    /// The directories that its `members` patterns matched, as the key of the default project's
+    /// `cargo metadata` has them (requirement R-VR-2): a new one changes what cargo resolves.
+    /// `None` when they could not be expanded.
+    pub members: Option<Vec<PathBuf>>,
     /// The targets that it builds for, the first for a lookup that gives none (requirement
     /// R-TG-1).
     pub targets: Vec<Box<str>>,
@@ -65,6 +69,35 @@ impl WorkspaceRecord {
         let lock = CargoLock::parse(&self.lock).map_err(io::Error::other)?;
         Ok(Resolution::Metadata { metadata, lock })
     }
+
+    /// Whether it records the same as `other`, but for when: what `cargo metadata` resolved, its
+    /// Cargo.lock, the contents of the files that it is made from, the directories that its
+    /// `members` patterns matched and the targets that it builds for. The records for its targets
+    /// are then still of it (decided in M2e's E4b-3).
+    #[must_use]
+    pub fn same_as(&self, other: &Self) -> bool {
+        let contents = |inputs: &Inputs| -> Vec<(PathBuf, Option<Box<str>>)> {
+            inputs
+                .files
+                .iter()
+                .map(|file| (file.path.clone(), file.sha256.clone()))
+                .collect()
+        };
+        self.metadata == other.metadata
+            && self.lock == other.lock
+            && self.members == other.members
+            && self.targets == other.targets
+            && contents(&self.inputs) == contents(&other.inputs)
+    }
+}
+
+/// The directories under the workspace root `root` that its `members` patterns match, sorted;
+/// `None` when they cannot be expanded.
+///
+/// It reads directories, so it is for a blocking thread.
+#[must_use]
+pub fn members_of(root: &Path) -> Option<Vec<PathBuf>> {
+    project::expand_members(root)
 }
 
 /// What `build_external_docs` recorded of a workspace outside the default project for a target.
@@ -105,8 +138,15 @@ pub enum Outcome {
         target: Box<str>,
     },
     /// A release of crates.io, which docs.rs may have: asked of docs.rs when it is looked up, and
-    /// else built by `build_external_docs` when asked for it (requirement R-WS-10).
-    DocsRs,
+    /// else built by `build_external_docs` when asked for it (requirement R-WS-10, decided in M2e's
+    /// E4b, 4).
+    DocsRs {
+        /// The target of the record that that build makes: the target's, or the host's for what
+        /// the build for the target builds for the host. `None` when `cargo rustdoc -p` cannot
+        /// name it, which is not built here.
+        #[serde(default)]
+        target: Option<Box<str>>,
+    },
     /// One that `cargo rustdoc -p` cannot name, which is not documented here (in a later version,
     /// decided in M2e's E4b, 2).
     Unnameable,
@@ -128,6 +168,13 @@ pub fn target_key(root: &Path, target: &str) -> Key {
         target: target.into(),
         hidden: false,
     }
+}
+
+/// The file of the record of the workspace at `root` in `cache`, whose length and time tell that
+/// it was recorded again.
+#[must_use]
+pub fn workspace_file(cache: &Cache, root: &Path) -> PathBuf {
+    workspace_key(root).dir(cache.dir()).join(WORKSPACE)
 }
 
 /// The record of the workspace at `root` in `cache`, without waiting; for the holder of its lock,
@@ -265,6 +312,7 @@ mod tests {
             metadata: METADATA.into(),
             lock: "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n".into(),
             inputs: freshness::collect(&[], &[], None).expect("collected"),
+            members: Some(vec![PathBuf::from("/w/crates/a")]),
             targets: vec!["x86_64-unknown-linux-gnu".into()],
             recorded_at: "2026-10-22T00:00:00Z".into(),
         }
@@ -354,7 +402,9 @@ mod tests {
                     package: "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0"
                         .into(),
                     crate_name: "serde".into(),
-                    outcome: Outcome::DocsRs,
+                    outcome: Outcome::DocsRs {
+                        target: Some(target.into()),
+                    },
                 },
             ],
         };
@@ -368,6 +418,46 @@ mod tests {
             .expect("read");
         assert!(text.contains(r#""outcome": "docs_rs""#), "{text}");
         found.trees.parse().expect("feature sets");
+    }
+
+    #[test]
+    fn a_new_directory_that_the_members_patterns_match_changes_the_members() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .expect("written");
+        fs::create_dir_all(root.join("crates/a")).expect("made");
+        let record = WorkspaceRecord {
+            members: members_of(root),
+            ..workspace_record()
+        };
+        assert_eq!(record.members, Some(vec![root.join("crates/a")]));
+        assert_eq!(members_of(root), record.members);
+        fs::create_dir_all(root.join("crates/b")).expect("made");
+        assert_ne!(members_of(root), record.members);
+    }
+
+    #[test]
+    fn a_record_of_the_same_is_the_same_but_for_when() {
+        let record = workspace_record();
+        let later = WorkspaceRecord {
+            recorded_at: "2026-10-23T00:00:00Z".into(),
+            ..workspace_record()
+        };
+        assert!(record.same_as(&later));
+        let other = WorkspaceRecord {
+            lock: "version = 4\n".into(),
+            ..workspace_record()
+        };
+        assert!(!record.same_as(&other));
+        let other = WorkspaceRecord {
+            targets: vec!["wasm32-wasip1".into()],
+            ..workspace_record()
+        };
+        assert!(!record.same_as(&other));
     }
 
     #[test]

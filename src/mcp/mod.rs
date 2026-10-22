@@ -276,6 +276,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
             git_externals: Flights::default(),
             #[cfg(feature = "local")]
             workspaces: Flights::handing_over(),
+            #[cfg(feature = "local")]
+            recorded_workspaces: parking_lot::Mutex::default(),
             calls: tool::CallLimit::from_settings(settings),
             wait,
             #[cfg(feature = "local")]

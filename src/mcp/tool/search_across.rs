@@ -542,6 +542,9 @@ async fn planned_outcome(
             | Planned::OtherTarget { error, .. }
             | Planned::Unnameable { error, .. },
         ) => Some(Outcome::Failed(failure_of(&error))),
+        // Of a workspace outside the default project, which this search does not reach yet
+        // (decided in M2e's E4b-3, 3).
+        Ok(Planned::Recorded(recorded)) => Some(Outcome::Failed(failure_of(&recorded.error))),
         Ok(Planned::Resolving(doing) | Planned::Planning(doing)) => Some(Outcome::Going(doing)),
         Ok(Planned::Not | Planned::OtherVersion(_)) => None,
     }

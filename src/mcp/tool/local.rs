@@ -14,7 +14,14 @@ use semver::Version;
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
-use super::{ToolState, error_result, get_item, project, project::BuildTargets};
+use super::{
+    ToolState,
+    error_result,
+    get_item,
+    project,
+    project::BuildTargets,
+    recorded_workspace,
+};
 use crate::{
     data::{
         build::{self, Bootstrap, BuiltBy, Documented, Plan, TargetDir},
@@ -142,10 +149,35 @@ pub(super) enum Member {
         /// The target that it is documented for.
         target: TargetTriple,
     },
+    /// A member's crate or a dependency of a workspace outside the default project, which the
+    /// query tools do not build: what `build_external_docs` recorded of it (decided in M2e's
+    /// E4b-3).
+    Recorded(Box<RecordedCrate>),
+}
+
+/// A crate of a workspace outside the default project, as `build_external_docs` recorded it
+/// (decided in M2e's E4b-3).
+#[derive(Debug)]
+pub(super) struct RecordedCrate {
+    /// The key of its record.
+    pub(super) key: crate::data::external::Key,
+    /// Its package.
+    pub(super) package: PackageId,
+    /// The target of its record: the one asked for, or the host's for what the build for it
+    /// builds for the host.
+    pub(super) target: TargetTriple,
+    /// The arguments of `build_external_docs` that record it again, as JSON.
+    pub(super) again: Box<str>,
+    /// Whether what the workspace is resolved from changed since it was recorded.
+    pub(super) changed: bool,
+    /// The error when it has no record, which tells how to make one.
+    pub(super) error: Box<CallToolResult>,
 }
 
 /// What the crate `name`, as `asked`, is in `workspace`, to build for `target`, waiting for
-/// `cargo metadata` until `until`.
+/// `cargo metadata` until `until`. In a workspace outside the default project, which the query
+/// tools neither run cargo in nor build, what `build_external_docs` recorded of it, as
+/// [`Member::Recorded`] (decided in M2e's E4b-3).
 pub(super) async fn member(
     state: &ToolState,
     workspace: &Workspace,
@@ -153,6 +185,10 @@ pub(super) async fn member(
     target: &TargetTriple,
     until: Instant,
 ) -> Result<Member, Box<CallToolResult>> {
+    // Outside the default project, what `build_external_docs` recorded (decided in M2e's E4b-3).
+    if recorded_workspace::is_outside(state, workspace) {
+        return recorded_workspace::member(state, workspace, (name, asked), target).await;
+    }
     member_for(
         state,
         workspace,
@@ -331,7 +367,9 @@ async fn features_of(
 /// build, and its public items only (requirement R-WS-5). `Member::Not` when it is not the
 /// project's dependency, or has no lib; `Member::Unnameable` when `-p` cannot name it; the error
 /// when the project's build does not build it for the target, or the scope of the builds is not
-/// known (`scope_unknown`).
+/// known (`scope_unknown`). In a workspace outside the default project, what `build_external_docs`
+/// recorded of it, as [`Member::Recorded`], or the error that tells why it did not (decided in
+/// M2e's E4b-3).
 pub(super) async fn dependency(
     state: &ToolState,
     workspace: &Workspace,
@@ -339,6 +377,10 @@ pub(super) async fn dependency(
     target: &TargetTriple,
     until: Instant,
 ) -> Result<Member, Box<CallToolResult>> {
+    // Outside the default project, what `build_external_docs` recorded (decided in M2e's E4b-3).
+    if recorded_workspace::is_outside(state, workspace) {
+        return recorded_workspace::dependency(state, workspace, package, target).await;
+    }
     dependency_for(state, workspace, package, (target, Built::Here), until).await
 }
 
@@ -612,7 +654,7 @@ fn build_unsupported(
 
 /// `docs_unavailable` with `build_unsupported` for the dependency `what`, which the project's
 /// build does not build for `target` (requirement R-WS-5).
-fn not_built_for(what: &str, target: &TargetTriple) -> CallToolResult {
+pub(super) fn not_built_for(what: &str, target: &TargetTriple) -> CallToolResult {
     error_result(&json!({
         "code": "docs_unavailable",
         "message": format!("the project's build for {target} does not build {what}"),

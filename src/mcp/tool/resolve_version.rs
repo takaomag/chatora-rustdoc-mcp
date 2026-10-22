@@ -92,7 +92,7 @@ fn output_schema() -> JsonObject {
                     "version": { "type": "string" },
                     "resolved_from": {
                         "type": "string",
-                        "enum": ["explicit", "explicit_req", "latest", "cargo_lock", "cargo_lock_raw", "git"],
+                        "enum": ["explicit", "explicit_req", "latest", "cargo_lock", "cargo_lock_raw", "git", "external"],
                     },
                     "project_from": {
                         "type": "string",
@@ -109,9 +109,11 @@ fn output_schema() -> JsonObject {
                     "stale": { "type": "boolean" },
                     "stale_reason": {
                         "type": "string",
-                        "enum": ["ref_ttl_expired"],
-                        "description": "A branch or a tag of git was resolved more than a day \
-                                        ago, at resolved_at.",
+                        "enum": ["ref_ttl_expired", "inputs_changed"],
+                        "description": "ref_ttl_expired: a branch or a tag of git was resolved \
+                                        more than a day ago, at resolved_at. inputs_changed: the \
+                                        workspace outside the default project that \
+                                        build_external_docs recorded changed since.",
                     },
                 },
                 // Before the version is known, a response while it is resolved has no `version`
@@ -290,16 +292,61 @@ async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallTool
             },
         },
     };
-    // A package of the project that is not from crates.io is not looked for there: a crate of
-    // the same name on crates.io is another (requirement R-VR-2).
+    answered(&state, name, decided, &lookup, warnings).await
+}
+
+/// What the project's package that `decided` found, or else crates.io, tells of the version that
+/// it decided for `lookup`.
+async fn answered(
+    state: &ToolState,
+    name: CrateName,
+    decided: Decided,
+    lookup: &project::LookupTarget,
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(unused_mut, reason = "only a project's package warns more")
+    )]
+    mut warnings: Vec<Box<str>>,
+) -> CallToolResult {
     #[cfg(feature = "local")]
-    if let Some(found) = &decided.found
-        && found.package.source != Source::CratesIo
-    {
-        explicitly_the_projects(found, &mut warnings);
-        return not_from_crates_io(found, &target, &warnings);
+    if let Some(found) = decided.found.clone() {
+        let target = &lookup.triple;
+        // A package of the project that is not from crates.io is not looked for there: a crate
+        // of the same name on crates.io is another (requirement R-VR-2).
+        let result = if found.package.source == Source::CratesIo {
+            from_crates_io(state, name, decided, lookup, warnings).await
+        } else {
+            explicitly_the_projects(&found, &mut warnings);
+            not_from_crates_io(&found, target, &warnings)
+        };
+        return of_changed_record(state, &found.workspace, target, result).await;
     }
-    from_crates_io(&state, name, decided, &lookup, warnings).await
+    from_crates_io(state, name, decided, lookup, warnings).await
+}
+
+/// `result`, of the project `workspace` for `target`, marked stale when it is of the record of a
+/// workspace outside the default project that changed since (decided in M2e's E4b-3, 1).
+#[cfg(feature = "local")]
+async fn of_changed_record(
+    state: &ToolState,
+    workspace: &crate::data::project::Workspace,
+    target: &TargetTriple,
+    result: CallToolResult,
+) -> CallToolResult {
+    let Some(mut response) = result
+        .structured_content
+        .clone()
+        .filter(|_| result.is_error != Some(true))
+    else {
+        return result;
+    };
+    let Some((recorded_at, again)) =
+        super::recorded_workspace::changed_since(state, workspace, Some(target)).await
+    else {
+        return result;
+    };
+    super::recorded_workspace::mark_changed(&mut response, &recorded_at, &again);
+    CallToolResult::structured(response)
 }
 
 /// Warns that the project's package `found` of the exact version given is answered for, which

@@ -950,6 +950,46 @@ fn lookups_start_nothing_for_a_project_outside_the_default_one() {
         !outside_marker.exists(),
         "a process was started outside the default project"
     );
+    // Nor once `build_external_docs` recorded it, which runs cargo there itself: they read the
+    // record (decided in M2e's E4b-3).
+    #[cfg(debug_assertions)]
+    {
+        let built = built_by_external(&mut server, 20, &json!({ "project": elsewhere }));
+        assert_eq!(built["structuredContent"]["data"]["built"], true, "{built}");
+        // What the tool runs after it answers, as for the inputs of its build, is done first.
+        let mut written = None;
+        for _ in 0..60 {
+            let now = std::fs::metadata(&outside_marker)
+                .map(|marker| marker.len())
+                .ok();
+            if now.is_some() && now == written {
+                break;
+            }
+            written = now;
+            thread::sleep(Duration::from_secs(1));
+        }
+        std::fs::remove_file(&outside_marker).expect("the trap went off for the tool");
+        let calls = [
+            ("list_crates", json!({ "project": elsewhere })),
+            (
+                "resolve_version",
+                json!({ "crate": "demo", "project": elsewhere }),
+            ),
+            (
+                "crate_overview",
+                json!({ "crate": "demo", "project": elsewhere }),
+            ),
+        ];
+        for (id, (tool, arguments)) in (100_u64..).zip(calls) {
+            server.send(&call_tool(id, tool, arguments));
+            let result = server.response(id)["result"].clone();
+            assert_ne!(result["isError"], true, "{tool}: {result}");
+        }
+        assert!(
+            !outside_marker.exists(),
+            "a process was started outside the default project, once recorded"
+        );
+    }
     // The control: the trap works.
     server.send(&call_tool(9, "list_crates", json!({})));
     assert_eq!(server.response(9)["result"]["isError"], false);
@@ -3602,6 +3642,249 @@ fn build_external_docs_documents_a_workspace_outside_the_default_project() {
         "{result}"
     );
     assert!(server.finish().success());
+}
+
+/// The query tools read a workspace outside the default project as `build_external_docs` recorded
+/// it, running no cargo there: not before it is recorded, which they tell how to; its members,
+/// with the versions that it resolved (`external`), its crates and the features of its build; for
+/// another target, its path dependency, and its dependency of crates.io that docs.rs has no JSON
+/// of once the tool built it in the workspace. Once the workspace changes, what they read is told
+/// stale (decided in M2e's E4b-3).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn the_query_tools_read_a_workspace_outside_the_default_project_as_recorded() {
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let outside = workspace_for_wasm(dir.path(), &registry);
+    let default = workspace_of("user");
+    let mut server = server_in_on(Some(default.path()), &registry, dir.path());
+    let project = outside.display().to_string();
+    let everywhere = json!({ "crate": "app", "path": "everywhere", "project": project });
+    server.send(&call_tool(1, "get_item", everywhere.clone()));
+    let result = server.response(1)["result"].clone();
+    assert_eq!(result["isError"], true, "{result}");
+    let error = text_json(&result);
+    assert_eq!(error["reason"], "no_record", "{result}");
+    assert!(
+        error["suggestions"]
+            .to_string()
+            .contains("build_external_docs"),
+        "{result}"
+    );
+    let built = built_by_external(&mut server, 10, &json!({ "project": project }));
+    assert_eq!(built["structuredContent"]["data"]["built"], true, "{built}");
+    let lookups = [
+        ("get_item", everywhere.clone()),
+        (
+            "crate_overview",
+            json!({ "crate": "app", "project": project }),
+        ),
+        ("list_crates", json!({ "project": project })),
+        (
+            "resolve_version",
+            json!({ "crate": "app", "project": project }),
+        ),
+    ];
+    for (id, (tool, arguments)) in (100_u64..).zip(lookups) {
+        server.send(&call_tool(id, tool, arguments));
+        let result = server.response(id)["result"].clone();
+        assert_ne!(result["isError"], true, "{tool}: {result}");
+        let provenance = &result["structuredContent"]["provenance"];
+        assert_eq!(provenance["resolved_from"], "external", "{tool}: {result}");
+        assert!(provenance.get("stale").is_none(), "{tool}: {result}");
+    }
+    server.send(&call_tool(110, "get_item", everywhere.clone()));
+    let result = server.response(110)["result"].clone();
+    let provenance = &result["structuredContent"]["provenance"];
+    assert_eq!(provenance["source"], "local", "{result}");
+    assert_eq!(provenance["recorded_by"], "build_external_docs", "{result}");
+
+    if has_other_target() {
+        looked_up_outside_for_another_target(&mut server, &project);
+        // Recorded for another target, the workspace is the same: what was recorded for the
+        // host is not stale.
+        server.send(&call_tool(450, "get_item", everywhere.clone()));
+        let result = server.response(450)["result"].clone();
+        let provenance = &result["structuredContent"]["provenance"];
+        assert_eq!(provenance["source"], "local", "{result}");
+        assert!(provenance.get("stale").is_none(), "{result}");
+    }
+
+    // The workspace changes since.
+    let manifest = outside.join("Cargo.toml");
+    let mut changed = std::fs::read_to_string(&manifest).expect("read");
+    changed.push_str("# changed\n");
+    std::fs::write(&manifest, changed).expect("written");
+    for (id, (tool, arguments)) in (500_u64..).zip([
+        ("get_item", everywhere),
+        ("list_crates", json!({ "project": project })),
+    ]) {
+        server.send(&call_tool(id, tool, arguments));
+        let result = server.response(id)["result"].clone();
+        let content = &result["structuredContent"];
+        assert_eq!(content["provenance"]["stale"], true, "{tool}: {result}");
+        assert_eq!(
+            content["provenance"]["stale_reason"], "inputs_changed",
+            "{tool}: {result}"
+        );
+        assert!(
+            content["hints"].to_string().contains("build_external_docs"),
+            "{tool}: {result}"
+        );
+    }
+    assert!(server.finish().success());
+}
+
+/// Looks up in `server` the crates of the workspace of [`workspace_for_wasm`] at `project`,
+/// outside the default project, for [`OTHER_TARGET`], once `build_external_docs` recorded them:
+/// its path dependency, and its dependency of crates.io that docs.rs has no JSON of once the tool
+/// built it in the workspace when asked for it (decided in M2e's E4b, 4).
+#[cfg(all(debug_assertions, feature = "local"))]
+fn looked_up_outside_for_another_target(server: &mut Server, project: &str) {
+    let for_wasm = json!({ "project": project, "target": OTHER_TARGET });
+    built_by_external(server, 200, &for_wasm);
+    server.send(&call_tool(
+        300,
+        "get_item",
+        json!({
+            "crate": "wasmonly",
+            "path": "only_wasm",
+            "project": project,
+            "target": OTHER_TARGET,
+        }),
+    ));
+    let result = server.response(300)["result"].clone();
+    assert_eq!(
+        result["structuredContent"]["provenance"]["source"], "local",
+        "{result}"
+    );
+    // docs.rs has no JSON of it: the tool builds it in the workspace when asked for it
+    // (decided in M2e's E4b, 4).
+    let from_crates_io = json!({
+        "crate": "fixture-wasmdep",
+        "path": "from_crates_io",
+        "project": project,
+        "target": OTHER_TARGET,
+    });
+    server.send(&call_tool(301, "get_item", from_crates_io.clone()));
+    let result = server.response(301)["result"].clone();
+    assert_eq!(result["isError"], true, "{result}");
+    let error = text_json(&result);
+    assert_eq!(error["reason"], "no_record", "{result}");
+    assert!(
+        error["suggestions"]
+            .to_string()
+            .contains("fixture-wasmdep@0.1.0"),
+        "{result}"
+    );
+    let asked = json!({
+        "crate": "fixture-wasmdep",
+        "project": project,
+        "target": OTHER_TARGET,
+    });
+    let built = built_by_external(server, 310, &asked);
+    assert_ne!(built["isError"], true, "{built}");
+    server.send(&call_tool(400, "get_item", from_crates_io));
+    let result = server.response(400)["result"].clone();
+    assert_eq!(
+        result["structuredContent"]["provenance"]["source"], "local",
+        "{result}"
+    );
+}
+
+/// `build_external_docs` does not write the Cargo.lock of a workspace outside the default project
+/// that has none, as it builds with `--locked`: it tells how to make one (requirement R-VR-2,
+/// decided in M2e's E4b).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn build_external_docs_tells_how_to_make_the_cargo_lock_of_a_workspace_outside() {
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let outside = dir.path().join("ws");
+    std::fs::create_dir_all(outside.join("src")).expect("made");
+    std::fs::write(
+        outside.join("Cargo.toml"),
+        "[package]\nname = \"unlocked\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )
+    .expect("written");
+    std::fs::write(outside.join("src/lib.rs"), "pub fn f() {}\n").expect("written");
+    let default = workspace_of("user");
+    let mut server = server_in_on(Some(default.path()), &registry, dir.path());
+    let result = built_by_external(
+        &mut server,
+        1,
+        &json!({ "project": outside.display().to_string() }),
+    );
+    assert_eq!(result["isError"], true, "{result}");
+    let error = text_json(&result);
+    assert_eq!(error["code"], "lockfile_outdated", "{result}");
+    assert!(error.to_string().contains("generate-lockfile"), "{result}");
+    assert!(!outside.join("Cargo.lock").exists(), "{result}");
+    assert!(server.finish().success());
+}
+
+/// Calls of `build_external_docs` for the same workspace outside the default project and target
+/// at once share the work that records it and plans its build: cargo resolves it as many times as
+/// for one call (decided in M2e's E4b). A wrapper of cargo first in `PATH` counts the runs, so it
+/// is for unix.
+#[cfg(all(debug_assertions, feature = "local", unix))]
+#[test]
+fn calls_at_once_for_a_workspace_outside_share_its_recording() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(cargo) = std::env::var("CARGO") else {
+        return;
+    };
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let outside = workspace_for_wasm(dir.path(), &registry);
+    let default = workspace_of("user");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("made");
+    let wrapper = bin.join("cargo");
+    let runs = dir.path().join("runs");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\t%s\\n' \"$(pwd -P)\" \"$*\" >> '{}'\nexec '{cargo}' \"$@\"\n",
+            runs.display()
+        ),
+    )
+    .expect("written");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("set");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let metadata_runs = |calls: u64| {
+        if runs.exists() {
+            std::fs::remove_file(&runs).expect("removed");
+        }
+        let mut server = server_with_on(Some(default.path()), &registry, dir.path(), &[(
+            "PATH",
+            path.as_str(),
+        )]);
+        let arguments = json!({ "project": outside.display().to_string() });
+        for id in 1..=calls {
+            server.send(&call_tool(id, "build_external_docs", arguments.clone()));
+        }
+        for id in 1..=calls {
+            let result = server.response(id)["result"].clone();
+            assert_ne!(result["isError"], true, "{result}");
+        }
+        assert!(server.finish().success());
+        let ran = std::fs::read_to_string(&runs).unwrap_or_default();
+        let in_outside = outside.canonicalize().expect("canonical");
+        ran.lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(dir, args)| {
+                Path::new(dir) == in_outside && args.split(' ').any(|arg| arg == "metadata")
+            })
+            .count()
+    };
+    let alone = metadata_runs(1);
+    assert!(alone > 0, "the wrapper of cargo was not run");
+    assert_eq!(metadata_runs(3), alone);
 }
 
 /// Looks up in `server` the crates of the project of [`workspace_for_wasm`] at `project` that

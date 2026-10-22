@@ -283,6 +283,8 @@ async fn for_built_target(
         Ok(Member::NotForTarget(error) | Member::Unknown(error)) | Err(error) => {
             external_build::external_body_of(&error)
         },
+        // Of the query tools only.
+        Ok(Member::Recorded(recorded)) => external_build::external_body_of(&recorded.error),
     }
 }
 
@@ -323,6 +325,8 @@ async fn member_for_built_target(
             | Member::Unnameable { error, .. },
         )
         | Err(error) => external_build::external_body_of(&error),
+        // Of the query tools only.
+        Ok(Member::Recorded(recorded)) => external_build::external_body_of(&recorded.error),
     }
 }
 
@@ -403,6 +407,11 @@ async fn built_by_query_tools(
     (wanted, package): (&LocalWanted, Option<&ProjectPackage>),
     target: &TargetTriple,
 ) -> bool {
+    // Never of a workspace outside the default project, which they do not build (decided in
+    // M2e's E4b-3).
+    if super::recorded_workspace::is_outside(state, workspace) {
+        return false;
+    }
     if wanted.plan.is_proc_macro() {
         return true;
     }
@@ -454,6 +463,8 @@ async fn built_planned(
             | Member::OtherTarget { error, .. },
         )
         | Err(error) => external_build::external_body_of(&error),
+        // Of the query tools only.
+        Ok(Member::Recorded(recorded)) => external_build::external_body_of(&recorded.error),
         Ok(Member::Unnameable { .. }) => super::build_external_docs::not_yet(
             &format!("{what}, a dependency that cargo rustdoc -p cannot name, for {target}"),
             "look it up with get_item for a target that the project builds for",
@@ -698,6 +709,10 @@ pub(super) async fn members(
             )
             | Err(error) => {
                 return external_build::external_body_of(&error);
+            },
+            // Of the query tools only.
+            Ok(Member::Recorded(recorded)) => {
+                return external_build::external_body_of(&recorded.error);
             },
             Ok(Member::Unnameable { error, .. }) => return *error,
         }

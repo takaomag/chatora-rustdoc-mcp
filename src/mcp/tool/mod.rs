@@ -31,6 +31,8 @@ mod project;
 mod recorded;
 #[cfg(feature = "local")]
 mod recorded_git;
+#[cfg(feature = "local")]
+mod recorded_workspace;
 mod resolve_version;
 mod search_across;
 mod search_items;
@@ -128,6 +130,10 @@ pub(super) struct ToolState {
     /// deadline is handed to the next call, which would else record it again.
     #[cfg(feature = "local")]
     pub(super) workspaces: Flights<external_workspace::SharedPlanned>,
+    /// What the query tools read of the records of workspaces outside the default project, until
+    /// they are recorded again (decided in M2e's E4b-3).
+    #[cfg(feature = "local")]
+    pub(super) recorded_workspaces: recorded_workspace::Kept,
     /// The calls being handled, at most `limits.concurrent_calls` (requirement R-SEC-7).
     pub(super) calls: CallLimit,
     /// How long a call waits for work that goes on without it, such as fetching and indexing a

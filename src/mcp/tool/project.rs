@@ -3,6 +3,8 @@
 //! default one, or the one the `project` argument names.
 
 use std::path::Path;
+#[cfg(feature = "local")]
+use std::sync::Arc;
 
 #[cfg(feature = "local")]
 use rmcp::model::CallToolResult;
@@ -12,14 +14,14 @@ use tokio::time::Instant;
 
 use super::ToolState;
 #[cfg(feature = "local")]
-use super::{ErrorChain, error_result};
+use super::{ErrorChain, error_result, recorded_workspace};
 #[cfg(feature = "local")]
 use crate::data::flight::{Doing, Joined};
 #[cfg(feature = "local")]
 use crate::data::{
     cargo::{Failure, GitFetchFailure},
     cargo_config::{self, CargoConfig},
-    metadata::{CargoError, Resolution, ResolveError},
+    metadata::{CargoError, Featured, Resolution, ResolveError, Resolved},
     packages::{Candidate, Lookup, PackageGraph, ProjectPackage},
     project::{self, DefaultProject, ProjectFrom, Workspace},
 };
@@ -70,7 +72,7 @@ pub(super) async fn version_in_project(
     project: Option<&Path>,
     until: Instant,
 ) -> InProject {
-    let (workspace, project_from) = match workspace(state.project.as_ref(), project) {
+    let (workspace, project_from) = match located(state, project).await {
         Ok(Some(found)) => found,
         Ok(None) => {
             return InProject::Elsewhere(vec![
@@ -79,7 +81,7 @@ pub(super) async fn version_in_project(
         },
         Err(error) => return InProject::Error(error),
     };
-    let resolution = match state.resolver.resolve_until(&workspace, until).await {
+    let resolution = match resolve_until(state, &workspace, until).await {
         Joined::Done(Ok(resolution)) => resolution,
         Joined::Done(Err(error)) => {
             return InProject::Error(Box::new(resolve_error(&workspace, &error)));
@@ -89,6 +91,10 @@ pub(super) async fn version_in_project(
     };
     let mut warnings = Vec::new();
     let resolved_from = match &*resolution {
+        // As `build_external_docs` recorded it (decided in M2e's E4b-3).
+        Resolution::Metadata { .. } if recorded_workspace::is_outside(state, &workspace) => {
+            ResolvedFrom::External
+        },
         Resolution::Metadata { .. } => ResolvedFrom::CargoLock,
         Resolution::CargoLockRaw { because, .. } => {
             warnings.extend(raw_warnings(because));
@@ -152,9 +158,9 @@ pub(super) async fn crates_io_in_project(
     project: Option<&Path>,
     until: Instant,
 ) -> Option<FromCratesIo> {
-    let (workspace, project_from) = workspace(state.project.as_ref(), project).ok()??;
+    let (workspace, project_from) = located(state, project).await.ok()??;
     // Past the deadline, the lookup goes on without it; the resolution goes on for later calls.
-    let Joined::Done(Ok(resolution)) = state.resolver.resolve_until(&workspace, until).await else {
+    let Joined::Done(Ok(resolution)) = resolve_until(state, &workspace, until).await else {
         return None;
     };
     // The build's features are known only from `cargo metadata` and `cargo tree`.
@@ -426,8 +432,20 @@ async fn project_target(
     warnings: &mut Vec<Box<str>>,
     own: &mut Option<String>,
 ) -> Option<TargetTriple> {
-    let Ok(Some((workspace, _))) = workspace(state.project.as_ref(), project) else {
-        return None;
+    let workspace = match place(state.project.as_ref(), project) {
+        Ok(Place::Here(workspace, _)) => workspace,
+        // As `build_external_docs` recorded it, the first of the targets that it builds for
+        // (decided in M2e's E4b-3).
+        Ok(Place::Outside(workspace)) => {
+            let recorded = recorded_workspace::read(state, &workspace).await.ok()?;
+            let targets: Vec<TargetTriple> = recorded
+                .targets
+                .iter()
+                .filter_map(|target| target.parse().ok())
+                .collect();
+            return first_of(targets, warnings);
+        },
+        Ok(Place::Nowhere) | Err(_) => return None,
     };
     let config = match read_cargo_config(state, &workspace.root).await? {
         Ok(config) => config,
@@ -455,6 +473,12 @@ async fn project_target(
             return None;
         },
     };
+    first_of(targets, warnings)
+}
+
+/// The first of `targets` that a project builds for, with a warning when there are several.
+#[cfg(feature = "local")]
+fn first_of(targets: Vec<TargetTriple>, warnings: &mut Vec<Box<str>>) -> Option<TargetTriple> {
     if let [first, others @ ..] = targets.as_slice()
         && !others.is_empty()
     {
@@ -473,12 +497,56 @@ async fn project_target(
 
 /// The workspace to read and where it came from: the one `project` names, or the default
 /// project's only one. `None` when there is no project. A project outside the default one is not
-/// read with cargo (requirement R-MCP-3), so it is an error until `build_external_docs` (M2).
+/// read with cargo (requirement R-MCP-3), so it is an error: the query tools read what
+/// `build_external_docs` recorded of it instead ([`located`]).
 #[cfg(feature = "local")]
 pub(super) fn workspace(
     default: Option<&DefaultProject>,
     project: Option<&Path>,
 ) -> Result<Option<(Workspace, ProjectFrom)>, Box<CallToolResult>> {
+    match place(default, project)? {
+        Place::Here(workspace, project_from) => Ok(Some((workspace, project_from))),
+        Place::Outside(workspace) => Err(Box::new(outside_error(&workspace))),
+        Place::Nowhere => Ok(None),
+    }
+}
+
+/// [`workspace`], for the query tools: a workspace outside the default project, which they read
+/// as `build_external_docs` recorded it (decided in M2e's E4b-3); or the response while it is
+/// recorded, when its record is broken, or `no_record`.
+#[cfg(feature = "local")]
+pub(super) async fn located(
+    state: &ToolState,
+    project: Option<&Path>,
+) -> Result<Option<(Workspace, ProjectFrom)>, Box<CallToolResult>> {
+    match place(state.project.as_ref(), project)? {
+        Place::Here(workspace, project_from) => Ok(Some((workspace, project_from))),
+        Place::Outside(workspace) => {
+            recorded_workspace::read(state, &workspace).await?;
+            Ok(Some((workspace, ProjectFrom::Argument)))
+        },
+        Place::Nowhere => Ok(None),
+    }
+}
+
+/// Where a project is.
+#[cfg(feature = "local")]
+pub(super) enum Place {
+    /// In the default project: the workspace, and where the project came from.
+    Here(Workspace, ProjectFrom),
+    /// Outside the default project, as the argument `project` names it.
+    Outside(Workspace),
+    /// There is no project.
+    Nowhere,
+}
+
+/// Where the project is that `project` names, or else the default project, whose only workspace
+/// it is.
+#[cfg(feature = "local")]
+pub(super) fn place(
+    default: Option<&DefaultProject>,
+    project: Option<&Path>,
+) -> Result<Place, Box<CallToolResult>> {
     if let Some(project) = project {
         let path = project_path(default, project);
         let workspace = project::workspace_of(&path).map_err(|error| {
@@ -488,27 +556,16 @@ pub(super) fn workspace(
             ))
         })?;
         if default.is_some_and(|default| default.contains(&workspace)) {
-            return Ok(Some((workspace, ProjectFrom::Argument)));
+            return Ok(Place::Here(workspace, ProjectFrom::Argument));
         }
-        return Err(Box::new(error_result(&json!({
-            "code": "docs_unavailable",
-            "message": format!(
-                "{} is outside the default project, whose dependencies are not resolved with \
-                 cargo; give the version, or document it with build_external_docs (in a later \
-                 version)",
-                workspace.root.display()
-            ),
-            "retryable": false,
-            "suggestions": ["give the version, as crate@version"],
-            "reason": "no_record",
-        }))));
+        return Ok(Place::Outside(workspace));
     }
     let Some(default) = default else {
-        return Ok(None);
+        return Ok(Place::Nowhere);
     };
     match &*default.workspaces {
-        [] => Ok(None),
-        [workspace] => Ok(Some((workspace.clone(), default.from))),
+        [] => Ok(Place::Nowhere),
+        [workspace] => Ok(Place::Here(workspace.clone(), default.from)),
         workspaces => {
             let candidates: Vec<String> = workspaces
                 .iter()
@@ -523,6 +580,23 @@ pub(super) fn workspace(
             )))
         },
     }
+}
+
+/// `docs_unavailable` with `no_record` for `workspace`, outside the default project, which
+/// `build_external_docs` documents, and which the external tool tells apart by it.
+#[cfg(feature = "local")]
+fn outside_error(workspace: &Workspace) -> CallToolResult {
+    error_result(&json!({
+        "code": "docs_unavailable",
+        "message": format!(
+            "{} is outside the default project, whose dependencies are not resolved with cargo; \
+             give the version, or document it with build_external_docs",
+            workspace.root.display()
+        ),
+        "retryable": false,
+        "suggestions": ["give the version, as crate@version"],
+        "reason": "no_record",
+    }))
 }
 
 /// The path that the argument `project` names: relative to the default project's directory unless
@@ -541,12 +615,16 @@ pub(super) fn project_path(default: Option<&DefaultProject>, project: &Path) -> 
 /// it.
 #[cfg(feature = "local")]
 pub(super) async fn known_now(state: &ToolState, project: Option<&Path>) -> bool {
-    match workspace(state.project.as_ref(), project) {
+    match located(state, project).await {
         Ok(None) => true,
-        Ok(Some((workspace, _))) => matches!(
-            state.resolver.resolve_until(&workspace, Instant::now()).await,
-            Joined::Done(Ok(resolution)) if matches!(&*resolution, Resolution::Metadata { .. })
-        ),
+        // As kept, too: its inputs are read again before it is given, which a loaded machine may
+        // not do at once.
+        Ok(Some((workspace, _))) => {
+            matches!(
+                resolve_until(state, &workspace, Instant::now()).await,
+                Joined::Done(Ok(resolution)) if matches!(&*resolution, Resolution::Metadata { .. })
+            ) || state.resolver.resolved_before(&workspace).await
+        },
         Err(_) => false,
     }
 }
@@ -649,7 +727,49 @@ pub(super) fn resolve_error(workspace: &Workspace, error: &ResolveError) -> Call
             "suggestions": ["check Cargo.lock with `cargo fetch`", "or give the version, as crate@version"],
         })),
         ResolveError::Stopped => super::get_item::stopped(),
+        ResolveError::NotRecorded => recorded_workspace::no_record(&workspace.root, None),
     }
+}
+
+/// The packages of `workspace` as `cargo metadata` resolves them, waiting for it until `until`;
+/// for a workspace outside the default project, as `build_external_docs` recorded them, as the
+/// query tools run no cargo there (requirement R-MCP-3, decided in M2e's E4b-3).
+#[cfg(feature = "local")]
+pub(super) async fn resolve_until(
+    state: &ToolState,
+    workspace: &Workspace,
+    until: Instant,
+) -> Joined<Resolved> {
+    if recorded_workspace::is_outside(state, workspace) {
+        // What the call returns otherwise is told when the workspace is read for it.
+        return Joined::Done(
+            recorded_workspace::read(state, workspace)
+                .await
+                .ok()
+                .map(|recorded| Arc::clone(&recorded.resolution))
+                .ok_or_else(|| Arc::new(ResolveError::NotRecorded)),
+        );
+    }
+    state.resolver.resolve_until(workspace, until).await
+}
+
+/// The feature sets of the build of `workspace` for `target`, as `cargo tree` tells them, waiting
+/// for it until `until`; for a workspace outside the default project, as `build_external_docs`
+/// recorded them (decided in M2e's E4b-3).
+#[cfg(feature = "local")]
+pub(super) async fn features_until(
+    state: &ToolState,
+    workspace: &Workspace,
+    target: &TargetTriple,
+    until: Instant,
+) -> Joined<Featured> {
+    if recorded_workspace::is_outside(state, workspace) {
+        return Joined::Done(recorded_workspace::feature_sets(state, workspace, target).await);
+    }
+    state
+        .resolver
+        .features_until(workspace, target, until)
+        .await
 }
 
 /// The warnings when the versions come from Cargo.lock alone, because `cargo metadata` failed

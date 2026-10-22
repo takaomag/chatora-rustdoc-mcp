@@ -10,7 +10,8 @@ use super::{
     InvalidArgument,
     ToolState,
     list_module::{self, CURSOR_EXAMPLE, CURSOR_FORM},
-    project::lookup_target,
+    project::{self, lookup_target},
+    recorded_workspace,
 };
 use crate::data::{
     cache::sha256_hex,
@@ -112,13 +113,16 @@ fn output_schema() -> JsonObject {
                     },
                     "resolved_from": {
                         "type": "string",
-                        "enum": ["cargo_lock", "cargo_lock_raw"],
+                        "enum": ["cargo_lock", "cargo_lock_raw", "external"],
                     },
                     "target": { "type": "string" },
+                    "stale": { "type": "boolean" },
+                    "stale_reason": { "type": "string", "enum": ["inputs_changed"] },
                 },
                 "required": ["source", "target"],
             },
             "warnings": strings,
+            "hints": strings,
             "data": {
                 "type": "object",
                 "properties": {
@@ -258,14 +262,10 @@ async fn build_sets(
     warnings: &mut Vec<Value>,
 ) -> Option<Arc<FeatureSets>> {
     // Until the call's deadline: they only annotate the list (requirement R-ARCH-6).
-    match state
-        .resolver
-        .features_until(workspace, target, until)
-        .await
-    {
+    match project::features_until(state, workspace, target, until).await {
         Joined::Done(Ok(sets)) => Some(sets),
         Joined::Done(Err(error)) => {
-            if resolved_from == "cargo_lock" {
+            if matches!(resolved_from, "cargo_lock" | "external") {
                 warnings.push(json!(format!(
                     "which crates the build for {target} uses is not known: {}",
                     super::ErrorChain(&error)
@@ -320,8 +320,7 @@ async fn list(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
     if arguments.refresh {
         super::local::refresh_project(&state, project).await;
     }
-    let (workspace, project_from) = match super::project::workspace(state.project.as_ref(), project)
-    {
+    let (workspace, project_from) = match project::located(&state, project).await {
         Ok(Some(found)) => found,
         Ok(None) => {
             return super::tool_error(
@@ -335,29 +334,20 @@ async fn list(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
     };
     let (lookup, target_warnings) = lookup_target(&state, arguments.target.as_ref(), project).await;
     let target = &lookup.triple;
-    let resolution = match state.resolver.resolve_until(&workspace, until).await {
+    let resolution = match project::resolve_until(&state, &workspace, until).await {
         Joined::Done(Ok(resolution)) => resolution,
-        Joined::Done(Err(error)) => return super::project::resolve_error(&workspace, &error),
+        Joined::Done(Err(error)) => return project::resolve_error(&workspace, &error),
         Joined::Ended => return super::get_item::stopped(),
         Joined::Going(doing) => {
             let provenance = resolving_provenance(&workspace, project_from.as_str(), target);
-            return super::project::resolving(provenance, doing, &target_warnings);
+            return project::resolving(provenance, doing, &target_warnings);
         },
     };
     let mut warnings: Vec<Value> = target_warnings
         .iter()
         .map(|warning| json!(warning))
         .collect();
-    let resolved_from = match &*resolution {
-        Resolution::Metadata { .. } => "cargo_lock",
-        Resolution::CargoLockRaw { .. } => {
-            warnings.push(json!(
-                "cargo metadata failed, so Cargo.lock is read directly: the members cannot be \
-                 told from path dependencies, and which crates the build uses is not known"
-            ));
-            "cargo_lock_raw"
-        },
-    };
+    let resolved_from = resolved_from(&state, &workspace, &resolution, &mut warnings);
     let built_for = (&workspace, target, until);
     let sets = build_sets(&state, built_for, resolved_from, &mut warnings).await;
     let graph = PackageGraph::new(&resolution);
@@ -410,7 +400,38 @@ async fn list(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
     }
     response.insert("data".to_owned(), json!({ "crates": entries }));
     response.insert("page".to_owned(), page);
-    CallToolResult::structured(Value::Object(response))
+    let mut response = Value::Object(response);
+    // Of a record of a workspace that changed since (decided in M2e's E4b-3, 1).
+    if let Some((recorded_at, again)) =
+        recorded_workspace::changed_since(&state, &workspace, Some(target)).await
+    {
+        recorded_workspace::mark_changed(&mut response, &recorded_at, &again);
+    }
+    CallToolResult::structured(response)
+}
+
+/// How the packages of `workspace` were resolved, as `resolution` tells: by `cargo metadata`, as
+/// `build_external_docs` recorded it for a workspace outside the default project (decided in M2e's
+/// E4b-3), or from Cargo.lock, which `warnings` then tell.
+fn resolved_from(
+    state: &ToolState,
+    workspace: &Workspace,
+    resolution: &Resolution,
+    warnings: &mut Vec<Value>,
+) -> &'static str {
+    match resolution {
+        Resolution::Metadata { .. } if recorded_workspace::is_outside(state, workspace) => {
+            "external"
+        },
+        Resolution::Metadata { .. } => "cargo_lock",
+        Resolution::CargoLockRaw { .. } => {
+            warnings.push(json!(
+                "cargo metadata failed, so Cargo.lock is read directly: the members cannot be \
+                 told from path dependencies, and which crates the build uses is not known"
+            ));
+            "cargo_lock_raw"
+        },
+    }
 }
 
 /// The crates to list: those of the name asked for, or the members and their direct

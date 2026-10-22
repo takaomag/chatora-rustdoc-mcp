@@ -289,6 +289,10 @@ pub enum ResolveError {
     /// The work that resolves the packages ended without a result, as when it panicked.
     #[error("the work that resolves the packages stopped")]
     Stopped,
+    /// The workspace is outside the default project, whose packages are read from what
+    /// `build_external_docs` recorded (decided in M2e's E4b), and that record cannot be read.
+    #[error("build_external_docs has no record of the workspace")]
+    NotRecorded,
 }
 
 /// The packages of a workspace, resolved for the calls that wanted them at once, or why they
@@ -315,6 +319,10 @@ pub enum FeaturesError {
          cargo tree is not run for"
     )]
     OwnTarget(String),
+    /// The workspace is outside the default project, whose feature sets are read from what
+    /// `build_external_docs` recorded (decided in M2e's E4b), and they are not, as this tells.
+    #[error("{0}")]
+    NotRecorded(String),
 }
 
 /// How long a failure of `cargo metadata` or `cargo tree` is given again without running cargo,
@@ -538,6 +546,19 @@ impl Resolver {
     ) -> Joined<Resolved> {
         let (key, what, start) = self.shared.work(workspace);
         self.shared.resolving.join(&key, &what, until, start).await
+    }
+
+    /// Whether `cargo metadata` resolved the packages of `workspace` before, as it is kept: told at
+    /// once, without waiting for its inputs to be read again, which [`Self::resolve_until`] does
+    /// even for what it keeps, and which a loaded machine may take a while for.
+    pub async fn resolved_before(&self, workspace: &Workspace) -> bool {
+        self.shared
+            .inner
+            .kept
+            .lock()
+            .await
+            .get(&workspace.root)
+            .is_some_and(|kept| matches!(&*kept.resolution, Resolution::Metadata { .. }))
     }
 
     /// The features that the normal build of `workspace` for `target`, the actual build target,

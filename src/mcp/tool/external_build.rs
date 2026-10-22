@@ -285,6 +285,8 @@ async fn unnameable(
         Member::NotForTarget(error) | Member::Unknown(error) => {
             Err(Box::new(external_body_of(&error)))
         },
+        // Of the query tools only.
+        Member::Recorded(recorded) => Err(Box::new(external_body_of(&recorded.error))),
         Member::Resolving(doing) | Member::Planning(doing) => {
             let mut provenance = Map::new();
             provenance.insert("source".to_owned(), json!("project"));

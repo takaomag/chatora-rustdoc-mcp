@@ -38,7 +38,7 @@ use crate::{
         build_scope::{BuildScope, Buildable},
         cargo::Failure,
         crate_name::CrateName,
-        external::Making,
+        external::{Making, Read},
         external_workspace::{self, Outcome, RecordedPackage, TargetRecord, WorkspaceRecord},
         features,
         flight::{Doing, Joined, Stage},
@@ -192,18 +192,30 @@ async fn record_workspace(
     let (cache, root, given) = (state.cache.clone(), root.clone(), given.to_path_buf());
     let written = crate::task::spawn_blocking(move || {
         let written = (|| {
-            let inputs = freshness::collect(&files, &[], None)?;
+            let before = match external_workspace::read_workspace(&cache, &root, Some(&making)) {
+                Read::Found(before) => Some(before),
+                Read::Building | Read::Failed(_) | Read::Broken(_) | Read::Missing => None,
+            };
+            let inputs =
+                freshness::collect(&files, &[], before.as_ref().map(|before| &before.inputs))?;
             let lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
-            let record = WorkspaceRecord {
+            let mut record = WorkspaceRecord {
                 metadata: text,
                 lock: lock.into(),
                 inputs,
+                members: external_workspace::members_of(&root),
                 targets: targets
                     .iter()
                     .map(|target| target.as_str().into())
                     .collect(),
                 recorded_at: crate::data::rfc3339(SystemTime::now()).into(),
             };
+            // The same as before: the records for the targets planned from it stay of it.
+            if let Some(before) = before
+                && before.same_as(&record)
+            {
+                record.recorded_at = before.recorded_at;
+            }
             external_workspace::record_workspace(&cache, &root, &record, &making)?;
             let mut aliases: Vec<&Path> = members.iter().map(PathBuf::as_path).collect();
             aliases.push(&given);
@@ -289,8 +301,14 @@ async fn plan_packages(
             match scope.buildable(&package.id) {
                 Buildable::NotBuilt => continue,
                 // docs.rs has it, whether `cargo rustdoc -p` names it or not.
-                _ if Source::parse(package.source.as_deref()) == Source::CratesIo => {
-                    table.push(recorded(&package.id.0, &lib, Outcome::DocsRs));
+                buildable if Source::parse(package.source.as_deref()) == Source::CratesIo => {
+                    // Where this tool records it, when docs.rs has none (decided in M2e's E4b, 4).
+                    let target = match buildable {
+                        Buildable::ForTarget => Some(target.as_str().into()),
+                        Buildable::ForHost => Some(host.as_str().into()),
+                        Buildable::Unnameable | Buildable::NotBuilt => None,
+                    };
+                    table.push(recorded(&package.id.0, &lib, Outcome::DocsRs { target }));
                     let found = project_package(state, workspace, package, until).await?;
                     planned.crates_io.push(found);
                     continue;
@@ -350,6 +368,10 @@ async fn plan_packages(
             | Member::Unknown(error)
             | Member::OtherTarget { error, .. } => {
                 return Err(Box::new(external_build::external_body_of(&error)));
+            },
+            // Of the query tools only.
+            Member::Recorded(recorded) => {
+                return Err(Box::new(external_build::external_body_of(&recorded.error)));
             },
             // No lib nor bin to document.
             Member::Not | Member::OtherVersion(_) => {},

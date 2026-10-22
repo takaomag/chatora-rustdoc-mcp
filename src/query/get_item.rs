@@ -352,6 +352,9 @@ pub enum ResolvedFrom {
     /// The version of a crate of a git repository at the commit that its ref resolved to, which
     /// `build_external_docs` recorded (decided in M2e's E3b).
     Git,
+    /// The version that `cargo metadata` resolved in a workspace outside the default project, as
+    /// `build_external_docs` recorded it (requirement R-WS-10, decided in M2e's E4b).
+    External,
 }
 
 /// The conditions of an entry of a list that is not an item of its own, such as an `impl`.

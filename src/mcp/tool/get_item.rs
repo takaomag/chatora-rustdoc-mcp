@@ -543,6 +543,7 @@ pub(super) fn provenance_schema() -> Value {
                     "cargo_lock_raw",
                     "reexport",
                     "git",
+                    "external",
                 ],
             },
             "project_from": {
@@ -589,7 +590,8 @@ pub(super) fn provenance_schema() -> Value {
                                 is made from changed; this is the build before, of built_at. \
                                 ref_ttl_expired: a branch or a tag of git was resolved more than \
                                 a day ago, at resolved_at. inputs_changed: what a build of \
-                                build_external_docs is made from changed since built_at.",
+                                build_external_docs is made from changed since built_at, or the \
+                                workspace outside the default project that it recorded.",
             },
             "features_requested": {
                 "type": "array",
@@ -1171,6 +1173,18 @@ async fn in_member(
             )
             .await
         },
+        Member::Recorded(recorded) => {
+            let made = (found.resolved_from, found.project_from);
+            recorded_outside(
+                state,
+                &found.workspace,
+                recorded,
+                (name, path, shape),
+                made,
+                until,
+            )
+            .await
+        },
         Member::Unknown(error) | Member::NotForTarget(error) | Member::Unnameable { error, .. } => {
             Err(error)
         },
@@ -1243,6 +1257,18 @@ async fn dependency_request(
                 error,
                 (name, path, target, shape),
                 (found.resolved_from, found.project_from),
+                until,
+            )
+            .await
+        },
+        Member::Recorded(recorded) => {
+            let made = (found.resolved_from, found.project_from);
+            recorded_outside(
+                state,
+                &found.workspace,
+                recorded,
+                (name, path, shape),
+                made,
                 until,
             )
             .await
@@ -1595,6 +1621,19 @@ async fn explicit_found_member(
         )
         .await
         .map(Some),
+        Member::Recorded(recorded) => {
+            let made = (ResolvedFrom::Explicit, from);
+            recorded_outside(
+                state,
+                &found.workspace,
+                recorded,
+                (name, path, shape),
+                made,
+                until,
+            )
+            .await
+            .map(Some)
+        },
         Member::Unknown(error) | Member::NotForTarget(error) | Member::Unnameable { error, .. } => {
             Err(error)
         },
@@ -1614,6 +1653,41 @@ async fn explicit_found_member(
     }
 }
 
+/// The workspace of the project that `project` names, or else the default project's, for a lookup
+/// that gives the version: `None` when it cannot be read, or is outside the default project and
+/// `build_external_docs` has not recorded it, which `warnings` then tell, as the release of
+/// crates.io is read instead (decided in M2e's E4b-3).
+#[cfg(feature = "local")]
+async fn explicit_workspace(
+    state: &ToolState,
+    project: Option<&std::path::Path>,
+    warnings: &mut Vec<Box<str>>,
+) -> Option<(Workspace, data::project::ProjectFrom)> {
+    match project::place(state.project.as_ref(), project) {
+        Ok(project::Place::Here(workspace, project_from)) => Some((workspace, project_from)),
+        Ok(project::Place::Outside(workspace)) => {
+            if super::recorded_workspace::read(state, &workspace)
+                .await
+                .is_ok()
+            {
+                return Some((workspace, data::project::ProjectFrom::Argument));
+            }
+            let warning: Box<str> = format!(
+                "build_external_docs has not recorded the workspace at {}, so the release of \
+                 crates.io is read: call it with {} to read the workspace's own",
+                workspace.root.display(),
+                super::recorded_workspace::again(&workspace.root, None)
+            )
+            .into();
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+            None
+        },
+        Ok(project::Place::Nowhere) | Err(_) => None,
+    }
+}
+
 /// The project's package of the crate `name` at the exact version `version`, in the project that
 /// `project` names, or the default one, and whether it is a workspace member (requirement R-VR-1,
 /// decided in M2's D7): of several of that name and version, a member's, then the release of
@@ -1630,8 +1704,7 @@ pub(super) async fn explicit_found(
     warnings: &mut Vec<Box<str>>,
 ) -> Result<Option<(project::Found, bool)>, Box<CallToolResult>> {
     // A project that cannot be read leaves the lookup to crates.io, as asked.
-    let Ok(Some((workspace, project_from))) = project::workspace(state.project.as_ref(), project)
-    else {
+    let Some((workspace, project_from)) = explicit_workspace(state, project, warnings).await else {
         return Ok(None);
     };
     // Nor is cargo waited for when the project's Cargo.lock has no package of that name and
@@ -1640,7 +1713,7 @@ pub(super) async fn explicit_found(
     if !metadata::lock_may_have(&workspace.root, name.as_str(), version).await {
         return Ok(None);
     }
-    let resolution = match state.resolver.resolve_until(&workspace, until).await {
+    let resolution = match project::resolve_until(state, &workspace, until).await {
         Joined::Done(Ok(resolution)) => resolution,
         Joined::Going(doing) => {
             let from = (doing, project_from.as_str());
@@ -1749,8 +1822,7 @@ async fn explicit_member(
     warnings: &mut Vec<Box<str>>,
 ) -> Result<Option<Request>, Box<CallToolResult>> {
     // A project that cannot be read leaves the lookup to crates.io, as asked.
-    let Ok(Some((workspace, project_from))) = project::workspace(state.project.as_ref(), project)
-    else {
+    let Some((workspace, project_from)) = explicit_workspace(state, project, warnings).await else {
         return Ok(None);
     };
     let asked = local::Asked::Explicit { version };
@@ -1806,7 +1878,23 @@ async fn explicit_member(
         )
         .await
         .map(Some),
+        Ok(Member::Recorded(recorded)) => {
+            let made = (ResolvedFrom::Explicit, project_from.as_str());
+            recorded_outside(
+                state,
+                &workspace,
+                recorded,
+                (name, path, shape),
+                made,
+                until,
+            )
+            .await
+            .map(Some)
+        },
         Ok(Member::NotForTarget(error) | Member::Unnameable { error, .. }) => Err(error),
+        // Of a workspace outside the default project, what tells that it has no record for the
+        // target, or is recording it: not the release of that name.
+        Err(error) if super::recorded_workspace::is_outside(state, &workspace) => Err(error),
         Ok(Member::Not | Member::Unknown(_) | Member::Resolving(_)) | Err(_) => Ok(None),
     }
 }
@@ -1876,6 +1964,33 @@ async fn recorded_elsewhere(
     let (package_name, version) = package.name_and_version().unwrap_or((name.as_str(), ""));
     let again = json!({ "crate": format!("{package_name}@{version}"), "target": target.as_str() })
         .to_string();
+    request_of_record(
+        state,
+        (workspace, &key, package),
+        (again, false),
+        error,
+        (name, path, target, shape),
+        (resolved_from, project_from),
+        until,
+    )
+    .await
+}
+
+/// The request for the crate of `package` of `workspace` in the record `key` of
+/// `build_external_docs`, for `target`, asked for as `name` with `path`: `again` are the arguments
+/// that make it again, and `changed` whether what it is made from changed besides what the record
+/// keeps (decided in M2e's E4b-3). Or the response while it is made, its failure, or else `error`.
+#[cfg(feature = "local")]
+async fn request_of_record(
+    state: &ToolState,
+    (workspace, key, package): (&Workspace, &data::external::Key, &PackageId),
+    (again, changed): (String, bool),
+    error: Box<CallToolResult>,
+    (name, path, target, shape): (&CrateName, &str, &TargetTriple, &Shape),
+    (resolved_from, project_from): (ResolvedFrom, &'static str),
+    until: Instant,
+) -> Result<Request, Box<CallToolResult>> {
+    let (package_name, version) = package.name_and_version().unwrap_or((name.as_str(), ""));
     let what = format!("{package_name} {version} for {target}");
     let call_again = format!("call build_external_docs with {again} to build it again");
     let provenance = || {
@@ -1886,15 +2001,16 @@ async fn recorded_elsewhere(
         provenance.insert("target".to_owned(), json!(target.as_str()));
         provenance
     };
-    let built =
-        match recorded::recorded_as(state, (&key, &what, &call_again), provenance, &[]).await {
-            recorded::Found::Built(built) => built,
-            recorded::Found::Response(result) => return Err(result),
-            recorded::Found::Missing => return Err(error),
-        };
-    let unchanged = !inputs_changed(&built)
-        .await
-        .ok_or_else(|| Box::new(shutting_down()))?;
+    let built = match recorded::recorded_as(state, (key, &what, &call_again), provenance, &[]).await
+    {
+        recorded::Found::Built(built) => built,
+        recorded::Found::Response(result) => return Err(result),
+        recorded::Found::Missing => return Err(error),
+    };
+    let unchanged = !changed
+        && !inputs_changed(&built)
+            .await
+            .ok_or_else(|| Box::new(shutting_down()))?;
     let path = in_lib(name, path, &built.record.crate_name);
     Ok(Request {
         name: package_name.parse().unwrap_or_else(|_| name.clone()),
@@ -1926,6 +2042,38 @@ async fn recorded_elsewhere(
             ..Here::default()
         },
     })
+}
+
+/// The request for the crate of a workspace outside the default project in what
+/// `build_external_docs` recorded of it, as `recorded` tells (decided in M2e's E4b-3); or the
+/// response while it is made, its failure, or else the error that tells how to make it.
+#[cfg(feature = "local")]
+async fn recorded_outside(
+    state: &ToolState,
+    workspace: &Workspace,
+    recorded: Box<local::RecordedCrate>,
+    (name, path, shape): (&CrateName, &str, &Shape),
+    made: (ResolvedFrom, &'static str),
+    until: Instant,
+) -> Result<Request, Box<CallToolResult>> {
+    let local::RecordedCrate {
+        key,
+        package,
+        target,
+        again,
+        changed,
+        error,
+    } = *recorded;
+    request_of_record(
+        state,
+        (workspace, &key, &package),
+        (again.into(), changed),
+        error,
+        (name, path, &target, shape),
+        made,
+        until,
+    )
+    .await
 }
 
 /// Whether what `built`, a record of `build_external_docs`, is made from changed since, as the record
@@ -2086,7 +2234,8 @@ async fn dependency_elsewhere(
         | Member::Not
         | Member::Unknown(_)
         | Member::NotForTarget(_)
-        | Member::OtherTarget { .. } => Err(error),
+        | Member::OtherTarget { .. }
+        | Member::Recorded(_) => Err(error),
     }
 }
 
@@ -2498,7 +2647,12 @@ fn chosen_by(
             sets: None,
         };
         let (resolved_from, project_from) = (found.resolved_from, found.project_from);
-        let here = if resolved_from == ResolvedFrom::CargoLock {
+        // Of a workspace outside the default project, what `build_external_docs` built in it
+        // (decided in M2e's E4b, 4).
+        let here = if matches!(
+            resolved_from,
+            ResolvedFrom::CargoLock | ResolvedFrom::External
+        ) {
             if_missing(*found)
         } else {
             Here::default()
@@ -3669,6 +3823,21 @@ async fn conclude(
     arguments: Request,
     warnings: Vec<Box<str>>,
 ) -> CallToolResult {
+    #[cfg(feature = "local")]
+    let mut looked_up = looked_up;
+    // Of the record of a workspace that changed since, unless the build read says so already
+    // (decided in M2e's E4b-3, 1).
+    #[cfg(feature = "local")]
+    if let Ok(response) = &mut looked_up
+        && arguments.resolved_from == ResolvedFrom::External
+        && arguments.here.inputs_changed.is_none()
+        && let Some(workspace) = &arguments.in_build.workspace
+        && let Some((recorded_at, again)) =
+            super::recorded_workspace::changed_since(state, workspace, Some(&arguments.target))
+                .await
+    {
+        super::recorded_workspace::mark_changed(response, &recorded_at, &again);
+    }
     match looked_up {
         Err(Failure::Item(GetItemError::Elsewhere(destination))) => {
             follow(state, *destination, arguments, warnings).await
@@ -4154,7 +4323,7 @@ async fn in_project_build_of(
 ) -> Option<InProjectBuild> {
     let workspace = origin.in_build.workspace.as_ref()?;
     // Until the call's deadline: past it, the project does not tell (requirement R-ARCH-6).
-    let Joined::Done(Ok(resolution)) = state.resolver.resolve_until(workspace, origin.until).await
+    let Joined::Done(Ok(resolution)) = project::resolve_until(state, workspace, origin.until).await
     else {
         return None;
     };
@@ -4394,6 +4563,14 @@ async fn built_here_destination(
             request.hops = origin.hops.saturating_add(1);
             Ok(request)
         },
+        Member::Recorded(recorded) => {
+            let asked = (&name, path.as_ref(), &origin.shape);
+            let made = (origin.resolved_from, project_from);
+            let mut request =
+                recorded_outside(state, workspace, recorded, asked, made, origin.until).await?;
+            request.hops = origin.hops.saturating_add(1);
+            Ok(request)
+        },
         Member::Unknown(error) | Member::NotForTarget(error) | Member::Unnameable { error, .. } => {
             Err(error)
         },
@@ -4455,11 +4632,7 @@ async fn feature_sets(
 ) -> Option<Arc<FeatureSets>> {
     let workspace = request.in_build.workspace.as_ref()?;
     // Until the call's deadline: they only annotate the items (requirement R-ARCH-6).
-    match state
-        .resolver
-        .features_until(workspace, &request.target, request.until)
-        .await
-    {
+    match project::features_until(state, workspace, &request.target, request.until).await {
         Joined::Done(Ok(sets)) => Some(sets),
         Joined::Done(Err(error)) => {
             warnings.push(
