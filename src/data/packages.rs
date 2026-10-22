@@ -125,6 +125,8 @@ pub struct PackageGraph {
 /// A dependency of a member.
 #[derive(Debug)]
 struct Direct {
+    /// The member, by index into `packages`.
+    member: usize,
     /// The name the member uses for it in code. When only Cargo.lock is known, the lib name,
     /// as renames are not recorded there.
     extern_name: Box<str>,
@@ -232,6 +234,7 @@ impl PackageGraph {
                 }
                 if members.contains(&from) {
                     direct.push(Direct {
+                        member: from,
                         extern_name: dep.name.clone(),
                         package: to,
                     });
@@ -277,6 +280,7 @@ impl PackageGraph {
                     && members.contains(&from)
                 {
                     direct.push(Direct {
+                        member: from,
                         extern_name: package.lib_name.clone(),
                         package: to,
                     });
@@ -301,6 +305,37 @@ impl PackageGraph {
                 .map(|users| users.into_iter().collect())
                 .collect(),
         }
+    }
+
+    /// The workspace member `name` at `version`, by its package name.
+    #[must_use]
+    pub fn member_named(&self, name: &str, version: &Version) -> Option<&ProjectPackage> {
+        self.members
+            .iter()
+            .filter_map(|&index| self.packages.get(index))
+            .find(|package| {
+                normalize(&package.name) == normalize(name) && package.version == *version
+            })
+    }
+
+    /// The package that the workspace member `member`, one of [`Self::packages`], depends on as
+    /// `name`: the name that it uses in its code, which may rename it, or the lib name, which
+    /// rustdoc names the crate by (requirement R-PR-4, decided in M2's D6). The name in code first.
+    #[must_use]
+    pub fn dependency_of(&self, member: &ProjectPackage, name: &str) -> Option<&ProjectPackage> {
+        let member = self.index_of(member)?;
+        let key = normalize(name);
+        let of_member = || self.direct.iter().filter(|direct| direct.member == member);
+        of_member()
+            .find(|direct| normalize(&direct.extern_name) == key)
+            .or_else(|| {
+                of_member().find(|direct| {
+                    self.packages
+                        .get(direct.package)
+                        .is_some_and(|package| normalize(&package.lib_name) == key)
+                })
+            })
+            .and_then(|direct| self.packages.get(direct.package))
     }
 
     /// Whether `package`, one of [`Self::packages`], is a workspace member.

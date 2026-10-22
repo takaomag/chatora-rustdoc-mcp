@@ -1908,31 +1908,62 @@ fn a_member_is_built_as_its_docs_rs_metadata_asks_when_it_may() {
     assert!(server.finish().success());
 }
 
-/// A member's re-export of another member's item is not followed into it (decided in M2's D2,
-/// until D6): the re-export is shown, with why.
+/// A workspace whose member `front` re-exports the items of the other members: `middle`, which
+/// depends on `back` as `renamed`; `a` and `b`, by globs; `other-pkg`, whose lib is `other_lib`
+/// and whose bin is `other-pkg`; and std's `collections`, by a glob.
 #[cfg(feature = "local")]
-#[test]
-fn a_reexport_of_another_member_is_not_followed() {
+fn reexporting_workspace() -> TempDir {
     let dir = TempDir::new().expect("a temporary directory");
     let write = |path: &str, text: &str| {
         let path = dir.path().join(path);
         std::fs::create_dir_all(path.parent().expect("a directory")).expect("made");
         std::fs::write(path, text).expect("written");
     };
+    let package = |name: &str, rest: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n{rest}")
+    };
     write(
         "Cargo.toml",
-        "[workspace]\nmembers = [\"front\", \"back\"]\nresolver = \"3\"\n",
+        "[workspace]\nmembers = [\"front\", \"middle\", \"back\", \"a\", \"b\", \"other\"]\n\
+         resolver = \"3\"\n",
     );
     write(
         "front/Cargo.toml",
-        "[package]\nname = \"front\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
-         [dependencies]\nback = { path = \"../back\" }\n",
+        &package(
+            "front",
+            "[dependencies]\nmiddle = { path = \"../middle\" }\na = { path = \"../a\" }\n\
+             b = { path = \"../b\" }\nother-pkg = { path = \"../other\" }\n",
+        ),
     );
-    write("front/src/lib.rs", "pub use back::Thing;\n");
     write(
-        "back/Cargo.toml",
-        "[package]\nname = \"back\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "front/src/lib.rs",
+        "pub use middle::Thing;\npub use middle::*;\npub use a::*;\npub use b::*;\n\
+         pub use std::collections::*;\npub use other_lib::Other;\n",
     );
+    write("a/Cargo.toml", &package("a", ""));
+    write("a/src/lib.rs", "/// In a.\npub fn in_a() {}\n");
+    write("b/Cargo.toml", &package("b", ""));
+    write("b/src/lib.rs", "/// In b.\npub fn in_b() {}\n");
+    // A lib named other than the package, which a bin of the package's name has too.
+    write(
+        "other/Cargo.toml",
+        &package("other-pkg", "[lib]\nname = \"other_lib\"\n"),
+    );
+    write("other/src/lib.rs", "/// Other.\npub struct Other;\n");
+    write("other/src/main.rs", "fn main() {}\n");
+    // `back` as `renamed`.
+    write(
+        "middle/Cargo.toml",
+        &package(
+            "middle",
+            "[dependencies]\nrenamed = { package = \"back\", path = \"../back\" }\n",
+        ),
+    );
+    write(
+        "middle/src/lib.rs",
+        "pub use renamed::Thing;\n/// In the middle.\npub fn in_middle() {}\n",
+    );
+    write("back/Cargo.toml", &package("back", ""));
     write("back/src/lib.rs", "/// A thing.\npub struct Thing;\n");
     let status = Command::new("cargo")
         .args(["generate-lockfile", "--offline"])
@@ -1944,29 +1975,85 @@ fn a_reexport_of_another_member_is_not_followed() {
         .status()
         .expect("cargo runs");
     assert!(status.success(), "cargo generate-lockfile");
+    dir
+}
+
+/// A member's re-export of another member's item is followed into it, built here, and so is a
+/// glob re-export of one, and shown at the path asked for (requirements R-PR-2 and R-PR-4, decided
+/// in M2's D6).
+#[cfg(feature = "local")]
+#[test]
+fn a_reexport_of_another_member_is_followed_into_it() {
+    let dir = reexporting_workspace();
     let mut server = Server::start_in(Some(dir.path()));
-    let mut found = Value::Null;
-    for id in 1..20 {
-        server.send(&call_tool(
-            id,
-            "get_item",
-            json!({ "crate": "front", "path": "Thing" }),
-        ));
-        found = server.response(id)["result"].clone();
-        if found["structuredContent"]["status"] != "building" {
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
+    // Into `back`: rustdoc resolves the re-export of `middle`'s re-export to `back`'s item, which
+    // `front` does not depend on directly, and `middle` by another name.
+    let found = built_item(
+        &mut server,
+        1,
+        &json!({ "crate": "front", "path": "Thing" }),
+    );
     assert_ne!(found["isError"], true, "{found}");
     let found = &found["structuredContent"];
     assert_eq!(found["provenance"]["source"], "local", "{found}");
-    assert_eq!(found["provenance"]["crate"], "front", "{found}");
-    assert_eq!(
-        found["data"]["reexport_of"]["path"], "back::Thing",
-        "{found}"
+    assert_eq!(found["provenance"]["crate"], "back", "{found}");
+    assert_eq!(found["data"]["path"], "front::Thing", "{found}");
+    assert_eq!(found["data"]["defined_at"], "back::Thing", "{found}");
+    // Through the glob into `middle`.
+    let globbed = built_item(
+        &mut server,
+        100,
+        &json!({ "crate": "front", "path": "in_middle" }),
     );
-    assert!(warns(found, "not from crates.io"), "{found}");
+    assert_ne!(globbed["isError"], true, "{globbed}");
+    let globbed = &globbed["structuredContent"];
+    assert_eq!(globbed["provenance"]["crate"], "middle", "{globbed}");
+    assert_eq!(globbed["data"]["path"], "front::in_middle", "{globbed}");
+    // Through each glob in turn, into the member that has it.
+    for (id, path, member) in [(300, "in_a", "a"), (400, "in_b", "b")] {
+        let found = built_item(&mut server, id, &json!({ "crate": "front", "path": path }));
+        assert_eq!(
+            found["structuredContent"]["provenance"]["crate"], member,
+            "{found}"
+        );
+    }
+    // Not found in `front` when no member has it, and not looked for in std or on crates.io.
+    let missing = built_item(
+        &mut server,
+        500,
+        &json!({ "crate": "front", "path": "no_such_thing" }),
+    );
+    assert_eq!(missing["isError"], true, "{missing}");
+    assert!(missing.to_string().contains("item_not_found"), "{missing}");
+    // The lib of a member, not its bin of the package's name.
+    let other = built_item(
+        &mut server,
+        600,
+        &json!({ "crate": "front", "path": "Other" }),
+    );
+    assert_eq!(
+        other["structuredContent"]["provenance"]["crate"], "other-pkg",
+        "{other}"
+    );
+    assert_eq!(
+        other["structuredContent"]["data"]["defined_at"], "other_lib::Other",
+        "{other}"
+    );
+    // Listed as the re-export of the member, by its crate's name, without a version that its
+    // JSON does not tell.
+    server.send(&call_tool(
+        200,
+        "list_module",
+        json!({ "crate": "front", "path": "front" }),
+    ));
+    let listed = server.response(200)["result"]["structuredContent"].clone();
+    assert!(
+        listed
+            .to_string()
+            .contains(r#""reexport_of":{"crate":"back","path":"back::Thing"}"#),
+        "{listed}"
+    );
+    assert!(!warns(&listed, "is unknown"), "{listed}");
     assert!(server.finish().success());
 }
 

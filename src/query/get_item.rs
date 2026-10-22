@@ -602,6 +602,12 @@ pub struct Destination {
     pub release: Option<(CrateName, Version)>,
     /// The crate is one of std, documented with the toolchain.
     pub is_std: bool,
+    /// It is through a glob re-export (`pub use other::*;`), which may not have the item: then the
+    /// path is not this crate's, and the next of `others`, the other globs it may be through, is
+    /// tried (decided in M2's D6).
+    pub via_glob: bool,
+    /// The other globs that the path may go on through, in the order to try them.
+    pub others: Vec<Self>,
 }
 
 /// Looks up the item at `request.path` in the crate of `view`.
@@ -1498,7 +1504,11 @@ impl<'a> Query<'a> {
                 .path
                 .components()
                 .any(|component| component.as_os_str() == "rustlib");
-        let name: Box<str> = if let Some((name, version)) =
+        let name: Box<str> = if self.is_member() {
+            // By its crate's name, as the workspace member's JSON names it, whose version the
+            // project decides: the JSON's `html_root_url` may be old (decided in M2's D6).
+            external.name.as_str().into()
+        } else if let Some((name, version)) =
             external.html_root_url.as_deref().and_then(docs_rs_release)
         {
             format!("{name}@{version}").into()
@@ -1523,10 +1533,18 @@ impl<'a> Query<'a> {
     /// dependency of std (sysroot's `hashbrown`), which is not the crate of crates.io
     /// (requirement R-PR-4).
     pub(super) fn destination(&self, path: &str) -> Option<Destination> {
-        let crossing = self.index.crossing(path)?;
+        let Some(crossing) = self.index.crossing(path) else {
+            return self.glob_destination(path);
+        };
         let summary = self.view.summary(crossing.reexport.target)?;
         let external = self.view.external_crate(summary.crate_id)?;
-        let release = external.html_root_url.as_deref().and_then(docs_rs_release);
+        // A workspace member's JSON has the `html_root_url` that a crate writes itself, if any,
+        // which may be old: the project's build tells the version (decided in M2's D6).
+        let release = external
+            .html_root_url
+            .as_deref()
+            .and_then(docs_rs_release)
+            .filter(|_| !self.is_member());
         let is_std = external
             .html_root_url
             .as_deref()
@@ -1555,7 +1573,59 @@ impl<'a> Query<'a> {
             lib_name: external.name.as_str().into(),
             release,
             is_std,
+            via_glob: false,
+            others: Vec::new(),
         })
+    }
+
+    /// Where `path`, which this crate does not have, may go on through a glob re-export of another
+    /// crate (`pub use other::*;`): in a workspace member only, which the caller follows into
+    /// another member only (decided in M2's D6). Not in another crate, as std (requirement R-PR-3).
+    /// The globs with the longest prefix come first, then in the order they are written; each
+    /// goes by what it re-exports, as the data has it, not by its `use` source, which may begin
+    /// with a local name.
+    fn glob_destination(&self, path: &str) -> Option<Destination> {
+        if !self.is_member() {
+            return None;
+        }
+        let segments: Vec<&str> = path.split("::").collect();
+        let same = |at: usize, want: &str, have: &str| {
+            // The crate's name, as `-` and `_` the same.
+            want == have || at == 0 && want.replace('-', "_") == have.replace('-', "_")
+        };
+        let mut found: Vec<(usize, Destination)> = self
+            .index
+            .external_globs()
+            .into_iter()
+            .filter_map(|glob| {
+                let prefix = glob.prefix.segments();
+                let matches = prefix.len() < segments.len()
+                    && prefix
+                        .iter()
+                        .zip(&segments)
+                        .enumerate()
+                        .all(|(at, (want, have))| same(at, want, have));
+                let target = glob.target.as_ref().filter(|_| matches)?;
+                let rest = segments.get(prefix.len()..)?.join("::");
+                Some((prefix.len(), Destination {
+                    entry: path.into(),
+                    reexport: glob.prefix.joined(),
+                    reexported: target.joined(),
+                    path: format!("{}::{rest}", target.joined()).into(),
+                    lib_name: target.segments().first()?.clone(),
+                    release: None,
+                    is_std: false,
+                    via_glob: true,
+                    others: Vec::new(),
+                }))
+            })
+            .collect();
+        // Stable: the order written, among the globs with prefixes as long.
+        found.sort_by_key(|(prefix, _)| std::cmp::Reverse(*prefix));
+        let mut found = found.into_iter().map(|(_, destination)| destination);
+        let mut first = found.next()?;
+        first.others = found.collect();
+        Some(first)
     }
 
     /// A hint about the re-export of another crate's item that has the path of the item returned
@@ -2689,6 +2759,8 @@ pub(super) mod tests {
             lib_name: "other".into(),
             release: other(),
             is_std: false,
+            via_glob: false,
+            others: Vec::new(),
         });
         // A path under the re-export goes on under its target, and is shown where it was asked.
         let under = destination("my_crate::Thing::method");

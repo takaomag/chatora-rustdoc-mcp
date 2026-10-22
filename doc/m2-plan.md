@@ -1012,6 +1012,9 @@ Claude Code 2.1.304、Linux で測った。
   3. (D6b) member の `list_module`・`crate_overview` は private な item も並べ、private なモジュールも開ける (検索とそろえる。長くなる一覧はページングで受ける)
   4. (D6b) member の `#[doc(hidden)]` な item も検索と一覧に出し、hidden の印を付ける。依存と std の hidden は除く
   5. (D6b) 検索と一覧の項目には、`pub` でないものにだけ `visibility` を付ける (`get_item` は member で常に付ける)
+  6. (D6c) member の re-export をたどって別の member に入るとき、行き先がまだビルドされていなければ、member の照会と同じ共有の仕事でビルドして `build.wait_secs` まで待つ。間に合わなければ、行き先を直接引いたときと同じく前回のビルド (stale) か `status: building`
+  7. (D6c) crate をまたぐ glob (`pub use other_member::*;`) は、member の間だけたどる。docs.rs の crate と std は今までどおりたどらない (R-PR-3)
+- 聞かずに決めたこと (D6c): member でない path 依存・git 依存への re-export は D7 まで今までどおりたどらない (m2-plan の D7 の範囲)。行き先の member の版は、起点の member の依存 (改名を含む) から決め、`html_root_url` は使わない (R-PR-4)
 - 聞かずに決めたこと: 含むモジュールと同じ範囲は `private` (シグネチャには何も付けない)、違えば `pub(in crate::…)` (`pub(super)` は JSON から分からないので書かない)。crate のルートの private は rustdoc が `crate` で出すので `pub(crate)` (同じ意味)。trait の item と trait impl の item は trait の、enum の variant は enum の可視性を継ぐ。公開パスの無い member の item は `crate::a::b::Item` で示し、`crate::` で始まるパスを受ける (R-PR-2)
 
 **D6a (可視性・crate 内のパス・private なフィールド。2026-10-21)**:
@@ -1073,6 +1076,25 @@ Claude Code 2.1.304、Linux で測った。
   6. hidden な trait の item (`PartialOrd::__chaining_*`、`Eq::assert_receiver_is_total_eq` など) が `list_methods` と `list_implementors` の `items` に出ていた (前からある): この crate の trait の hidden な item は、`impl` に書かれたものも提供されたものも除く
   - テストを足した: 公開でないモジュールは引けず、そこから公開されたものは引けること、variant のフィールド
 - 残したもの: ほかの crate の hidden か非公開の trait の blanket impl (`core::mem::SizedTypeProperties` などを、alloc や std の型の `list_impls` が出す。ほかの crate の trait が hidden かは分からない。通常の docs.rs の JSON には無い)。core の中の型で `needs_use` が誤る (前からある)。`list_impls` の `has_private_fields` は hidden な `pub` のフィールドを数えない (`get_item` は「`/* private fields */`」にする)。member の `list_implementors` の型は `crate::` でなくソースの書き方。名前で書けない戻り値の型は、依存では引けなくなった (R-PR-2 の `unnameable` は未実装)。private な固有メソッドと同名の trait のメソッドのテストは無い
+
+**D6c (member の間の re-export をたどる。2026-10-22)**:
+
+- 依存グラフ (`PackageGraph`): member の依存に、どの member のものかを足し、`member_named` (名前と版の member) と `dependency_of` (member がコードで使う名前の依存) を足した
+- 行き先 (`Query::destination`): 起点が member なら、JSON の `html_root_url` (crate が自分で書いたもので古いことがある) から版を取らない。ほかの crate の glob (`pub use other::*;`) を、member でだけ行き先にする (`glob_destination`。いちばん長い接頭辞のもの 1 つ。決定 7)
+- MCP (`in_project_build_of`): 起点が member なら、行き先の package を起点の依存 (`dependency_of`) から、無ければ名前で引く。行き先が member なら `InProjectBuild::Member` で、member の照会と同じ共有の仕事でビルドして引く (`member_destination`。決定 6。間に合わなければ前回のビルドか `status: building`、cargo が解決・計画中ならその応答)。行き先のパスの先頭はパッケージの名前に替える。member でない path 依存・git 依存は今までどおりたどらない (D7)
+- 一覧の再公開 (`reexport_target`): 起点が member なら、版を付けず (分からない旨の warning も付けない)、crate の名前で示す
+- 実測: rustdoc は re-export の連鎖を最後の定義に解決するので、`front` が `middle` 経由で再公開した `back` の item は、`back` へ 1 度で入る (`front` が直接依存していない crate。名前で引く)。JSON の外の crate の名前は lib の名前で、依存の改名ではない
+- テスト: stdio の `a_reexport_of_another_member_is_not_followed` を `a_reexport_of_another_member_is_followed_into_it` に置き換えた (`front`→`middle`→`back`、`middle` は `back` を改名して依存): `front::Thing` は `back` をビルドして `data.path: front::Thing`・`defined_at: back::Thing`、glob の `front::in_middle` は `middle` で引ける (glob を外すと落ちることを確かめた)。一覧の再公開は `back` で、版が分からない旨の warning が無い
+- レビューで直したこと (試しの workspace で stdio を叩いて実測):
+  1. glob の行き先の crate を `use` の `source` の文字列から取っていた (`::middle`・`super::aliased`・別名で壊れ、`super` を crates.io に引きに行った。R-PR-3 は source を最後の手段とする): 公開パス索引の `ExternalGlob` に、`use` の行き先の id から取った定義パス (`target`) を持たせ、それで行き先を決める。アーカイブの形式を 8 に上げた
+  2. glob の行き先が std や crates.io の crate にも向き、glob を持つ member では typo のパスでも行き先を引きに行った (`pub use std::collections::*;` で何もかも `crate_not_found`): glob は行き先が member のときだけたどり、そうでなければその候補を捨てる。どの glob も持たなければ、起点の `item_not_found`
+  3. 同じ長さの接頭辞の glob が複数あると最後の 1 つしか試さなかった: 候補をすべて持ち (`Destination::others`。長い接頭辞の順、同じなら書かれた順)、`item_not_found` なら次へ。ビルドに失敗したら、その失敗に行き先を直接引く案内を付けて返す
+  4. lib 名とパッケージ名が違い bin も持つ member に入ると、bin を文書化していた: 行き先の crate 名 (lib 名) で計画する
+  5. docs.rs の crate から、同じ名前の member に入りえた: 起点が member のときだけ member に入る
+  6. 改名した依存の照合が効いていなかった (JSON の外の crate の名前は lib 名): `dependency_of` は名前 (改名) の次に lib 名で照合する。起点が member で、プロジェクトが版を教えなければ、crates.io の latest にせず re-export を返す
+  7. glob でたどったときの warning の文言 (「front is a re-export of b」と誤っていた)
+  - テストを広げた: 複数の glob を順に、std の glob があっても typo は `front` の `item_not_found`、lib 名の違う member の lib (`other-pkg` の `other_lib`)
+- 残したもの: member の glob で再公開された item は、`list_module` と検索には出ない (たどるのは `get_item` 系のパスの解決だけ)。glob の行き先の member のビルドに失敗したとき、`refresh` は行き先に届かない (行き先を直接引く案内を付ける)。`dependency_of` は dev・build・target 別の依存を区別しない。glob の連鎖では 1 回の呼び出しで `build.wait_secs` の数倍待ちうる
 
 **止まる危険の監査と直し 1 (2026-10-21)**:
 

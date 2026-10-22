@@ -104,8 +104,12 @@ pub struct Crossing {
 pub struct ExternalGlob {
     /// The path in this crate that the glob re-exports into.
     pub prefix: PublicPath,
-    /// The `use` source as written, such as `axum_core::extract::rejection`.
+    /// The `use` source as written, such as `axum_core::extract::rejection`, which may begin
+    /// with a local name (`super`, an alias).
     pub source: Box<str>,
+    /// What it re-exports, by its definition path in the other crate, which begins with that
+    /// crate's name, when the data has it (requirement R-PR-3, decided in M2's D6).
+    pub target: Option<PublicPath>,
 }
 
 /// The public paths of the items of one crate. It is archived with the crate (requirement
@@ -247,9 +251,18 @@ impl PathIndex {
         let external_globs = walker
             .external_globs
             .into_iter()
-            .map(|(prefix, source)| ExternalGlob {
+            .map(|(prefix, source, target)| ExternalGlob {
                 prefix: PublicPath::new(&prefix),
                 source: source.into(),
+                target: krate.paths.get(&target).map(|summary| {
+                    PublicPath(
+                        summary
+                            .path
+                            .iter()
+                            .map(|segment| segment.as_str().into())
+                            .collect(),
+                    )
+                }),
             })
             .collect();
         let children = children_of(by_public_path.keys().chain(external_reexports.keys()));
@@ -523,6 +536,7 @@ impl ArchivedPathIndex {
             .map(|glob| ExternalGlob {
                 prefix: PublicPath::from_archived(&glob.prefix),
                 source: glob.source.as_ref().into(),
+                target: glob.target.as_ref().map(PublicPath::from_archived),
             })
             .collect()
     }
@@ -713,7 +727,7 @@ struct Walker<'a> {
     paths: HashMap<Id, Vec<Place<'a>>>,
     /// Re-exports of other crates' items, at their paths, with what each goes through.
     external_reexports: Vec<(Vec<&'a str>, Id, Vec<Id>)>,
-    external_globs: Vec<(Vec<&'a str>, &'a str)>,
+    external_globs: Vec<(Vec<&'a str>, &'a str, Id)>,
     /// The modules being walked, to stop at a cycle.
     on_stack: HashSet<Id>,
     /// How many times each module has been walked.
@@ -839,7 +853,7 @@ impl<'a> Walker<'a> {
             // The item is in another crate.
             if reexport.is_glob {
                 self.external_globs
-                    .push((place.path.clone(), &reexport.source));
+                    .push((place.path.clone(), &reexport.source, target));
             } else {
                 let via = place.then(None, &[use_id]).via;
                 self.external_reexports
@@ -1449,6 +1463,7 @@ mod tests {
         assert_eq!(index.external_globs(), [ExternalGlob {
             prefix: PublicPath::new(&["c"]),
             source: "other::prelude".into(),
+            target: Some(PublicPath::new(&["other", "prelude"])),
         }]);
     }
 

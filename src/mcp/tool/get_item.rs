@@ -2019,23 +2019,83 @@ async fn conclude(
 }
 
 /// Looks the path up in the crate that it goes on in, through a re-export of that crate's item
-/// (requirement R-PR-4): a crate of std, or a release on docs.rs. If that fails, the re-export
-/// itself is returned from `origin`, with why.
+/// (requirement R-PR-4): a crate of std, a release on docs.rs, or another workspace member. If
+/// that fails, the re-export itself is returned from `origin`, with why.
+///
+/// Through glob re-exports (`pub use other::*;`) of a workspace member, each is tried in turn
+/// into another member, as one may not have the item; when none has it, the path is not found in
+/// `origin` (decided in M2's D6).
 async fn follow(
     state: &Arc<ToolState>,
     destination: Destination,
     mut origin: Request,
     warnings: Vec<Box<str>>,
 ) -> CallToolResult {
-    let mut followed = warnings.clone();
+    let mut candidates = vec![destination.clone()];
+    candidates.extend(destination.others.iter().cloned());
+    let mut failed = None;
+    for destination in candidates {
+        let result = follow_into(state, &destination, &origin, &warnings).await;
+        if result.is_error != Some(true) {
+            return result_at_entry(result, &destination.entry);
+        }
+        if destination.via_glob && error_code(&result).as_deref() == Some("item_not_found") {
+            continue;
+        }
+        failed = Some((destination, result));
+        break;
+    }
+    origin.hops = MAX_FOLLOWED;
+    let Some((destination, result)) = failed else {
+        // No glob had it: as if there were none.
+        return Box::pin(look_up_release(state, origin, warnings)).await;
+    };
+    // The glob's member failed to be built, as told, which looking it up itself tells again.
+    if destination.via_glob {
+        return with_suggestion(
+            result,
+            &format!(
+                "{} goes on in {} through a glob re-export; look the item up there with get_item, \
+                 which takes refresh",
+                destination.entry, destination.reexported
+            ),
+        );
+    }
+    let mut warnings = warnings;
+    warnings.push(
+        format!(
+            "{} goes on as {}, which could not be looked up: {}",
+            origin.path,
+            destination.path,
+            error_summary(&result)
+        )
+        .into(),
+    );
+    let fallback = Box::pin(look_up_release(state, origin, warnings)).await;
+    // Without the re-export to show, the error of the crate the path goes on in tells more.
+    if fallback.is_error == Some(true) {
+        result
+    } else {
+        fallback
+    }
+}
+
+/// The lookup of the path in the crate that `destination` goes on in, from `origin`.
+async fn follow_into(
+    state: &Arc<ToolState>,
+    destination: &Destination,
+    origin: &Request,
+    warnings: &[Box<str>],
+) -> CallToolResult {
+    let mut followed = warnings.to_vec();
     let std = destination
         .lib_name
         .parse::<CrateName>()
         .ok()
         .and_then(|name| Some((std_crate(&name)?, name)));
-    let result = match std {
+    match std {
         Some((krate, name)) if destination.is_std => {
-            followed.push(shown_from(&destination, &origin, krate.as_str()));
+            followed.push(shown_from(destination, origin, krate.as_str()));
             let arguments = Arguments {
                 name,
                 version: None,
@@ -2055,11 +2115,11 @@ async fn follow(
             .await
         },
         Some(_) | None => {
-            match destination_request(state, &destination, &origin, &mut followed).await {
+            match destination_request(state, destination, origin, &mut followed).await {
                 Ok(request) => {
                     followed.push(shown_from(
-                        &destination,
-                        &origin,
+                        destination,
+                        origin,
                         &format!("{} {}", request.name, request.version),
                     ));
                     Box::pin(look_up_release(state, request, followed)).await
@@ -2067,28 +2127,30 @@ async fn follow(
                 Err(result) => *result,
             }
         },
+    }
+}
+
+/// The code of the tool error `result`.
+fn error_code(result: &CallToolResult) -> Option<String> {
+    let text = &result.content.first()?.as_text()?.text;
+    let body: Value = serde_json::from_str(text).ok()?;
+    body.get("code")?.as_str().map(str::to_owned)
+}
+
+/// The tool error `result` with `suggestion` added to its suggestions.
+fn with_suggestion(result: CallToolResult, suggestion: &str) -> CallToolResult {
+    let Some(mut body) = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .and_then(|text| serde_json::from_str::<Value>(&text.text).ok())
+    else {
+        return result;
     };
-    if result.is_error != Some(true) {
-        return result_at_entry(result, &destination.entry);
+    if let Some(Value::Array(suggestions)) = body.get_mut("suggestions") {
+        suggestions.push(json!(suggestion));
     }
-    let mut warnings = warnings;
-    warnings.push(
-        format!(
-            "{} goes on as {}, which could not be looked up: {}",
-            origin.path,
-            destination.path,
-            error_summary(&result)
-        )
-        .into(),
-    );
-    origin.hops = MAX_FOLLOWED;
-    let fallback = Box::pin(look_up_release(state, origin, warnings)).await;
-    // Without the re-export to show, the error of the crate the path goes on in tells more.
-    if fallback.is_error == Some(true) {
-        result
-    } else {
-        fallback
-    }
+    error_result(&body)
 }
 
 /// `result`, shown at `entry` by [`show_at_entry`].
@@ -2180,7 +2242,14 @@ fn rebase(value: &mut Value, from: &str, to: &str) {
 /// The warning that the path asked for in `origin` is shown from `krate`.
 fn shown_from(destination: &Destination, origin: &Request, krate: &str) -> Box<str> {
     let (asked, there) = (&origin.path, &destination.path);
-    if asked == &destination.reexport {
+    if destination.via_glob {
+        format!(
+            "{asked} is not in {} itself, which re-exports all of {} ({krate}), so it is shown as \
+             {there} from there",
+            destination.reexport, destination.reexported
+        )
+        .into()
+    } else if asked == &destination.reexport {
         format!("{asked} is a re-export of {there} ({krate}), shown from there").into()
     } else {
         format!(
@@ -2222,21 +2291,8 @@ async fn destination_request(
     warnings: &mut Vec<Box<str>>,
 ) -> Result<Request, Box<CallToolResult>> {
     #[cfg(feature = "local")]
-    match in_project_build(state, destination, origin).await {
-        InProjectBuild::Release(request) => return Ok(*request),
-        // Not the crate of that name on crates.io (decided in M2's D2, until D6).
-        InProjectBuild::NotFromCratesIo(package) => {
-            return Err(Box::new(super::tool_error(
-                "docs_unavailable",
-                &format!(
-                    "{package} in the project is not from crates.io, and a path is not followed \
-                     into it yet"
-                ),
-                false,
-                &[&format!("look the item up in {package} itself")],
-            )));
-        },
-        InProjectBuild::Elsewhere => {},
+    if let Some(found) = in_project_destination(state, destination, origin).await {
+        return found;
     }
     let (name, version, resolved_from, index_fetched_at) =
         if let Some((name, version)) = &destination.release {
@@ -2306,11 +2362,66 @@ async fn destination_request(
     })
 }
 
+/// What the project's build tells of the crate that `destination` goes on in from `origin`
+/// (decided in M2's D2 and D6): the request for a release of crates.io or for another workspace
+/// member, or why it is not followed; `None` when the project does not tell, from a crate that is
+/// not a member.
+#[cfg(feature = "local")]
+async fn in_project_destination(
+    state: &ToolState,
+    destination: &Destination,
+    origin: &Request,
+) -> Option<Result<Request, Box<CallToolResult>>> {
+    let in_build = in_project_build(state, destination, origin).await;
+    // A glob of a member goes on into another member only (decided in M2's D6).
+    if destination.via_glob && !matches!(in_build, InProjectBuild::Member(..)) {
+        return Some(Err(Box::new(super::tool_error(
+            "item_not_found",
+            &format!("{} is not a workspace member", destination.reexported),
+            false,
+            &[],
+        ))));
+    }
+    // From a member, a crate that its project does not tell is not taken at crates.io's latest:
+    // the re-export is shown (decided in M2's D6).
+    if origin.local.is_some() && matches!(in_build, InProjectBuild::Elsewhere) {
+        return Some(Err(Box::new(super::tool_error(
+            "docs_unavailable",
+            &format!(
+                "the version of {} that {} uses is not known from the project",
+                destination.lib_name, origin.name
+            ),
+            true,
+            &[],
+        ))));
+    }
+    match in_build {
+        InProjectBuild::Release(request) => Some(Ok(*request)),
+        // Another workspace member, built here (decided in M2's D6).
+        InProjectBuild::Member(package, workspace) => {
+            Some(member_destination(state, &package, &workspace, destination, origin).await)
+        },
+        // Not the crate of that name on crates.io, and not a member (until M2's D7).
+        InProjectBuild::NotFromCratesIo(package) => Some(Err(Box::new(super::tool_error(
+            "docs_unavailable",
+            &format!(
+                "{package} in the project is not from crates.io, and a path is not followed \
+                     into it yet"
+            ),
+            false,
+            &[&format!("look the item up in {package} itself")],
+        )))),
+        InProjectBuild::Elsewhere => None,
+    }
+}
+
 /// The crate that the path goes on in, in the project's build.
 #[cfg(feature = "local")]
 enum InProjectBuild {
     /// The request for it at its version there, a release of crates.io.
     Release(Box<Request>),
+    /// It is a workspace member, of the workspace.
+    Member(Box<ProjectPackage>, Box<Workspace>),
     /// It is the project's package, as `name@version`, which is not from crates.io.
     NotFromCratesIo(String),
     /// The project does not tell.
@@ -2345,12 +2456,25 @@ async fn in_project_build_of(
         return None;
     };
     let graph = PackageGraph::new(&resolution);
+    // From a workspace member, the package that it depends on by that name: its JSON does not
+    // tell the version (decided in M2's D6).
+    let from_member = origin
+        .local
+        .as_ref()
+        .and_then(|_| graph.member_named(origin.name.as_str(), &origin.version))
+        .and_then(|member| graph.dependency_of(member, &destination.lib_name));
     let built_with = destination.release.as_ref().map(|(_, version)| version);
     let name = destination
         .release
         .as_ref()
         .map_or(&*destination.lib_name, |(name, _)| name.as_str());
-    let package = match graph.look_up(name) {
+    let package = match from_member.map_or_else(
+        || graph.look_up(name),
+        |package| PackageLookup::Found {
+            package,
+            other_versions: Vec::new(),
+        },
+    ) {
         PackageLookup::Found {
             package,
             other_versions,
@@ -2364,6 +2488,13 @@ async fn in_project_build_of(
             .find(|package| Some(&package.version) == built_with)?,
         PackageLookup::AmbiguousPackage(_) | PackageLookup::NotFound => return None,
     };
+    // From a member only: a docs.rs crate's re-export of a crate of that name is not the member.
+    if origin.local.is_some() && graph.is_member(package) {
+        return Some(InProjectBuild::Member(
+            Box::new(package.clone()),
+            Box::new(workspace.clone()),
+        ));
+    }
     if package.source != Source::CratesIo {
         return Some(InProjectBuild::NotFromCratesIo(format!(
             "{}@{}",
@@ -2390,6 +2521,79 @@ async fn in_project_build_of(
         until: origin.until,
         local: None,
     })))
+}
+
+/// The request for the item that the path goes on to in the workspace member `package`, built here
+/// by the work that the lookups of it share, from the member `origin` (decided in M2's D6); or the
+/// response while cargo resolves or plans it, or the error.
+#[cfg(feature = "local")]
+async fn member_destination(
+    state: &ToolState,
+    package: &ProjectPackage,
+    workspace: &Workspace,
+    destination: &Destination,
+    origin: &Request,
+) -> Result<Request, Box<CallToolResult>> {
+    // Its lib, by the name that the path goes on with, as `[lib] name` may make it other than the
+    // package's, which a bin of the package has.
+    let name: CrateName = destination.lib_name.parse().map_err(|error| {
+        Box::new(super::tool_error(
+            "item_not_found",
+            &format!("the member that the path goes on in has a name that is not valid: {error}"),
+            false,
+            &[],
+        ))
+    })?;
+    let asked = local::Asked::Package {
+        name: &package.name,
+        version: &package.version,
+    };
+    let project_from = origin.project_from.unwrap_or("argument");
+    let path = destination.path.clone();
+    match local::member(
+        state,
+        workspace,
+        (&name, asked),
+        &origin.target,
+        origin.until,
+    )
+    .await?
+    {
+        Member::Is { wanted, package } => {
+            let mut request = member_request(
+                &package,
+                wanted,
+                (&name, &path),
+                (&origin.target, &origin.shape),
+                (origin.resolved_from, project_from, workspace),
+                origin.until,
+            );
+            request.hops = origin.hops.saturating_add(1);
+            Ok(request)
+        },
+        Member::Unknown(error) => Err(error),
+        Member::Resolving(doing) => Err(Box::new(project::resolving_crate(
+            &name,
+            &origin.target,
+            (doing, project_from),
+            &[],
+        ))),
+        Member::Planning(doing) => Err(Box::new(project::planning_crate(
+            &name,
+            &origin.target,
+            (doing, project_from),
+            &[],
+        ))),
+        Member::OtherVersion(_) | Member::Not => Err(Box::new(super::tool_error(
+            "item_not_found",
+            &format!(
+                "{name} {} is not a member that is built here",
+                package.version
+            ),
+            false,
+            &[],
+        ))),
+    }
 }
 
 /// What the response warns about the features of the project's build, when the work that reads
