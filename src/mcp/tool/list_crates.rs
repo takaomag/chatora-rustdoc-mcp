@@ -234,7 +234,9 @@ pub(super) fn parse_arguments(
         },
     };
     Ok(Arguments {
-        project: string("project")?.map(PathBuf::from),
+        project: string("project")?
+            .map(super::get_item::checked_project)
+            .transpose()?,
         target,
         all,
         name: string("crate")?.map(Into::into),

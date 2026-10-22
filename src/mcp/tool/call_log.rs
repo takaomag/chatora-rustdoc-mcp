@@ -13,7 +13,7 @@ use rmcp::model::{CallToolResult, ContentBlock, ErrorData, JsonObject};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    data::fetches::Fetches,
+    data::{fetches::Fetches, git_source::GitUrl},
     logging::{self, REQUEST_ID_FIELD},
 };
 
@@ -209,6 +209,22 @@ fn summarize(arguments: &JsonObject) -> Value {
             } else {
                 MAX_SUMMARY_CHARS
             };
+            // Logged before it is checked: only as it is taken, else with what it is not taken
+            // for, as it may have credentials (requirement R-SEC-4).
+            if key == "git" {
+                let logged = match value {
+                    Value::String(url) => GitUrl::parse(url.trim()).map_or_else(
+                        |error| format!("(not taken: {error})"),
+                        |url| url.as_given().to_owned(),
+                    ),
+                    Value::Null
+                    | Value::Bool(_)
+                    | Value::Number(_)
+                    | Value::Array(_)
+                    | Value::Object(_) => "(not a string)".to_owned(),
+                };
+                return (key.clone(), cut(&logged, max).into());
+            }
             (key.clone(), summarize_value(value, max))
         })
         .collect();
@@ -307,5 +323,23 @@ mod tests {
             ["docs.rs", "std"]
         );
         assert_eq!(sources(&Value::Null), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_credentials_of_a_git_url_are_not_logged() {
+        for git in [
+            json!("https://secret@example.com/o/r"),
+            json!("https:\\\\secret@example.com/o/r"),
+            json!("user:secret@example.com:o/r"),
+            json!(["https://secret@example.com/o/r"]),
+        ] {
+            let mut arguments = JsonObject::new();
+            arguments.insert("git".to_owned(), git);
+            let logged = summarize(&arguments).to_string();
+            assert!(!logged.contains("secret"), "{logged}");
+        }
+        let mut arguments = JsonObject::new();
+        arguments.insert("git".to_owned(), json!("https://example.com/o/r"));
+        assert_eq!(summarize(&arguments)["git"], "https://example.com/o/r");
     }
 }

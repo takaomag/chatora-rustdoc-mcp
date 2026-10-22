@@ -358,7 +358,7 @@ pub(super) fn definitions() -> Vec<Tool> {
         expect(unused_mut, reason = "only a debug build adds the tool for testing")
     )]
     let mut tools: Vec<Tool> = if cfg!(feature = "local") {
-        tools.into_iter().map(with_refresh).collect()
+        tools.into_iter().map(with_refresh).map(with_git).collect()
     } else {
         tools.into_iter().map(without_project).collect()
     };
@@ -394,6 +394,46 @@ fn with_refresh(mut tool: Tool) -> Tool {
     tool.input_schema = Arc::new(schema);
     tool
 }
+
+/// `tool` with the arguments `git`, `rev`, `branch` and `tag` (§6.4), which every query tool that
+/// takes `crate` takes with local features, to look up a crate of a git repository that
+/// `build_external_docs` documented (requirement R-MCP-3); and that tool too. Not `list_crates`,
+/// whose `crate` is the project's.
+fn with_git(mut tool: Tool) -> Tool {
+    let mut schema = (*tool.input_schema).clone();
+    let Some(Value::Object(properties)) = schema.get_mut("properties") else {
+        return tool;
+    };
+    if !properties.contains_key("crate") || tool.name == "list_crates" {
+        return tool;
+    }
+    for (name, description) in GIT_ARGUMENTS {
+        properties.insert(
+            (*name).to_owned(),
+            json!({ "type": "string", "description": description }),
+        );
+    }
+    tool.input_schema = Arc::new(schema);
+    tool
+}
+
+/// The arguments of a crate of a git repository, and what each is (§6.4).
+const GIT_ARGUMENTS: &[(&str, &str)] = &[
+    (
+        "git",
+        "The URL of a git repository (https://, ssh://, http:// or git://) that the crate is in, \
+         which build_external_docs documented.",
+    ),
+    (
+        "rev",
+        "With `git`: the commit, as its hash (7 to 64 hex digits) or a ref under refs/.",
+    ),
+    (
+        "branch",
+        "With `git`: the branch. Without rev, branch and tag: the default branch.",
+    ),
+    ("tag", "With `git`: the tag."),
+];
 
 /// The end of every tool's description of `project` (doc/m2-plan.md §5, P5): the server sees only
 /// the directory that Claude Code was opened in, not the worktree of a subagent, so one that works
@@ -556,6 +596,7 @@ async fn dispatch(
     context: RequestContext<RoleServer>,
     state: &Arc<ToolState>,
 ) -> Result<CallToolResult, ErrorData> {
+    let git = names_git(&request);
     match request.name.as_ref() {
         #[cfg(feature = "local")]
         build_external_docs::NAME => {
@@ -567,13 +608,19 @@ async fn dispatch(
             }
         },
         get_item::NAME => match get_item::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => Ok(run_tool(get_item::execute(arguments, Arc::clone(state))).await),
+            Ok(arguments) => Ok(if git {
+                git_later()
+            } else {
+                run_tool(get_item::execute(arguments, Arc::clone(state))).await
+            }),
             Err(error) => Ok(error.into_result()),
         },
         crate_overview::NAME => match crate_overview::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => {
-                Ok(run_tool(crate_overview::execute(arguments, Arc::clone(state))).await)
-            },
+            Ok(arguments) => Ok(if git {
+                git_later()
+            } else {
+                run_tool(crate_overview::execute(arguments, Arc::clone(state))).await
+            }),
             Err(error) => Ok(error.into_result()),
         },
         #[cfg(feature = "local")]
@@ -583,37 +630,53 @@ async fn dispatch(
         },
         list_implementors::NAME => {
             match list_implementors::parse_arguments(request.arguments.as_ref()) {
-                Ok(arguments) => {
-                    Ok(run_tool(list_implementors::execute(arguments, Arc::clone(state))).await)
-                },
+                Ok(arguments) => Ok(if git {
+                    git_later()
+                } else {
+                    run_tool(list_implementors::execute(arguments, Arc::clone(state))).await
+                }),
                 Err(error) => Ok(error.into_result()),
             }
         },
         list_impls::NAME => match list_impls::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => Ok(run_tool(list_impls::execute(arguments, Arc::clone(state))).await),
+            Ok(arguments) => Ok(if git {
+                git_later()
+            } else {
+                run_tool(list_impls::execute(arguments, Arc::clone(state))).await
+            }),
             Err(error) => Ok(error.into_result()),
         },
         list_methods::NAME => match list_methods::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => {
-                Ok(run_tool(list_methods::execute(arguments, Arc::clone(state))).await)
-            },
+            Ok(arguments) => Ok(if git {
+                git_later()
+            } else {
+                run_tool(list_methods::execute(arguments, Arc::clone(state))).await
+            }),
             Err(error) => Ok(error.into_result()),
         },
         list_module::NAME => match list_module::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => Ok(run_tool(list_module::execute(arguments, Arc::clone(state))).await),
+            Ok(arguments) => Ok(if git {
+                git_later()
+            } else {
+                run_tool(list_module::execute(arguments, Arc::clone(state))).await
+            }),
             Err(error) => Ok(error.into_result()),
         },
         search_items::NAME => match search_items::parse_arguments(request.arguments.as_ref()) {
-            Ok(arguments) => {
-                Ok(run_tool(search_items::execute(arguments, Arc::clone(state))).await)
-            },
+            Ok(arguments) => Ok(if git {
+                git_later()
+            } else {
+                run_tool(search_items::execute(arguments, Arc::clone(state))).await
+            }),
             Err(error) => Ok(error.into_result()),
         },
         resolve_version::NAME => match resolve_version::parse_arguments(request.arguments.as_ref())
         {
-            Ok(arguments) => {
-                Ok(run_tool(resolve_version::execute(arguments, Arc::clone(state))).await)
-            },
+            Ok(arguments) => Ok(if git {
+                git_later()
+            } else {
+                run_tool(resolve_version::execute(arguments, Arc::clone(state))).await
+            }),
             Err(error) => Ok(error.into_result()),
         },
         #[cfg(debug_assertions)]
@@ -630,6 +693,29 @@ async fn dispatch(
             ))
         },
     }
+}
+
+/// Whether `request` names a crate of a git repository (`git`), which only a server with local
+/// features takes.
+fn names_git(request: &CallToolRequestParams) -> bool {
+    cfg!(feature = "local")
+        && request
+            .arguments
+            .as_ref()
+            .is_some_and(|arguments| arguments.contains_key("git"))
+}
+
+/// The response to a call that names a crate of a git repository (`git`), checked as its arguments
+/// are: those come in a later version (M2e's E3b).
+fn git_later() -> CallToolResult {
+    error_result(&json!({
+        "code": "docs_unavailable",
+        "message": "looking up a crate of a git repository is not supported yet (in a later \
+                    version)",
+        "retryable": false,
+        "suggestions": ["look the crate up on docs.rs, without `git`"],
+        "reason": "build_unsupported",
+    }))
 }
 
 /// Runs a tool in a task of its own, so that a panic becomes an `internal_error` result

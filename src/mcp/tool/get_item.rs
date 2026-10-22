@@ -43,6 +43,7 @@ use crate::{
         dist::{DistError, StdCrate},
         docs_rs::FetchError,
         flight::{Doing, Joined},
+        git_source::{self, GitRef, GitUrl},
         rustdoc_json::ParseError,
         sparse_index::{IndexEntry, IndexError, IndexVersion},
         std_json::Chosen,
@@ -761,6 +762,15 @@ pub(super) fn parse_release(
         return Err(InvalidArgument::new("`crate` is required", CRATE_EXAMPLE));
     };
     let (project, target) = parse_project_and_target(arguments)?;
+    if parse_git(arguments)?.is_some() {
+        apart_from_git(version.as_ref(), project.as_deref())?;
+        if std_crate(&name).is_some() {
+            return Err(InvalidArgument::new(
+                "std is no crate of a git repository: look it up without `git`",
+                GIT_EXAMPLE,
+            ));
+        }
+    }
     Ok(ReleaseArguments {
         name,
         version,
@@ -768,6 +778,75 @@ pub(super) fn parse_release(
         target,
         refresh: parse_refresh(arguments)?,
     })
+}
+
+/// How to pass `git`, for `invalid_argument`.
+const GIT_EXAMPLE: &[&str] = &[
+    r#"pass the repository's URL with the crate, for example {"crate": "foo", "git": "https://example.com/owner/foo", "branch": "main"}"#,
+];
+
+/// A crate of a git repository, as `git`, with `rev`, `branch` or `tag`, names it (§6.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GitSpec {
+    /// The repository.
+    pub(super) url: GitUrl,
+    /// Its commit asked for.
+    pub(super) reference: GitRef,
+}
+
+/// Checks `git`, `rev`, `branch` and `tag` (§6.4, requirement R-SEC-4): `None` when none is given.
+/// A server without local features does not document crates of git repositories, which it tells
+/// rather than look the crate up on crates.io.
+pub(super) fn parse_git(
+    arguments: Option<&JsonObject>,
+) -> Result<Option<GitSpec>, InvalidArgument> {
+    let git = string_argument(arguments, "git", GIT_EXAMPLE)?;
+    let rev = string_argument(arguments, "rev", GIT_EXAMPLE)?;
+    let branch = string_argument(arguments, "branch", GIT_EXAMPLE)?;
+    let tag = string_argument(arguments, "tag", GIT_EXAMPLE)?;
+    if git.is_none() && rev.is_none() && branch.is_none() && tag.is_none() {
+        return Ok(None);
+    }
+    if !cfg!(feature = "local") {
+        return Err(InvalidArgument::new(
+            "this server is built without local features, so it does not document crates of git \
+             repositories",
+            &["look the crate up on docs.rs, without `git`"],
+        ));
+    }
+    let Some(git) = git else {
+        return Err(InvalidArgument::new(
+            "`rev`, `branch` and `tag` go with `git`",
+            GIT_EXAMPLE,
+        ));
+    };
+    let url =
+        GitUrl::parse(git).map_err(|error| InvalidArgument::new(error.to_string(), GIT_EXAMPLE))?;
+    let reference = GitRef::parse(rev, branch, tag)
+        .map_err(|error| InvalidArgument::new(error.to_string(), GIT_EXAMPLE))?;
+    Ok(Some(GitSpec { url, reference }))
+}
+
+/// Checks that a crate of a git repository is asked for without `version`, as its commit decides
+/// it, and without `project`, as it is no package of a workspace here.
+pub(super) fn apart_from_git(
+    version: Option<&VersionSpec>,
+    project: Option<&std::path::Path>,
+) -> Result<(), InvalidArgument> {
+    if version.is_some() {
+        return Err(InvalidArgument::new(
+            "`git` takes no version: the commit decides it; give `rev`, `branch` or `tag`",
+            GIT_EXAMPLE,
+        ));
+    }
+    if project.is_some() {
+        return Err(InvalidArgument::new(
+            "`git` and `project` do not go together: a crate of a git repository is no package of a \
+             workspace here",
+            GIT_EXAMPLE,
+        ));
+    }
+    Ok(())
 }
 
 /// The string argument `name`, trimmed, or `None` when it is not given.
@@ -840,7 +919,9 @@ pub(super) fn parse_crate(
 pub(super) fn parse_project_and_target(
     arguments: Option<&JsonObject>,
 ) -> Result<(Option<PathBuf>, Option<TargetTriple>), InvalidArgument> {
-    let project = string_argument(arguments, "project", PROJECT_EXAMPLE)?.map(PathBuf::from);
+    let project = string_argument(arguments, "project", PROJECT_EXAMPLE)?
+        .map(checked_project)
+        .transpose()?;
     let target = string_argument(arguments, "target", TARGET_EXAMPLE)?
         .map(|target| {
             target.parse::<TargetTriple>().map_err(|error| {
@@ -849,6 +930,21 @@ pub(super) fn parse_project_and_target(
         })
         .transpose()?;
     Ok((project, target))
+}
+
+/// The path that `project` gives, without a control, bidirectional or invisible character, so that
+/// it looks on screen, in the provenance and in the log as it is (requirement R-SEC-4).
+pub(super) fn checked_project(project: &str) -> Result<PathBuf, InvalidArgument> {
+    if let Some(c) = git_source::hidden_char(project) {
+        return Err(InvalidArgument::new(
+            format!(
+                "`project` has a control, bidirectional or invisible character (U+{:04X})",
+                u32::from(c)
+            ),
+            PROJECT_EXAMPLE,
+        ));
+    }
+    Ok(PathBuf::from(project))
 }
 
 /// Checks `refresh` (§6.4): `false` when it is not given.

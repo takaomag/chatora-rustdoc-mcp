@@ -150,11 +150,24 @@ fn stderr_filter(settings: &Settings) -> EnvFilter {
         .get("log.filter", |value| {
             value
                 .text()
-                .and_then(|text| builder().parse(text).ok())
+                .and_then(|text| {
+                    let filter = builder().parse(text).ok()?;
+                    // rmcp logs each request whole at `debug`, with the arguments, which may have
+                    // credentials, as a `git` URL that is not taken (requirement R-SEC-4): unless
+                    // the filter asks for rmcp's.
+                    Some(if text.contains("rmcp") {
+                        filter
+                    } else {
+                        filter.add_directive(RMCP_FILTER.parse().ok()?)
+                    })
+                })
                 .ok_or("a filter of tracing's EnvFilter syntax, such as \"debug\"")
         })
         .unwrap_or_else(|| builder().parse_lossy(""))
 }
+
+/// What of rmcp is logged unless the filter names it: not the requests, whole.
+const RMCP_FILTER: &str = "rmcp=info";
 
 /// The limits of the log files, from their settings or their defaults.
 fn limits(settings: &Settings) -> Limits {

@@ -29,6 +29,7 @@ pub mod flight;
 pub mod format_version;
 #[cfg(feature = "local")]
 pub mod freshness;
+pub mod git_source;
 mod http;
 #[cfg(feature = "local")]
 pub mod local_std;

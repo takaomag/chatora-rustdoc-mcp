@@ -2923,6 +2923,147 @@ fn dir_of_record(server: &Server, name: &str, version: &str) -> PathBuf {
     .dir(server.cache.path())
 }
 
+/// `git`, `rev`, `branch` and `tag` are checked (requirement R-SEC-4), and a crate of a git
+/// repository comes in a later version (M2e's E3b); credentials in the URL are not logged, and a
+/// `project` with a bidirectional control is not taken. Without local features, `git` is refused.
+#[test]
+fn git_arguments_are_checked_and_told_to_come() {
+    let mut server = Server::start();
+    // Every tool that takes it, as one of its dispatch.
+    let tools = [
+        ("get_item", json!({ "path": "foo::Bar" })),
+        ("crate_overview", json!({})),
+        ("list_module", json!({ "path": "foo" })),
+        ("list_methods", json!({ "path": "foo::Bar" })),
+        ("list_impls", json!({ "path": "foo::Bar" })),
+        ("list_implementors", json!({ "path": "foo::Baz" })),
+        ("search_items", json!({ "query": "bar" })),
+        ("resolve_version", json!({})),
+        ("build_external_docs", json!({})),
+    ];
+    for (id, (tool, mut arguments)) in (1_u64..).zip(tools) {
+        if tool == "build_external_docs" && !cfg!(feature = "local") {
+            continue;
+        }
+        arguments["crate"] = json!("foo");
+        arguments["git"] = json!("ssh://git@example.invalid/owner/foo");
+        arguments["branch"] = json!("main");
+        server.send(&call_tool(id, tool, arguments));
+        let result = server.response(id)["result"].clone();
+        assert_eq!(result["isError"], true, "{result}");
+        let error = text_json(&result);
+        if cfg!(feature = "local") {
+            assert_eq!(error["code"], "docs_unavailable", "{tool}: {result}");
+            assert!(
+                error["message"].to_string().contains("later version"),
+                "{tool}: {result}"
+            );
+        } else {
+            assert_eq!(error["code"], "invalid_argument", "{tool}: {result}");
+            assert!(
+                error["message"]
+                    .to_string()
+                    .contains("without local features"),
+                "{result}"
+            );
+        }
+    }
+    assert!(server.finish().success());
+}
+
+/// What `git`, `rev`, `branch` and `tag` must be (requirement R-SEC-4), and that credentials in
+/// `git` are not logged; a `project` with a bidirectional control is not taken either.
+#[test]
+fn git_arguments_that_could_mislead_or_leak_are_refused() {
+    let mut server = Server::start();
+    let git = "https://example.invalid/owner/foo";
+    let refused = [
+        (json!({ "git": "git@example.com:o/foo" }), "ssh://"),
+        (json!({ "branch": "main" }), "go with `git`"),
+        (
+            json!({ "crate": "foo@1.0.0", "git": git }),
+            "takes no version",
+        ),
+        (json!({ "git": git, "rev": "v1" }), "`rev` must be"),
+        (
+            json!({ "git": "https://secret@example.com/o/foo" }),
+            "credentials",
+        ),
+        (
+            json!({ "git": "https://evil.com\\@good.com/o/foo" }),
+            "backslash",
+        ),
+        (
+            json!({ "git": "ssh://-oProxyCommand=x/o/foo" }),
+            "must not begin with -",
+        ),
+        (
+            json!({ "git": ["https://secret@example.com/o/foo"] }),
+            "must be a string",
+        ),
+        (json!({ "crate": "std", "git": git }), "std is no crate"),
+    ];
+    for (id, (fields, told)) in (20_u64..).zip(refused) {
+        let mut arguments = json!({ "crate": "foo", "path": "x" });
+        for (name, value) in fields.as_object().expect("an object") {
+            arguments[name] = value.clone();
+        }
+        server.send(&call_tool(id, "get_item", arguments));
+        let result = server.response(id)["result"].clone();
+        assert_eq!(result["isError"], true, "{result}");
+        let error = text_json(&result);
+        assert_eq!(error["code"], "invalid_argument", "{result}");
+        let expected = if cfg!(feature = "local") {
+            told
+        } else {
+            "without local features"
+        };
+        // A value that is not a string is so whatever the build.
+        let expected = if told == "must be a string" {
+            told
+        } else {
+            expected
+        };
+        assert!(
+            error["message"].to_string().contains(expected),
+            "{told}: {result}"
+        );
+        assert!(!result.to_string().contains("secret"), "{result}");
+    }
+    let others = [
+        (
+            "search_items",
+            json!({ "query": "x", "git": git }),
+            "needs `crate`",
+        ),
+        (
+            "crate_overview",
+            json!({ "crate": "foo", "project": "/tmp/\u{202E}x" }),
+            "bidirectional",
+        ),
+    ];
+    for (id, (tool, arguments, told)) in (40_u64..).zip(others) {
+        server.send(&call_tool(id, tool, arguments));
+        let result = server.response(id)["result"].clone();
+        let error = text_json(&result);
+        assert_eq!(error["code"], "invalid_argument", "{tool}: {result}");
+        if cfg!(feature = "local") {
+            assert!(
+                error["message"].to_string().contains(told),
+                "{tool}: {result}"
+            );
+        }
+    }
+    assert!(
+        !server
+            .log()
+            .iter()
+            .any(|line| line.to_string().contains("secret")),
+        "the credentials were logged"
+    );
+    assert!(server.finish().success());
+}
+
 /// The host's target, as `rustc -vV` tells it.
 #[cfg(feature = "local")]
 fn host_triple() -> String {
@@ -3842,15 +3983,22 @@ fn a_release_that_the_project_does_not_use_is_looked_up_for_the_host() {
         "[build]\ntarget = \"wasm32-unknown-unknown\"\n",
     );
     let mut server = Server::start_in(Some(project.path()));
-    // Once cargo has resolved the project.
-    server.send(&call_tool(1, "list_crates", json!({})));
-    assert_eq!(server.response(1)["result"]["isError"], false);
+    // Once cargo has resolved the project, which a loaded machine may take a while for.
+    for id in 1_u64..60 {
+        server.send(&call_tool(id, "list_crates", json!({})));
+        let result = server.response(id)["result"].clone();
+        assert_eq!(result["isError"], false, "{result}");
+        if result["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
     server.send(&call_tool(
-        2,
+        100,
         "get_item",
         json!({ "crate": "demo@0.1.0", "path": "hello" }),
     ));
-    let found = server.response(2)["result"]["structuredContent"].clone();
+    let found = server.response(100)["result"]["structuredContent"].clone();
     assert_eq!(found["provenance"]["target"], TARGET, "{found}");
     assert!(!warns(&found, "wasm32"), "{found}");
     assert!(server.finish().success());

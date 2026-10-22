@@ -1439,6 +1439,30 @@ Claude Code 2.1.304、Linux で測った。
   - 照会のツールが読んだら最後に使った日時を更新する (R-CA-5。std の `used` と同じく 1 時間に 1 回)。re-export をたどるときは外の記録を読まない (R-WS-10)。照会のツールの `refresh` は外の失敗を解かない (R-WS-10・§6.4)
   - テストの記録は、E2a が使う `data::external` の書き手で置く
 
+**E3a (git の URL と引数。2026-10-22)**:
+
+- `data::git_source`: `hidden_char` (制御文字・双方向の制御と印・見えない書式文字)、`GitUrl::parse` (生の文字列で文字を確かめてから `url` で解析。scheme は https・ssh・http・git だけ、scp の形と `file://` は案内付きで断る、ホストの非 ASCII・空のホスト・資格情報 (ssh は password だけ)・query・fragment・空の path を断る。エラーは URL を載せない)、鍵の正規化 (末尾の `/`、github.com の path を小文字、`.git`。scheme は残す)、`plaintext`。`GitRef::parse` (`rev` は 7〜64 桁の 16 進 (小文字に) か `refs/…`、`branch`・`tag` は check-ref-format の規則と `@` を断る、1 つだけ)
+- 照会のツール: `crate` を取るツール (`list_crates` を除く) と外のツールに、ローカル機能の構成でだけ `git`・`rev`・`branch`・`tag` を宣言 (`with_git`。説明は引数に)。`get_item::parse_git` と `apart_from_git` (`version`・`project` と一緒に受けない)、`crate` なしの検索に `git` は断る。E3a の間は検証を通った `git` の呼び出しに「(in a later version)」(`git_later`)。ローカル機能の無い構成では `git` などを `invalid_argument` で断る
+- `project` のパスの文字の確かめ (`checked_project`) を `parse_project_and_target`・`list_crates`・`crate` なしの検索に。呼び出しの記録は `git` の userinfo を `***` に伏せる
+- `get_item.md` の古い「path・git の依存はまだ」を直した
+- テスト: `git_source` の単体 4 件 (鍵の正規化・断る URL・ref・文字)、呼び出しの記録の単体、checks (宣言の有無)、stdio の 1 件 (後の版の応答・断る形 (scp・git なしの branch・版付き・16 進でない rev・資格情報・crate なしの検索・双方向の制御の入った project)・記録に資格情報が残らない・ローカル機能の無い構成は断る)。real_data の 4 つの引数は `CheckedElsewhere`
+- レビュー (サブエージェント、読むだけ) の対応: (1) `\` を断る (`https://evil.com\@good.com/…` は `url` では host が evil.com になり、画面の見た目と取得先が違った)。書いたホストと解析したホストが同じでなければ断る (percent-encoding や `0x7f.1` のような数の形) (2) 呼び出しの記録の `git` は、受けた URL か「受けない理由」だけを書く (文字列でない値、`://` の無い形も)。rmcp は `debug` で要求を引数ごと stderr に書くので、ログの絞り込みが rmcp を名指ししない限り `rmcp=info` に抑える (3) ssh のホストやユーザーが `-` で始まるもの (ssh のオプション) を断る (5) 見えない文字に U+2028・2029、U+206A〜206F、U+FFF9〜FFFB、ハングルの埋め字などを足した (7) std に `git` を付けたら `invalid_argument` (8) 説明の直し (`rev` は 7〜64 桁、ホストの非 ASCII のメッセージにユーザーも、get_item の説明は「docs.rs に無い依存の多くも」) (9) テスト: 照会のツール 8 つと外のツールすべてで後の版の応答、断る形はメッセージの中身まで (ローカル機能の無い構成は「ローカル機能が無い」)。残したもの: (6) 解析した `git` を `ReleaseArguments` に持たせるのは E3b (今は検証して捨て、振り分けは `git` の有無で)
+- 負荷のある全体のテストで E2b-1 の `a_release_that_the_project_does_not_use_is_looked_up_for_the_host` が揺れた: `list_crates` が cargo の解決中に `status: building` を返すと、プロジェクトのパッケージが分からず決定 11 で host にならない。解決し終わるまで `list_crates` を呼び直す形に直した
+
+**E3 の下調べと決定 (2026-10-22)**:
+
+- 下調べ (サブエージェント、読むだけ): URL は依存にある `url` (reqwest の `Url`) で解析できる。cargo の `CanonicalUrl` は記憶で、手元にソースが無く未確認 (末尾の `/` を 1 つ外す、github.com は scheme を https に・path を小文字、最後の段の `.git` を外す。userinfo・ポート・query・fragment は残す)。`url` は解析の前に制御文字・タブ・改行を黙って消すので、R-SEC-4 の文字の確かめは生の文字列で先にする。ssh・git は特別な scheme でないので host の大小とポートが残る。呼び出しの記録 (`call_log`) は検証の前の引数を書くので、資格情報の入った URL が残る。`get_item.md` と `search_items.md` は 2048 字の上限まで 10 字も無い。`project` のパスの制御文字の確かめ (R-SEC-4) がまだ無い
+- 利用者が決めたこと:
+  - (1) ホスト名に非 ASCII の文字があれば断り、punycode で書くよう案内する (似た文字の偽装を ask の確認画面や provenance で防ぐ)
+  - (2) git の crate の provenance は平らに並べる: `git` (正規化した URL)・`rev` (解決したコミット)・`ref` (指した branch・tag・refs/…)・`resolved_at`・`plaintext` (http・git のときだけ)。照会のツールの引数名とそろう
+  - (3) 外のツールの cargo に git の CLI を強いない (利用者の cargo の設定に従う。テストは設定で CLI を使う)
+- 聞かずに決めたこと (要件か下調べの推奨のとおり):
+  - E3a の間は、`git` を付けた呼び出しは外のツールも照会のツールも「(in a later version)」(検証はすべて効かせる)
+  - `git`・`rev`・`branch`・`tag` は `crate` を取るツールすべて (`list_crates` を除く。`resolve_version` も) にローカル機能の構成でだけ宣言し、説明は引数の説明に書く。ローカル機能の無い構成では宣言せず、渡されたら `invalid_argument` (黙って crates.io の crate を返さない)
+  - 正規化は cargo と同じ規則で scheme だけ残す (ssh・git の host の大小はそのまま)。query・fragment は断る (Cargo.lock の `git+URL?branch=x#commit` の形を貼られたら `branch`・`tag`・`rev` を案内)。cargo に渡すのは検証した URL のまま (正規化は鍵だけ)
+  - `git` と `version` (`crate@version`) は一緒に受けない (コミットが版を決める)。`git` と `project` も受けない。`git` には `crate` が要る (`crate` なしの検索にも付けられない)
+  - 呼び出しの記録では `git` の userinfo を伏せる (検証の前に書かれるため)。`project` のパスにも制御文字・双方向の制御文字・見えない書式文字の確かめを入れる (R-SEC-4)
+
 **E2b-3 (cdylib・呼び直し・オフラインのテスト。2026-10-22)**:
 
 - テスト (stdio): cdylib だけの lib のリリースを外のツールで作って引ける (計画の (e)。依存としての `cargo rustdoc -p` で通る)。build script が印のファイルを見て panic するリリースは `build_failed`、照会のツールはその失敗を返し続け、印を消して外のツールを呼び直すと作り直して引ける (R-WS-10。印のファイルは鍵に入らない)。オフラインで `.crate` がキャッシュに無ければ `offline_miss` で、ネットワークに何も問い合わせない

@@ -283,6 +283,33 @@ fn external_cases() -> Vec<Case> {
     cases
 }
 
+/// `git`, `rev`, `branch` and `tag` look up a crate of a git repository, which comes in M2e's
+/// E3b: until then, a stdio test (`git_arguments_are_checked_and_told_to_come`) checks that the
+/// tools take them.
+fn git_cases() -> Vec<Case> {
+    if !cfg!(feature = "local") {
+        return Vec::new();
+    }
+    let tools = [
+        "build_external_docs",
+        "crate_overview",
+        "get_item",
+        "list_implementors",
+        "list_impls",
+        "list_methods",
+        "list_module",
+        "resolve_version",
+        "search_items",
+    ];
+    tools
+        .into_iter()
+        .flat_map(|tool| {
+            ["git", "rev", "branch", "tag"]
+                .map(|argument| case(tool, argument, json!({}), Change::CheckedElsewhere))
+        })
+        .collect()
+}
+
 fn cases() -> Vec<Case> {
     let mut cases = item_cases();
     cases.extend(list_cases());
@@ -290,6 +317,7 @@ fn cases() -> Vec<Case> {
     cases.extend(project_cases());
     cases.extend(refresh_cases());
     cases.extend(external_cases());
+    cases.extend(git_cases());
     cases
 }
 

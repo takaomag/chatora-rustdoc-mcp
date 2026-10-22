@@ -227,31 +227,16 @@ pub(super) fn parse_arguments(
         },
     };
     if argument("crate").is_none() {
-        let target_example: &'static [&'static str] =
-            &[r#"pass a target triple, for example {"target": "x86_64-unknown-linux-gnu"}"#];
-        let target = match argument("target") {
-            None => None,
-            Some(Value::String(target)) => {
-                Some(target.trim().parse::<TargetTriple>().map_err(|error| {
-                    InvalidArgument::new(format!("`target` is not valid: {error}"), target_example)
-                })?)
-            },
-            Some(_) => {
-                return Err(InvalidArgument::new(
-                    "`target` must be a string",
-                    target_example,
-                ));
-            },
-        };
-        let project = match argument("project") {
-            None => None,
-            Some(Value::String(project)) => Some(PathBuf::from(project.trim())),
-            Some(_) => {
-                return Err(InvalidArgument::new("`project` must be a string", &[
-                    r#"pass the directory or the Cargo.toml of a workspace, for example {"project": "/home/me/app"}"#,
-                ]));
-            },
-        };
+        let (project, target) = get_item::parse_project_and_target(arguments)?;
+        // A crate of a git repository is named.
+        if get_item::parse_git(arguments)?.is_some() {
+            return Err(InvalidArgument::new(
+                "`git` needs `crate`: the package in the repository",
+                &[
+                    r#"pass the crate, for example {"crate": "foo", "git": "https://example.com/owner/foo"}"#,
+                ],
+            ));
+        }
         return Ok(SearchArguments::Dependencies {
             project,
             target,

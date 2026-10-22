@@ -49,6 +49,8 @@ pub(super) struct Arguments {
     project: Option<PathBuf>,
     /// The target asked for.
     target: Option<TargetTriple>,
+    /// The git repository of the crate, and its commit asked for (decided in M2e's E3).
+    git: Option<get_item::GitSpec>,
 }
 
 /// Definition of the tool for `tools/list`.
@@ -175,10 +177,21 @@ pub(super) fn parse_arguments(
             WHAT_EXAMPLE,
         ));
     }
+    let git = get_item::parse_git(arguments)?;
+    if git.is_some() {
+        let Some((_, version)) = &krate else {
+            return Err(InvalidArgument::new(
+                "`git` needs `crate`: the package in the repository",
+                WHAT_EXAMPLE,
+            ));
+        };
+        get_item::apart_from_git(version.as_ref(), project.as_deref())?;
+    }
     Ok(Arguments {
         krate,
         project,
         target,
+        git,
     })
 }
 
@@ -188,7 +201,14 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
         krate,
         project,
         target,
+        git,
     } = arguments;
+    if git.is_some() {
+        return not_yet(
+            "a crate of a git repository",
+            "look the crate up on docs.rs, without `git`",
+        );
+    }
     match (krate, project) {
         (None, Some(project)) => workspace(&state, &project, target.as_ref()).await,
         (Some((name, version)), None) => {
