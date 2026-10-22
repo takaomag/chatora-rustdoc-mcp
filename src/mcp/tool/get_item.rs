@@ -361,6 +361,28 @@ struct Here {
     /// The project's package of the release, which is built here when docs.rs has no JSON of it
     /// (requirements R-DS-3 and R-TG-1, decided in M2's D7).
     if_missing: Option<Box<IfMissing>>,
+    /// Whether docs.rs's JSON is of its default target for the crate, not of the request's: the
+    /// project builds for a target of its own, with its own std, and none was asked for
+    /// (requirement R-TG-1, decided in M2's D7).
+    docs_rs_default: bool,
+}
+
+impl Request {
+    /// The target of the JSON of docs.rs: `None` for its default target for the crate.
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "without local features, no project builds for a target of its own"
+        )
+    )]
+    const fn docs_rs_target(&self) -> Option<&TargetTriple> {
+        #[cfg(feature = "local")]
+        if self.here.docs_rs_default {
+            return None;
+        }
+        Some(&self.target)
+    }
 }
 
 /// The project's package of a release, to build here when docs.rs has no JSON of it (decided in
@@ -513,7 +535,12 @@ pub(super) fn provenance_schema() -> Value {
                 },
                 "required": ["source", "reason"],
             },
-            "target": { "type": "string" },
+            "target": {
+                "type": "string",
+                "description": "The target triple of the data. Absent while the JSON of the \
+                                default target of docs.rs for the crate is not read yet, for a \
+                                project that builds its own std.",
+            },
             "format_version": { "type": "integer" },
             "features": strings,
             "all_features": { "type": "boolean" },
@@ -546,8 +573,9 @@ pub(super) fn provenance_schema() -> Value {
             },
         },
         // Before the version is known, a response while it is fetched has no `version`, and may
-        // have no `source` (requirement R-OUT-9).
-        "required": ["crate", "target"],
+        // have no `source` (requirement R-OUT-9); before docs.rs's JSON of the default target is
+        // read, no `target` (decided in M2's D7).
+        "required": ["crate"],
     })
 }
 
@@ -1245,7 +1273,7 @@ fn member_request(
         until,
         here: Here {
             local: Some(LocalSource::Wanted(wanted)),
-            if_missing: None,
+            ..Here::default()
         },
     }
 }
@@ -1257,7 +1285,7 @@ fn member_request(
 async fn resolve(
     state: &ToolState,
     arguments: Arguments,
-    target: TargetTriple,
+    lookup: project::LookupTarget,
     mut warnings: Vec<Box<str>>,
     until: Instant,
 ) -> Result<(Request, Vec<Box<str>>), Box<CallToolResult>> {
@@ -1278,14 +1306,14 @@ async fn resolve(
         (spec, FromProject::default())
     } else {
         let in_project = project::version_in_project(state, &name, project.as_deref(), until).await;
-        decided_in_project(in_project, &name, &target, &mut warnings)?
+        decided_in_project(in_project, &name, &lookup.triple, &mut warnings)?
     };
     #[cfg(feature = "local")]
     if let Some(request) = member_in_project(
         state,
         (from_project.as_deref(), &spec, project.as_deref()),
         &name,
-        (&path, &target, &shape),
+        (&path, &lookup.triple, &shape),
         until,
         &mut warnings,
     )
@@ -1304,9 +1332,9 @@ async fn resolve(
     let checked_later = from_project.is_some() || same_release.is_some();
     #[cfg(not(feature = "local"))]
     let checked_later = false;
-    if !checked_later && let Some(version) = cached_exact(state, &name, &spec, &target) {
+    if !checked_later && let Some(version) = cached_exact(state, &name, &spec, lookup.docs_rs()) {
         return Ok((
-            cached_request(name, version, &path, target, shape, until),
+            cached_request(name, version, &path, lookup.triple, shape, until),
             warnings,
         ));
     }
@@ -1315,7 +1343,7 @@ async fn resolve(
         state,
         from_project.as_deref(),
         &name,
-        (&path, &target, &shape),
+        (&path, &lookup.triple, &shape),
         until,
         &mut warnings,
     )
@@ -1356,7 +1384,7 @@ async fn resolve(
         project_from: chosen.project_from,
         path,
         resolved_from: chosen.resolved_from,
-        target,
+        target: lookup.triple,
         shape,
         until,
         #[cfg(feature = "local")]
@@ -1532,11 +1560,11 @@ fn chosen_by(
     // The project's package, built here when docs.rs has no JSON of it; not from Cargo.lock
     // alone, which does not tell what to build (requirement R-VR-2, decided in M2's D7).
     let if_missing = |found: project::Found| Here {
-        local: None,
         if_missing: Some(Box::new(IfMissing {
             found,
             refresh: false,
         })),
+        ..Here::default()
     };
     if let Some(found) = from_project {
         let in_build = InBuild {
@@ -1607,12 +1635,12 @@ fn cached_exact(
     state: &ToolState,
     name: &CrateName,
     spec: &VersionSpec,
-    target: &TargetTriple,
+    target: Option<&TargetTriple>,
 ) -> Option<Version> {
     let VersionSpec::Exact(version) = spec else {
         return None;
     };
-    let dir = state.cache.docs_rs_dir(name, version, Some(target));
+    let dir = state.cache.docs_rs_dir(name, version, target);
     matches!(state.cache.docs_rs_source(&dir), Ok(Some(_))).then(|| version.clone())
 }
 
@@ -1883,19 +1911,26 @@ async fn look_up(
     if refresh {
         state.index.forget(&arguments.name);
     }
-    let (target, warnings) = match &arguments.target {
-        Some(target) => (target.clone(), Vec::new()),
-        None => project::default_target(&state, arguments.project.as_deref()).await,
-    };
+    let (target, warnings) = project::lookup_target(
+        &state,
+        arguments.target.as_ref(),
+        arguments.project.as_deref(),
+    )
+    .await;
     #[cfg_attr(
         not(feature = "local"),
         expect(unused_mut, reason = "only local features refresh the release")
     )]
-    let (mut arguments, warnings) = match resolve(&state, arguments, target, warnings, until).await
-    {
-        Ok(resolved) => resolved,
-        Err(error) => return *error,
-    };
+    let (mut arguments, warnings) =
+        match resolve(&state, arguments, target.clone(), warnings, until).await {
+            Ok(resolved) => resolved,
+            Err(error) => return *error,
+        };
+    // Of a lookup on docs.rs, not of a crate built here (decided in M2's D7).
+    #[cfg(feature = "local")]
+    if arguments.here.local.is_none() {
+        arguments.here.docs_rs_default = target.docs_rs_default;
+    }
     #[cfg(feature = "local")]
     if refresh {
         refresh_release(&state, &mut arguments).await;
@@ -1947,7 +1982,7 @@ async fn look_up_release(
             &state.cache,
             &arguments.name,
             &arguments.version,
-            &arguments.target,
+            arguments.docs_rs_target(),
         )
         .await
         && let Some(why) = no_json_why(&arguments, &ArchiveError::Load(error))
@@ -1973,9 +2008,11 @@ async fn look_up_release(
     {
         arguments.in_build.sets = feature_sets(state, &arguments, &mut warnings).await;
     }
-    let dir = state
-        .cache
-        .docs_rs_dir(&arguments.name, &arguments.version, Some(&arguments.target));
+    let dir = state.cache.docs_rs_dir(
+        &arguments.name,
+        &arguments.version,
+        arguments.docs_rs_target(),
+    );
     let looked_up = load_and_look_up(state, dir, arguments, &mut warnings).await;
     match looked_up {
         Ok((looked_up, arguments)) => conclude(state, looked_up, arguments, warnings).await,
@@ -2223,7 +2260,11 @@ async fn load_and_look_up(
     )]
     let mut arguments =
         match look_up_archived(state.cache.clone(), dir.clone(), Box::new(arguments)).await {
-            Some(Ok((looked_up, arguments))) => return Ok((looked_up, *arguments)),
+            Some(Ok((looked_up, arguments))) => {
+                #[cfg(feature = "local")]
+                tell_default_target(&arguments, &looked_up, warnings);
+                return Ok((looked_up, *arguments));
+            },
             Some(Err(arguments)) => *arguments,
             None => return Err(response(shutting_down())),
         };
@@ -2233,7 +2274,7 @@ async fn load_and_look_up(
         &state.docs_rs,
         &arguments.name,
         &arguments.version,
-        Some(&arguments.target),
+        arguments.docs_rs_target(),
         arguments.until,
     )
     .await
@@ -2259,12 +2300,41 @@ async fn load_and_look_up(
         (looked_up, arguments)
     });
     match task.await {
-        Ok(done) => Ok(done),
+        Ok((looked_up, arguments)) => {
+            #[cfg(feature = "local")]
+            tell_default_target(&arguments, &looked_up, warnings);
+            Ok((looked_up, arguments))
+        },
         Err(error) => {
             let error = crate::task::resume_if_panic(error);
             tracing::error!(%error, "the get_item lookup did not finish");
             Err(response(shutting_down()))
         },
+    }
+}
+
+/// Tells in `warnings` the target that docs.rs's JSON of the release of `arguments` is of, as
+/// `looked_up` has it, when it is of docs.rs's default target for the crate (requirement R-TG-2,
+/// decided in M2's D7).
+#[cfg(feature = "local")]
+fn tell_default_target(
+    arguments: &Request,
+    looked_up: &Result<Value, Failure>,
+    warnings: &mut Vec<Box<str>>,
+) {
+    if arguments.here.docs_rs_default
+        && let Ok(response) = looked_up
+        && let Some(target) = response
+            .pointer("/provenance/target")
+            .and_then(Value::as_str)
+    {
+        warnings.push(
+            format!(
+                "the rustdoc JSON of {} is for {target}, the default target of docs.rs for it",
+                release(arguments)
+            )
+            .into(),
+        );
     }
 }
 
@@ -2360,7 +2430,10 @@ fn docs_rs_provenance(arguments: &Request) -> Map<String, Value> {
     if let Some(fetched_at) = &arguments.index_fetched_at {
         provenance.insert("index_fetched_at".to_owned(), json!(fetched_at));
     }
-    provenance.insert("target".to_owned(), json!(arguments.target.as_str()));
+    // docs.rs's default target, which its JSON tells, is not known yet (decided in M2's D7).
+    if let Some(target) = arguments.docs_rs_target() {
+        provenance.insert("target".to_owned(), json!(target.as_str()));
+    }
     provenance
 }
 
@@ -2520,6 +2593,18 @@ async fn follow_into(
     match std {
         Some((krate, name)) if destination.is_std => {
             followed.push(shown_from(destination, origin, krate.as_str()));
+            // Not docs.rs's default target of the crate that re-exports it (decided in M2's D7).
+            #[cfg(feature = "local")]
+            if origin.here.docs_rs_default {
+                followed.push(
+                    format!(
+                        "std is read for the host's target, {}, which this server documents std \
+                         for, not for the project's target of its own",
+                        origin.target
+                    )
+                    .into(),
+                );
+            }
             let arguments = Arguments {
                 name,
                 version: None,
@@ -2782,7 +2867,11 @@ async fn destination_request(
         index_fetched_at,
         until: origin.until,
         #[cfg(feature = "local")]
-        here: Here::default(),
+        // docs.rs's default target, as the crate that re-exports it (decided in M2's D7).
+        here: Here {
+            docs_rs_default: origin.here.docs_rs_default,
+            ..Here::default()
+        },
     })
 }
 
@@ -2987,7 +3076,11 @@ async fn in_project_build_of(
             // The version is the project's, not the index's.
             index_fetched_at: None,
             until: origin.until,
-            here: Here::default(),
+            // docs.rs's default target, as the crate that re-exports it (decided in M2's D7).
+            here: Here {
+                docs_rs_default: origin.here.docs_rs_default,
+                ..Here::default()
+            },
         }),
         Box::new(package.clone()),
     ))
@@ -3689,7 +3782,7 @@ fn look_up_in(
         version: &arguments.version,
         path: &arguments.path,
         origin,
-        target: Some(arguments.target.as_str()),
+        target: arguments.docs_rs_target().map(TargetTriple::as_str),
         detail: arguments.shape.detail,
         project_features: arguments
             .in_build

@@ -3461,6 +3461,46 @@ fn a_project_for_a_target_of_its_own_is_not_built() {
             .contains("a target of its own"),
         "{found}"
     );
+    // Without a target, docs.rs's default target of the crate, which its JSON tells: here only
+    // in the cache's place for it, of a target that is not the host's.
+    let cache = Cache::at(server.cache.path());
+    let (name, version) = ("demo".parse().expect("a crate name"), Version::new(0, 1, 0));
+    let mut other = demo_crate();
+    other.target.triple = "aarch64-unknown-linux-gnu".to_owned();
+    cache
+        .write_docs_rs_json(
+            &cache.docs_rs_dir(&name, &version, None),
+            rustdoc_types::FORMAT_VERSION,
+            &serde_json::to_vec(&other).expect("serializes"),
+        )
+        .expect("the cache is writable");
+    let of_target = cache.docs_rs_dir(&name, &version, Some(&TARGET.parse().expect("a target")));
+    std::fs::remove_dir_all(of_target).expect("removed");
+    let found = built_item(&mut server, 2, &json!({ "crate": "demo", "path": "hello" }));
+    assert_ne!(found["isError"], true, "{found}");
+    let found = &found["structuredContent"];
+    assert_eq!(
+        found["provenance"]["target"], "aarch64-unknown-linux-gnu",
+        "{found}"
+    );
+    assert!(!found.to_string().contains("was asked for"), "{found}");
+    for told in [
+        "its default target there",
+        "is for aarch64-unknown-linux-gnu",
+    ] {
+        assert!(found["warnings"].to_string().contains(told), "{found}");
+    }
+    // So does the search of the dependencies, whose provenance has each crate's target only.
+    server.send(&call_tool(4, "search_items", json!({ "query": "hello" })));
+    let searched = server.response(4)["result"]["structuredContent"].clone();
+    assert!(searched["provenance"].get("target").is_none(), "{searched}");
+    assert_eq!(
+        searched["provenance"]["sources"][0]["target"], "aarch64-unknown-linux-gnu",
+        "{searched}"
+    );
+    server.send(&call_tool(3, "resolve_version", json!({ "crate": "demo" })));
+    let resolved = server.response(3)["result"]["structuredContent"].clone();
+    assert_eq!(resolved["data"]["docs_rs_json"], "available", "{resolved}");
     assert!(server.finish().success());
 }
 

@@ -22,7 +22,12 @@ use crate::data::{
     sparse_index::IndexEntry,
 };
 use crate::{
-    data::{crate_name::CrateName, target::TargetTriple, version::VersionSpec},
+    data::{
+        crate_name::CrateName,
+        docs_rs::FetchError,
+        target::TargetTriple,
+        version::VersionSpec,
+    },
     query::get_item::ResolvedFrom,
 };
 
@@ -189,10 +194,14 @@ async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallTool
     {
         state.index.forget(&arguments.name);
     }
-    let (target, mut warnings) = match &arguments.target {
-        Some(target) => (target.clone(), Vec::new()),
-        None => project::default_target(&state, arguments.project.as_deref()).await,
-    };
+    let (lookup, mut warnings) = project::lookup_target(
+        &state,
+        arguments.target.as_ref(),
+        arguments.project.as_deref(),
+    )
+    .await;
+    #[cfg(feature = "local")]
+    let target = lookup.triple.clone();
     let ReleaseArguments {
         name,
         version,
@@ -238,7 +247,7 @@ async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallTool
     {
         return not_from_crates_io(found, &target, &warnings);
     }
-    from_crates_io(&state, name, decided, &target, warnings).await
+    from_crates_io(&state, name, decided, &lookup, warnings).await
 }
 
 /// The answer for a version on crates.io.
@@ -246,9 +255,10 @@ async fn from_crates_io(
     state: &ToolState,
     name: CrateName,
     decided: Decided,
-    target: &TargetTriple,
+    lookup: &project::LookupTarget,
     mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
+    let target = &lookup.triple;
     let entry = match state.index.entry(&name).await {
         Ok(entry) => entry,
         Err(error) => return get_item::index_error(&state.cache, &name, &error),
@@ -283,7 +293,8 @@ async fn from_crates_io(
     #[cfg(not(feature = "local"))]
     let (resolved_from, project_from, on_docs_rs) = (by_argument, None::<&str>, true);
     let docs_rs_json = if on_docs_rs {
-        json_status(state, &published, &found.version, target, &mut warnings).await
+        let docs_rs = lookup.docs_rs();
+        json_status(state, &published, &found.version, docs_rs, &mut warnings).await
     } else {
         "not_on_docs_rs"
     };
@@ -381,13 +392,21 @@ async fn json_status(
     state: &ToolState,
     name: &CrateName,
     version: &Version,
-    target: &TargetTriple,
+    target: Option<&TargetTriple>,
     warnings: &mut Vec<Box<str>>,
 ) -> &'static str {
-    let dir = state.cache.docs_rs_dir(name, version, Some(target));
+    let dir = state.cache.docs_rs_dir(name, version, target);
     if matches!(state.cache.docs_rs_source(&dir), Ok(Some(_))) {
         return "available";
     }
+    // Without a target, of docs.rs's default target (decided in M2's D7).
+    let Some(target) = target else {
+        return match state.docs_rs.has_rustdoc_json(name, version).await {
+            Ok(true) => "available",
+            Ok(false) => "no_json",
+            Err(error) => unknown_json(name, version, &error, warnings),
+        };
+    };
     let asked = match state
         .docs_rs
         .has_rustdoc_json_for(name, version, target)
@@ -401,16 +420,25 @@ async fn json_status(
             .map(|any| if any { "no_target_json" } else { "no_json" }),
         Err(error) => Err(error),
     };
-    asked.unwrap_or_else(|error| {
-        warnings.push(
-            format!(
-                "whether docs.rs has rustdoc JSON of {name} {version} is not known: {}",
-                ErrorChain(&error)
-            )
-            .into(),
-        );
-        "unknown"
-    })
+    asked.unwrap_or_else(|error| unknown_json(name, version, &error, warnings))
+}
+
+/// `unknown`, with a warning of why whether docs.rs has rustdoc JSON of `name` at `version` is
+/// not known.
+fn unknown_json(
+    name: &CrateName,
+    version: &Version,
+    error: &FetchError,
+    warnings: &mut Vec<Box<str>>,
+) -> &'static str {
+    warnings.push(
+        format!(
+            "whether docs.rs has rustdoc JSON of {name} {version} is not known: {}",
+            ErrorChain(error)
+        )
+        .into(),
+    );
+    "unknown"
 }
 
 /// The response, with the provenance's absent values left out.

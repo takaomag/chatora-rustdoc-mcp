@@ -342,15 +342,18 @@ pub async fn remembered_no_json(
     cache: &Cache,
     name: &CrateName,
     version: &Version,
-    target: &TargetTriple,
+    target: Option<&TargetTriple>,
 ) -> Option<LoadError> {
-    let dir = cache.docs_rs_dir(name, version, Some(target));
+    let dir = cache.docs_rs_dir(name, version, target);
     let cache = cache.clone();
     let (kind, _) = blocking(move || read_miss(&cache, &dir)).await.ok()??;
     match kind {
-        MissKind::NoTarget => Some(LoadError::NoTargetJson {
-            target: target.clone(),
-        }),
+        MissKind::NoTarget => Some(target.map_or(
+            LoadError::Fetch(FetchError::NotFound),
+            |target| LoadError::NoTargetJson {
+                target: target.clone(),
+            },
+        )),
         MissKind::Missing | MissKind::NoSupportedFormat => {
             Some(LoadError::Fetch(FetchError::NotFound))
         },

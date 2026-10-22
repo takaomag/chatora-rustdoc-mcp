@@ -132,12 +132,19 @@ async fn build_sets(
 pub(super) async fn dependencies(
     state: Arc<ToolState>,
     project: Option<PathBuf>,
-    target: TargetTriple,
+    target: super::project::LookupTarget,
     detail: Detail,
     searching: Searching,
     mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
     let until = state.until();
+    // docs.rs's default target of each crate, for a project that builds for a target of its own
+    // (decided in M2's D7).
+    let docs_rs = target.docs_rs().cloned();
+    let super::project::LookupTarget {
+        triple: target,
+        docs_rs_default,
+    } = target;
     let (workspace, project_from) =
         match super::project::workspace(state.project.as_ref(), project.as_deref()) {
             Ok(Some(found)) => found,
@@ -158,7 +165,9 @@ pub(super) async fn dependencies(
         Joined::Ended => return get_item::stopped(),
         Joined::Going(doing) => {
             let mut provenance = Map::new();
-            provenance.insert("target".to_owned(), json!(target.as_str()));
+            if let Some(target) = &docs_rs {
+                provenance.insert("target".to_owned(), json!(target.as_str()));
+            }
             provenance.insert("project_from".to_owned(), json!(project_from.as_str()));
             return super::project::resolving(provenance, doing, &warnings);
         },
@@ -198,7 +207,7 @@ pub(super) async fn dependencies(
             outcome: Outcome::Going(Doing::Fetching),
         });
     }
-    let loaded = load_all(&state, loads, &target, until).await;
+    let loaded = load_all(&state, loads, docs_rs.as_ref(), until).await;
     for member in &mut members {
         if let Some(outcome) = loaded
             .iter()
@@ -214,6 +223,7 @@ pub(super) async fn dependencies(
     }
     let context = Context {
         target,
+        docs_rs_default,
         project_from: Some(project_from.as_str()),
         resolved_from: resolution_from(&resolution),
         sets,
@@ -301,6 +311,7 @@ pub(super) async fn std(
         .collect();
     let context = Context {
         target,
+        docs_rs_default: false,
         project_from: None,
         resolved_from: ResolvedFrom::Latest,
         #[cfg(feature = "local")]
@@ -324,6 +335,9 @@ struct StdContext {
 /// What the search of the scope shares.
 struct Context {
     target: TargetTriple,
+    /// Whether docs.rs's JSON of each crate is of its default target there, not of `target`
+    /// (decided in M2's D7).
+    docs_rs_default: bool,
     project_from: Option<&'static str>,
     resolved_from: ResolvedFrom,
     /// The project's builds, for `enabled_in_project`.
@@ -340,17 +354,17 @@ struct Context {
 async fn load_all(
     state: &Arc<ToolState>,
     releases: Vec<(CrateName, Version)>,
-    target: &TargetTriple,
+    target: Option<&TargetTriple>,
     until: Instant,
 ) -> Vec<(CrateName, Version, Outcome)> {
     let handles: Vec<_> = releases
         .into_iter()
         .map(|(name, version)| {
-            let (state, target) = (Arc::clone(state), target.clone());
+            let (state, target) = (Arc::clone(state), target.cloned());
             let (task_name, task_version) = (name.clone(), version.clone());
             // Aborted if the call is cancelled while it waits (requirement R-WS-6).
             let handle = super::AbortOnDrop::new(super::spawn(async move {
-                load_release(&state, &task_name, &task_version, &target, until).await
+                load_release(&state, &task_name, &task_version, target.as_ref(), until).await
             }));
             (name, version, handle)
         })
@@ -373,10 +387,10 @@ async fn load_release(
     state: &ToolState,
     name: &CrateName,
     version: &Version,
-    target: &TargetTriple,
+    target: Option<&TargetTriple>,
     until: Instant,
 ) -> Outcome {
-    let dir = state.cache.docs_rs_dir(name, version, Some(target));
+    let dir = state.cache.docs_rs_dir(name, version, target);
     let cache = state.cache.clone();
     let opened = crate::task::spawn_blocking(move || load::open_archived(&cache, &dir))
         .await
@@ -392,7 +406,7 @@ async fn load_release(
         &state.docs_rs,
         name,
         version,
-        Some(target),
+        target,
         until,
     )
     .await;
@@ -579,7 +593,7 @@ fn request_of<'a>(
         detail: context.detail,
         project_features: project_features(context, member),
         follow: false,
-        target: Some(context.target.as_str()),
+        target: (!context.docs_rs_default).then(|| context.target.as_str()),
     }
 }
 
@@ -587,7 +601,9 @@ fn request_of<'a>(
 /// (requirement R-OUT-9).
 fn provenance(context: &Context, sources: Vec<Value>) -> Value {
     let mut provenance = Map::new();
-    provenance.insert("target".to_owned(), json!(context.target.as_str()));
+    if !context.docs_rs_default {
+        provenance.insert("target".to_owned(), json!(context.target.as_str()));
+    }
     if let Some(project_from) = context.project_from {
         provenance.insert("project_from".to_owned(), json!(project_from));
     }
@@ -656,7 +672,9 @@ fn sources(
         let mut source = Map::new();
         source.insert("crate".to_owned(), json!(member.name.as_str()));
         source.insert("version".to_owned(), json!(member.version.to_string()));
-        source.insert("target".to_owned(), json!(context.target.as_str()));
+        if !context.docs_rs_default {
+            source.insert("target".to_owned(), json!(context.target.as_str()));
+        }
         match &member.outcome {
             Outcome::Loaded(_) => continue,
             Outcome::Failed(failure) => {

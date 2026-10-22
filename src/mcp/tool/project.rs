@@ -208,10 +208,82 @@ pub(super) async fn version_in_project(
     InProject::Elsewhere(warnings)
 }
 
-/// The target of a lookup that names none, with what the response warns about (requirement
-/// R-TG-1): the `build.target` of the project (the one `project` names, or the default one), the
-/// first of several; or else the host's.
+/// The target of a lookup of std that names none, with what the response warns about
+/// (requirement R-TG-1): the `build.target` of the project (the one `project` names, or the
+/// default one), the first of several; or else the host's, also for a project that builds for a
+/// target of its own, whose std this server does not document.
 pub(super) async fn default_target(
+    state: &ToolState,
+    project: Option<&Path>,
+) -> (TargetTriple, Vec<Box<str>>) {
+    let (target, mut warnings, own) = default_target_of(state, project).await;
+    if let Some(own) = own {
+        warnings.push(
+            format!(
+                "the project builds its own std, for a target of its own or with build-std \
+                 ({own}), which this server does not document, so the host's target is used"
+            )
+            .into(),
+        );
+    }
+    (target, warnings)
+}
+
+/// The target of a lookup, and of the rustdoc JSON of docs.rs for it (requirement R-TG-1).
+#[derive(Debug, Clone)]
+pub(super) struct LookupTarget {
+    /// The target asked for, or else the project's, or the host's.
+    pub(super) triple: TargetTriple,
+    /// Whether docs.rs's JSON of each crate is of its default target there: none was asked for,
+    /// and the project builds for a target of its own with its own std (decided in M2's D7).
+    pub(super) docs_rs_default: bool,
+}
+
+impl LookupTarget {
+    /// The target of the JSON of docs.rs: `None` for the default target of each crate there.
+    pub(super) fn docs_rs(&self) -> Option<&TargetTriple> {
+        (!self.docs_rs_default).then_some(&self.triple)
+    }
+}
+
+/// The target of a lookup that asks for `asked`, or for none in the project `project`
+/// (requirement R-TG-1), with what the response warns about: for a project that builds for a
+/// target of its own with its own std, docs.rs's default target of each crate, as its provenance
+/// tells (decided in M2's D7).
+pub(super) async fn lookup_target(
+    state: &ToolState,
+    asked: Option<&TargetTriple>,
+    project: Option<&Path>,
+) -> (LookupTarget, Vec<Box<str>>) {
+    if let Some(triple) = asked {
+        let target = LookupTarget {
+            triple: triple.clone(),
+            docs_rs_default: false,
+        };
+        return (target, Vec::new());
+    }
+    let (triple, mut warnings, own) = default_target_of(state, project).await;
+    if let Some(own) = &own {
+        warnings.push(
+            format!(
+                "the project builds its own std, for a target of its own or with build-std \
+                 ({own}), which docs.rs does not build for: the rustdoc JSON of each crate on \
+                 docs.rs is read for its default target there"
+            )
+            .into(),
+        );
+    }
+    let target = LookupTarget {
+        triple,
+        docs_rs_default: own.is_some(),
+    };
+    (target, warnings)
+}
+
+/// The target of a lookup that names none: the project's `build.target`, the first of several,
+/// or else the host's; with what the response warns about, and the target of its own, with its
+/// own std, that the project builds for instead, if any.
+async fn default_target_of(
     state: &ToolState,
     #[cfg_attr(
         not(feature = "local"),
@@ -221,11 +293,16 @@ pub(super) async fn default_target(
         )
     )]
     project: Option<&Path>,
-) -> (TargetTriple, Vec<Box<str>>) {
+) -> (TargetTriple, Vec<Box<str>>, Option<String>) {
     let mut warnings = Vec::new();
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(unused_mut, reason = "without local features, no project is read")
+    )]
+    let mut own = None;
     #[cfg(feature = "local")]
-    if let Some(target) = project_target(state, project, &mut warnings).await {
-        return (target, warnings);
+    if let Some(target) = project_target(state, project, &mut warnings, &mut own).await {
+        return (target, warnings, None);
     }
     let host = state.host().await;
     if let Some(why) = &host.stand_in_because {
@@ -237,7 +314,7 @@ pub(super) async fn default_target(
             .into(),
         );
     }
-    (host.triple.clone(), warnings)
+    (host.triple.clone(), warnings, own)
 }
 
 /// Whether the project at `root` sets `build.target` in cargo's settings (or `CARGO_BUILD_TARGET`):
@@ -341,12 +418,13 @@ fn targets_of(
 
 /// The project's `build.target`, as cargo's settings give it (Q-31), when it is a target this
 /// server documents: the first of several. A target of its own (a target JSON, or with
-/// `build-std`) is not yet: the host's is used, with a warning (decided in M2's B3b, until D7c).
+/// `build-std`) is not: it is put in `own`, for the caller to tell (decided in M2's D7).
 #[cfg(feature = "local")]
 async fn project_target(
     state: &ToolState,
     project: Option<&Path>,
     warnings: &mut Vec<Box<str>>,
+    own: &mut Option<String>,
 ) -> Option<TargetTriple> {
     let Ok(Some((workspace, _))) = workspace(state.project.as_ref(), project) else {
         return None;
@@ -368,14 +446,8 @@ async fn project_target(
     let host = state.host().await.triple.clone();
     let targets = match targets_of(&config, &host) {
         Ok(targets) => targets?,
-        Err(TargetsError::OwnTarget(own)) => {
-            warnings.push(
-                format!(
-                    "the project builds its own std, for a target of its own or with build-std \
-                     ({own}), which this server does not document yet, so the host's target is used"
-                )
-                .into(),
-            );
+        Err(TargetsError::OwnTarget(target)) => {
+            *own = Some(target);
             return None;
         },
         Err(TargetsError::NotATarget(why)) => {

@@ -1237,6 +1237,24 @@ Claude Code 2.1.304、Linux で測った。
 - レビュー (サブエージェント) の指摘は低だけ。直したもの: `build.target` の値の前後の空白を落としてから判定する。文言を「its own std, for a target of its own or with build-std」に (`build-std` と通常の triple の組み合わせにも当てはまるように)。古い doc コメント (`sets_build_target`・`Member::NotForTarget`)。`targets_of` の単体テストに、target でない値と target の JSON 仕様が混ざる配列 (JSON 仕様が勝つ) と空の配列
 - 残したもの (記録だけ): 環境変数 `CARGO_UNSTABLE_BUILD_STD` は読まない (cargo が受けるかは未確認)。stable のプロジェクトでも `$CARGO_HOME` の設定に `build-std` があれば `target_unsupported` (R-TG-1 の文言どおり)。`.json` を付けずに `RUST_TARGET_PATH` で名指しする独自の target と、member のディレクトリだけに `.cargo/config.toml` がある構成は判定の外 (前者はビルドの前の検査で `toolchain_missing`)。`cargo tree` の範囲 (`read_scope`) には判定を置いていない (呼び出し元はどれも判定の後)。`CARGO_BUILD_TARGET` で JSON 仕様を足す経路・`list_crates` と `crate` なしの検索の結合テストは無い
 
+**D7c-2 (`target` を省いた docs.rs の照会を既定の target に。2026-10-22)**:
+
+- 利用者が決めたこと: docs.rs を読むツールすべてで一度に (`get_item` の系統・`resolve_version` の `docs_rs_json`・`list_crates` の印・`crate` なしの検索)。std は配布物から読むので対象外 (host と warning のまま)
+- `project::lookup_target`: 照会の target (`LookupTarget`: target と、docs.rs をその crate の既定の target で読むか) と warning を返し、各ツールの「`target` が無ければ既定」の分岐をまとめた。独自の target のプロジェクトで `target` を省いたときだけ既定の target (決定 2)。std の照会は `default_target` (host と、独自の target なら host を使う warning)
+- `get_item`: 要求の `Here` に `docs_rs_default` を持たせ (`resolve` の後に付ける。re-export の行き先は起点から引き継ぐ)、docs.rs のキャッシュの置き場・読み込み・覚えた失敗・照会の target を `Request::docs_rs_target` (既定なら `None`) にした。照会に target を渡さないので、provenance の target は JSON の実際の triple、「頼まれた target と違う」warning は出ない。読む前の応答 (ビルド中) の provenance には target を載せない
+- `crate` なしの検索: 読み込みと照会の target を既定に、全体と読めなかった crate の provenance の target を省く (読めた crate の `sources` は JSON の triple。スキーマはレビューの後に必須を外した)
+- `resolve_version`: `docs_rs_json` は target の無い URL で確かめる (`available`・`no_json`)。出力スキーマが provenance の `target` を必須にしているので、そこは host のまま (warning で既定の target で調べたと示す)
+- `list_crates`: `docs_rs_json: cached` の印を既定の target の置き場で見る
+- テスト: 独自の target のテストに、`target` を省いた `get_item` が既定の target の置き場の JSON を読み (target の置き場を消しても)、provenance の target が JSON の triple で、既定の target の warning が付き、`resolve_version` の `docs_rs_json` が `available` になることを足した (印を外すと落ちる)
+- レビュー (サブエージェント) の指摘と直し:
+  - (1・2) `crate` なしの検索の応答 (全体と読めなかった crate の `sources`) と `get_item` 系統のビルド中の応答が、provenance の `target` を欠いて出力スキーマの必須に反した。利用者の決定: スキーマで必須を外す (`get_item` 系統の provenance は `crate` だけ、`crate` なしの検索の provenance は必須なし、`sources` は `crate`・`version`)。実際の triple が分からない (docs.rs の既定の target の JSON を読む前) ときだけ省き、分かれば載せる。説明文にその旨
+  - (3) 版を明示したときの近道 (`cached_exact`) が host の置き場を見ていた。`resolve` に `LookupTarget` を渡し、既定の target の置き場を見る
+  - (4) warning の「provenance が示す」は `resolve_version`・`list_crates` では事実と違った。文言から外し、`get_item` では読んだ後に実際の triple を warning にも書く (`tell_default_target`。R-TG-2)
+  - (5) std への re-export を辿ると host の std になる旨の warning が無かった。足した
+  - (6) テストの JSON の triple が Linux の host と同じで区別できなかった。`aarch64-unknown-linux-gnu` にし、provenance と warning にその値が出ること、`crate` なしの検索の provenance に `target` が無く `sources` に JSON の triple が載ることを足した (スキーマの必須を戻すと落ちる)。`real_data` の検証器の自己テストは、必須を欠く例を `target` から `crate` に変えた
+  - (7) 印 (`docs_rs_default`) をここでビルドする要求にも付けていた。docs.rs の照会だけに付ける
+- 残したもの: `resolve_version` と `list_crates` の provenance の `target` は host のまま (読む JSON が無い)。(8) `get_item` の cargo の解決中の応答には host の `target` が載り、`crate` なしの検索の解決中は省く (どちらもスキーマには合う)。`list_crates`・ビルド中の応答・refresh で既定の target の失敗を忘れることの結合テストは無い
+
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
 - 利用者の指示で、デッドロックと止まって戻らない危険を、コード全体で監査した (サブエージェント、読むだけ。D4b のハングの後)。ロックの循環、ガードを持ったままの `.await` (clippy の `await_holding_lock` も `suspicious` の deny で効いている)、自分の結果を待つ形の循環は無かった。止まって長く戻らない箇所は次のとおり

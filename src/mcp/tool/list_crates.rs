@@ -10,6 +10,7 @@ use super::{
     InvalidArgument,
     ToolState,
     list_module::{self, CURSOR_EXAMPLE, CURSOR_FORM},
+    project::lookup_target,
 };
 use crate::data::{
     cache::sha256_hex,
@@ -312,33 +313,32 @@ pub(super) async fn execute(mut arguments: Arguments, state: Arc<ToolState>) -> 
 /// [`execute`], forgetting what failed for the project first when it asks for `refresh`.
 async fn list(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
     let until = state.until();
+    let project = arguments.project.as_deref();
     // Of the workspace only, not of each crate (decided in M2's D5).
     if arguments.refresh {
-        super::local::refresh_project(&state, arguments.project.as_deref()).await;
+        super::local::refresh_project(&state, project).await;
     }
-    let (workspace, project_from) =
-        match super::project::workspace(state.project.as_ref(), arguments.project.as_deref()) {
-            Ok(Some(found)) => found,
-            Ok(None) => {
-                return super::tool_error(
-                    "project_not_found",
-                    "there is no project here whose crates to list",
-                    false,
-                    &[r#"pass the workspace, for example {"project": "/home/me/app"}"#],
-                );
-            },
-            Err(error) => return *error,
-        };
-    let (target, target_warnings) = match &arguments.target {
-        Some(target) => (target.clone(), Vec::new()),
-        None => super::project::default_target(&state, arguments.project.as_deref()).await,
+    let (workspace, project_from) = match super::project::workspace(state.project.as_ref(), project)
+    {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return super::tool_error(
+                "project_not_found",
+                "there is no project here whose crates to list",
+                false,
+                &[r#"pass the workspace, for example {"project": "/home/me/app"}"#],
+            );
+        },
+        Err(error) => return *error,
     };
+    let (lookup, target_warnings) = lookup_target(&state, arguments.target.as_ref(), project).await;
+    let target = &lookup.triple;
     let resolution = match state.resolver.resolve_until(&workspace, until).await {
         Joined::Done(Ok(resolution)) => resolution,
         Joined::Done(Err(error)) => return super::project::resolve_error(&workspace, &error),
         Joined::Ended => return super::get_item::stopped(),
         Joined::Going(doing) => {
-            let provenance = resolving_provenance(&workspace, project_from.as_str(), &target);
+            let provenance = resolving_provenance(&workspace, project_from.as_str(), target);
             return super::project::resolving(provenance, doing, &target_warnings);
         },
     };
@@ -356,14 +356,14 @@ async fn list(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
             "cargo_lock_raw"
         },
     };
-    let built_for = (&workspace, &target, until);
+    let built_for = (&workspace, target, until);
     let sets = build_sets(&state, built_for, resolved_from, &mut warnings).await;
     let graph = PackageGraph::new(&resolution);
     let context = Listing {
         graph: &graph,
         sets: sets.as_deref(),
         state: &state,
-        target: &target,
+        docs_rs: lookup.docs_rs(),
     };
     let crates = selected(&graph, &arguments);
     let listed: Vec<String> = graph
@@ -462,7 +462,9 @@ struct Listing<'a> {
     graph: &'a PackageGraph,
     sets: Option<&'a FeatureSets>,
     state: &'a ToolState,
-    target: &'a TargetTriple,
+    /// The target of the JSON of docs.rs, `None` for its default target of each crate (decided
+    /// in M2's D7).
+    docs_rs: Option<&'a TargetTriple>,
 }
 
 impl Listing<'_> {
@@ -506,7 +508,7 @@ impl Listing<'_> {
             let dir = self
                 .state
                 .cache
-                .docs_rs_dir(&name, &package.version, Some(self.target));
+                .docs_rs_dir(&name, &package.version, self.docs_rs);
             if matches!(self.state.cache.docs_rs_source(&dir), Ok(Some(_))) {
                 entry.insert("docs_rs_json".to_owned(), json!("cached"));
             }

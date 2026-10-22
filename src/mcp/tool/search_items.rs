@@ -151,7 +151,9 @@ fn output_schema() -> JsonObject {
         }
     }
     if let Some(fields) = source.as_object_mut() {
-        fields.insert("required".to_owned(), json!(["crate", "version", "target"]));
+        // Without `target` before docs.rs's JSON of the default target is read (decided in M2's
+        // D7).
+        fields.insert("required".to_owned(), json!(["crate", "version"]));
     }
     let mut provenance = get_item::provenance_schema();
     if let Some(properties) = provenance
@@ -164,7 +166,7 @@ fn output_schema() -> JsonObject {
         );
     }
     if let Some(fields) = provenance.as_object_mut() {
-        fields.insert("required".to_owned(), json!(["target"]));
+        fields.remove("required");
     }
     object(json!({
         "type": "object",
@@ -412,10 +414,8 @@ pub(super) async fn execute(arguments: SearchArguments, state: Arc<ToolState>) -
             }
             #[cfg(not(feature = "local"))]
             let _ = refresh;
-            let (target, warnings) = match target {
-                Some(target) => (target, Vec::new()),
-                None => super::project::default_target(&state, project.as_deref()).await,
-            };
+            let (target, warnings) =
+                super::project::lookup_target(&state, target.as_ref(), project.as_deref()).await;
             let result = dependencies(state, project, target, detail, searching, warnings).await;
             #[cfg(feature = "local")]
             super::local::refresh_told(&scope, &result);
@@ -429,7 +429,7 @@ pub(super) async fn execute(arguments: SearchArguments, state: Arc<ToolState>) -
 async fn dependencies(
     state: Arc<ToolState>,
     project: Option<PathBuf>,
-    target: TargetTriple,
+    target: super::project::LookupTarget,
     detail: Detail,
     searching: Searching,
     warnings: Vec<Box<str>>,
@@ -446,7 +446,7 @@ async fn dependencies(
 async fn dependencies(
     _state: Arc<ToolState>,
     _project: Option<PathBuf>,
-    _target: TargetTriple,
+    _target: super::project::LookupTarget,
     _detail: Detail,
     _searching: Searching,
     _warnings: Vec<Box<str>>,
