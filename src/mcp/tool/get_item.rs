@@ -906,7 +906,7 @@ async fn in_member(
             (found.resolved_from, found.project_from, &found.workspace),
             until,
         )),
-        Member::Unknown(error) => Err(error),
+        Member::Unknown(error) | Member::NotForTarget(error) => Err(error),
         Member::Resolving(doing) => Err(Box::new(project::resolving_crate(
             name,
             target,
@@ -946,7 +946,7 @@ async fn dependency_request(
             (found.resolved_from, found.project_from, &found.workspace),
             until,
         )),
-        Member::Unknown(error) => Err(error),
+        Member::Unknown(error) | Member::NotForTarget(error) => Err(error),
         Member::Resolving(doing) => Err(Box::new(project::resolving_crate(
             name,
             target,
@@ -1021,6 +1021,8 @@ async fn explicit_member(
             warnings,
         ))),
         // Not told while cargo resolves, nor when it fails: the release is looked up as asked.
+        // The member of that version, which is not built for the target (decided in M2's D7).
+        Ok(Member::NotForTarget(error)) => Err(error),
         Ok(Member::Not | Member::Unknown(_) | Member::Resolving(_)) | Err(_) => Ok(None),
     }
 }
@@ -2662,7 +2664,7 @@ async fn built_here_destination(
             request.hops = origin.hops.saturating_add(1);
             Ok(request)
         },
-        Member::Unknown(error) => Err(error),
+        Member::Unknown(error) | Member::NotForTarget(error) => Err(error),
         Member::Resolving(doing) => Err(Box::new(project::resolving_crate(
             &name,
             &origin.target,

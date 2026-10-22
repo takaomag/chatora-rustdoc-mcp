@@ -108,6 +108,10 @@ pub(super) enum Member {
     /// A member's crate, whose build cargo is still planning past the deadline of the call: it
     /// reads the features of the project's build (`cargo tree`), as this says.
     Planning(Doing),
+    /// A member's crate or a dependency, which is not built for the target asked for, as the
+    /// project does not build for it: the error to return (requirement R-MCP-3, decided in M2's
+    /// D7).
+    NotForTarget(Box<CallToolResult>),
 }
 
 /// What the crate `name`, as `asked`, is in `workspace`, to build for `target`, waiting for
@@ -148,6 +152,13 @@ pub(super) async fn member(
         return Ok(Member::Not);
     };
     let root = &workspace.root;
+    let targets = project::build_targets(state, root).await;
+    if !targets.contains(target) {
+        let what = format!("{} {}", package.name, package.version);
+        return Ok(Member::NotForTarget(Box::new(other_target(
+            &what, target, &targets,
+        ))));
+    }
     // The member's features in the build of the whole workspace, as rust-analyzer checks it and
     // `enabled_in_project` tells (requirement R-FT-3, decided in M2's D3), or else cargo's default.
     let (features, mut warnings) = match features_of(state, workspace, target, package, until).await
@@ -286,15 +297,35 @@ pub(super) async fn dependency(
         return Ok(Member::Not);
     };
     let what = format!("{} {}", found.name, found.version);
+    // For a target that the project builds for; or for the host, what the project's build builds
+    // for the host, as a build or proc-macro dependency, by the scope of a target that it builds
+    // for (requirement R-MCP-3, decided in M2's D7).
+    let targets = project::build_targets(state, &workspace.root).await;
+    let host = state.host().await.triple.clone();
+    let not_for_target = || {
+        Ok(Member::NotForTarget(Box::new(other_target(
+            &what, target, &targets,
+        ))))
+    };
+    let scope_target = match targets.first() {
+        _ if targets.contains(target) => target,
+        Some(first) if *target == host => first,
+        Some(_) | None => return not_for_target(),
+    };
     // Whether `-p` can name it for the target (requirement R-WS-5).
-    let built_for = match state.resolver.scope_until(workspace, target, until).await {
+    let target_built = match state
+        .resolver
+        .scope_until(workspace, scope_target, until)
+        .await
+    {
         Joined::Done(Ok(scope)) => match scope.buildable(&found.id) {
+            Buildable::ForTarget if scope_target != target => return not_for_target(),
             Buildable::ForTarget => target.clone(),
             // For the host, which the project's build builds it for (decided in M2's D7). The
             // response warns that the data is not for the target asked for, as for a proc macro.
-            Buildable::ForHost => state.host().await.triple.clone(),
+            Buildable::ForHost => host.clone(),
             Buildable::Unnameable => return Err(Box::new(build_unsupported(&what))),
-            Buildable::NotBuilt => return Err(Box::new(not_built_for(&what, target))),
+            Buildable::NotBuilt => return Err(Box::new(not_built_for(&what, scope_target))),
         },
         Joined::Done(Err(error)) => return Err(Box::new(scope_unknown(&what, &error))),
         Joined::Ended => return Err(Box::new(get_item::stopped())),
@@ -323,7 +354,7 @@ pub(super) async fn dependency(
     Ok(Member::Is {
         wanted: Box::new(LocalWanted {
             plan,
-            target: built_for,
+            target: target_built,
             project_sets_target: project::sets_build_target(state, root).await,
             cargo_home: state.resolver.cargo_home().map(Path::to_path_buf),
             docs_rs_features: None,
@@ -334,6 +365,35 @@ pub(super) async fn dependency(
         }),
         package: found.name.clone(),
     })
+}
+
+/// `docs_unavailable` for `what`, which is not built here for `target`, as the project builds for
+/// `targets`: a build for another target would run what the project's own build does not, as the
+/// build scripts of the dependencies for that target (requirement R-MCP-3, decided in M2's D7,
+/// for a member too).
+fn other_target(what: &str, target: &TargetTriple, targets: &[TargetTriple]) -> CallToolResult {
+    let names: Vec<&str> = targets.iter().map(TargetTriple::as_str).collect();
+    let give = match names.as_slice() {
+        [one] => format!("give {one} as \"target\", or leave it out"),
+        several => format!(
+            "give one of {} as \"target\", or leave it out",
+            several.join(", ")
+        ),
+    };
+    error_result(&json!({
+        "code": "docs_unavailable",
+        "message": format!(
+            "{what} is not built here for {target}: the project builds for {}, and a build for \
+             another target would run what the project's build does not",
+            names.join(", ")
+        ),
+        "retryable": false,
+        "suggestions": [
+            give,
+            "document it for another target with build_external_docs (in a later version)",
+        ],
+        "reason": "no_json",
+    }))
 }
 
 /// `docs_unavailable` with `build_unsupported` for the dependency `what`, which `cargo rustdoc -p`

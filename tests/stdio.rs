@@ -2008,20 +2008,23 @@ fn a_path_dependency_is_built_here_with_its_public_items() {
 }
 
 /// With the feature resolver 1, a build dependency is built, for the host, which the project
-/// builds it for (decided in M2's D7).
+/// builds it for; a member or a dependency is not built for a target that the project does not
+/// build for (requirement R-MCP-3, decided in M2's D7).
 #[cfg(feature = "local")]
 #[test]
 fn a_build_dependency_is_built_for_the_host() {
     let dir = path_dependencies("1");
+    std::fs::create_dir_all(dir.path().join("ws/.cargo")).expect("made");
+    std::fs::write(
+        dir.path().join("ws/.cargo/config.toml"),
+        "[build]\ntarget = \"wasm32-unknown-unknown\"\n",
+    )
+    .expect("written");
     let mut server = Server::start_in(Some(&dir.path().join("ws")));
     let for_host = built_item(
         &mut server,
         1,
-        &json!({
-            "crate": "buildonly",
-            "path": "build_helper",
-            "target": "wasm32-unknown-unknown",
-        }),
+        &json!({ "crate": "buildonly", "path": "build_helper" }),
     );
     assert_ne!(for_host["isError"], true, "{for_host}");
     assert!(
@@ -2030,7 +2033,55 @@ fn a_build_dependency_is_built_for_the_host() {
             .contains("wasm32-unknown-unknown was asked for, but the data is for"),
         "{for_host}"
     );
+    // Asked for the host, it is built too, as what the project's build builds for the host.
+    let host = host_triple();
+    let asked_host = built_item(
+        &mut server,
+        50,
+        &json!({ "crate": "buildonly", "path": "build_helper", "target": host }),
+    );
+    assert_ne!(asked_host["isError"], true, "{asked_host}");
+    // Not a member, nor a dependency for the target, for another target: nor the member of the
+    // version given, which is not taken for a release of crates.io of its name.
+    for (id, krate, target) in [
+        (100, "libdep", "x86_64-unknown-none"),
+        (200, "app", "x86_64-unknown-none"),
+        (300, "app@0.1.0", "x86_64-unknown-none"),
+        (400, "libdep", host.as_str()),
+    ] {
+        let other = built_item(
+            &mut server,
+            id,
+            &json!({ "crate": krate, "path": "Shown", "target": target }),
+        );
+        assert_eq!(other["isError"], true, "{other}");
+        let error = text_json(&other);
+        assert_eq!(error["reason"], "no_json", "{krate} {target}: {other}");
+        assert_eq!(error["retryable"], false, "{other}");
+        assert!(
+            error
+                .to_string()
+                .contains("the project builds for wasm32-unknown-unknown"),
+            "{other}"
+        );
+    }
     assert!(server.finish().success());
+}
+
+/// The host's target, as `rustc -vV` tells it.
+#[cfg(feature = "local")]
+fn host_triple() -> String {
+    let output = Command::new("rustc")
+        .arg("-vV")
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .output()
+        .expect("rustc runs");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("rustc tells the host")
+        .to_owned()
 }
 
 /// In a new temporary directory, the git repository `repo/` with the package `dep` on its branch

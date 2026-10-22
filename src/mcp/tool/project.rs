@@ -18,7 +18,7 @@ use crate::data::flight::{Doing, Joined};
 #[cfg(feature = "local")]
 use crate::data::{
     cargo::{Failure, GitFetchFailure},
-    cargo_config,
+    cargo_config::{self, CargoConfig},
     metadata::{CargoError, Resolution, ResolveError},
     packages::{Candidate, Lookup, PackageGraph, ProjectPackage},
     project::{self, DefaultProject, ProjectFrom, Workspace},
@@ -246,22 +246,99 @@ pub(super) async fn default_target(
 /// M2's D2).
 #[cfg(feature = "local")]
 pub(super) async fn sets_build_target(state: &ToolState, root: &Path) -> bool {
+    read_cargo_config(state, root)
+        .await
+        .is_some_and(|config| config.is_ok_and(|config| config.build_target.is_some()))
+}
+
+/// The targets that the project at `root` builds for (requirement R-MCP-3): its `build.target`,
+/// all of several, or else the host's. A target of its own is not documented yet, and the host's
+/// is taken for it, as for a lookup without a target (decided in M2's B3b, until D7c); so is a
+/// setting that cannot be read, or that has a value that is not a target.
+#[cfg(feature = "local")]
+pub(super) async fn build_targets(state: &ToolState, root: &Path) -> Vec<TargetTriple> {
+    let host = state.host().await.triple.clone();
+    match read_cargo_config(state, root).await {
+        Some(Ok(config)) => match targets_of(&config, &host) {
+            Ok(Some(targets)) => targets,
+            Ok(None) | Err(_) => vec![host],
+        },
+        Some(Err(_)) | None => vec![host],
+    }
+}
+
+/// The cargo settings of the project at `root`, with `CARGO_BUILD_TARGET` of the server's
+/// environment, which cargo that the server starts sees. `None` when the read did not end.
+#[cfg(feature = "local")]
+async fn read_cargo_config(
+    state: &ToolState,
+    root: &Path,
+) -> Option<Result<CargoConfig, cargo_config::ConfigError>> {
     let (root, home) = (
         root.to_path_buf(),
         state.resolver.cargo_home().map(Path::to_path_buf),
     );
     let env = std::env::var("CARGO_BUILD_TARGET").ok();
-    crate::task::spawn_blocking(move || {
-        cargo_config::read(&root, home.as_deref(), env.as_deref())
-            .is_ok_and(|config| config.build_target.is_some())
-    })
-    .await
-    .unwrap_or(false)
+    crate::task::spawn_blocking(move || cargo_config::read(&root, home.as_deref(), env.as_deref()))
+        .await
+        .ok()
+}
+
+/// The targets of `build.target` of `config`, with `host-tuple` for `host`, as cargo 1.91 and
+/// later take it; `None` when it is not set. The error tells why the host's target is used
+/// instead: a target of its own, which this server does not document yet, or a value that is not
+/// a target.
+#[cfg(feature = "local")]
+fn targets_of(
+    config: &CargoConfig,
+    host: &TargetTriple,
+) -> Result<Option<Vec<TargetTriple>>, String> {
+    let Some(build_target) = &config.build_target else {
+        return Ok(None);
+    };
+    let Some(first) = build_target.first() else {
+        return Ok(None);
+    };
+    if config.build_std
+        || build_target
+            .all()
+            .iter()
+            .any(|target| is_target_json(target))
+    {
+        return Err(format!(
+            "the project builds for a target of its own ({first}) with its own std, which this \
+             server does not document yet, so the host's target is used"
+        ));
+    }
+    build_target
+        .all()
+        .iter()
+        .map(|target| {
+            if target == "host-tuple" {
+                return Ok(host.clone());
+            }
+            target.parse().map_err(|error| {
+                format!(
+                    "build.target {target:?} of the project is not a target ({error}), so the \
+                     host's is used"
+                )
+            })
+        })
+        .collect::<Result<_, _>>()
+        .map(Some)
+}
+
+/// Whether `target`, of `build.target`, is the path of a target JSON.
+#[cfg(feature = "local")]
+fn is_target_json(target: &str) -> bool {
+    Path::new(target)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
 }
 
 /// The project's `build.target`, as cargo's settings give it (Q-31), when it is a target this
-/// server documents. A target of its own (a target JSON, or with `build-std`) is not yet: the
-/// host's is used, with a warning (decided in M2's B3b, until D7).
+/// server documents: the first of several. A target of its own (a target JSON, or with
+/// `build-std`) is not yet: the host's is used, with a warning (decided in M2's B3b, until D7c).
 #[cfg(feature = "local")]
 async fn project_target(
     state: &ToolState,
@@ -271,16 +348,7 @@ async fn project_target(
     let Ok(Some((workspace, _))) = workspace(state.project.as_ref(), project) else {
         return None;
     };
-    let root = workspace.root.clone();
-    let home = state.resolver.cargo_home().map(Path::to_path_buf);
-    // cargo, which the server starts, sees the server's environment.
-    let env = std::env::var("CARGO_BUILD_TARGET").ok();
-    let read = crate::task::spawn_blocking(move || {
-        cargo_config::read(&root, home.as_deref(), env.as_deref())
-    })
-    .await
-    .ok()?;
-    let config = match read {
+    let config = match read_cargo_config(state, &workspace.root).await? {
         Ok(config) => config,
         Err(error) => {
             warnings.push(
@@ -294,43 +362,28 @@ async fn project_target(
             return None;
         },
     };
-    let build_target = config.build_target?;
-    let first = build_target.first()?;
-    let is_json = |target: &String| {
-        Path::new(target)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    let host = state.host().await.triple.clone();
+    let targets = match targets_of(&config, &host) {
+        Ok(targets) => targets?,
+        Err(why) => {
+            warnings.push(why.into());
+            return None;
+        },
     };
-    if config.build_std || build_target.all().iter().any(is_json) {
-        warnings.push(
-            format!(
-                "the project builds for a target of its own ({first}) with its own std, which \
-                 this server does not document yet, so the host's target is used"
-            )
-            .into(),
-        );
-        return None;
-    }
-    let Ok(target) = first.parse::<TargetTriple>() else {
-        warnings.push(
-            format!("build.target {first:?} of the project is not a target, so the host's is used")
-                .into(),
-        );
-        return None;
-    };
-    if let [_, others @ ..] = build_target.all()
+    if let [first, others @ ..] = targets.as_slice()
         && !others.is_empty()
     {
+        let all: Vec<&str> = targets.iter().map(TargetTriple::as_str).collect();
         warnings.push(
             format!(
                 "the project builds for several targets ({}); {first} is used: pass `target` for \
                  another",
-                build_target.all().join(", ")
+                all.join(", ")
             )
             .into(),
         );
     }
-    Some(target)
+    targets.into_iter().next()
 }
 
 /// The workspace to read and where it came from: the one `project` names, or the default
@@ -570,6 +623,62 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn the_targets_of_build_target_are_its_values_with_host_tuple_for_the_host() {
+        use crate::data::cargo_config::BuildTarget;
+        let host: TargetTriple = "x86_64-unknown-linux-gnu".parse().expect("a target");
+        let with = |build_target: Option<BuildTarget>, build_std: bool| CargoConfig {
+            build_target,
+            build_std,
+            ..CargoConfig::default()
+        };
+        let several = |targets: &[&str]| {
+            Some(BuildTarget::Several(
+                targets.iter().map(|&target| target.to_owned()).collect(),
+            ))
+        };
+        let names = |targets: Vec<TargetTriple>| -> Vec<String> {
+            targets
+                .iter()
+                .map(|target| target.as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(targets_of(&with(None, false), &host), Ok(None));
+        let found = targets_of(
+            &with(several(&["host-tuple", "wasm32-unknown-unknown"]), false),
+            &host,
+        )
+        .map(|targets| targets.map(names));
+        assert_eq!(
+            found,
+            Ok(Some(vec![
+                "x86_64-unknown-linux-gnu".to_owned(),
+                "wasm32-unknown-unknown".to_owned(),
+            ]))
+        );
+        let one = Some(BuildTarget::One("wasm32-unknown-unknown".to_owned()));
+        assert_eq!(
+            targets_of(&with(one.clone(), false), &host).map(|targets| targets.map(names)),
+            Ok(Some(vec!["wasm32-unknown-unknown".to_owned()]))
+        );
+        // The host's is used for each of these, with why.
+        for (config, why) in [
+            (with(one, true), "a target of its own"),
+            (
+                with(several(&["wasm32-unknown-unknown", "my.JSON"]), false),
+                "a target of its own",
+            ),
+            (
+                with(several(&["wasm32-unknown-unknown", "no target"]), false),
+                "is not a target",
+            ),
+        ] {
+            let error = targets_of(&config, &host).expect_err("the host's");
+            assert!(error.contains(why), "{error}");
+        }
+    }
 
     /// A directory with a package `name` in it.
     fn package(dir: &Path, name: &str) {

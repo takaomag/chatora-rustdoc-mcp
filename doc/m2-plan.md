@@ -1137,6 +1137,40 @@ Claude Code 2.1.304、Linux で測った。
   - member をやめて path 依存にした直後、期限を過ぎた呼び出しは前回の member のビルド (`private: true`) を返す (D4c の決定どおり、ビルドし直すまでの間だけ)
 - 残したもの: 別レジストリの依存の結合テストは無い (path・git と同じ道を通る)。checksum の不一致と `no_target_json` は D7b、`crate` なしの検索の `local_build_required` は D7d
 
+**D7b の下調べと決定 (2026-10-22)**:
+
+- 下調べ (サブエージェント、読むだけ): checksum の不一致・checksum 無し・index に無い版 (`DocsRsCheck`) は、`get_item` 系の `resolve` で `local_build_required` (crate を引くほかのツールも `get_item::execute` を通るのでここで決まる)。プロジェクトの crates.io の package の crate が index に無い (私的なミラー) と `crate_not_found` で、`NotInIndex` に届かない。re-export の行き先 (`InProjectBuild::Release`) と `crate` なしの検索 (`search_across::dependencies`) は照合せず、合わない写しを黙って docs.rs の版で見せる (R-VR-2 に反する)。`no_target_json` は docs.rs の読み込み (`load_error_of`) で `docs_unavailable` になり、プロジェクトの依存かを区別しない (`Request` はプロジェクトの package を持たない)。要件 §5.1・R-DS-3 は `no_json` (2025-05-23 より前・docs.rs のビルドの失敗・対応しない形式) もローカルビルドで補うと求める。Cargo.lock の版 1 は checksum を `[metadata]` に持ち、今は読まないので crates.io の package がすべて `NoChecksum`。D7a の依存のビルドも渡された target でビルドする (R-MCP-3 の判定が無い)。`build.prefer_local` (R-DS-1) は実装が無い
+- 利用者が決めたこと:
+  1. 戻す範囲: `no_target_json` に加え `no_json` (2025-05-23 より前・docs.rs のビルドの失敗・対応しない形式) もローカルビルドで補う。`unparsable`・`too_large`・`version_mismatch` は今のまま
+  2. 戻す時点: docs.rs の読み込みが失敗した後 (`Request` にプロジェクトの package を持たせる)。docs.rs に聞く回数は今と同じ。覚えている失敗は `.crate` の取得の前に見て、無駄な取得を省く
+  3. 対象: プロジェクトが版を決めたもの (`cargo_lock`)、そこからの re-export の行き先、`crate@version` で明示した版がプロジェクトの依存と同じもの (計画では D7d だった分を含める)。`cargo_lock_raw` はビルドしない (R-VR-2)
+  4. target の制限: D7c の「実際のビルド target か」の判定だけを D7b に前倒しし、依存の計画の共通の入口に置く (D7a の path・git も正しくなる)。独自の target の `target_unsupported` と docs.rs の既定の target は D7c
+  5. `NoChecksum`: Cargo.lock の版 1 の `[metadata]` の checksum も読み、本当に無いものだけローカルビルドに (cargo が版 1 を `--locked` で受けるかは実装で実測)
+  6. index に無い: TTL を無視して 1 回読み直し、それでも版が無ければローカルビルド。crate 自体が無い (私的なミラー) ときもローカルビルド。オフライン・通信の失敗で読めないときは今のまま (`offline_miss`・`network_error`、残りとして記録)
+  7. 戻した後にビルドが失敗したら、ビルドの失敗 (`build_failed` など) を返し、失敗の記録と refresh (D5) に乗せる。docs.rs にあるもの (既定の target の JSON など) を message か suggestions に足す
+  8. 知らせ方: provenance は D7a のまま (`source: local`・`package_source: crates.io`)、理由は warnings に 1 行。スキーマは増やさない
+  9. re-export の行き先: 起点がローカルのビルドなら index で照合し、合わなければ依存としてローカルでビルド。起点が docs.rs の crate なら今のまま docs.rs を使い warning を付ける
+  10. `crate` なしの検索の照合とローカルビルドは D7d でまとめて (並列度・`sources` の `building` と)。それまで合わない依存を docs.rs で検索することを残りとして記録
+  11. `build.prefer_local` (R-DS-1) は M2 の後に回し、記録だけ
+- 段の分け方 (聞かずに決めたこと): D7b-1 (実際のビルド target の判定。決定 4)、D7b-2 (checksum の照合。決定 5・6・9)、D7b-3 (docs.rs の失敗と明示した版。決定 1・2・3・7・8)
+- 利用者が決めたこと (続き):
+  12. D7b-1 の判定は member にも当てる (R-MCP-3 のとおり。member を他の target で見る手段は外のツール (M2e) までなくなる)
+- 実測 (rustc・cargo 1.99.1、オフライン、cargo home はテスト用): vendor (`replace-with` で directory source) の crates.io の package は、`cargo metadata` の id が `registry+https://github.com/rust-lang/crates.io-index#demo@0.1.0` のままで、`cargo rustdoc --locked -p <その id>` が vendor の中身を文書化する。Cargo.lock の checksum は vendor の `.cargo-checksum.json` の `package` の値。Cargo.lock の版 1 (`version` の行が無く、checksum は `[metadata]` の `"checksum <name> <version> (<source>)"`) は、`cargo metadata --locked`・`cargo rustdoc --locked` とも受け、Cargo.lock を書き換えない
+
+**D7b-1 (実際のビルド target の判定。2026-10-22)**:
+
+- `project::build_targets`: プロジェクトの実際のビルド target。cargo の設定の `build.target` (配列ならそのすべて)、無ければ host (サーバーのキャッシュのディレクトリでの `rustc -vV`)。独自の target (target JSON・`build-std`) と読めない設定は、`target` を省いた照会と同じく host とみなす (D7c まで)
+- `local::built_for`: member の計画 (`local::member`、member と決まった後) と依存の計画 (`local::dependency`) の入口で、頼まれた target が実際のビルド target のどれでもなければビルドせず、`docs_unavailable`・`reason: no_json`・`retryable: false` (実際のビルド target の一覧と、外のツール (後の版) の案内)。member でない crate (`crate@version` の docs.rs の照会など) は止めない
+- テスト: stdio の build-dependency のテストを、プロジェクトの `build.target` を `wasm32-unknown-unknown` にして `target` を省く形に改め (host 用の依存は host でビルドし、データの target が違う旨の warning)、`x86_64-unknown-none` では path 依存も member もビルドしないことを足した
+- レビュー (サブエージェント) の指摘と直し:
+  1. `crate@version` で明示した版の member が他の target で止められると、`explicit_member` がその `Err` を握りつぶし、crates.io の同じ名前の別物の照会に化けた (テストでは crates.io の `app` の `version_not_found`)。`Member::NotForTarget` を足し、明示した版の経路ではそのエラーを返す
+  2. cargo 1.91 から `build.target` に書ける `"host-tuple"` (host の triple に置き換わる) を文字どおりの target として扱っていた (前からの `project_target` も)。`build.target` の解析を `targets_of` にまとめ、`host-tuple` を host にする。`build_targets`・`project_target`・`sets_build_target` は設定を同じ関数 (`read_cargo_config`) で読む
+  3. 解析できない要素があるとき、判定 (残りを使う) と既定の target (host) が食い違った。`targets_of` は 1 つでも解析できなければ全体を host とみなす
+  4. build-dependency・proc-macro の依存を host を明示して引くと止めていた。host が実際のビルド target でないときは、実際のビルド target (先頭) の範囲で host 用 (`ForHost`) のものだけ通す
+  5. 文言: target が 1 つのときの案内を「give <target> as "target"」に。同じ名前の変数が関数を隠していたのを改名
+  6. テスト: `targets_of` の単体テスト (配列・`host-tuple`・target JSON・build-std・target でない値)。stdio に、host を明示した host 用の依存、明示した版の member、host を明示した target 用の依存が止まること、`reason: no_json`・`retryable: false` を足した (1 の直しを外すと落ちることを確かめた)
+- 残したもの: 判定の host はキャッシュのディレクトリでの `rustc -vV` の host (R-TG-1・`default_target` と同じ)。プロジェクトの toolchain が別の host 向けのときと、`rustc -vV` が使えず代わりの値のときは食い違う (D7a の再レビューの残りと同じ)。stdio のテストのサーバーは、走らせる人の `CARGO_BUILD_TARGET` と `~/.cargo/config.toml` を引き継ぐ (前から)
+
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
 - 利用者の指示で、デッドロックと止まって戻らない危険を、コード全体で監査した (サブエージェント、読むだけ。D4b のハングの後)。ロックの循環、ガードを持ったままの `.await` (clippy の `await_holding_lock` も `suspicious` の deny で効いている)、自分の結果を待つ形の循環は無かった。止まって長く戻らない箇所は次のとおり
