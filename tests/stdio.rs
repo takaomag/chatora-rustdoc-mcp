@@ -3669,7 +3669,16 @@ fn a_search_that_finds_nothing_while_crates_are_fetched_is_building() {
     assert_eq!(building["building_reason"], "fetching");
     assert_eq!(building["partial"], true);
     assert_eq!(building["retry_after_secs"], 10);
-    assert_eq!(building["provenance"]["sources"][0]["status"], "building");
+    // The workspace's member is built here, or not for the target given on another host than
+    // Linux (decided in M2's D7): `demo` is what is fetched.
+    let demo = |response: &Value| {
+        response["provenance"]["sources"]
+            .as_array()
+            .and_then(|sources| sources.iter().find(|source| source["crate"] == "demo"))
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert_eq!(demo(building)["status"], "building", "{result}");
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(20))
         .expect("in range");
@@ -3679,13 +3688,17 @@ fn a_search_that_finds_nothing_while_crates_are_fetched_is_building() {
         id += 1;
         server.send(&call_tool(id, "search_items", arguments.clone()));
         let result = server.response(id)["result"].clone();
-        // Until the workspace's member, built here, is in too (decided in M2's D7).
-        if result["structuredContent"].get("partial").is_none() {
+        // Until nothing is still being loaded or built (decided in M2's D7).
+        let going = result["structuredContent"]["provenance"]["sources"]
+            .as_array()
+            .is_some_and(|sources| sources.iter().any(|source| source["status"] == "building"));
+        if !going {
             break result;
         }
         assert!(Instant::now() < deadline, "still {result}");
     };
     let found = &found["structuredContent"];
+    assert_eq!(demo(found)["status"], "ok", "{found}");
     assert_eq!(found["data"]["items"][0]["path"], "demo::hello", "{found}");
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 }

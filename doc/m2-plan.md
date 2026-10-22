@@ -1305,6 +1305,7 @@ Claude Code 2.1.304、Linux で測った。
   - (2) 作り直し中の crate を「まだ来る」側に数えず、`partial`・`retry_after_secs` が付かず、それだけを探して 0 件なら「無い」と答えていた。作り直し中も数え、source にも `retry_after_secs`、hints に呼び直す案内 (R-SR-5・R-OUT-9)
   - (3) crates.io の依存の照合で index を期限なしに読んでいた。呼び出しの期限で包み、過ぎたら照合できないときと同じく docs.rs で warning
   - (4) 既存のテスト (`a_search_that_finds_nothing_while_crates_are_fetched_is_building`) は、member のビルドが終わる前に `status` が消えると `partial` で落ちうる。`partial` が消えるまで呼び直す
+- CI (014c701) の `check` が 3 つの OS で落ちた: (4) の直しで `partial` が消えるまで待つようにしたが、このテストは `target` に Linux の triple を明示するので、macOS・Windows では member がプロジェクトのビルド target の外として `unavailable` のまま `partial` が消えず (Windows は時間切れ)、`sources[0]` も `demo` でなく member になりうる (Linux では先に `ok`、macOS では `unavailable`)。テストは `demo` の source を名前で探して確かめ、`building` の source が無くなるまで呼び直す形にした
   - (5) refresh の案内が docs.rs の失敗にも出ていた。ローカルビルドの失敗 (`build_failed`・`fetch_failed`・`toolchain_missing`・`toolchain_too_old`) だけにする
   - (6) 照合できない warning が crate ごとに並んでいた。1 行にまとめる
   - (8) 名前を読めない crate も仕事を起こしていた。起こす前に読む
@@ -1312,6 +1313,14 @@ Claude Code 2.1.304、Linux で測った。
   - (10) 古い説明文 (search_items.md・README・search_across と search_items のコメント)。説明文には「workspace の crate (private も) と直接依存」(2048 文字に収めた)
   - (12) `failure_of` が `retry_after_secs` を落としていた。残す
 - 残したもの: (7) ローカルビルドの warning (docsrs なし・新しい形式など) を検索では出さない (docs.rs の分も前から出していない)。(11) 検索のたびに範囲のビルドを一度に起こし `build.wait_secs` まで待つので、member の編集直後は検索が最大 10 秒待ってから stale を返し、その間の `get_item` は同じ workspace のビルドのロックの後ろに並びうる (決定 7 のとおり)。作り直し中の `stale` の検索・index が読めないとき・`cargo_lock_raw`・member の間の path 依存の結合テストは無い。`search.scope` の設定 (R-SR-2) は計画に無く未実装
+
+**M2d の区切りの Claude Code での試し (headless、`claude -p --mcp-config`、release ビルド、空のキャッシュ。2026-10-22)**:
+
+1. 名指しせずに自分の workspace の private な item (`query::local::Rebuilding`) を聞くと、モデルはこのサーバーを使わず grep・sed・LSP で答えた (答えは正確)。D4d の試しと同じ課題が残る (M2f の F4: instructions・説明文)
+2. 名指しして `crate` なしの検索: member (`chatora-rustdoc-mcp`、private を含む) と直接依存 28 個の 29 個を範囲に検索した。空のキャッシュで初めの 3 回は member が `building` で `partial: true`、モデルは cargo のプロセスの終わりを待って呼び直し、29 個すべて `ok` になった
+3. 名指しして private な item: `visibility: private`、パスは `crate::query::local::Rebuilding` (D4d の試しの `pub(in ::x)` は D6 で直った)。モデルから、フィールドに可視性の印が無い (`pub struct` に private なフィールドが混ざるときに外から作れるかが分からない) と指摘があった
+4. 依存 (`tokio::sync::Mutex::lock`): Cargo.lock の版 (1.53.3) を docs.rs から 1 回で返した
+- モデルの使用量は 4 問で約 1.7 USD (利用者のアカウント)
 
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
