@@ -17,7 +17,7 @@ use tracing::Instrument as _;
 
 use super::load::{self, Archived, LoadError};
 use crate::data::{
-    build::{self, BuildError, BuildRecord, Built, DepInfoRun, Documented, Plan},
+    build::{self, BuildError, BuildRecord, Built, BuiltBy, DepInfoRun, Documented, Plan},
     cache::{self, Cache},
     cargo::{Failure, GitFetchFailure, RunError},
     child,
@@ -49,6 +49,10 @@ pub struct LocalWanted {
     pub docs_rs_features: Option<Vec<Box<str>>>,
     /// What the response warns about how the build was planned.
     pub warnings: Vec<Box<str>>,
+    /// Whether the features of the member's `[package.metadata.docs.rs]` would build what the
+    /// project's build does not, so that the plan has the project's: what `build_external_docs`
+    /// built with them is read first (decided in M2e's E4c, 2).
+    pub docs_rs_beyond_scope: bool,
     /// Whether the call asks for `refresh`, which the call sets: what failed or fell back for the
     /// member is forgotten by the work that it starts. One that joins a work does not change it
     /// (§6.4, decided in M2's D5).
@@ -205,8 +209,13 @@ fn flight_key(wanted: &LocalWanted) -> String {
         Documented::Lib { .. } => "lib".to_owned(),
         Documented::Bin { name } => format!("bin {name}"),
     };
+    let apart = if wanted.plan.by == BuiltBy::ExternalTool {
+        ":apart"
+    } else {
+        ""
+    };
     format!(
-        "local:{}:{}:{}:{documented}",
+        "local:{}:{}:{}:{documented}{apart}",
         wanted.plan.root.display(),
         wanted.plan.package.0,
         wanted.target
@@ -306,6 +315,7 @@ async fn build_and_archive(
         input_files,
         input_packages,
         refresh,
+        docs_rs_beyond_scope: _,
     } = wanted;
     let root = plan.root.clone();
     let programs = Programs::this();
@@ -565,7 +575,10 @@ impl Builder<'_> {
             plan.cfg_docsrs = false;
         }
         let (projects, cfg_docsrs) = (plan.features.clone(), plan.cfg_docsrs);
-        let docs_rs = self.docs_rs.filter(|_| !features_broke);
+        // Apart, they are what is asked for, which a failure does not change (decided in M2e's
+        // E4c, 3).
+        let apart = plan.by == BuiltBy::ExternalTool;
+        let docs_rs = self.docs_rs.filter(|_| apart || !features_broke);
         if let Some(features) = docs_rs {
             plan.features = Some(features.to_vec());
         } else if self.docs_rs.is_some() {
@@ -598,7 +611,7 @@ impl Builder<'_> {
             .as_ref()
             .err()
             .is_some_and(BuildError::is_compiler_error);
-        if docs_rs.is_some() && compiler_failed {
+        if docs_rs.is_some() && compiler_failed && !apart {
             tracing::info!(package = %plan.package.0, "the build failed with the features of [package.metadata.docs.rs], so it is tried with the project's");
             // With `--cfg docsrs` as it began, which did not break it: it failed without it too.
             (plan.features, plan.cfg_docsrs) = (projects, cfg_docsrs);
@@ -1448,6 +1461,7 @@ mod tests {
             cfgs: Box::default(),
             features: None,
             document_private: true,
+            by: BuiltBy::QueryTools,
         }
     }
 

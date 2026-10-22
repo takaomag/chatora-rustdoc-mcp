@@ -253,7 +253,7 @@ async fn for_built_target(
 ) -> CallToolResult {
     let found = (workspace, project_from);
     let Found::Dependency(dependency) = package else {
-        return query_tools_build(found, package.package(), built);
+        return member_for_built_target(state, found, package.package(), built, until).await;
     };
     let what = package.what();
     match local::dependency(state, workspace, dependency, built, until).await {
@@ -275,6 +275,46 @@ async fn for_built_target(
         Ok(Member::NotForTarget(error) | Member::Unknown(error)) | Err(error) => {
             external_build::external_body_of(&error)
         },
+    }
+}
+
+/// The response for the member `member` of the project, asked for `built`, a target that the
+/// project builds for: the query tools build it themselves, unless the features of its
+/// `[package.metadata.docs.rs]` build beyond their scope, which are built with here, apart, and
+/// recorded (decided in M2e's E4c, 1).
+async fn member_for_built_target(
+    state: &Arc<ToolState>,
+    (workspace, project_from): (&Workspace, ProjectFrom),
+    member: &ProjectPackage,
+    built: &TargetTriple,
+    until: Instant,
+) -> CallToolResult {
+    let found = (workspace, project_from);
+    let Ok(name) = member.name.parse::<CrateName>() else {
+        return query_tools_build(found, member, built);
+    };
+    let asked = || Asked::Package {
+        name: &member.name,
+        version: &member.version,
+    };
+    match local::member(state, workspace, (&name, asked()), built, until).await {
+        Ok(Member::Is { wanted, .. }) if wanted.docs_rs_beyond_scope => {
+            let apart = (built, Built::Elsewhere);
+            let planned = local::member_for(state, workspace, (&name, asked()), apart, until).await;
+            built_planned(state, found, (member, built), (planned, Vec::new())).await
+        },
+        Ok(Member::Resolving(doing) | Member::Planning(doing)) => {
+            planning(found, Some(built), doing)
+        },
+        Ok(Member::Is { .. } | Member::OtherVersion(_)) => query_tools_build(found, member, built),
+        Ok(Member::Not) => no_crate(&format!("{} {}", member.name, member.version)),
+        Ok(
+            Member::NotForTarget(error)
+            | Member::Unknown(error)
+            | Member::OtherTarget { error, .. }
+            | Member::Unnameable { error, .. },
+        )
+        | Err(error) => external_build::external_body_of(&error),
     }
 }
 

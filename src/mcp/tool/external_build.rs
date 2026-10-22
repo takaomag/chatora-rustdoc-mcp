@@ -959,6 +959,7 @@ async fn build_in_temporary_project(
         cargo_home: state.resolver.cargo_home().map(Path::to_path_buf),
         docs_rs_features: None,
         warnings: Vec::new(),
+        docs_rs_beyond_scope: false,
         refresh,
         input_files: state.resolver.input_files(&root, metadata).await,
         input_packages: Vec::new(),

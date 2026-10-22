@@ -17,7 +17,7 @@ use tokio::time::Instant;
 use super::{ToolState, error_result, get_item, project, project::BuildTargets};
 use crate::{
     data::{
-        build::{self, Bootstrap, Documented, Plan, TargetDir},
+        build::{self, Bootstrap, BuiltBy, Documented, Plan, TargetDir},
         build_scope::{Buildable, ScopeError},
         cargo::Failure,
         crate_file,
@@ -236,9 +236,9 @@ pub(super) async fn member_for(
     };
     let docs_rs = match docs_rs_of(
         state,
-        workspace,
+        (workspace, built),
         target,
-        package,
+        (package, &documented),
         features.as_deref(),
         until,
     )
@@ -265,6 +265,7 @@ pub(super) async fn member_for(
         features,
         // A member's own code (requirement R-WS-3).
         document_private: true,
+        by: built_by(built),
     };
     Ok(Member::Is {
         wanted: Box::new(LocalWanted {
@@ -274,6 +275,7 @@ pub(super) async fn member_for(
             cargo_home: state.resolver.cargo_home().map(Path::to_path_buf),
             docs_rs_features: docs_rs.features,
             warnings,
+            docs_rs_beyond_scope: docs_rs.beyond_scope,
             input_files: state.resolver.input_files(root, metadata).await,
             input_packages: build::source_packages(metadata, package),
             refresh: false,
@@ -433,6 +435,7 @@ pub(super) async fn dependency_for(
         cfgs: Box::default(),
         features: None,
         document_private: false,
+        by: built_by(built),
     };
     Ok(Member::Is {
         wanted: Box::new(LocalWanted {
@@ -442,12 +445,21 @@ pub(super) async fn dependency_for(
             cargo_home: state.resolver.cargo_home().map(Path::to_path_buf),
             docs_rs_features: None,
             warnings: Vec::new(),
+            docs_rs_beyond_scope: false,
             input_files: state.resolver.input_files(root, metadata).await,
             input_packages: build::source_packages(metadata, found),
             refresh: false,
         }),
         package: found.name.clone(),
     })
+}
+
+/// Which tool builds a plan made as `built` (decided in M2e's E4c).
+const fn built_by(built: Built) -> BuiltBy {
+    match built {
+        Built::Here => BuiltBy::QueryTools,
+        Built::Elsewhere => BuiltBy::ExternalTool,
+    }
 }
 
 /// The target directory of the builds of the workspace at `root` for `target`, as `built`: the
@@ -636,19 +648,26 @@ struct DocsRsAsks {
     cfgs: Box<[Box<str>]>,
     /// What the response warns about.
     warnings: Vec<Box<str>>,
+    /// Whether its features would build what the project's build does not, so that
+    /// `build_external_docs` builds with them (decided in M2e's E4c).
+    beyond_scope: bool,
 }
 
 /// What the `[package.metadata.docs.rs]` of the member `package` of `workspace` asks of its build
 /// for `target`, whose features in the project's build are `projects` (requirements R-FT-3 and
-/// R-MCP-3, decided in M2's D3). Its features are taken when the project's build has them all,
-/// or when a build with them builds no package that the project's build does not; else the
-/// project's are, with a warning. What `cargo tree` tells of that is waited for until `until`:
-/// else the member is told as being resolved.
+/// R-MCP-3, decided in M2's D3).
+///
+/// Its features are taken when the project's build has them all, or when a build with them builds
+/// no package that the project's build does not; else the project's are, with a warning, which
+/// tells how `build_external_docs` builds with them. What `cargo tree` tells of that is waited for
+/// until `until`: else the member is told as being resolved. A build of `build_external_docs`,
+/// `built` elsewhere, takes them as they are (decided in M2e's E4c, 4); which builds the lib of
+/// `package`, `documented`, and not a proc macro, which the query tools build for the host.
 async fn docs_rs_of(
     state: &ToolState,
-    workspace: &Workspace,
+    (workspace, built): (&Workspace, Built),
     target: &TargetTriple,
-    package: &Package,
+    (package, documented): (&Package, &Documented),
     projects: Option<&[Box<str>]>,
     until: Instant,
 ) -> Result<DocsRsAsks, Result<Member, Box<CallToolResult>>> {
@@ -676,7 +695,10 @@ async fn docs_rs_of(
     if !docs.asks_features || projects == Some(&*features) {
         return Ok(asks);
     }
-    if projects.is_some_and(|projects| features.iter().all(|feature| projects.contains(feature))) {
+    if built == Built::Elsewhere
+        || projects
+            .is_some_and(|projects| features.iter().all(|feature| projects.contains(feature)))
+    {
         asks.features = Some(features);
         return Ok(asks);
     }
@@ -686,15 +708,29 @@ async fn docs_rs_of(
         .await
     {
         Joined::Done(Ok(outside)) if outside.is_empty() => asks.features = Some(features),
-        Joined::Done(Ok(outside)) => asks.warnings.push(
-            format!(
-                "built with the features of the project's build: those of \
-                 [package.metadata.docs.rs] would build {}, which the project's build does not; \
-                 build_external_docs builds with them",
-                outside.join(", ")
-            )
-            .into(),
-        ),
+        Joined::Done(Ok(outside)) => {
+            asks.beyond_scope = *documented == (Documented::Lib { proc_macro: false });
+            let instead = if asks.beyond_scope {
+                format!(
+                    "; build_external_docs builds with them, passing {}",
+                    json!({
+                        "crate": format!("{}@{}", package.name, package.version),
+                        "target": target.as_str(),
+                    })
+                )
+            } else {
+                String::new()
+            };
+            asks.warnings.push(
+                format!(
+                    "built with the features of the project's build: those of \
+                     [package.metadata.docs.rs] would build {}, which the project's build does \
+                     not{instead}",
+                    outside.join(", "),
+                )
+                .into(),
+            );
+        },
         Joined::Done(Err(error)) => asks.warnings.push(
             format!(
                 "built with the features of the project's build: whether those of \

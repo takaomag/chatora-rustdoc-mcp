@@ -1439,6 +1439,24 @@ Claude Code 2.1.304、Linux で測った。
   - 照会のツールが読んだら最後に使った日時を更新する (R-CA-5。std の `used` と同じく 1 時間に 1 回)。re-export をたどるときは外の記録を読まない (R-WS-10)。照会のツールの `refresh` は外の失敗を解かない (R-WS-10・§6.4)
   - テストの記録は、E2a が使う `data::external` の書き手で置く
 
+**E4c (member を docs.rs の組で。2026-10-22)**:
+
+- `Plan.by: BuiltBy {QueryTools, ExternalTool}`: 外のツールが既定のプロジェクトの中で作るもの (`Built::Elsewhere`) は照会のツールのビルドから離す。置き場 (`<lib|bin>.apart`) と flight の鍵 (`:apart`) を分け、target dir は `TargetDir::for_target`、docs.rs の組は範囲を確かめずに使い (決定 4。他の target のビルドも)、コンパイラのエラーでもプロジェクトの組に戻さず失敗として記録する (決定 3)
+- 照会のツール: `docs_rs_of` が docs.rs の組が範囲の外を作ると判じたら `LocalWanted.docs_rs_beyond_scope` を立て、warning は外のツールに渡す引数 (`{"crate": "<package>@<版>"}`) を案内する。`look_up_member` はその member の外の記録 (`Key::Target`、プロジェクトの target) が丸ごとあれば先に使い (決定 2)、入力が変わっていれば `inputs_changed`。作成中・失敗・壊れた記録は使わず今どおりプロジェクトの組で作る
+- 外のツール: `crate` に member を target なしかプロジェクトの target で渡されたら、照会のツールの計画で範囲の外かを見て、外ならその target で離して作り記録する (決定 1)。範囲内なら `query_tools_build`
+- テスト: stdio の `build_external_docs_builds_a_member_with_its_docs_rs_features` (fixture の `opt` に build.rs で印を書かせ、照会のツールは作らず外のツールだけが作ること、記録を照会のツールが読むこと、範囲内の member は `query_tools_build`、member の変更で `inputs_changed`)。説明文に docs.rs の組の行を足した
+- レビュー (サブエージェント、読むだけ) の対応: (1)(8) proc macro と member の bin は外のツールが docs.rs の組で作らないので、案内を出さず記録も探さない (2) 案内に target を入れた (3) 記録を使うときの `refresh` の warning (4) 外のツールが member の計画のエラーや終了を `query_tools_build` にしていた (5) 作成中・失敗した記録のときは、その旨の warning を付けてプロジェクトの組で作る (9) 記録の置き場が無ければ読まない近道、説明文の「自分のプロジェクトはこのツールが要らない」に「照会のツールが求めない限り」。残したもの: (6) 記録を使っているとき、編集で足した item を引くと `item_not_found` だけで stale の案内が付かない (E4a-3 の他の target の記録も同じ) (7) crate なしの検索は記録を読まずプロジェクトの組 (E1b の決めどおり)。E4a の前の置き場 (`<target>/lib`) に残った外のツールの記録は GC (F1) まで残る
+
+**E4c (決定 10: member を docs.rs の組で) の下調べと決定 (2026-10-22)**:
+
+- 下調べ (サブエージェント、読むだけ。要点は scratchpad の e4c-research.md): 照会のツールは、member の `[package.metadata.docs.rs]` の組がビルドの範囲の外を作るときプロジェクトの組で作り、「build_external_docs builds with them」と warning で案内している (引数は無い)。E4a の他の target のビルドも同じ確かめを通り、外のツール自身の応答に自分を指す warning が出うる。置き場 (`published_dir`) と flight の鍵には features の次元が無く、プロジェクトの target で docs.rs の組で作ると照会のツールの置き場を上書きする
+- 利用者が決めたこと:
+  1. 頼み方は `crate` で暗黙に: member を (target なしかプロジェクトの target で) 渡し、その docs.rs の組が照会のツールの範囲の外を作るときだけその組で作る。範囲内なら今どおり `query_tools_build`。新しい引数は足さない。照会のツールの warning は外のツールに渡す引数を案内する
+  2. 照会のツールは、その warning を出す場面で記録を探し、あれば優先する (入力が変わっていれば `inputs_changed`)。無ければ今どおりプロジェクトの組で作る。`enabled_in_project` はプロジェクトの組のまま
+  3. docs.rs の組でコンパイラのエラーになれば、失敗として記録する (プロジェクトの組に戻さない)。照会のツールはその記録を使わずプロジェクトの組で作る
+  4. E4a の他の target のビルドも範囲の確かめをやめ、member を docs.rs の組で作る (壊れたら失敗として記録)
+- 聞かずに決めたこと: 鍵はプロジェクトの target の `Key::Target` (印は足さない。外のツールが既定のプロジェクトの中で作るものはすべて docs.rs の組で、離れた置き場に置くため)。プロジェクトの target での docs.rs の組のビルドは target dir と置き場を照会のツールのものと分ける
+
 **E4a-3 (照会のツールが他の target の記録を読む。2026-10-22)**:
 
 - `local`: プロジェクトの target でない member と依存は `Member::OtherTarget{error, package, crate_name}` (`NotForTarget` は自前の std などだけに)。`other_target` の案内は外のツールに渡す引数 (`{"crate": "<package>@<版>", "target": …}`)。proc macro の member は、他の target でもプロジェクトの先頭の target で計画する (決定 2。データは host のもので、「求めた target でなく host のデータ」の warning は今の照会の層が付ける)

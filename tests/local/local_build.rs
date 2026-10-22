@@ -12,7 +12,7 @@ use std::{
 };
 
 use chatora_rustdoc_mcp::data::{
-    build::{self, Bootstrap, Built, Documented, Plan, TargetDir},
+    build::{self, Bootstrap, Built, BuiltBy, Documented, Plan, TargetDir},
     cache::Cache,
     freshness,
     metadata::{Metadata, Resolution, Resolver},
@@ -94,6 +94,7 @@ fn plan(
         cfgs: Box::default(),
         features: None,
         document_private: true,
+        by: BuiltBy::QueryTools,
     }
 }
 
@@ -241,6 +242,7 @@ async fn a_member_is_built_and_archived_for_the_calls_that_want_it() {
         cargo_home: resolver.cargo_home().map(Path::to_path_buf),
         docs_rs_features: None,
         warnings: Vec::new(),
+        docs_rs_beyond_scope: false,
         refresh: false,
         input_files: Vec::new(),
         input_packages: Vec::new(),
@@ -312,6 +314,7 @@ async fn a_member_that_breaks_with_docsrs_is_built_without_it() {
         cargo_home: resolver.cargo_home().map(Path::to_path_buf),
         docs_rs_features: None,
         warnings: Vec::new(),
+        docs_rs_beyond_scope: false,
         refresh: false,
         input_files: Vec::new(),
         input_packages: build::source_packages(
@@ -498,6 +501,7 @@ impl Members {
             cargo_home: self.resolver.cargo_home().map(Path::to_path_buf),
             docs_rs_features: None,
             warnings: Vec::new(),
+            docs_rs_beyond_scope: false,
             refresh,
             input_files: self
                 .resolver
@@ -1187,6 +1191,7 @@ async fn a_git_dependency_of_a_members_name_is_built_with_its_public_items() {
         cfgs: Box::default(),
         features: None,
         document_private: false,
+        by: BuiltBy::QueryTools,
     };
     let cache = Cache::at(&dir.join("cache"));
     let built = build::build(

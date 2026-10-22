@@ -1768,7 +1768,8 @@ fn built_item(server: &mut Server, first: u64, arguments: &Value) -> Value {
 /// A workspace in `ws/` of a new temporary directory, whose members' `[package.metadata.docs.rs]`
 /// asks for: features within the project's build, with `--cfg my_cfg` (`asked`); only `--cfg
 /// my_cfg` (`argsonly`); all its features, which clash (`clash`); all its features, which build an
-/// optional dependency outside (`wide`).
+/// optional dependency outside (`wide`), `opt`, whose build script writes `opt-built` in the
+/// directory.
 #[cfg(feature = "local")]
 fn docs_rs_workspace() -> TempDir {
     let dir = TempDir::new().expect("a temporary directory");
@@ -1817,7 +1818,10 @@ fn docs_rs_workspace() -> TempDir {
              [package.metadata.docs.rs]\nall-features = true\n",
         ),
     );
-    write("ws/wide/src/lib.rs", "/// Always.\npub fn always() {}\n");
+    write(
+        "ws/wide/src/lib.rs",
+        "/// Always.\npub fn always() {}\n/// With `opt`.\n#[cfg(feature = \"opt\")]\npub fn with_opt() {}\n",
+    );
     // Only `rustdoc-args`: no features are asked for, and the project's are built with.
     write(
         "ws/argsonly/Cargo.toml",
@@ -1834,6 +1838,11 @@ fn docs_rs_workspace() -> TempDir {
     );
     write("opt/Cargo.toml", &package("opt", ""));
     write("opt/src/lib.rs", "");
+    write(
+        "opt/build.rs",
+        "fn main() {\n    let dir = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\"));\n    \
+         std::fs::write(dir.join(\"../opt-built\"), \"\").unwrap();\n}\n",
+    );
     let status = Command::new("cargo")
         .args(["generate-lockfile", "--offline"])
         .current_dir(dir.path().join("ws"))
@@ -1921,6 +1930,69 @@ fn a_member_is_built_as_its_docs_rs_metadata_asks_when_it_may() {
         &json!({ "crate": "argsonly", "path": "cfged" }),
     );
     assert_ne!(cfged["isError"], true, "{cfged}");
+    assert!(server.finish().success());
+}
+
+/// `build_external_docs` builds a member with the features of its `[package.metadata.docs.rs]`,
+/// which build what the query tools' builds do not, apart from them, and records it: the query
+/// tools then read it, and tell it stale once the member changes. One whose features are within
+/// their scope they build themselves (decided in M2e's E4c).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn build_external_docs_builds_a_member_with_its_docs_rs_features() {
+    let dir = docs_rs_workspace();
+    let marker = dir.path().join("opt-built");
+    let mut server = Server::start_in(Some(&dir.path().join("ws")));
+    let wide = built_item(
+        &mut server,
+        1,
+        &json!({ "crate": "wide", "path": "always" }),
+    );
+    assert!(
+        warns(
+            &wide["structuredContent"],
+            r#"passing {"crate":"wide@0.1.0","target""#
+        ),
+        "{wide}"
+    );
+    assert!(!marker.exists(), "the query tools built opt");
+    let result = built_by_external(&mut server, 100, &json!({ "crate": "wide" }));
+    let content = &result["structuredContent"];
+    assert_eq!(content["data"]["built"], true, "{result}");
+    assert_eq!(
+        content["provenance"]["features_requested"],
+        json!(["opt"]),
+        "{result}"
+    );
+    assert!(marker.exists(), "build_external_docs did not build opt");
+    let lookup = json!({ "crate": "wide", "path": "with_opt" });
+    let found = built_item(&mut server, 200, &lookup);
+    let provenance = &found["structuredContent"]["provenance"];
+    assert_eq!(provenance["recorded_by"], "build_external_docs", "{found}");
+    assert!(provenance.get("stale").is_none(), "{found}");
+    // Within the scope, the query tools build it.
+    server.send(&call_tool(
+        300,
+        "build_external_docs",
+        json!({ "crate": "asked" }),
+    ));
+    let result = server.response(300)["result"].clone();
+    assert_eq!(
+        result["structuredContent"]["data"]["reason"], "query_tools_build",
+        "{result}"
+    );
+    // The member changes.
+    std::fs::write(
+        dir.path().join("ws/wide/src/lib.rs"),
+        "/// Always.\npub fn always() {}\n/// With `opt`.\n#[cfg(feature = \"opt\")]\n\
+         pub fn with_opt() {}\npub fn added() {}\n",
+    )
+    .expect("written");
+    let found = built_item(&mut server, 400, &lookup);
+    assert_eq!(
+        found["structuredContent"]["provenance"]["stale_reason"], "inputs_changed",
+        "{found}"
+    );
     assert!(server.finish().success());
 }
 

@@ -1892,18 +1892,9 @@ async fn recorded_elsewhere(
             recorded::Found::Response(result) => return Err(result),
             recorded::Found::Missing => return Err(error),
         };
-    // What it is made from, as the record keeps it, as it is now (decided in M2e's E4a-3, 1): not
-    // told when the record does not keep it, as when it could not be read.
-    let recorded = Arc::clone(&built);
-    let unchanged = crate::task::spawn_blocking(move || {
-        recorded
-            .record
-            .inputs
-            .as_ref()
-            .is_none_or(data::freshness::unchanged_as_recorded)
-    })
-    .await
-    .map_err(|_joined| Box::new(shutting_down()))?;
+    let unchanged = !inputs_changed(&built)
+        .await
+        .ok_or_else(|| Box::new(shutting_down()))?;
     let path = in_lib(name, path, &built.record.crate_name);
     Ok(Request {
         name: package_name.parse().unwrap_or_else(|_| name.clone()),
@@ -1935,6 +1926,104 @@ async fn recorded_elsewhere(
             ..Here::default()
         },
     })
+}
+
+/// Whether what `built`, a record of `build_external_docs`, is made from changed since, as the record
+/// keeps it (decided in M2e's E4a-3, 1): not told when the record does not keep it, as when it
+/// could not be read. `None` when the task did not end.
+#[cfg(feature = "local")]
+async fn inputs_changed(built: &Arc<crate::query::local::LocalBuilt>) -> Option<bool> {
+    let recorded = Arc::clone(built);
+    crate::task::spawn_blocking(move || {
+        !recorded
+            .record
+            .inputs
+            .as_ref()
+            .is_none_or(data::freshness::unchanged_as_recorded)
+    })
+    .await
+    .ok()
+}
+
+/// What `build_external_docs` made of the member that `wanted` plans, with the features of its
+/// `[package.metadata.docs.rs]`, which the query tools do not build with as they build beyond their
+/// scope (decided in M2e's E4c, 2).
+#[cfg(feature = "local")]
+enum Apart {
+    /// Its build, whole, with the arguments that build it again when what it is made from changed
+    /// since.
+    Built(Arc<crate::query::local::LocalBuilt>, Option<Box<str>>),
+    /// What the response warns of a record being made, or of a build that failed: the query tools
+    /// build with the project's features meanwhile.
+    Not(Box<str>),
+}
+
+/// What `build_external_docs` made of the member that `wanted` plans with the features of its
+/// `[package.metadata.docs.rs]`, as [`Apart`] tells; `None` when it made nothing, or the record
+/// is broken.
+#[cfg(feature = "local")]
+async fn recorded_apart(state: &ToolState, wanted: &LocalWanted) -> Option<Apart> {
+    let key = data::external::Key::Target {
+        workspace: wanted.plan.root.display().to_string().into(),
+        package: wanted.plan.package.0.clone(),
+        name: wanted.plan.crate_name.clone(),
+        target: wanted.target.as_str().into(),
+        hidden: false,
+    };
+    // Most members have none, which a look at the directory tells without a thread.
+    if !key.dir(state.cache.dir()).is_dir() {
+        return None;
+    }
+    let cache = state.cache.clone();
+    let read = crate::task::spawn_blocking(move || data::external::read(&cache, &key))
+        .await
+        .ok()?;
+    let (built, told) = match read {
+        data::external::Recorded::Built(built, told) => (built, told),
+        data::external::Recorded::Building => {
+            return Some(Apart::Not(
+                "build_external_docs is building it with the features of \
+                 [package.metadata.docs.rs]: this is the project's build meanwhile"
+                    .into(),
+            ));
+        },
+        data::external::Recorded::Failed(failed) => {
+            let message = failed
+                .body
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("it failed")
+                .to_owned();
+            return Some(Apart::Not(
+                format!(
+                    "build_external_docs could not build it with the features of \
+                     [package.metadata.docs.rs] at {} ({message}): this is the project's build",
+                    failed.time
+                )
+                .into(),
+            ));
+        },
+        data::external::Recorded::Broken(_) | data::external::Recorded::Missing => return None,
+    };
+    let built = Arc::new(
+        crate::query::local::recorded(&state.cache, *built, &told)
+            .await
+            .ok()?,
+    );
+    let (name, version) = wanted
+        .plan
+        .package
+        .name_and_version()
+        .unwrap_or((&wanted.plan.crate_name, ""));
+    let again = json!({
+        "crate": format!("{name}@{version}"),
+        "target": wanted.target.as_str(),
+    });
+    let changed = inputs_changed(&built).await?;
+    Some(Apart::Built(
+        built,
+        changed.then(|| again.to_string().into()),
+    ))
 }
 
 /// Where the project's dependency for another target is documented (decided in M2e's E4a).
@@ -3119,18 +3208,11 @@ async fn look_up_member(
             }
             built
         },
+        // What `build_external_docs` built with the features of `[package.metadata.docs.rs]`
+        // (decided in M2e's E4c, 2).
         LocalSource::Wanted(wanted) => {
-            let provenance = local_provenance(&arguments, package_source);
-            // `build.wait_secs` from now, within the call's deadline (decided in M2's D3).
-            let until_built = Instant::now()
-                .checked_add(state.build_wait)
-                .map_or(arguments.until, |until| until.min(arguments.until));
-            let until = (until_built, arguments.until);
-            match local::built(state, *wanted, until, provenance, &warnings).await {
-                Ok(built) => {
-                    warnings.extend(built.archived.warnings.iter().cloned());
-                    built
-                },
+            match wanted_built(state, &mut arguments, wanted, package_source, &mut warnings).await {
+                Ok(built) => built,
                 Err(result) => return *result,
             }
         },
@@ -3203,6 +3285,48 @@ async fn look_up_member(
             shutting_down()
         },
     }
+}
+
+/// The build of the member that `wanted` plans for `arguments`, made by work that the calls for it
+/// share, waited for `build.wait_secs`; or what `build_external_docs` built of it with the
+/// features of its `[package.metadata.docs.rs]`, which the query tools do not build with (decided
+/// in M2e's E4c, 2). What the response warns of is added to `warnings`; the response, while it is
+/// built or when it failed.
+#[cfg(feature = "local")]
+async fn wanted_built(
+    state: &Arc<ToolState>,
+    arguments: &mut Request,
+    wanted: Box<LocalWanted>,
+    package_source: Option<&'static str>,
+    warnings: &mut Vec<Box<str>>,
+) -> Result<Arc<crate::query::local::LocalBuilt>, Box<CallToolResult>> {
+    let apart = if wanted.docs_rs_beyond_scope {
+        recorded_apart(state, &wanted).await
+    } else {
+        None
+    };
+    match apart {
+        Some(Apart::Built(built, again)) => {
+            warnings.extend(built.archived.warnings.iter().cloned());
+            warnings.push(recorded::toolchain_warning(&built));
+            if wanted.refresh {
+                warnings.push(NO_REFRESH.into());
+            }
+            arguments.here.inputs_changed = again;
+            return Ok(built);
+        },
+        Some(Apart::Not(why)) => warnings.push(why),
+        None => {},
+    }
+    let provenance = local_provenance(arguments, package_source);
+    // `build.wait_secs` from now, within the call's deadline (decided in M2's D3).
+    let until_built = Instant::now()
+        .checked_add(state.build_wait)
+        .map_or(arguments.until, |until| until.min(arguments.until));
+    let until = (until_built, arguments.until);
+    let built = local::built(state, *wanted, until, provenance, warnings).await?;
+    warnings.extend(built.archived.warnings.iter().cloned());
+    Ok(built)
 }
 
 /// Marks `response` as of the build of a member made at `built_at`, given while the member is built

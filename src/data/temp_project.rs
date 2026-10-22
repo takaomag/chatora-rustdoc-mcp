@@ -16,7 +16,7 @@ use std::{
 use semver::Version;
 
 use super::{
-    build::{self, Bootstrap, BuildError, Plan, TargetDir},
+    build::{self, Bootstrap, BuildError, BuiltBy, Plan, TargetDir},
     cargo,
     crate_name::CrateName,
     external::EXT_DIR,
@@ -270,6 +270,7 @@ pub fn plan(
         cfgs: release.cfgs.clone(),
         features: None,
         document_private: false,
+        by: BuiltBy::QueryTools,
     })
 }
 

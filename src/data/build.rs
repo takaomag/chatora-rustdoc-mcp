@@ -593,6 +593,19 @@ pub struct Plan {
     /// dependency's, which shows its public items only (requirements R-WS-3 and R-SH-5, decided
     /// in M2's D6 and D7).
     pub document_private: bool,
+    /// Which tool builds it: `build_external_docs` builds the default project's crates apart from
+    /// the query tools' builds (decided in M2e's E4c), published apart, by work of its own, with
+    /// the features of `[package.metadata.docs.rs]` to try first and nothing else.
+    pub by: BuiltBy,
+}
+
+/// Which tool builds a plan (decided in M2e's E4c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltBy {
+    /// The query tools, as they look it up.
+    QueryTools,
+    /// `build_external_docs`, apart from them.
+    ExternalTool,
 }
 
 impl Plan {
@@ -680,6 +693,11 @@ impl Plan {
         let documented = match &self.documented {
             Documented::Lib { .. } => "lib".to_owned(),
             Documented::Bin { name } => format!("bin-{name}"),
+        };
+        let documented = if self.by == BuiltBy::ExternalTool {
+            format!("{documented}.apart")
+        } else {
+            documented
         };
         cache
             .join(LOCAL_DIR)
@@ -2001,6 +2019,7 @@ mod tests {
             cfgs: Box::default(),
             features: None,
             document_private: true,
+            by: BuiltBy::QueryTools,
         }
     }
 
@@ -2371,6 +2390,7 @@ mod tests {
             cfgs: Box::from([Box::from("tokio_unstable")]),
             features: Some(vec!["default".into(), "extra".into()]),
             document_private: true,
+            by: BuiltBy::QueryTools,
         };
         let command = plan.command();
         let command = command.as_std();
@@ -2451,6 +2471,7 @@ mod tests {
             cfgs: Box::from([Box::from("tokio_unstable")]),
             features: None,
             document_private: true,
+            by: BuiltBy::QueryTools,
         };
         let command = plan.command();
         let args: Vec<_> = command
