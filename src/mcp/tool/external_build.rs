@@ -7,7 +7,7 @@
 //! record is (decided in M2e, 13). A call waits for it as the query tools wait for a build, and
 //! then returns `status: building` while it goes on; the query tools find the record.
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 
 use rmcp::model::CallToolResult;
 use serde_json::{Map, Value, json};
@@ -65,12 +65,13 @@ const OTHER_MAKES_FOR: Duration = Duration::from_mins(30);
 const TRY_AGAIN_EVERY: Duration = Duration::from_millis(200);
 
 /// Documents the release of `name` that `spec` names, or the latest, for `target`, or the host's
-/// (decided in M2e, 11), in a temporary project, unless the project uses it or docs.rs has it.
+/// (decided in M2e, 11), in a temporary project, unless the project uses it or docs.rs has it. The
+/// project is the workspace `project` of the default project, if given.
 pub(super) async fn release(
     state: Arc<ToolState>,
-    name: CrateName,
-    spec: Option<VersionSpec>,
+    (name, spec): (CrateName, Option<VersionSpec>),
     target: Option<TargetTriple>,
+    project: Option<&Path>,
 ) -> CallToolResult {
     let until = state.until();
     let entry = match get_item::index_entry(&state, &name).await {
@@ -80,7 +81,7 @@ pub(super) async fn release(
     // A dependency's, as its Cargo.lock has it (requirement R-WS-10), or else the latest.
     let spec = match spec {
         Some(spec) => spec,
-        None => match project_version(&state, &name, until).await {
+        None => match project_version(&state, (&name, project), until).await {
             Ok(version) => version.map_or(VersionSpec::Latest, VersionSpec::Exact),
             Err(result) => return *result,
         },
@@ -104,7 +105,7 @@ pub(super) async fn release(
             .map(|warning| Box::from(warning.as_ref())),
     );
     let published: CrateName = entry.name.parse().unwrap_or(name);
-    let used = match uses(&state, &entry, &version, until).await {
+    let used = match uses(&state, (&entry, &version), project, until).await {
         Uses::No => None,
         Uses::Unknown(why) => {
             warnings.push(why.into());
@@ -191,10 +192,11 @@ enum Uses {
 /// (requirement R-MCP-3), or the response while cargo resolves it.
 async fn project_version(
     state: &ToolState,
-    name: &CrateName,
+    (name, project): (&CrateName, Option<&Path>),
     until: Instant,
 ) -> Result<Option<semver::Version>, Box<CallToolResult>> {
-    let Some((workspace, project_from)) = project::workspace(state.project.as_ref(), None)? else {
+    let Some((workspace, project_from)) = project::workspace(state.project.as_ref(), project)?
+    else {
         return Ok(None);
     };
     let resolution = match state.resolver.resolve_until(&workspace, until).await {
@@ -255,38 +257,20 @@ async fn build_target(state: &ToolState, workspace: &Workspace) -> TargetTriple 
 /// Whether the project's `package` of `workspace`, a dependency, is one that `cargo rustdoc -p`
 /// cannot name for `target`, built here, for the target that it returns (decided in M2e's E2b);
 /// `None` for one that is not the project's after all, or has no lib. Else the response: the query
-/// tools build it, it is not built for the target, which is the step of another target (M2e's E4a)
-/// if `asked`, or else to be given, or cargo plans it still.
+/// tools build it, it is not built for the target, which is documented for another target if
+/// `asked` (decided in M2e's E4a), or else to be given, or cargo plans it still.
 async fn unnameable(
-    state: &ToolState,
-    (workspace, package, project_from): &(Workspace, ProjectPackage, ProjectFrom),
+    state: &Arc<ToolState>,
+    used: &(Workspace, ProjectPackage, ProjectFrom),
     (target, asked): (&TargetTriple, bool),
     until: Instant,
 ) -> Result<Option<TargetTriple>, Box<CallToolResult>> {
-    let other_target = || {
-        if asked {
-            super::build_external_docs::not_yet(
-                "a dependency of the project for another target than it builds it for",
-                "look it up with get_item and that target, which reads docs.rs",
-            )
-        } else {
-            error_result(&json!({
-                "code": "invalid_argument",
-                "message": format!(
-                    "the project's build does not build {} {} for {target}: it may use it only \
-                     for another target",
-                    package.name, package.version
-                ),
-                "retryable": false,
-                "suggestions": ["give the target that the project uses it for as `target`"],
-            }))
-        }
-    };
+    let (workspace, package, project_from) = used;
     let planned = match local::dependency(state, workspace, package, target, until).await {
         Ok(planned) => planned,
         // Not built for the target (`not_built_for`).
         Err(error) if body_of(&error).get("reason") == Some(&json!("build_unsupported")) => {
-            return Err(Box::new(other_target()));
+            return other_target(state, used, (target, asked), until).await;
         },
         Err(error) => return Err(Box::new(external_body_of(&error))),
     };
@@ -298,7 +282,7 @@ async fn unnameable(
             target,
         ))),
         Member::NotForTarget(error) if body_of(&error).get("reason") == Some(&json!("no_json")) => {
-            Err(Box::new(other_target()))
+            other_target(state, used, (target, asked), until).await
         },
         Member::NotForTarget(error) | Member::Unknown(error) => {
             Err(Box::new(external_body_of(&error)))
@@ -321,8 +305,64 @@ async fn unnameable(
     }
 }
 
+/// The project's dependency `package` of `workspace`, which the project's build does not build for
+/// `target`: documented for it if `asked` (decided in M2e's E4a), as [`unnameable`] returns; else
+/// the error, which tells what the project uses it for, as far as `cargo metadata` tells
+/// (requirement R-WS-10).
+async fn other_target(
+    state: &Arc<ToolState>,
+    (workspace, package, project_from): &(Workspace, ProjectPackage, ProjectFrom),
+    (target, asked): (&TargetTriple, bool),
+    until: Instant,
+) -> Result<Option<TargetTriple>, Box<CallToolResult>> {
+    if asked {
+        return super::external_target::dependency(
+            state,
+            (workspace, *project_from),
+            package,
+            target,
+        )
+        .await
+        .map(Some);
+    }
+    let conditions = match state.resolver.resolve_until(workspace, until).await {
+        Joined::Done(Ok(resolution)) => match &*resolution {
+            Resolution::Metadata { metadata, .. } => {
+                super::external_target::conditions(metadata, package)
+            },
+            Resolution::CargoLockRaw { .. } => Vec::new(),
+        },
+        Joined::Done(Err(_)) | Joined::Ended | Joined::Going(_) => Vec::new(),
+    };
+    Err(Box::new(not_used_for(package, target, &conditions)))
+}
+
+/// `invalid_argument` for the project's dependency `package`, which the project's build does not
+/// build for `target`, the build target: it uses it for `conditions` (requirement R-WS-10).
+pub(super) fn not_used_for(
+    package: &ProjectPackage,
+    target: &TargetTriple,
+    conditions: &[Box<str>],
+) -> CallToolResult {
+    let used_for = if conditions.is_empty() {
+        "it may use it only for another target".to_owned()
+    } else {
+        format!("the project uses it for {}", conditions.join(", "))
+    };
+    error_result(&json!({
+        "code": "invalid_argument",
+        "message": format!(
+            "the project's build does not build {} {} for {target}: {used_for}",
+            package.name, package.version
+        ),
+        "retryable": false,
+        "suggestions": ["give a target that the project uses it for as `target`"],
+        "conditions": conditions,
+    }))
+}
+
 /// The error `result` as this tool tells it: with its suggestions ([`external_body`]).
-fn external_body_of(result: &CallToolResult) -> CallToolResult {
+pub(super) fn external_body_of(result: &CallToolResult) -> CallToolResult {
     error_result(&external_body(body_of(result)))
 }
 
@@ -364,11 +404,11 @@ fn the_query_tools_build(
 /// crates.io is documented apart then, which builds nothing of the project.
 async fn uses(
     state: &ToolState,
-    entry: &IndexEntry,
-    version: &semver::Version,
+    (entry, version): (&IndexEntry, &semver::Version),
+    project: Option<&Path>,
     until: Instant,
 ) -> Uses {
-    let (workspace, project_from) = match project::workspace(state.project.as_ref(), None) {
+    let (workspace, project_from) = match project::workspace(state.project.as_ref(), project) {
         Ok(Some(found)) => found,
         Ok(None) => return Uses::No,
         Err(_) => {
@@ -389,9 +429,16 @@ async fn uses(
                         && package.docs_rs_check(entry) == DocsRsCheck::Allowed
                 })
                 .cloned();
-            used.map_or(Uses::No, |package| {
-                Uses::Yes(Box::new((workspace, package, project_from)))
-            })
+            match used {
+                Some(package) => Uses::Yes(Box::new((workspace, package, project_from))),
+                // Told, as the workspace was asked for.
+                None if project.is_some() => Uses::Unknown(format!(
+                    "the workspace given does not use {} {version}, so it is built as the release \
+                     of crates.io alone",
+                    entry.name
+                )),
+                None => Uses::No,
+            }
         },
         Joined::Done(Ok(_) | Err(_)) => Uses::No,
         Joined::Ended => Uses::Response(Box::new(get_item::stopped())),
@@ -414,7 +461,7 @@ async fn whole_record(state: &ToolState, key: &Key) -> Option<LocalBuilt> {
 }
 
 /// What docs.rs has of a release.
-enum DocsRs {
+pub(super) enum DocsRs {
     /// No rustdoc JSON that this server reads: it is built here.
     Lacks,
     /// It could not be asked, as this tells: it is built here.
@@ -425,7 +472,7 @@ enum DocsRs {
 
 /// What docs.rs has of the release of `name` at `version` for `target`, read as the query tools
 /// read it (decided in M2e's E2a): if it has JSON that this server reads, nothing is built.
-async fn on_docs_rs(
+pub(super) async fn on_docs_rs(
     state: &ToolState,
     (name, version, target): (&CrateName, &semver::Version, &TargetTriple),
     until: Instant,
@@ -686,47 +733,66 @@ pub(super) async fn make(
         Recorded::Building | Recorded::Missing => false,
     };
     let (made, told) = with_a_set(state, (key, release, target), refresh, progress).await;
-    let cache = state.cache.clone();
-    let key = key.clone();
     match made {
-        Ok(built) => {
-            let to_record = Built {
-                json: built.json.clone(),
-                record: built.record.clone(),
-                rebuilt: Vec::new(),
-            };
-            let recording = told.clone();
-            let written = crate::task::spawn_blocking(move || {
-                external::record(&cache, &key, (&to_record, &recording), &making)
-            })
-            .await;
-            if let Ok(Err(error)) | Err(error) = written.map_err(std::io::Error::other) {
-                tracing::warn!(%error, "an external record could not be written");
-            }
-            let built = Built {
-                json: built.json.clone(),
-                record: built.record.clone(),
-                rebuilt: Vec::new(),
-            };
-            recorded(&state.cache, built, &told)
-                .await
-                .map(Arc::new)
-                .map_err(|error| Arc::new(failed_so(&what, &error.to_string(), true)))
-        },
+        Ok(built) => record_made(state, key, (&built, told), making, &what).await,
         Err(Unmade::Stopped) => Err(Arc::new(stopped_body())),
-        Err(Unmade::Failed { body, .. }) => {
-            let transient = body.get("retryable") == Some(&Value::Bool(true));
-            let failed = Failed::now(None, None, transient, body.clone());
-            let remembered = crate::task::spawn_blocking(move || {
-                external::remember_failure(&cache, &key, &failed, &making)
-            })
-            .await;
-            if let Ok(Err(error)) | Err(error) = remembered.map_err(std::io::Error::other) {
-                tracing::warn!(%error, "the failure of an external build could not be remembered");
-            }
-            Err(Arc::new(body))
-        },
+        Err(Unmade::Failed { body, .. }) => Err(remember_unmade(state, key, body, making).await),
     }
+}
+
+/// Records `built`, of `what`, made under the lock of `key` (`making`), with what its record
+/// tells, `told`, and returns it as the query tools read it from the record.
+pub(super) async fn record_made(
+    state: &ToolState,
+    key: &Key,
+    (built, told): (&LocalBuilt, Told),
+    making: Making,
+    what: &str,
+) -> SharedExternal {
+    let (cache, key) = (state.cache.clone(), key.clone());
+    let to_record = Built {
+        json: built.json.clone(),
+        record: built.record.clone(),
+        rebuilt: Vec::new(),
+    };
+    let recording = told.clone();
+    let written = crate::task::spawn_blocking(move || {
+        external::record(&cache, &key, (&to_record, &recording), &making)
+    })
+    .await;
+    if let Ok(Err(error)) | Err(error) = written.map_err(std::io::Error::other) {
+        tracing::warn!(%error, "an external record could not be written");
+    }
+    let built = Built {
+        json: built.json.clone(),
+        record: built.record.clone(),
+        rebuilt: Vec::new(),
+    };
+    recorded(&state.cache, built, &told)
+        .await
+        .map(Arc::new)
+        .map_err(|error| Arc::new(failed_so(what, &error.to_string(), true)))
+}
+
+/// Remembers that making the record of `key` under its lock (`making`) failed, as `body` tells,
+/// for the query tools; and returns `body`.
+pub(super) async fn remember_unmade(
+    state: &ToolState,
+    key: &Key,
+    body: Value,
+    making: Making,
+) -> Arc<Value> {
+    let (cache, key) = (state.cache.clone(), key.clone());
+    let transient = body.get("retryable") == Some(&Value::Bool(true));
+    let failed = Failed::now(None, None, transient, body.clone());
+    let remembered = crate::task::spawn_blocking(move || {
+        external::remember_failure(&cache, &key, &failed, &making)
+    })
+    .await;
+    if let Ok(Err(error)) | Err(error) = remembered.map_err(std::io::Error::other) {
+        tracing::warn!(%error, "the failure of an external build could not be remembered");
+    }
+    Arc::new(body)
 }
 
 /// `release` built for `target` in the temporary project of `key` with the features that docs.rs
@@ -750,7 +816,7 @@ async fn with_a_set(
     if !fell_back {
         let told = Told {
             features_requested: Some(requested),
-            warnings: Vec::new(),
+            ..Told::default()
         };
         return (made, told);
     }
@@ -791,13 +857,18 @@ async fn with_a_set(
             )
             .into(),
         ],
+        ..Told::default()
     };
     (made, told)
 }
 
 /// The record of `key`, as it is now, for the holder of its lock, `making`, which it gives back;
 /// `None` when the task did not end (as the server shuts down, or a panic), which lets the lock go.
-async fn read_record(state: &ToolState, key: &Key, making: Making) -> Option<(Recorded, Making)> {
+pub(super) async fn read_record(
+    state: &ToolState,
+    key: &Key,
+    making: Making,
+) -> Option<(Recorded, Making)> {
     let (cache, key) = (state.cache.clone(), key.clone());
     crate::task::spawn_blocking(move || (external::read_making(&cache, &key, &making), making))
         .await
@@ -887,10 +958,7 @@ async fn build_in_temporary_project(
         plan,
         target,
         project_sets_target,
-        cargo_home: state
-            .resolver
-            .cargo_home()
-            .map(std::path::Path::to_path_buf),
+        cargo_home: state.resolver.cargo_home().map(Path::to_path_buf),
         docs_rs_features: None,
         warnings: Vec::new(),
         refresh,
@@ -1027,7 +1095,7 @@ pub(super) const CALL_AGAIN: &str =
 
 /// Removes the Cargo.lock of the temporary project at `root`, if it has one: cargo could not read
 /// it, or it is made anew.
-pub(super) async fn remove_lock(root: &std::path::Path) {
+pub(super) async fn remove_lock(root: &Path) {
     let lock = root.join("Cargo.lock");
     let removed = crate::task::spawn_blocking(move || std::fs::remove_file(lock)).await;
     if let Ok(Err(error)) = removed

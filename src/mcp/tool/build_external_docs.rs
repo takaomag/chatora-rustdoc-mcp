@@ -132,6 +132,25 @@ fn output_schema() -> JsonObject {
                     "target": { "type": "string" },
                     "git": { "type": "string" },
                     "rev": { "type": "string" },
+                    "members": {
+                        "type": "array",
+                        "description": "The members of a workspace documented for another \
+                                        target: each built, being built, failed (with its \
+                                        error), or built by the other tools themselves.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "crate": { "type": "string" },
+                                "version": { "type": "string" },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["built", "building", "failed", "query_tools_build"],
+                                },
+                                "error": { "type": "object" },
+                            },
+                            "required": ["crate", "version", "status"],
+                        },
+                    },
                 },
                 "required": ["built"],
             },
@@ -220,10 +239,23 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
             super::external_git::crate_of_git(state, name, git, target).await
         },
         (None, Some(project)) => workspace(&state, &project, target.as_ref()).await,
-        (Some((name, version)), None) => {
-            super::external_build::release(state, name, version, target).await
+        // A member, or a dependency not from crates.io, of the default project (decided in M2e's
+        // E4a); else a release of crates.io.
+        (Some((name, version)), project) => {
+            let asked = (&name, version.as_ref());
+            if let Some(result) = super::external_target::project_crate(
+                &state,
+                asked,
+                target.as_ref(),
+                project.as_deref(),
+            )
+            .await
+            {
+                return result;
+            }
+            super::external_build::release(state, (name, version), target, project.as_deref()).await
         },
-        (Some(_), Some(_)) | (None, None) => not_yet(
+        (None, None) => not_yet(
             "a crate of a workspace",
             "look it up with get_item, which reads docs.rs",
         ),
@@ -234,7 +266,7 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
 /// project's, for a target that it builds for, which the query tools build themselves (requirement
 /// R-WS-10).
 async fn workspace(
-    state: &ToolState,
+    state: &Arc<ToolState>,
     project: &Path,
     target: Option<&TargetTriple>,
 ) -> CallToolResult {
@@ -256,17 +288,27 @@ async fn workspace(
         Ok(targets) => targets,
         Err(error) => return *error,
     };
-    let built = target.map_or_else(
-        || targets.first(),
-        |target| targets.iter().find(|built| *built == target),
-    );
-    let Some(target) = built else {
-        return not_yet(
-            "the default project for another target",
-            "for a dependency from crates.io, call get_item with the target, which reads docs.rs",
-        );
-    };
-    query_tools_build(&workspace, target)
+    match target {
+        Some(target) if !targets.contains(target) => {
+            // Another target than it builds for (decided in M2e's E4a).
+            super::external_target::members(
+                Arc::clone(state),
+                (workspace, ProjectFrom::Argument),
+                target.clone(),
+            )
+            .await
+        },
+        Some(target) => query_tools_build(&workspace, target),
+        None => targets.first().map_or_else(
+            || {
+                not_yet(
+                    "a project that builds for no target",
+                    "look its crates up with get_item",
+                )
+            },
+            |target| query_tools_build(&workspace, target),
+        ),
+    }
 }
 
 /// The response for the default project's workspace for a target that it builds for: the query

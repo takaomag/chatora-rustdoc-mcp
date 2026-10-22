@@ -79,6 +79,18 @@ pub enum Key {
         /// Whether it documents the hidden items.
         hidden: bool,
     },
+    /// A package of the default project, a member or a dependency, documented for another target
+    /// than the project builds for (decided in M2e's E4a).
+    Target {
+        /// The root of the workspace, as the project's workspace is found.
+        workspace: Box<str>,
+        /// The package, by its id in `cargo metadata`, which tells its source and version.
+        package: Box<str>,
+        /// The target it is documented for.
+        target: Box<str>,
+        /// Whether it documents the hidden items.
+        hidden: bool,
+    },
     /// What a ref of a git repository resolves to, for a crate in it (decided in M2e's E3).
     GitRef {
         /// The repository's URL, as its key.
@@ -103,6 +115,7 @@ impl Key {
             Self::Release { .. } => "release",
             Self::Git { .. } => "git",
             Self::GitRef { .. } => "git_ref",
+            Self::Target { .. } => "target",
         }
     }
 
@@ -146,6 +159,10 @@ pub struct Told {
     /// What the responses warn about how it was built, as when those features broke it.
     #[serde(default)]
     pub warnings: Vec<Box<str>>,
+    /// Whether it was built in the default project, not in a temporary project: what the build
+    /// warns of its `RUSTC_BOOTSTRAP` is then the project's (decided in M2e's E4a).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_project: bool,
 }
 
 /// The index of a record: its key, and the build that it is of.
@@ -598,7 +615,7 @@ struct GitCrate<'a> {
 /// for each.
 fn commits_dir(root: &Path, key: &Key) -> Option<PathBuf> {
     let of = match key {
-        Key::Release { .. } => return None,
+        Key::Release { .. } | Key::Target { .. } => return None,
         Key::Git {
             url,
             name,
@@ -846,6 +863,7 @@ mod tests {
         let told = Told {
             features_requested: Some(vec!["full".into()]),
             warnings: vec!["w".into()],
+            in_project: true,
         };
         let text = serde_json::to_value(Index {
             told: told.clone(),
@@ -902,6 +920,22 @@ mod tests {
             commits_dir(Path::new("/c"), &reference)
         );
         assert!(commits_dir(Path::new("/c"), &tokio_key()).is_none());
+    }
+
+    #[test]
+    fn the_names_of_a_key_of_another_target_do_not_change() {
+        let key = Key::Target {
+            workspace: "/p".into(),
+            package: "path+file:///p#app@0.1.0".into(),
+            target: "wasm32-wasip1".into(),
+            hidden: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&key).expect("JSON"),
+            r#"{"kind":"target","workspace":"/p","package":"path+file:///p#app@0.1.0","target":"wasm32-wasip1","hidden":false}"#
+        );
+        assert!(key.dir(Path::new("/c")).starts_with("/c/ext/v1/target"));
+        assert!(commits_dir(Path::new("/c"), &key).is_none());
     }
 
     #[test]

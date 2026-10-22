@@ -262,8 +262,24 @@ impl TargetDir {
     /// `cache`: the first that is not marked [`UNUSABLE`].
     #[must_use]
     pub fn of(cache: &Path, root: &Path) -> Self {
-        let stem = workspace_hash(root);
-        let stem = stem.as_str();
+        Self::in_cache(cache, &workspace_hash(root))
+    }
+
+    /// That of the workspace at `root` for `target`, another target than it builds for, which
+    /// `build_external_docs` builds in: not the query tools', whose builds would wait for its lock
+    /// while a first build for the target builds every dependency (decided in M2e's E4a, 2).
+    #[must_use]
+    pub fn for_target(cache: &Path, root: &Path, target: &TargetTriple) -> Self {
+        let mut key = root.as_os_str().as_encoded_bytes().to_vec();
+        key.push(0);
+        key.extend_from_slice(target.as_str().as_bytes());
+        let mut stem = cache::sha256_hex(&key);
+        stem.truncate(HASH_DIGITS);
+        Self::in_cache(cache, &stem)
+    }
+
+    /// The first in the cache at `cache` named after `stem` that is not marked [`UNUSABLE`].
+    fn in_cache(cache: &Path, stem: &str) -> Self {
         let dirs = cache.join(TARGET_DIRS);
         let first = dirs.join(stem);
         let dir = (0..=u32::MAX)
@@ -1935,6 +1951,26 @@ mod tests {
         );
         assert_eq!(second.target(), second.path().join("target"));
         assert_eq!(second.build(), second.path().join("build"));
+    }
+
+    #[test]
+    fn another_target_has_a_target_directory_of_its_own() {
+        let cache = tempfile::tempdir().expect("a temporary directory");
+        let root = Path::new("/ws");
+        let wasm: TargetTriple = "wasm32-wasip1".parse().expect("a triple");
+        let windows: TargetTriple = "x86_64-pc-windows-gnu".parse().expect("a triple");
+        let of_wasm = TargetDir::for_target(cache.path(), root, &wasm);
+        assert_eq!(TargetDir::for_target(cache.path(), root, &wasm), of_wasm);
+        assert_ne!(of_wasm, TargetDir::of(cache.path(), root));
+        assert_ne!(of_wasm, TargetDir::for_target(cache.path(), root, &windows));
+        assert_ne!(
+            of_wasm,
+            TargetDir::for_target(cache.path(), Path::new("/other"), &wasm)
+        );
+        assert_eq!(
+            of_wasm.path().parent(),
+            Some(&*cache.path().join(TARGET_DIRS))
+        );
     }
 
     #[test]

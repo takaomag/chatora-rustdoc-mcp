@@ -142,6 +142,34 @@ pub(super) async fn member(
     target: &TargetTriple,
     until: Instant,
 ) -> Result<Member, Box<CallToolResult>> {
+    member_for(
+        state,
+        workspace,
+        (name, asked),
+        (target, Built::Here),
+        until,
+    )
+    .await
+}
+
+/// Which targets a build is planned for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Built {
+    /// Those that the project builds for, as the query tools build (requirement R-MCP-3).
+    Here,
+    /// Another, as `build_external_docs` builds, in a target directory of its own (decided in
+    /// M2e's E4a).
+    Elsewhere,
+}
+
+/// [`member`], for `target` as `built` allows.
+pub(super) async fn member_for(
+    state: &ToolState,
+    workspace: &Workspace,
+    (name, asked): (&CrateName, Asked<'_>),
+    (target, built): (&TargetTriple, Built),
+    until: Instant,
+) -> Result<Member, Box<CallToolResult>> {
     let resolution = match state.resolver.resolve_until(workspace, until).await {
         Joined::Done(Ok(resolution)) => resolution,
         Joined::Done(Err(error)) => {
@@ -176,7 +204,7 @@ pub(super) async fn member(
         Ok(targets) => targets,
         Err(error) => return Ok(Member::NotForTarget(error)),
     };
-    if !targets.contains(target) {
+    if built == Built::Here && !targets.contains(target) {
         return Ok(Member::NotForTarget(Box::new(other_target(
             &what, target, &targets,
         ))));
@@ -207,7 +235,7 @@ pub(super) async fn member(
         offline: state.resolver.offline_in(root).await,
         toolchain: None,
         bootstrap: Bootstrap::of(metadata),
-        target_dir: TargetDir::of(state.cache.dir(), root),
+        target_dir: target_dir(state, root, (target, built)),
         package: package.id.clone(),
         manifest: package.manifest_path.clone(),
         crate_name: build::documented_name(package, &documented).into(),
@@ -291,6 +319,18 @@ pub(super) async fn dependency(
     target: &TargetTriple,
     until: Instant,
 ) -> Result<Member, Box<CallToolResult>> {
+    dependency_for(state, workspace, package, (target, Built::Here), until).await
+}
+
+/// [`dependency`], for `target` as `built` allows: for another target, what the project's build
+/// for it builds, for it or for the host (decided in M2e's E4a).
+pub(super) async fn dependency_for(
+    state: &ToolState,
+    workspace: &Workspace,
+    package: &ProjectPackage,
+    (target, built): (&TargetTriple, Built),
+    until: Instant,
+) -> Result<Member, Box<CallToolResult>> {
     let resolution = match state.resolver.resolve_until(workspace, until).await {
         Joined::Done(Ok(resolution)) => resolution,
         Joined::Done(Err(error)) => {
@@ -334,7 +374,7 @@ pub(super) async fn dependency(
         ))))
     };
     let scope_target = match targets.first() {
-        _ if targets.contains(target) => target,
+        _ if targets.contains(target) || built == Built::Elsewhere => target,
         Some(first) if *target == host => first,
         Some(_) | None => return not_for_target(),
     };
@@ -366,7 +406,7 @@ pub(super) async fn dependency(
         offline: state.resolver.offline_in(root).await,
         toolchain: None,
         bootstrap: Bootstrap::of(metadata),
-        target_dir: TargetDir::of(state.cache.dir(), root),
+        target_dir: target_dir(state, root, (target, built)),
         package: found.id.clone(),
         // The workspace's, as cargo would take the dependency's for a root of its own and write
         // another Cargo.lock (requirement R-WS-5).
@@ -394,6 +434,19 @@ pub(super) async fn dependency(
         }),
         package: found.name.clone(),
     })
+}
+
+/// The target directory of the builds of the workspace at `root` for `target`, as `built`: the
+/// query tools', or else one of its own (decided in M2e's E4a, 2).
+fn target_dir(
+    state: &ToolState,
+    root: &Path,
+    (target, built): (&TargetTriple, Built),
+) -> TargetDir {
+    match built {
+        Built::Here => TargetDir::of(state.cache.dir(), root),
+        Built::Elsewhere => TargetDir::for_target(state.cache.dir(), root, target),
+    }
 }
 
 /// The targets that the project at `root` builds for, which `what` may be built here for; or, as

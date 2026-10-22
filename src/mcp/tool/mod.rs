@@ -13,6 +13,8 @@ mod crate_overview;
 mod external_build;
 #[cfg(feature = "local")]
 mod external_git;
+#[cfg(feature = "local")]
+mod external_target;
 mod get_item;
 #[cfg(feature = "local")]
 mod list_crates;

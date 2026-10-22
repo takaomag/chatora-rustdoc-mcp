@@ -1358,11 +1358,13 @@ pub async fn recorded(cache: &Cache, built: Built, told: &Told) -> Result<LocalB
         recorded.record.features_requested = Some(features.clone());
     }
     // Every temporary project builds with it (decided in M2e's E2a), as docs.rs builds with a
-    // nightly: not what the warning is of.
-    recorded
-        .archived
-        .warnings
-        .retain(|warning| &**warning != BOOTSTRAP_ALL);
+    // nightly: not what the warning is of. A build in the project is as the query tools' are.
+    if !told.in_project {
+        recorded
+            .archived
+            .warnings
+            .retain(|warning| &**warning != BOOTSTRAP_ALL);
+    }
     recorded.recorded_by = Some(RECORDED_BY);
     Ok(recorded)
 }

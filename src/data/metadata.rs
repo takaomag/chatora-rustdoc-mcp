@@ -3,7 +3,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     io,
     path::{Path, PathBuf},
@@ -180,6 +180,55 @@ pub struct DepKind {
     pub kind: Option<Box<str>>,
     /// The `cfg` or target that the dependency is limited to, if any.
     pub target: Option<Box<str>>,
+}
+
+impl Metadata {
+    /// The `cfg` or targets that limit the dependency `package` to some platforms, through the
+    /// first edge so limited on each way from a workspace member to it, sorted: what to tell of a
+    /// dependency that the project uses only for another target than it builds for (requirement
+    /// R-WS-10, decided in M2e's E4a). Empty when a way has none, or the graph is not resolved.
+    #[must_use]
+    pub fn platform_conditions(&self, package: &PackageId) -> Vec<Box<str>> {
+        let Some(resolve) = &self.resolve else {
+            return Vec::new();
+        };
+        let mut dependents: HashMap<&PackageId, Vec<(&PackageId, &[DepKind])>> = HashMap::new();
+        for node in &resolve.nodes {
+            for dependency in &node.deps {
+                dependents
+                    .entry(&dependency.pkg)
+                    .or_default()
+                    .push((&node.id, &dependency.dep_kinds));
+            }
+        }
+        let mut conditions = BTreeSet::new();
+        let mut seen = HashSet::from([package]);
+        let mut next = vec![package];
+        while let Some(id) = next.pop() {
+            for &(dependent, kinds) in dependents.get(id).map(Vec::as_slice).unwrap_or_default() {
+                let mut unlimited = false;
+                for kind in kinds {
+                    match &kind.target {
+                        Some(target) => {
+                            conditions.insert(target.clone());
+                        },
+                        None => unlimited = true,
+                    }
+                }
+                if !unlimited {
+                    continue;
+                }
+                // A member that uses it on every platform.
+                if self.workspace_members.contains(dependent) {
+                    return Vec::new();
+                }
+                if seen.insert(dependent) {
+                    next.push(dependent);
+                }
+            }
+        }
+        conditions.into_iter().collect()
+    }
 }
 
 /// How the packages of a workspace were resolved.
@@ -1084,6 +1133,45 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn the_platforms_that_a_dependency_is_limited_to_are_told() {
+        let id = |name: &str| format!("path+file:///p/{name}#{name}@0.1.0");
+        let edge = |name: &str, target: Option<&str>| {
+            serde_json::json!({
+                "name": name,
+                "pkg": id(name),
+                "dep_kinds": [{ "kind": null, "target": target }],
+            })
+        };
+        let node = |name: &str, deps: Vec<serde_json::Value>| serde_json::json!({ "id": id(name), "deps": deps, "features": [] });
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "workspace_root": "/p",
+            "workspace_members": [id("app")],
+            "packages": [],
+            "resolve": { "nodes": [
+                node("app", vec![
+                    edge("winonly", Some("cfg(windows)")),
+                    edge("shared", None),
+                    edge("both", None),
+                ]),
+                node("shared", vec![edge("deep", Some("cfg(unix)")), edge("both", None)]),
+                node("winonly", vec![edge("deep", Some("wasm32-wasip1"))]),
+                node("deep", vec![]),
+                node("both", vec![]),
+            ] },
+            "version": 1,
+        }))
+        .expect("metadata");
+        let conditions = |name: &str| metadata.platform_conditions(&PackageId(id(name).into()));
+        assert_eq!(conditions("winonly"), [Box::from("cfg(windows)")]);
+        assert_eq!(conditions("deep"), [
+            Box::from("cfg(unix)"),
+            Box::from("wasm32-wasip1")
+        ]);
+        // On every platform, through `app` itself.
+        assert_eq!(conditions("both"), Vec::<Box<str>>::new());
+    }
 
     #[tokio::test]
     async fn the_lock_is_read_directly_for_a_package_of_a_version() {

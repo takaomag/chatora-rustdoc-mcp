@@ -2235,15 +2235,6 @@ fn build_external_docs_builds_nothing_that_the_query_tools_build() {
             "invalid_argument",
         ),
         (json!({ "project": missing }), "project_not_found"),
-        // Builds come in a later version (M2e).
-        (
-            json!({ "project": ".", "target": "wasm32-unknown-unknown" }),
-            "docs_unavailable",
-        ),
-        (
-            json!({ "project": ".", "crate": "demo" }),
-            "docs_unavailable",
-        ),
     ];
     for (id, (arguments, code)) in (10_u64..).zip(errors) {
         server.send(&call_tool(id, "build_external_docs", arguments));
@@ -3323,6 +3314,183 @@ fn git_item(more: Value) -> Value {
         arguments[name] = value;
     }
     arguments
+}
+
+/// The target that the tests document the project for, which is the host of none of the systems
+/// that the server is released for (decided in M2e's E4a, 6).
+#[cfg(all(debug_assertions, feature = "local"))]
+const OTHER_TARGET: &str = "wasm32-wasip1";
+
+/// Whether the toolchain has the std of [`OTHER_TARGET`].
+#[cfg(all(debug_assertions, feature = "local"))]
+fn has_other_target() -> bool {
+    let output = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .output()
+        .expect("rustc runs");
+    let sysroot = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Path::new(&sysroot)
+        .join("lib/rustlib")
+        .join(OTHER_TARGET)
+        .is_dir()
+}
+
+/// A workspace whose root package `app` has an item for wasm only, and uses for wasm only the path
+/// dependency `wasmonly` and the release `fixture-wasmdep` of `registry`, with the proc-macro
+/// member `macros`, and its Cargo.lock, in `dir`, whose cargo home takes crates.io from `registry`.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn workspace_for_wasm(dir: &Path, registry: &registry::FakeRegistry) -> PathBuf {
+    registry.publish(
+        &registry::FakeCrate::new("fixture-wasmdep", "0.1.0")
+            .file("src/lib.rs", "pub fn from_crates_io() {}\n"),
+    );
+    let write = |path: &str, contents: &str| {
+        let path = dir.join(path);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+        std::fs::write(path, contents).expect("written");
+    };
+    write("cargo-home/config.toml", &registry.cargo_config());
+    write(
+        "ws/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [target.'cfg(target_arch = \"wasm32\")'.dependencies]\n\
+         wasmonly = { path = \"../wasmonly\" }\nfixture-wasmdep = \"0.1\"\n\n\
+         [workspace]\nmembers = [\"macros\"]\n",
+    );
+    write(
+        "ws/src/lib.rs",
+        "pub fn everywhere() {}\n#[cfg(target_arch = \"wasm32\")]\npub fn on_wasm() {}\n",
+    );
+    write(
+        "ws/macros/Cargo.toml",
+        "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [lib]\nproc-macro = true\n",
+    );
+    write("ws/macros/src/lib.rs", "");
+    write(
+        "wasmonly/Cargo.toml",
+        "[package]\nname = \"wasmonly\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write("wasmonly/src/lib.rs", "pub fn only_wasm() {}\n");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile"])
+        .current_dir(dir.join("ws"))
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .env("CARGO_HOME", dir.join("cargo-home"))
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    dir.join("ws")
+}
+
+/// `build_external_docs` documents the default project's members, and dependencies that it uses
+/// only for wasm, one by path and one from crates.io, which docs.rs has no JSON of, for another
+/// target than the project builds for, in the project, and records them; the proc macro is left
+/// to the query tools, which build it for the host. Without the target, it tells what the
+/// dependency is used for, and that the query tools build the members; without the target's std,
+/// it tells to add it (requirement R-WS-10, decided in M2e's E4a).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn build_external_docs_documents_the_project_for_another_target() {
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let project = workspace_for_wasm(dir.path(), &registry);
+    let mut server = server_in_on(Some(&project), &registry, dir.path());
+    let members = json!({ "project": project.display().to_string(), "target": OTHER_TARGET });
+    let result = built_by_external(&mut server, 1, &members);
+    let data = &result["structuredContent"]["data"];
+    let status = |name: &str| {
+        data["members"]
+            .as_array()
+            .and_then(|members| members.iter().find(|member| member["crate"] == name))
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert_eq!(status("macros")["status"], "query_tools_build", "{result}");
+    if !has_other_target() {
+        assert_eq!(
+            status("app")["error"]["code"],
+            "toolchain_missing",
+            "{result}"
+        );
+        assert!(server.finish().success());
+        return;
+    }
+    assert_eq!(data["built"], true, "{result}");
+    assert_eq!(status("app")["status"], "built", "{result}");
+    assert_eq!(
+        result["structuredContent"]["provenance"]["recorded_by"],
+        "build_external_docs"
+    );
+    assert!(
+        server
+            .cache
+            .path()
+            .join("ext/v1/target")
+            .read_dir()
+            .is_ok_and(|mut records| records.next().is_some()),
+        "recorded"
+    );
+    dependencies_for_another_target(&mut server);
+    assert!(server.finish().success());
+}
+
+/// Asks `server`, of the project of [`workspace_for_wasm`], for its dependencies used for wasm
+/// only, with and without the target, and for crates that are not the project's.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn dependencies_for_another_target(server: &mut Server) {
+    for (id, name) in [(100, "wasmonly"), (200, "fixture-wasmdep")] {
+        let result = built_by_external(
+            server,
+            id,
+            &json!({ "crate": name, "target": OTHER_TARGET }),
+        );
+        let content = &result["structuredContent"];
+        assert_eq!(content["data"]["built"], true, "{name}: {result}");
+        assert_eq!(content["provenance"]["source"], "local", "{name}: {result}");
+        assert_eq!(
+            content["provenance"]["target"], OTHER_TARGET,
+            "{name}: {result}"
+        );
+    }
+    server.send(&call_tool(
+        300,
+        "build_external_docs",
+        json!({ "crate": "wasmonly" }),
+    ));
+    let result = server.response(300)["result"].clone();
+    let error = text_json(&result);
+    assert_eq!(error["code"], "invalid_argument", "{result}");
+    assert_eq!(
+        error["conditions"],
+        json!(["cfg(target_arch = \"wasm32\")"]),
+        "{result}"
+    );
+    server.send(&call_tool(
+        301,
+        "build_external_docs",
+        json!({ "crate": "app" }),
+    ));
+    let result = server.response(301)["result"].clone();
+    assert_eq!(
+        result["structuredContent"]["data"]["reason"], "query_tools_build",
+        "{result}"
+    );
+    // A requirement that the member does not meet asks for the release of crates.io.
+    server.send(&call_tool(
+        302,
+        "build_external_docs",
+        json!({ "crate": "app@^9", "target": OTHER_TARGET }),
+    ));
+    let result = server.response(302)["result"].clone();
+    assert_eq!(text_json(&result)["code"], "crate_not_found", "{result}");
 }
 
 /// A release whose lib is a cdylib only is documented (the plan's test crate (e)).
@@ -4534,14 +4702,22 @@ fn a_release_that_the_project_does_not_use_is_looked_up_for_the_host() {
         }
         thread::sleep(Duration::from_secs(1));
     }
-    server.send(&call_tool(
-        100,
-        "get_item",
-        json!({ "crate": "demo@0.1.0", "path": "hello" }),
-    ));
-    let found = server.response(100)["result"]["structuredContent"].clone();
-    assert_eq!(found["provenance"]["target"], TARGET, "{found}");
-    assert!(!warns(&found, "wasm32"), "{found}");
+    let mut result = Value::Null;
+    for id in 100_u64..160 {
+        server.send(&call_tool(
+            id,
+            "get_item",
+            json!({ "crate": "demo@0.1.0", "path": "hello" }),
+        ));
+        result = server.response(id)["result"].clone();
+        if result["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    let found = &result["structuredContent"];
+    assert_eq!(found["provenance"]["target"], TARGET, "{result}");
+    assert!(!warns(found, "wasm32"), "{result}");
     assert!(server.finish().success());
 }
 

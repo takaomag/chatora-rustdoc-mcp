@@ -1439,6 +1439,26 @@ Claude Code 2.1.304、Linux で測った。
   - 照会のツールが読んだら最後に使った日時を更新する (R-CA-5。std の `used` と同じく 1 時間に 1 回)。re-export をたどるときは外の記録を読まない (R-WS-10)。照会のツールの `refresh` は外の失敗を解かない (R-WS-10・§6.4)
   - テストの記録は、E2a が使う `data::external` の書き手で置く
 
+**E4a-1・E4a-2 (外のツールで既定のプロジェクトを他の target で作る。2026-10-22)**:
+
+- E4a-1 (データと計画): `TargetDir::for_target` ((workspace, target) ごとの target dir、決定 2)、外の記録の鍵 `Key::Target{workspace, package (cargo metadata の id), target, hidden}` (`ext/v1/target/<digest>`)、`Told.in_project` (プロジェクトの中のビルドは `RUSTC_BOOTSTRAP` の warning を残す)、`local::member_for`・`dependency_for` と `Built::{Here, Elsewhere}` (Elsewhere は `targets_built` の関所を通さず、その target の `cargo tree` で計画し、他の target 用の target dir で)、`Metadata::platform_conditions` (member から依存までの道で最初に限られた辺の cfg・target)。E4a-1 は使う側が無いので E4a-2 と一緒にコミットする
+- E4a-2 (外のツール): `mcp::tool::external_target`。`project` と他の `target` は全 member を共有の仕事で一度に始め、`build.wait_secs` まで待って member ごとに `built`・`building`・`failed` (エラー付き)・`query_tools_build` (proc macro は照会のツールが host 向けに作る) を並べる (決定 4)。`crate` が member か crates.io でない依存なら (`project_crate`)、他の target ではプロジェクトの中で作って記録し、プロジェクトの target か target なしなら照会のツールの範囲 (依存がその target で作られなければ、使われる cfg を `conditions` に付けた `invalid_argument`)。crates.io の依存は `release` → `unnameable` → `other_target` から `external_target::dependency` (docs.rs を先に見て、無ければプロジェクトの中で。名指しできなければ E2b の仮のプロジェクトをその target で)。作成は `take_lock` → 失敗・壊れた記録なら `refresh` → `local_archive_telling` → `record_made`・`remember_unmade` (crates.io のリリースの作成と共有)。`release` は `project` を受け、その workspace で使うかを判定する (使わなければ warning)。CI の check job に `rustup target add wasm32-wasip1`
+- 聞かずに決めたこと: `crate@latest` はプロジェクトで引き取らず crates.io のリリース、範囲の指定は member と依存の版に照合する。member・依存・crates.io の同名が重なれば `invalid_argument` と候補 (R-WS-10)。host 向けにだけ作られる依存は、照会のツールがプロジェクトのビルドで作るなら `query_tools_build`、作らなければ host 向けに作り記録の鍵も host で、warning を付ける (E4a-3 で照会のツールは計画し直して鍵を求める)
+- テスト: 単体 (target dir・鍵の名前・`platform_conditions`・member の一覧の応答)、stdio の 1 件 (wasm32-wasip1 で全 member・path の依存・偽の crates.io の依存、proc macro は `query_tools_build`、target なしの `conditions`、member は `query_tools_build`、範囲の指定は crates.io へ、rust-std が無ければ `toolchain_missing`)、`build_external_docs_builds_nothing_that_the_query_tools_build` から他の target の「(in a later version)」を外した
+- レビュー (サブエージェント、読むだけ) の対応: (1) proc macro の member を他の target 用に作ると照会のツールの置き場に別の features で書き、記録が壊れては作り直すのを繰り返しうる → 照会のツールに任せる (2) 範囲の指定と `latest` が crates.io の要求を横取りしていた (3) `project` を `release` が無視していた (4) host 向けの依存に warning と鍵の決まり (5) target なしで計画中・名指しできない・ほかのエラーを `query_tools_build` にしていた (6) 同名の重なりを `invalid_argument` に、`conditions` は取得元まで照合 (7) docs.rs が分からない warning を残す (8) 外の workspace は E4b の「まだ」。残したもの: 複数の workspace の `crate`+`project`、失敗の記録の呼び直しのテストは無い。全体のテストの中でだけ揺れる `a_release_that_the_project_does_not_use_is_looked_up_for_the_host` は応答全体を出すように直した (原因は未特定)
+
+**E4a の下調べと決定 (2026-10-22)**:
+
+- 下調べ (サブエージェント、読むだけ。要点は scratchpad の e4a-research.md): 他の target で「(in a later version)」を返すのは、外のツールの `workspace()` (`project` と `target`)・`crate` と `project`・`unnameable` の `other_target`、照会のツールの `local::other_target` (`member`・`dependency` の `Member::NotForTarget`、get_item の 5 か所と `search_across`)。今のビルド (`local::member`・`dependency` → `LocalWanted` → `local_archive_telling`) は flight の鍵と置き場 (`local/v1/<ws>/<pkg>/<target>`) に target を含むので、他の target でもそのまま使え、止めているのは `targets_built` の関所だけ。cargo metadata は target によらない。rust-std の確かめ (`toolchain::check_target` → `toolchain_missing` と `rustup target add`) はビルドの道にある。stale の理由 `inputs_changed` は要件にあり、スキーマに無い
+- 利用者が決めたこと:
+  1. E4a は cargo metadata を記録しない (ビルドごとの入力のダイジェストだけ、版は照会のときに cargo metadata で解決する)。R-WS-10 の「metadata を記録する」は外の workspace (E4b) だけに直す
+  2. 他の target のビルドは、照会のツールの target dir と分ける (他の target の長い初回ビルドの間、照会のツールのビルドがロックで待たされないため)。R-WS-2 を直す
+  3. 他の target の member の記録は、その後にソースが変われば、前の記録を `stale: true`・`stale_reason: inputs_changed` と warning、「外のツールを同じ引数で呼び直す」と「その後の変更は LSP で」の hint 付きで返す
+  4. `project` と `target` だけなら、member ごとの共有の仕事を一度に始めて `build.wait_secs` まで待ち、member ごとに built・building・failed を並べて返す (一部の失敗で呼び出しを失敗にしない)。記録は package ごと
+  5. 決定 10 (member を `[package.metadata.docs.rs]` の組で) は E4a の後の別の段
+  6. 他の target のテストは wasm32-wasip1 で作り、CI の check job に `rustup target add wasm32-wasip1` を足す。入っていない環境では `toolchain_missing` を確かめる
+- 聞かずに決めたこと (要件か下調べの推奨のとおり): target dir は (workspace, target) ごと。member は private も文書化 (R-WS-3)。host 向けにだけ作る依存は host で (E2b と同じ)。照会のツールが記録を読むのは get_item の系統と、同じ workspace・target の中の re-export の行き先 (crate なしの検索は読まない、E1b と同じ)。段は E4a-1 (データと計画)・E4a-2 (外のツール)・E4a-3 (照会のツール)・E4a-4 (テストと CI)
+
 **E3b-2 (照会のツールで git の crate を引く。2026-10-22)**:
 
 - `mcp::tool::recorded_git`: `recorded_git` は ref なら解決の記録 (`Key::GitRef`) を、ハッシュなら記録のある commit (完全なハッシュは `Key::Git` を直に、短いものは一覧の前方一致で記録のあるものだけ、決定 2) を引き、無ければその短いハッシュの要求の鍵を読む (決定 3)。commit の記録は `recorded::recorded_as` (鍵と「呼び直す」の文面を取るように広げた) で読む。ref の応答は provenance に `git`・`ref`・`rev`・`resolved_at`・`plaintext`、期限内でも「解決し直すには外のツール」の hint、1 日を過ぎるか読めないか時計より 5 分以上先なら `stale: ref_ttl_expired` と warning (`data::parse_rfc3339` を足した)。外のツールが ref のロックを持つ間は、commit の記録が失敗・壊れた・無いでも作成中として `building`、ref が動いていて前の commit の記録があればそれを `stale: rebuilding` と `retry_after_secs` 付きで返す (決定 4。`Resolved.previous` を外のツールが書く)
@@ -1595,6 +1615,9 @@ Claude Code 2.1.304、Linux で測った。
    - R-WS-6・R-CA-4・R-DIST-3・Q-29 (C4。利用者が決めた): 残った子孫の記録・作業用ディレクトリ・使えない target dir の印をキャッシュの下 (`procs/v<版>/`・`work/<実体 ID>/`) に置くこと (「state に置く」を改める)。持ち主の生死は、サーバーが生きている間持つ `owner:<実体 ID>` のロックで判定すること (案の PID と起動時刻をやめる。このロックファイルだけは、持ち主の止まった後に掃除が消す)。子孫は、継承させるロックで残っていることを確かめ、セッション ID と起動時刻 (マシンと起動の識別が同じもの) で誰かを確かめて止めること。Windows は記録しないこと (Job Object が止める)。確かでなければ止めず記録を残すこと。起動時の片付けは裏で 5 秒までで、残りは次の起動に回すこと (「判定の上限」)。他の版の記録は持ち主が止まって 7 日で消すこと (「読めない記録には触らない」を改める)。使えない target dir の名前と伝え方は D2
    - §8: `local_build_required` の扱い (M2 で使われなくなるか)、ビルドの状態の値 (R-OUT-9)
    - R-SC-4 の `readme` の扱いを M3 に送る
+   - R-WS-10・R-WS-5 (M2e): 外の記録の置き場 (`ext/v1` の索引と `local/v1` の本体、決定 1)・鍵 (`Key::Release`・`Git`・`GitRef`・`Target`)・進行中のロック (決定 13)。git は要求の鍵で解決し commit の鍵で作ること、呼び直しは `cargo update -p` ではなく Cargo.lock を作り直すこと (ハッシュの rev は作り直さない)、解決の記録に前の commit を残し新しい commit の作成中はそれを `stale: rebuilding` で返すこと (E3b-2 の決定 4)、短いハッシュは記録のある commit だけで照合すること (E3b-2 の決定 2・3)。既定のプロジェクトの他の target では cargo metadata を記録しないこと (E4a の決定 1。「まず metadata を記録する」は外の workspace だけに)。決定 10 (member を docs.rs の組で) の表の行
+   - R-WS-2 (E4a の決定 2): 外のツールが既定のプロジェクトを他の target で作るときの target dir は (workspace, target) ごとに分けること
+   - R-OUT の stale の理由: `ref_ttl_expired` (E3b-2)・`inputs_changed` (E4a-3) をスキーマに入れたこと
    - §12 の M2 の到達点と、M3 以降に回したもの
 3. README を合わせる (F6)。公開は M3 の後にまとめて行う (P9。利用者が行う)
 4. M3 の計画を立てる
