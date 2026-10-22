@@ -333,6 +333,31 @@ pub async fn docs_rs_json(
     }
 }
 
+/// The error of a load of the rustdoc JSON of `name` at `version` for `target`, while docs.rs is
+/// remembered to have none of it, or none for `target` (requirements R-DS-3 and R-TG-1).
+///
+/// For a lookup that builds the release here instead, before its `.crate` is fetched (decided in
+/// M2's D7). A failure of another kind is not told.
+pub async fn remembered_no_json(
+    cache: &Cache,
+    name: &CrateName,
+    version: &Version,
+    target: &TargetTriple,
+) -> Option<LoadError> {
+    let dir = cache.docs_rs_dir(name, version, Some(target));
+    let cache = cache.clone();
+    let (kind, _) = blocking(move || read_miss(&cache, &dir)).await.ok()??;
+    match kind {
+        MissKind::NoTarget => Some(LoadError::NoTargetJson {
+            target: target.clone(),
+        }),
+        MissKind::Missing | MissKind::NoSupportedFormat => {
+            Some(LoadError::Fetch(FetchError::NotFound))
+        },
+        MissKind::Transient | MissKind::Unparsable | MissKind::Corrupt => None,
+    }
+}
+
 /// Looks for the rustdoc JSON of `name` at `version` in another format that this server reads,
 /// when the one docs.rs returned by default, in format `found`, could not be read.
 ///

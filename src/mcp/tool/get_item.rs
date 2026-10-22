@@ -346,10 +346,32 @@ struct Request {
     index_fetched_at: Option<Box<str>>,
     /// Until when the call waits for work that goes on without it (requirement R-ARCH-6).
     until: Instant,
-    /// The workspace member's crate that is built here instead, if it is one (decided in M2's
-    /// D2).
+    /// What is built here (decided in M2's D2 and D7).
     #[cfg(feature = "local")]
+    here: Here,
+}
+
+/// What of a lookup is built here.
+#[cfg(feature = "local")]
+#[derive(Debug, Default)]
+struct Here {
+    /// The crate that is built here instead of the release, a workspace member's or a
+    /// dependency's (decided in M2's D2 and D7).
     local: Option<LocalSource>,
+    /// The project's package of the release, which is built here when docs.rs has no JSON of it
+    /// (requirements R-DS-3 and R-TG-1, decided in M2's D7).
+    if_missing: Option<Box<IfMissing>>,
+}
+
+/// The project's package of a release, to build here when docs.rs has no JSON of it (decided in
+/// M2's D7).
+#[cfg(feature = "local")]
+#[derive(Debug)]
+struct IfMissing {
+    /// The package, of the project.
+    found: project::Found,
+    /// Whether the call asks for `refresh`, which its build takes (decided in M2's D5).
+    refresh: bool,
 }
 
 /// The most crates that a path is followed into, through re-exports of their items, after the
@@ -1058,6 +1080,10 @@ fn told_why(result: CallToolResult, why: &str) -> CallToolResult {
     let Some(mut body) = body else {
         return result;
     };
+    // Not of an item that the build here does not have, which is not why docs.rs is not used.
+    if body.get("code").and_then(Value::as_str) == Some("item_not_found") {
+        return result;
+    }
     if let Some(message) = body.get("message").and_then(Value::as_str) {
         let message = format!("{why}; {message}");
         body.insert("message".to_owned(), json!(message));
@@ -1186,11 +1212,19 @@ fn member_request(
     (resolved_from, project_from, workspace): (ResolvedFrom, &'static str, &Workspace),
     until: Instant,
 ) -> Request {
-    // The crate's name, which `[lib] name` may make other than the package's.
+    // The crate's name, which `[lib] name` may make other than the package's. A path that the
+    // package's name heads, followed by the lib's, as a lookup by the lib's name makes it, goes on
+    // after the lib's, as for docs.rs (`with_root_name`).
     let path = with_lib_name(name.as_str(), path);
+    let lib = &*wanted.plan.crate_name;
     let path = match path.split_once("::") {
-        Some((_, rest)) => format!("{}::{rest}", wanted.plan.crate_name).into(),
-        None => wanted.plan.crate_name.clone(),
+        Some((head, rest)) if head != lib => match rest.split_once("::") {
+            Some((next, after)) if next == lib => format!("{lib}::{after}").into(),
+            None if rest == lib => lib.into(),
+            Some(_) | None => format!("{lib}::{rest}").into(),
+        },
+        Some((_, rest)) => format!("{lib}::{rest}").into(),
+        None => lib.into(),
     };
     Request {
         name: package.parse().unwrap_or_else(|_| name.clone()),
@@ -1209,7 +1243,10 @@ fn member_request(
         hops: 0,
         index_fetched_at: None,
         until,
-        local: Some(LocalSource::Wanted(wanted)),
+        here: Here {
+            local: Some(LocalSource::Wanted(wanted)),
+            if_missing: None,
+        },
     }
 }
 
@@ -1273,8 +1310,6 @@ async fn resolve(
             warnings,
         ));
     }
-    // docs.rs has the project's package only if it is the one on crates.io; else it is built here
-    // (requirement R-VR-2, decided in M2's D7).
     #[cfg(feature = "local")]
     let entry = match entry_or_copy(
         state,
@@ -1301,11 +1336,10 @@ async fn resolve(
         the_release_in_build(same, &resolved.version.version, &entry, &mut warnings)
     });
     #[cfg(feature = "local")]
-    let (resolved_from, project_from, in_build) = chosen_by(&spec, from_project, same_release);
+    let chosen = chosen_by(&spec, from_project, same_release);
     #[cfg(not(feature = "local"))]
-    let (resolved_from, project_from, in_build) = chosen_by(&spec);
-    // The name as published, for docs.rs and the cache, and at the head of the path as code writes
-    // it (`Serde_Json::Value` is `serde_json::Value`).
+    let chosen = chosen_by(&spec);
+    // As published, for docs.rs and the cache, and as code writes it at the head of the path.
     let published: CrateName = entry.name.parse().unwrap_or(name);
     let path = with_lib_name(published.as_str(), &path);
     let request = Request {
@@ -1313,22 +1347,36 @@ async fn resolve(
         version: resolved.version.version.clone(),
         checksum: Some(resolved.version.checksum.clone()),
         build: None,
-        in_build,
+        in_build: chosen.in_build,
         hops: 0,
         index_fetched_at: entry
             .stale
             .as_ref()
             .map(|_| data::rfc3339(entry.fetched_at).into()),
-        project_from,
+        project_from: chosen.project_from,
         path,
-        resolved_from,
+        resolved_from: chosen.resolved_from,
         target,
         shape,
         until,
         #[cfg(feature = "local")]
-        local: None,
+        here: chosen.here,
     };
     Ok((request, warnings))
+}
+
+/// How the version of a release was chosen, and what of the project it is.
+struct VersionChoice {
+    /// How the version was chosen.
+    resolved_from: ResolvedFrom,
+    /// Where the project came from, if it chose the version or has the same release.
+    project_from: Option<&'static str>,
+    /// The project's build of the crate.
+    in_build: InBuild,
+    /// The project's package of the release, built here when docs.rs has no JSON of it (decided
+    /// in M2's D7).
+    #[cfg(feature = "local")]
+    here: Here,
 }
 
 /// The project's package that decided the version, when it did.
@@ -1410,7 +1458,7 @@ fn cached_request(
         index_fetched_at: None,
         until,
         #[cfg(feature = "local")]
-        local: None,
+        here: Here::default(),
     }
 }
 
@@ -1445,14 +1493,21 @@ fn the_release_in_build(
     version: &Version,
     entry: &IndexEntry,
     warnings: &mut Vec<Box<str>>,
-) -> Option<(Workspace, &'static str)> {
+) -> Option<project::Found> {
     let package = same
         .packages
         .iter()
         .find(|package| package.version == *version)?;
     let check = package.docs_rs_check(entry);
     if check == DocsRsCheck::Allowed {
-        return Some((same.workspace, same.project_from));
+        return Some(project::Found {
+            package: package.clone(),
+            // Of the version given, which the caller tells.
+            resolved_from: ResolvedFrom::Explicit,
+            project_from: same.project_from,
+            warnings: Vec::new(),
+            workspace: same.workspace,
+        });
     }
     warnings.push(
         format!(
@@ -1472,32 +1527,68 @@ fn the_release_in_build(
 fn chosen_by(
     spec: &VersionSpec,
     from_project: Option<Box<project::Found>>,
-    same_release: Option<(Workspace, &'static str)>,
-) -> (ResolvedFrom, Option<&'static str>, InBuild) {
+    same_release: Option<project::Found>,
+) -> VersionChoice {
+    // The project's package, built here when docs.rs has no JSON of it; not from Cargo.lock
+    // alone, which does not tell what to build (requirement R-VR-2, decided in M2's D7).
+    let if_missing = |found: project::Found| Here {
+        local: None,
+        if_missing: Some(Box::new(IfMissing {
+            found,
+            refresh: false,
+        })),
+    };
     if let Some(found) = from_project {
         let in_build = InBuild {
-            workspace: Some(found.workspace),
+            workspace: Some(found.workspace.clone()),
             sets: None,
         };
-        return (found.resolved_from, Some(found.project_from), in_build);
+        let (resolved_from, project_from) = (found.resolved_from, found.project_from);
+        let here = if resolved_from == ResolvedFrom::CargoLock {
+            if_missing(*found)
+        } else {
+            Here::default()
+        };
+        return VersionChoice {
+            resolved_from,
+            project_from: Some(project_from),
+            in_build,
+            here,
+        };
     }
     let (resolved_from, ..) = chosen_by_argument(spec);
     match same_release {
-        Some((workspace, project_from)) => {
+        Some(mut found) => {
             let in_build = InBuild {
-                workspace: Some(workspace),
+                workspace: Some(found.workspace.clone()),
                 sets: None,
             };
-            (resolved_from, Some(project_from), in_build)
+            found.resolved_from = resolved_from;
+            VersionChoice {
+                resolved_from,
+                project_from: Some(found.project_from),
+                in_build,
+                here: if_missing(found),
+            }
         },
-        None => (resolved_from, None, InBuild::default()),
+        None => VersionChoice {
+            resolved_from,
+            project_from: None,
+            in_build: InBuild::default(),
+            here: Here::default(),
+        },
     }
 }
 
 /// How the version was chosen: without local features, by the argument.
 #[cfg(not(feature = "local"))]
-fn chosen_by(spec: &VersionSpec) -> (ResolvedFrom, Option<&'static str>, InBuild) {
-    chosen_by_argument(spec)
+fn chosen_by(spec: &VersionSpec) -> VersionChoice {
+    let (resolved_from, project_from, in_build) = chosen_by_argument(spec);
+    VersionChoice {
+        resolved_from,
+        project_from,
+        in_build,
+    }
 }
 
 /// How the version was chosen by the argument `spec`.
@@ -1817,7 +1908,7 @@ async fn look_up(
 /// `.crate` are fetched again.
 #[cfg(feature = "local")]
 async fn refresh_release(state: &ToolState, request: &mut Request) {
-    match &mut request.local {
+    match &mut request.here.local {
         Some(LocalSource::Wanted(wanted)) => wanted.refresh = true,
         Some(LocalSource::Built(_)) => {},
         None => {
@@ -1828,6 +1919,10 @@ async fn refresh_release(state: &ToolState, request: &mut Request) {
                 data::forget_failures(dir, false).await;
             }
             data::forget_failure_of(&state.cache.crate_file_path(&request.name, &request.version));
+            // And its build here, if docs.rs has no JSON of it (decided in M2's D7).
+            if let Some(if_missing) = &mut request.here.if_missing {
+                if_missing.refresh = true;
+            }
         },
     }
 }
@@ -1841,9 +1936,28 @@ async fn look_up_release(
 ) -> CallToolResult {
     // Built here: docs.rs and static.crates.io have another crate of its name, if any.
     #[cfg(feature = "local")]
-    if let Some(source) = arguments.local.take() {
+    if let Some(source) = arguments.here.local.take() {
         return look_up_member(state, arguments, source, warnings).await;
     }
+    // The project's package that docs.rs has no JSON of, as it remembers, is built here before its
+    // `.crate` is fetched (decided in M2's D7).
+    #[cfg(feature = "local")]
+    if arguments.here.if_missing.is_some()
+        && let Some(error) = data::remembered_no_json(
+            &state.cache,
+            &arguments.name,
+            &arguments.version,
+            &arguments.target,
+        )
+        .await
+        && let Some(why) = no_json_why(&arguments, &ArchiveError::Load(error))
+        && let Some(if_missing) = arguments.here.if_missing.take()
+    {
+        return built_instead(state, arguments, *if_missing, &why, warnings).await;
+    }
+    // What the response warns about before docs.rs is read, which a build here keeps.
+    #[cfg(feature = "local")]
+    let planned = warnings.len();
     arguments.build = docs_rs_build(state, &arguments, &mut warnings)
         .await
         .map(Box::new);
@@ -1865,7 +1979,85 @@ async fn look_up_release(
     let looked_up = load_and_look_up(state, dir, arguments, &mut warnings).await;
     match looked_up {
         Ok((looked_up, arguments)) => conclude(state, looked_up, arguments, warnings).await,
-        Err(result) => *result,
+        Err(Unloaded::Response(result)) => *result,
+        #[cfg(feature = "local")]
+        Err(Unloaded::NoJson(arguments, if_missing, why)) => {
+            // Not what docs.rs's build of it tells.
+            warnings.truncate(planned);
+            built_instead(state, *arguments, *if_missing, &why, warnings).await
+        },
+    }
+}
+
+/// Why the JSON of a release was not looked up in.
+enum Unloaded {
+    /// The response to return.
+    Response(Box<CallToolResult>),
+    /// docs.rs has no JSON of the project's package, as this tells, which is built here
+    /// (decided in M2's D7).
+    #[cfg(feature = "local")]
+    NoJson(Box<Request>, Box<IfMissing>, String),
+}
+
+/// Why docs.rs has no JSON of the release of `arguments`, as `error` tells, when it is built here
+/// instead (requirements R-DS-3, R-DS-6, R-FV-4 and R-TG-1, decided in M2's D7).
+#[cfg(feature = "local")]
+fn no_json_why(arguments: &Request, error: &ArchiveError) -> Option<String> {
+    let release = release(arguments);
+    if let ArchiveError::Load(LoadError::NoTargetJson { target }) = error {
+        return Some(format!(
+            "docs.rs has rustdoc JSON of {release} only for another target than {target}, as it \
+             builds most releases for one target since 2026-05-01"
+        ));
+    }
+    if let ArchiveError::Load(LoadError::Fetch(FetchError::NotFound | FetchError::BadRequest))
+    | ArchiveError::Make(load::LoadError::Parse(ParseError::UnsupportedFormat { .. })) = error
+    {
+        return Some(format!(
+            "docs.rs has no rustdoc JSON of {release} that this server reads: it was built there \
+             before 2025-05-23, its build there failed, or its format is not one that this server \
+             reads"
+        ));
+    }
+    None
+}
+
+/// Looks the item up in the project's package of the release of `arguments`, `if_missing`, built
+/// here as a dependency, as docs.rs has no JSON of it, as `why` tells (requirements R-DS-3 and
+/// R-TG-1, decided in M2's D7). An error tells `why` too.
+#[cfg(feature = "local")]
+async fn built_instead(
+    state: &Arc<ToolState>,
+    arguments: Request,
+    if_missing: IfMissing,
+    why: &str,
+    mut warnings: Vec<Box<str>>,
+) -> CallToolResult {
+    let IfMissing { found, refresh } = if_missing;
+    let shape = (
+        &*arguments.path,
+        &arguments.target,
+        &arguments.shape,
+        DocsRsCheck::Allowed,
+    );
+    let mut request =
+        match dependency_request(state, &found, &arguments.name, shape, arguments.until).await {
+            Ok(request) => request,
+            Err(result) => return told_why(*result, why),
+        };
+    request.hops = arguments.hops;
+    let Some(mut source) = request.here.local.take() else {
+        return told_why(stopped(), why);
+    };
+    if let LocalSource::Wanted(wanted) = &mut source {
+        wanted.refresh = refresh;
+    }
+    warnings.push(format!("{why}, so it is built here").into());
+    let result = Box::pin(look_up_member(state, request, source, warnings)).await;
+    if result.is_error == Some(true) {
+        told_why(result, why)
+    } else {
+        result
     }
 }
 
@@ -1912,7 +2104,7 @@ async fn look_up_member(
     }
     arguments.in_build.sets = feature_sets(state, &arguments, &mut warnings).await;
     // Kept for the lookup again when a re-export is not followed.
-    arguments.local = Some(LocalSource::Built(Arc::clone(&built)));
+    arguments.here.local = Some(LocalSource::Built(Arc::clone(&built)));
     let task = crate::task::spawn_blocking(move || {
         let record = &built.record;
         let origin = Origin::Local {
@@ -2023,12 +2215,17 @@ async fn load_and_look_up(
     dir: PathBuf,
     arguments: Request,
     warnings: &mut Vec<Box<str>>,
-) -> Result<(Result<Value, Failure>, Request), Box<CallToolResult>> {
-    let arguments =
+) -> Result<(Result<Value, Failure>, Request), Unloaded> {
+    let response = |result: CallToolResult| Unloaded::Response(Box::new(result));
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(unused_mut, reason = "only a project's package is built instead")
+    )]
+    let mut arguments =
         match look_up_archived(state.cache.clone(), dir.clone(), Box::new(arguments)).await {
             Some(Ok((looked_up, arguments))) => return Ok((looked_up, *arguments)),
             Some(Err(arguments)) => *arguments,
-            None => return Err(Box::new(shutting_down())),
+            None => return Err(response(shutting_down())),
         };
     let archived = match load::docs_rs_archive(
         &state.archives,
@@ -2043,10 +2240,17 @@ async fn load_and_look_up(
     {
         Joined::Done(Ok(archived)) => archived,
         Joined::Done(Err(error)) => {
-            return Err(Box::new(archive_error(&state.cache, &arguments, &error)));
+            // The project's package, built here instead (decided in M2's D7).
+            #[cfg(feature = "local")]
+            if let Some(why) = no_json_why(&arguments, &error)
+                && let Some(if_missing) = arguments.here.if_missing.take()
+            {
+                return Err(Unloaded::NoJson(Box::new(arguments), if_missing, why));
+            }
+            return Err(response(archive_error(&state.cache, &arguments, &error)));
         },
-        Joined::Ended => return Err(Box::new(stopped())),
-        Joined::Going(doing) => return Err(Box::new(building(&arguments, doing, warnings))),
+        Joined::Ended => return Err(response(stopped())),
+        Joined::Going(doing) => return Err(response(building(&arguments, doing, warnings))),
     };
     warnings.extend(archived.warnings.iter().cloned());
     let mapped = Arc::clone(&archived.mapped);
@@ -2059,7 +2263,7 @@ async fn load_and_look_up(
         Err(error) => {
             let error = crate::task::resume_if_panic(error);
             tracing::error!(%error, "the get_item lookup did not finish");
-            Err(Box::new(shutting_down()))
+            Err(response(shutting_down()))
         },
     }
 }
@@ -2578,7 +2782,7 @@ async fn destination_request(
         index_fetched_at,
         until: origin.until,
         #[cfg(feature = "local")]
-        local: None,
+        here: Here::default(),
     })
 }
 
@@ -2605,7 +2809,7 @@ async fn in_project_destination(
     }
     // From a crate built here, one that its project does not tell is not taken at crates.io's latest:
     // the re-export is shown (decided in M2's D6).
-    if origin.local.is_some() && matches!(in_build, InProjectBuild::Elsewhere) {
+    if origin.here.local.is_some() && matches!(in_build, InProjectBuild::Elsewhere) {
         return Some(Err(Box::new(super::tool_error(
             "docs_unavailable",
             &format!(
@@ -2707,6 +2911,7 @@ async fn in_project_build_of(
     // tell the version (decided in M2's D6). A dependency's package is not a member, which may
     // have its name and version (decided in M2's D7).
     let from_member = origin
+        .here
         .local
         .as_ref()
         .and_then(|local| {
@@ -2745,13 +2950,13 @@ async fn in_project_build_of(
         PackageLookup::AmbiguousPackage(_) | PackageLookup::NotFound => return None,
     };
     // From a member only: a docs.rs crate's re-export of a crate of that name is not the member.
-    if origin.local.is_some() && graph.is_member(package) {
+    if origin.here.local.is_some() && graph.is_member(package) {
         return Some(InProjectBuild::Member(
             Box::new(package.clone()),
             Box::new(workspace.clone()),
         ));
     }
-    if package.source != Source::CratesIo && origin.local.is_some() {
+    if package.source != Source::CratesIo && origin.here.local.is_some() {
         return Some(InProjectBuild::Dependency(
             Box::new(package.clone()),
             Box::new(workspace.clone()),
@@ -2782,7 +2987,7 @@ async fn in_project_build_of(
             // The version is the project's, not the index's.
             index_fetched_at: None,
             until: origin.until,
-            local: None,
+            here: Here::default(),
         }),
         Box::new(package.clone()),
     ))
@@ -2801,8 +3006,29 @@ async fn release_destination(
     origin: &Request,
     warnings: &mut Vec<Box<str>>,
 ) -> Result<Request, Box<CallToolResult>> {
-    // When the index cannot be read, the release is taken, whose lookup tells why it fails.
+    // When the index cannot be read, the release is taken, whose lookup tells why it fails; built
+    // here as the project's package when docs.rs has no JSON of it (decided in M2's D7).
     let Ok(InIndex::Copy(check)) = project_entry(state, package, &request.name).await else {
+        let mut request = request;
+        // Not from Cargo.lock alone, which does not tell what to build (requirement R-VR-2).
+        let from_metadata = request.resolved_from != ResolvedFrom::CargoLockRaw;
+        request.here.if_missing = request
+            .in_build
+            .workspace
+            .clone()
+            .filter(|_| from_metadata)
+            .map(|workspace| {
+                Box::new(IfMissing {
+                    found: project::Found {
+                        package: package.clone(),
+                        resolved_from: request.resolved_from,
+                        project_from: origin.project_from.unwrap_or("argument"),
+                        warnings: Vec::new(),
+                        workspace,
+                    },
+                    refresh: false,
+                })
+            });
         return Ok(request);
     };
     let what = format!(
@@ -2815,7 +3041,7 @@ async fn release_destination(
         .in_build
         .workspace
         .clone()
-        .filter(|_| origin.local.is_some())
+        .filter(|_| origin.here.local.is_some())
     else {
         warnings.push(
             format!("{what}: the release on crates.io of its version is shown instead").into(),
@@ -3109,11 +3335,10 @@ async fn execute_std(
         index_fetched_at: None,
         until,
         #[cfg(feature = "local")]
-        local: None,
+        here: Here::default(),
     };
-    // The archives that the lookup opens, made here as a task: the lookup, on a blocking thread,
-    // then only opens them, without waiting there for a lock or a place among the crates being
-    // parsed. One that cannot be made is told by the lookup.
+    // The archives that the lookup opens, made here: the lookup, on a blocking thread, then only
+    // opens them, waiting there for no lock nor place. One that cannot be made, it tells.
     let mut opened = vec![krate];
     for other in [StdCrate::Std, StdCrate::Alloc, StdCrate::Core] {
         if !opened.contains(&other) {
@@ -3976,7 +4201,7 @@ mod tests {
             index_fetched_at: None,
             until: Instant::now(),
             #[cfg(feature = "local")]
-            local: None,
+            here: Here::default(),
         };
         let candidates = (0..25).map(|n| format!("item {n}").into()).collect();
         let result = item_error(&request, &GetItemError::Ambiguous { candidates });

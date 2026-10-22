@@ -47,7 +47,7 @@ pub(super) enum InProject {
 
 /// A package of the project that a crate name means.
 #[cfg(feature = "local")]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct Found {
     /// The package, with its source and checksum.
     pub(super) package: ProjectPackage,

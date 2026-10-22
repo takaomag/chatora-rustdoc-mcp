@@ -1180,19 +1180,43 @@ Claude Code 2.1.304、Linux で測った。
 - 文言: `local_build_required` は lib の無い依存だけになった。`metadata_failed` は「not from crates.io」をやめ「docs.rs does not have」
 - テスト: stdio に、vendor で中身を変えた `demo` 0.1.0 (checksum が index と合わない、オフライン) を直接引いても member の re-export から引いても、依存としてローカルでビルドされ (`package_source: crates.io`・理由の warning)、private な関数は出ないことを足した (行き先の照合を外すと re-export の方が落ちることを確かめた)。単体テストに、Cargo.lock の版 1 の checksum、`entry_fresh` の 1 回だけの読み直しと、無かった crate の読み直し
 - レビュー (サブエージェント) の指摘と直し:
-  1. 照合する index を問い合わせの名前で引いていた。lib 名 (`md5` の `md-5`) や改名で引くと別の crate の index を読み、誤った理由の warning 付きでビルドしていた (前は誤った `local_build_required`)。プロジェクトの package 名で引く。stdio のテストに、vendor の `demo` の lib 名を `patched_demo` にして lib 名で引くことを足した (直しを外すと `offline_miss` で落ちる)
-  2. 起点が docs.rs の crate で行き先が合わない写しのとき、要求にプロジェクトの checksum と workspace が残り、`.crate` の取得が checksum の不一致で毎回失敗し、写しのビルドの組で `enabled_in_project` を付けていた。この分岐では checksum を外し (index の値で取り直す)、プロジェクトのビルドの組も付けない
-  3. 古い index (オフライン・通信の失敗) で版が無いことを「crates.io が載せていない」と断定してビルドしていた。前例 (R-CA-3、`version_not_found`) と決定 6 の「今のまま」に合わせ、`offline_miss`・`network_error` を返す (`InIndex::Unlisted`、`stale_index_error` を共有)。checksum の不一致は版が載っているので古い index でも照合できる
-  4. 写しの経路のエラー (`build_unsupported`・`no_json`・`metadata_failed` など) とビルド中の応答に docs.rs を使わない理由が出なかった。message の頭か warnings に付ける (`told_why`)
-  6. refresh (`SparseIndex::forget`) が読み直しの記録を消さず、10 分の間は読み直さなかった。消す
-  8. 文言: docs.rs が起点のときの warning を「crates.io の版を代わりに見せる」に。行き先の `local_build_required` に実際の理由 (check) を渡す。`metadata_failed` の doc コメント
-  9. テスト: `entry_fresh` のテストが 3 回目の要求が無いことを守っていなかった (サーバーが閉じて古いキャッシュに落ちても通った)。古くないことと要求が無いことを確かめ、refresh の後は読み直すことを足した
+  - (1) 照合する index を問い合わせの名前で引いていた。lib 名 (`md5` の `md-5`) や改名で引くと別の crate の index を読み、誤った理由の warning 付きでビルドしていた (前は誤った `local_build_required`)。プロジェクトの package 名で引く。stdio のテストに、vendor の `demo` の lib 名を `patched_demo` にして lib 名で引くことを足した (直しを外すと `offline_miss` で落ちる)
+  - (2) 起点が docs.rs の crate で行き先が合わない写しのとき、要求にプロジェクトの checksum と workspace が残り、`.crate` の取得が checksum の不一致で毎回失敗し、写しのビルドの組で `enabled_in_project` を付けていた。この分岐では checksum を外し (index の値で取り直す)、プロジェクトのビルドの組も付けない
+  - (3) 古い index (オフライン・通信の失敗) で版が無いことを「crates.io が載せていない」と断定してビルドしていた。前例 (R-CA-3、`version_not_found`) と決定 6 の「今のまま」に合わせ、`offline_miss`・`network_error` を返す (`InIndex::Unlisted`、`stale_index_error` を共有)。checksum の不一致は版が載っているので古い index でも照合できる
+  - (4) 写しの経路のエラー (`build_unsupported`・`no_json`・`metadata_failed` など) とビルド中の応答に docs.rs を使わない理由が出なかった。message の頭か warnings に付ける (`told_why`)
+  - (6) refresh (`SparseIndex::forget`) が読み直しの記録を消さず、10 分の間は読み直さなかった。消す
+  - (8) 文言: docs.rs が起点のときの warning を「crates.io の版を代わりに見せる」に。行き先の `local_build_required` に実際の理由 (check) を渡す。`metadata_failed` の doc コメント
+  - (9) テスト: `entry_fresh` のテストが 3 回目の要求が無いことを守っていなかった (サーバーが閉じて古いキャッシュに落ちても通った)。古くないことと要求が無いことを確かめ、refresh の後は読み直すことを足した
 - 残したもの:
   - (5) 読み直しの記録は取り直しの前に付けるので、同じ crate の同時の呼び出しのうち後のものが、取り直しがキャッシュのロックを取る前に古いキャッシュを読むと、答えが割れうる (窓は短い)
   - (7) `entry()` が今まさに取り直した直後でも、版が無ければもう 1 回条件付きの要求を出す。re-export の行き先ごとに index を読む (決定 9 のとおり、TTL 内はキャッシュ)
   - (10) `resolve_version` は新しい照合を使わず、版が index に無いと `version_not_found`・crate が無いと `crate_not_found` (D7d で)
   - 結合テストの無い経路: 版や crate が index に無い (オンラインの index のモックが要る)、読み直しで公開済みと分かり docs.rs に戻る、docs.rs を起点にした行き先の写し、`cargo_lock_raw` の写し
   - `crate` なしの検索の照合は D7d (決定 10)。`list_crates` の `docs_rs_json` は checksum を見ずに `cached` を付ける (軽微)
+
+**D7b-3 (docs.rs に JSON が無い release。2026-10-22)**:
+
+- `Request` に、ここでビルドするもの (`Here`: 前からの `local` と、新しい `if_missing`) を持たせた。`if_missing` は docs.rs に JSON が無いときにビルドするプロジェクトの package (`project::Found`) と refresh の印で、入れるのは Cargo.lock が版を決めたとき (`cargo_lock`。`cargo_lock_raw` は入れない、R-VR-2)、明示した版がプロジェクトの crates.io の release と同じとき (`the_release_in_build`。決定 3)、re-export の行き先がプロジェクトの release のとき (`release_destination`)。行き先が合わない写しで docs.rs の版を見せるときは入れない
+- 戻すきっかけ (決定 1): docs.rs の読み込みの `NoTargetJson` と `Fetch(NotFound | BadRequest)` (2025-05-23 より前・docs.rs のビルドの失敗・対応しない形式は、どれもこれになる)。`unparsable`・`too_large`・`version_mismatch` は今のまま
+- 戻す時点 (決定 2): 読み込みが失敗した後 (`load_and_look_up` が `Unloaded::NoJson` を返す)。覚えている失敗 (`data::remembered_no_json`) は `.crate` の取得の前に見て、取得を省く
+- 戻し (`built_instead`): 依存の計画 (`dependency_request`) で要求を作り、refresh を引き継ぎ (`refresh_release` が `if_missing` にも印を付ける)、理由を warnings に 1 行 (決定 8)。計画やビルドが失敗したら、その失敗を返し、message の頭に docs.rs に無い理由を付ける (決定 7。`told_why`)。`no_target_json` の理由は「docs.rs は他の target の JSON だけを持つ」
+- `resolve` が長くなったので、`chosen_by` は構造体 `VersionChoice` を返す
+- テスト: stdio に、vendor の `demo` 0.1.0 (crates.io の release と同じ checksum) を、キャッシュに docs.rs の失敗の記録 (`missing`・`no_target`) を置いてオフラインで、Cargo.lock の版・明示した版・member の re-export から引き、どれもローカルでビルドされて理由の warning が付くことを足した (戻しを外すと落ち、`.crate` の前の判定だけ外しても読み込みの失敗の後の経路で通ることを確かめた)
+- レビュー (サブエージェント) の指摘と直し:
+  - (1) 対応しない形式 (R-FV-4) は、1 回目は形式の読み取りの失敗 (`ArchiveError::Make` の `UnsupportedFormat`) で返り、戻らなかった (2 回目は覚えた失敗で戻った)。これも戻す
+  - (2) lib 名が package 名と違う crate (`md-5` の `md5`) を戻すと、path の頭が二重 (`md5::md5::Md5`) になり `item_not_found` だった。`member_request` は頭を lib 名に置き換えた後、続く lib 名を 1 段落とす (docs.rs の照会の `with_root_name` と同じ規則)
+  - (3) 起点が `cargo_lock_raw` の re-export の行き先にも `if_missing` が入っていた。入れない
+  - (4) 戻したビルドにその item が無いだけの `item_not_found` にも理由の前置きが付いた。付けない
+  - (5) 読み込みの失敗の後に戻すとき、docs.rs のビルドについての warning (`.crate` の取得の失敗など) が残った。docs.rs を読む前の分まで戻す
+  - テスト: D7b-3 のテストの vendor の `demo` の lib 名を `patched_demo` にして lib 名で引くこと (2 の直しを外すと落ちる)、docs.rs のビルドの warning が無いこと、一時的な失敗 (`transient`) を覚えているときは戻さないことを足した
+- 再レビューで残したもの (記録だけ):
+  - (6) プロジェクトのビルド target でない `target` を渡すと、`no_target_json` だった応答が、依存の計画の `no_json` (他の target) か `build_unsupported` に理由の前置きを付けたものになる (R-MCP-3 のとおり)
+  - (7) 戻す対象は「明示した版」より広く、版の要件 (`crate@^1`) や latest でもプロジェクトの release と同じ版に解決すれば戻す (`enabled_in_project` を出す前からの扱いと同じ)
+  - (8) target 付きの 404 の後の HEAD が失敗すると何も覚えず `Fetch(NotFound)` になり、理由の文は no_json のもの (前から)
+  - (10) オフラインで失敗を覚えていなければ戻さず `offline_miss` (決定 1 の範囲の外)
+  - `.crate` の前の判定は通信を 1 回省くだけで、オフラインのテストでは見分けられない (外しても読み込みの失敗の後の経路で同じ応答になる)。対応しない形式で戻る経路の結合テストは無い (docs.rs のモックで形式の違う JSON を返すものが要る)
+- テストの待ちの上限 (`tests/stdio.rs` の `TIMEOUT`) を 5 秒から 30 秒に (利用者の了承)。D7a の CI の Windows と、手元でテストを並べたときに、最初の応答を 5 秒待って落ちた。上限なので、通るテストは長く待たない
+- 残したもの: `crate` なしの検索 (`search_across`) と `resolve_version` は D7d。戻した依存が lib を持たないとき (`local_build_required`) の理由の文言は crates.io の release のものではない (稀)
 
 **止まる危険の監査と直し 1 (2026-10-21)**:
 

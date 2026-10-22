@@ -54,8 +54,9 @@ use semver::Version;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-/// Longest wait for a message the test expects.
-const TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest wait for a message the test expects: a bound only, which a test that passes does not
+/// wait for, long enough for a loaded machine, as a CI runner (5 seconds was not on Windows).
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The only protocol version the server supports.
 const PROTOCOL_VERSION: &str = "2026-07-28";
@@ -3316,6 +3317,102 @@ fn a_copy_of_a_crates_io_release_that_differs_is_built_here() {
     );
     assert!(inside.to_string().contains("item_not_found"), "{inside}");
     assert!(server.finish().success());
+}
+
+/// The project's `demo` 0.1.0, the release of crates.io, vendored with the lib `patched_demo`,
+/// which docs.rs is remembered to have no JSON of (`missing`), or none for the target
+/// (`no_target`), is built here as a dependency, before its `.crate` is fetched: with its version
+/// from Cargo.lock, by its lib's name, with the version given, and by the re-export of a member,
+/// offline (requirements R-DS-3 and R-TG-1, decided in M2's D7). A transient failure is not why.
+#[cfg(feature = "local")]
+#[test]
+fn a_release_that_docs_rs_has_no_json_of_is_built_here() {
+    let project = workspace_using_demo();
+    std::fs::write(
+        project.path().join("vendor/demo/src/lib.rs"),
+        "/// Says hello here.\npub fn hello() -> u8 {\n    1\n}\n",
+    )
+    .expect("written");
+    std::fs::write(
+        project.path().join("vendor/demo/Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [lib]\nname = \"patched_demo\"\n",
+    )
+    .expect("written");
+    std::fs::write(
+        project.path().join("src/lib.rs"),
+        "pub use patched_demo::hello;\n",
+    )
+    .expect("written");
+    let host = host_triple();
+    for (kind, told) in [
+        ("missing", "docs.rs has no rustdoc JSON of demo@0.1.0"),
+        ("no_target", "only for another target"),
+        ("transient", ""),
+    ] {
+        let offline = [("CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE", "true")];
+        let mut server = Server::start_with(Some(project.path()), &offline);
+        write_old_demo_index(&server);
+        let cache = Cache::at(server.cache.path());
+        std::fs::remove_dir_all(server.cache.path().join("docs.rs")).expect("removed");
+        let dir = cache.docs_rs_dir(
+            &"demo".parse().expect("a crate name"),
+            &Version::new(0, 1, 0),
+            Some(&host.parse().expect("a target")),
+        );
+        std::fs::create_dir_all(&dir).expect("made");
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        std::fs::write(
+            dir.join("miss.json"),
+            json!({ "kind": kind, "at": at, "server": env!("CARGO_PKG_VERSION") }).to_string(),
+        )
+        .expect("written");
+        if kind == "transient" {
+            server.send(&call_tool(
+                1,
+                "get_item",
+                json!({ "crate": "demo", "path": "hello" }),
+            ));
+            let failed = server.response(1)["result"].clone();
+            assert_eq!(failed["isError"], true, "{failed}");
+            assert!(!failed.to_string().contains("built here"), "{failed}");
+            assert!(server.finish().success());
+            continue;
+        }
+        for (first, krate) in [
+            (1, "demo"),
+            (50, "patched_demo"),
+            (100, "demo@0.1.0"),
+            (200, "app"),
+        ] {
+            let arguments = json!({ "crate": krate, "path": "hello" });
+            let found = built_item(&mut server, first, &arguments);
+            assert_ne!(found["isError"], true, "{kind} {krate}: {found}");
+            // Not after its `.crate`, which offline is not fetched.
+            assert!(
+                !found.to_string().contains("docs.rs built"),
+                "{kind} {krate}: {found}"
+            );
+            let found = &found["structuredContent"];
+            assert_eq!(
+                found["provenance"]["source"], "local",
+                "{kind} {krate}: {found}"
+            );
+            assert_eq!(
+                found["provenance"]["package_source"], "crates.io",
+                "{found}"
+            );
+            assert!(found.to_string().contains("Says hello here."), "{found}");
+            assert!(
+                found["warnings"].to_string().contains(told),
+                "{kind} {krate}: {found}"
+            );
+        }
+        assert!(server.finish().success());
+    }
 }
 
 /// A search of the project's dependencies that finds nothing while they are still being fetched
