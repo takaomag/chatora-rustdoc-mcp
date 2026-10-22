@@ -86,6 +86,9 @@ pub enum Key {
         workspace: Box<str>,
         /// The package, by its id in `cargo metadata`, which tells its source and version.
         package: Box<str>,
+        /// The crate of the package documented, its lib or a bin, as code writes it.
+        #[serde(rename = "crate")]
+        name: Box<str>,
         /// The target it is documented for.
         target: Box<str>,
         /// Whether it documents the hidden items.
@@ -927,12 +930,13 @@ mod tests {
         let key = Key::Target {
             workspace: "/p".into(),
             package: "path+file:///p#app@0.1.0".into(),
+            name: "app".into(),
             target: "wasm32-wasip1".into(),
             hidden: false,
         };
         assert_eq!(
             serde_json::to_string(&key).expect("JSON"),
-            r#"{"kind":"target","workspace":"/p","package":"path+file:///p#app@0.1.0","target":"wasm32-wasip1","hidden":false}"#
+            r#"{"kind":"target","workspace":"/p","package":"path+file:///p#app@0.1.0","crate":"app","target":"wasm32-wasip1","hidden":false}"#
         );
         assert!(key.dir(Path::new("/c")).starts_with("/c/ext/v1/target"));
         assert!(commits_dir(Path::new("/c"), &key).is_none());

@@ -388,6 +388,9 @@ struct Here {
     /// What the response tells of the crate of a git repository that `build_external_docs`
     /// recorded, when it is one (decided in M2e's E3b).
     git: Option<Box<GitOrigin>>,
+    /// The arguments of `build_external_docs` that build again its record for another target,
+    /// when what the record is made from changed since (decided in M2e's E4a, 3).
+    inputs_changed: Option<Box<str>>,
 }
 
 impl Request {
@@ -581,11 +584,12 @@ pub(super) fn provenance_schema() -> Value {
             },
             "stale_reason": {
                 "type": "string",
-                "enum": ["rebuilding", "ref_ttl_expired"],
+                "enum": ["rebuilding", "ref_ttl_expired", "inputs_changed"],
                 "description": "rebuilding: a workspace member is being built again, as what it \
                                 is made from changed; this is the build before, of built_at. \
                                 ref_ttl_expired: a branch or a tag of git was resolved more than \
-                                a day ago, at resolved_at.",
+                                a day ago, at resolved_at. inputs_changed: what a build of \
+                                build_external_docs is made from changed since built_at.",
             },
             "features_requested": {
                 "type": "array",
@@ -1152,6 +1156,21 @@ async fn in_member(
             (found.resolved_from, found.project_from, &found.workspace),
             until,
         )),
+        Member::OtherTarget {
+            error,
+            package,
+            crate_name,
+        } => {
+            recorded_elsewhere(
+                state,
+                (&found.workspace, (&package, &crate_name), None),
+                error,
+                (name, path, target, shape),
+                (found.resolved_from, found.project_from),
+                until,
+            )
+            .await
+        },
         Member::Unknown(error) | Member::NotForTarget(error) | Member::Unnameable { error, .. } => {
             Err(error)
         },
@@ -1202,7 +1221,31 @@ async fn dependency_request(
             target: documented,
         } if check == DocsRsCheck::Allowed && found.package.source == Source::CratesIo => {
             let asked = (name, path, &documented, shape);
-            recorded_dependency(state, found, asked, error, until).await
+            let of = (
+                &found.workspace,
+                &found.package,
+                (found.resolved_from, found.project_from),
+            );
+            recorded_dependency(state, of, asked, error, until).await
+        },
+        Member::OtherTarget {
+            error,
+            package,
+            crate_name,
+        } => {
+            recorded_elsewhere(
+                state,
+                (
+                    &found.workspace,
+                    (&package, &crate_name),
+                    Some((&found.package, check)),
+                ),
+                error,
+                (name, path, target, shape),
+                (found.resolved_from, found.project_from),
+                until,
+            )
+            .await
         },
         Member::Unknown(error) | Member::NotForTarget(error) | Member::Unnameable { error, .. } => {
             Err(error)
@@ -1231,12 +1274,12 @@ async fn dependency_request(
 #[cfg(feature = "local")]
 async fn recorded_dependency(
     state: &ToolState,
-    found: &project::Found,
+    (workspace, package, made): (&Workspace, &ProjectPackage, (ResolvedFrom, &'static str)),
     (name, path, target, shape): (&CrateName, &str, &TargetTriple, &Shape),
     unsupported: Box<CallToolResult>,
     until: Instant,
 ) -> Result<Request, Box<CallToolResult>> {
-    let package = &found.package;
+    let (resolved_from, project_from) = made;
     let Ok(package_name) = package.name.parse::<CrateName>() else {
         return Err(unsupported);
     };
@@ -1259,15 +1302,15 @@ async fn recorded_dependency(
     Ok(Request {
         name: package_name,
         version: package.version.clone(),
-        project_from: Some(found.project_from),
+        project_from: Some(project_from),
         path,
-        resolved_from: found.resolved_from,
+        resolved_from,
         target: target.clone(),
         shape: shape.clone(),
         checksum: None,
         build: None,
         in_build: InBuild {
-            workspace: Some(found.workspace.clone()),
+            workspace: Some(workspace.clone()),
             sets: None,
         },
         hops: 0,
@@ -1538,6 +1581,20 @@ async fn explicit_found_member(
                 until,
             )))
         },
+        Member::OtherTarget {
+            error,
+            package,
+            crate_name,
+        } => recorded_elsewhere(
+            state,
+            (&found.workspace, (&package, &crate_name), None),
+            error,
+            (name, path, target, shape),
+            (ResolvedFrom::Explicit, from),
+            until,
+        )
+        .await
+        .map(Some),
         Member::Unknown(error) | Member::NotForTarget(error) | Member::Unnameable { error, .. } => {
             Err(error)
         },
@@ -1733,9 +1790,249 @@ async fn explicit_member(
             warnings,
         ))),
         // Not told while cargo resolves, nor when it fails: the release is looked up as asked.
-        // The member of that version, which is not built for the target (decided in M2's D7).
+        // The member of that version, which is not built for the target (decided in M2's D7),
+        // unless `build_external_docs` recorded it (decided in M2e's E4a).
+        Ok(Member::OtherTarget {
+            error,
+            package,
+            crate_name,
+        }) => recorded_elsewhere(
+            state,
+            (&workspace, (&package, &crate_name), None),
+            error,
+            (name, path, target, shape),
+            (ResolvedFrom::Explicit, project_from.as_str()),
+            until,
+        )
+        .await
+        .map(Some),
         Ok(Member::NotForTarget(error) | Member::Unnameable { error, .. }) => Err(error),
         Ok(Member::Not | Member::Unknown(_) | Member::Resolving(_)) | Err(_) => Ok(None),
+    }
+}
+
+/// The request for the project's package `package` of `workspace`, which the project does not build
+/// for `target`, in the record that `build_external_docs` made of it for the target (decided in
+/// M2e's E4a); or `error`, which tells how to make it, when there is none.
+///
+/// A member's record is keyed by its package. A dependency, `dependency`, is planned for the
+/// target, as the external tool plans it, by the scope of the project's build for it, which runs
+/// `cargo tree` but no build: one that that build builds for the host is the host's record, or
+/// the query tools' own build when the project's build builds it for the host too. What the record
+/// is made from that changed since is told ([`Here::inputs_changed`]).
+#[cfg(feature = "local")]
+async fn recorded_elsewhere(
+    state: &ToolState,
+    (workspace, (package, crate_name), dependency): (
+        &Workspace,
+        (&PackageId, &str),
+        Option<(&ProjectPackage, DocsRsCheck)>,
+    ),
+    error: Box<CallToolResult>,
+    (name, path, target, shape): (&CrateName, &str, &TargetTriple, &Shape),
+    (resolved_from, project_from): (ResolvedFrom, &'static str),
+    until: Instant,
+) -> Result<Request, Box<CallToolResult>> {
+    let key = match dependency {
+        None => data::external::Key::Target {
+            workspace: workspace.root.display().to_string().into(),
+            package: package.0.clone(),
+            name: crate_name.into(),
+            target: target.as_str().into(),
+            hidden: false,
+        },
+        Some((dependency, check)) => {
+            let asked = (name, target, project_from);
+            match dependency_elsewhere(state, (workspace, dependency), asked, error.clone(), until)
+                .await?
+            {
+                Elsewhere::Recorded(key) => key,
+                // The query tools' own build, for the host.
+                Elsewhere::Here(wanted, package) => {
+                    let made = (resolved_from, project_from, workspace);
+                    let shaped = (target, shape);
+                    return Ok(member_request(
+                        &package,
+                        wanted,
+                        (name, path),
+                        shaped,
+                        made,
+                        until,
+                    ));
+                },
+                // The release of crates.io that it is, as `build_external_docs` builds it, but not
+                // a copy (decided in M2e's E2b).
+                Elsewhere::Unnameable(documented)
+                    if check == DocsRsCheck::Allowed && dependency.source == Source::CratesIo =>
+                {
+                    let of = (workspace, dependency, (resolved_from, project_from));
+                    let asked = (name, path, &documented, shape);
+                    return recorded_dependency(state, of, asked, error, until).await;
+                },
+                Elsewhere::Unnameable(_) => return Err(error),
+            }
+        },
+    };
+    let (package_name, version) = package.name_and_version().unwrap_or((name.as_str(), ""));
+    let again = json!({ "crate": format!("{package_name}@{version}"), "target": target.as_str() })
+        .to_string();
+    let what = format!("{package_name} {version} for {target}");
+    let call_again = format!("call build_external_docs with {again} to build it again");
+    let provenance = || {
+        let mut provenance = Map::new();
+        provenance.insert("source".to_owned(), json!("local"));
+        provenance.insert("crate".to_owned(), json!(package_name));
+        provenance.insert("version".to_owned(), json!(version));
+        provenance.insert("target".to_owned(), json!(target.as_str()));
+        provenance
+    };
+    let built =
+        match recorded::recorded_as(state, (&key, &what, &call_again), provenance, &[]).await {
+            recorded::Found::Built(built) => built,
+            recorded::Found::Response(result) => return Err(result),
+            recorded::Found::Missing => return Err(error),
+        };
+    // What it is made from, as the record keeps it, as it is now (decided in M2e's E4a-3, 1): not
+    // told when the record does not keep it, as when it could not be read.
+    let recorded = Arc::clone(&built);
+    let unchanged = crate::task::spawn_blocking(move || {
+        recorded
+            .record
+            .inputs
+            .as_ref()
+            .is_none_or(data::freshness::unchanged_as_recorded)
+    })
+    .await
+    .map_err(|_joined| Box::new(shutting_down()))?;
+    let path = in_lib(name, path, &built.record.crate_name);
+    Ok(Request {
+        name: package_name.parse().unwrap_or_else(|_| name.clone()),
+        version: built
+            .record
+            .crate_version
+            .parse()
+            .unwrap_or(Version::new(0, 0, 0)),
+        project_from: Some(project_from),
+        path,
+        resolved_from,
+        target: target.clone(),
+        shape: shape.clone(),
+        checksum: None,
+        build: None,
+        in_build: InBuild {
+            workspace: Some(workspace.clone()),
+            sets: None,
+        },
+        hops: 0,
+        index_fetched_at: None,
+        until,
+        here: Here {
+            local: Some(LocalSource::Recorded {
+                built,
+                of_project: false,
+            }),
+            inputs_changed: (!unchanged).then(|| again.into()),
+            ..Here::default()
+        },
+    })
+}
+
+/// Where the project's dependency for another target is documented (decided in M2e's E4a).
+#[cfg(feature = "local")]
+enum Elsewhere {
+    /// In the record of `build_external_docs` of this key.
+    Recorded(data::external::Key),
+    /// By the query tools themselves, for the host, as the project's build builds it for the host
+    /// too: what builds it, of the package.
+    Here(Box<LocalWanted>, Box<str>),
+    /// As the release of crates.io alone, for this target, as `cargo rustdoc -p` cannot name it
+    /// (decided in M2e's E2b).
+    Unnameable(TargetTriple),
+}
+
+/// Where the project's `dependency` of `workspace`, asked for as `name` for `target`, which the
+/// project does not build for it, is documented, as `build_external_docs` plans it for the target
+/// (decided in M2e's E4a); or the response while cargo resolves or plans the project, or `error`.
+#[cfg(feature = "local")]
+async fn dependency_elsewhere(
+    state: &ToolState,
+    (workspace, dependency): (&Workspace, &ProjectPackage),
+    (name, target, project_from): (&CrateName, &TargetTriple, &'static str),
+    error: Box<CallToolResult>,
+    until: Instant,
+) -> Result<Elsewhere, Box<CallToolResult>> {
+    let elsewhere = (target, local::Built::Elsewhere);
+    match local::dependency_for(state, workspace, dependency, elsewhere, until).await? {
+        Member::Is { wanted, .. } if wanted.target != *target => {
+            // As `build_external_docs` tells it, which records it for the host otherwise.
+            let host = &wanted.target;
+            if let Ok(Member::Is {
+                wanted: here,
+                package,
+            }) = local::dependency(state, workspace, dependency, host, until).await
+            {
+                return Ok(Elsewhere::Here(here, package));
+            }
+            Ok(Elsewhere::Recorded(super::external_target::key_of(
+                workspace, &wanted,
+            )))
+        },
+        Member::Is { wanted, .. } => Ok(Elsewhere::Recorded(super::external_target::key_of(
+            workspace, &wanted,
+        ))),
+        Member::Resolving(doing) => Err(Box::new(project::resolving_crate(
+            name,
+            target,
+            (doing, project_from),
+            &[],
+        ))),
+        Member::Planning(doing) => Err(Box::new(project::planning_crate(
+            name,
+            target,
+            (doing, project_from),
+            &[],
+        ))),
+        Member::Unnameable { target, .. } => Ok(Elsewhere::Unnameable(target)),
+        Member::OtherVersion(_)
+        | Member::Not
+        | Member::Unknown(_)
+        | Member::NotForTarget(_)
+        | Member::OtherTarget { .. } => Err(error),
+    }
+}
+
+/// Marks `response`, of the record of a build made at `built_at` by `build_external_docs`, as
+/// stale, as what it is made from changed since: `stale` and `stale_reason` in its provenance, a
+/// warning, and hints to see the changes with the LSP and to build it again, passing `again`
+/// (decided in M2e's E4a, 3).
+#[cfg(feature = "local")]
+fn mark_inputs_changed(response: &mut Value, built_at: &str, again: &str) {
+    let Some(fields) = response.as_object_mut() else {
+        return;
+    };
+    if let Some(Value::Object(provenance)) = fields.get_mut("provenance") {
+        provenance.insert("stale".to_owned(), json!(true));
+        provenance.insert("stale_reason".to_owned(), json!("inputs_changed"));
+    }
+    let warning = format!(
+        "what it is made from changed since build_external_docs built it at {built_at}: the lines \
+         of `span` may have moved"
+    );
+    if let Value::Array(warnings) = fields
+        .entry("warnings")
+        .or_insert_with(|| Value::Array(Vec::new()))
+    {
+        warnings.push(Value::from(warning));
+    }
+    let hints = [
+        format!("for the code changed since {built_at}, use the LSP tool (rust-analyzer)"),
+        format!("to document it as it is now, call build_external_docs with {again}"),
+    ];
+    if let Value::Array(all) = fields
+        .entry("hints")
+        .or_insert_with(|| Value::Array(Vec::new()))
+    {
+        all.extend(hints.into_iter().map(Value::from));
     }
 }
 
@@ -2598,6 +2895,11 @@ async fn look_up(
     }
     #[cfg(feature = "local")]
     if refresh {
+        // Not what `build_external_docs` recorded, which only it makes again (requirement
+        // R-WS-10).
+        if matches!(arguments.here.local, Some(LocalSource::Recorded { .. })) {
+            warnings.push(NO_REFRESH.into());
+        }
         refresh_release(&state, &mut arguments).await;
     }
     look_up_release(&state, arguments, warnings).await
@@ -2773,6 +3075,9 @@ async fn built_instead(
         wanted.refresh = refresh;
     }
     let instead = if matches!(source, LocalSource::Recorded { .. }) {
+        if refresh {
+            warnings.push(NO_REFRESH.into());
+        }
         "what build_external_docs built is read"
     } else {
         "it is built here"
@@ -2785,6 +3090,12 @@ async fn built_instead(
         result
     }
 }
+
+/// What a lookup warns of `refresh`, which it does not act on for what `build_external_docs`
+/// recorded, which only that tool makes again (requirement R-WS-10).
+#[cfg(feature = "local")]
+const NO_REFRESH: &str = "refresh does not build again what build_external_docs recorded: call \
+                          build_external_docs again for that";
 
 /// Looks the item up in the build of the workspace member's crate that `source` names, made by
 /// work that the calls for it share, and follows the path into the crate it goes on in, if any
@@ -2826,6 +3137,7 @@ async fn look_up_member(
     };
     // The build before, while the member is built again (decided in M2's D4).
     let built_before = built.stale.then(|| built.record.built_at.clone());
+
     let rebuilt = built.stale.then(|| built.record.crate_name.clone());
     if let (Some(built_at), Some(krate)) = (&built_before, &rebuilt) {
         warnings.push(
@@ -2860,6 +3172,10 @@ async fn look_up_member(
         // Of a crate of git (decided in M2e's E3b).
         if let (Some(git), Ok(response)) = (&arguments.here.git, &mut looked_up) {
             git.mark(response);
+        }
+        // Of a record for another target, whose inputs changed (decided in M2e's E4a).
+        if let (Some(again), Ok(response)) = (&arguments.here.inputs_changed, &mut looked_up) {
+            mark_inputs_changed(response, &record.built_at, again);
         }
         (looked_up, arguments)
     });
@@ -3932,6 +4248,25 @@ async fn built_here_destination(
                 (origin.resolved_from, project_from, workspace),
                 origin.until,
             );
+            request.hops = origin.hops.saturating_add(1);
+            Ok(request)
+        },
+        // In the same workspace and for the same target (decided in M2e's E4a).
+        Member::OtherTarget {
+            error,
+            package: id,
+            crate_name,
+        } => {
+            let dependency = (!is_member).then_some((package, check));
+            let mut request = recorded_elsewhere(
+                state,
+                (workspace, (&id, &crate_name), dependency),
+                error,
+                (&name, &path, &origin.target, &origin.shape),
+                (origin.resolved_from, project_from),
+                origin.until,
+            )
+            .await?;
             request.hops = origin.hops.saturating_add(1);
             Ok(request)
         },

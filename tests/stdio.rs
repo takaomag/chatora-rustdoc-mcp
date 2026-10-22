@@ -3363,6 +3363,7 @@ fn workspace_for_wasm(dir: &Path, registry: &registry::FakeRegistry) -> PathBuf 
         "ws/src/lib.rs",
         "pub fn everywhere() {}\n#[cfg(target_arch = \"wasm32\")]\npub fn on_wasm() {}\n",
     );
+    write("ws/src/bin/app-cli.rs", "fn main() {}\n");
     write(
         "ws/macros/Cargo.toml",
         "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
@@ -3403,6 +3404,21 @@ fn build_external_docs_documents_the_project_for_another_target() {
     let dir = TempDir::new().expect("a temporary directory");
     let project = workspace_for_wasm(dir.path(), &registry);
     let mut server = server_in_on(Some(&project), &registry, dir.path());
+    // Before it is built: how to build it (decided in M2e's E4a).
+    server.send(&call_tool(
+        1000,
+        "get_item",
+        json!({ "crate": "app", "path": "everywhere", "target": OTHER_TARGET }),
+    ));
+    let result = server.response(1000)["result"].clone();
+    let error = text_json(&result);
+    assert_eq!(error["reason"], "no_json", "{result}");
+    assert!(
+        error["suggestions"]
+            .to_string()
+            .contains(r#"\"crate\":\"app@0.1.0\",\"target\":\"wasm32-wasip1\""#),
+        "{result}"
+    );
     let members = json!({ "project": project.display().to_string(), "target": OTHER_TARGET });
     let result = built_by_external(&mut server, 1, &members);
     let data = &result["structuredContent"]["data"];
@@ -3439,7 +3455,102 @@ fn build_external_docs_documents_the_project_for_another_target() {
         "recorded"
     );
     dependencies_for_another_target(&mut server);
+    looked_up_for_another_target(&mut server, &project);
     assert!(server.finish().success());
+}
+
+/// Looks up in `server` the crates of the project of [`workspace_for_wasm`] at `project` that
+/// `build_external_docs` documented for [`OTHER_TARGET`], in its records: the proc macro is the
+/// project's build for the host; once the member changes, its record is stale (decided in M2e's
+/// E4a-3).
+#[cfg(all(debug_assertions, feature = "local"))]
+fn looked_up_for_another_target(server: &mut Server, project: &Path) {
+    let lookups = [
+        ("app", "on_wasm"),
+        // The exact version of the member.
+        ("app@0.1.0", "everywhere"),
+        ("wasmonly", "only_wasm"),
+        ("fixture-wasmdep", "from_crates_io"),
+    ];
+    for (id, (name, path)) in (500_u64..).zip(lookups) {
+        server.send(&call_tool(
+            id,
+            "get_item",
+            json!({ "crate": name, "path": path, "target": OTHER_TARGET }),
+        ));
+        let result = server.response(id)["result"].clone();
+        let provenance = &result["structuredContent"]["provenance"];
+        assert_eq!(provenance["source"], "local", "{name}: {result}");
+        assert_eq!(provenance["target"], OTHER_TARGET, "{name}: {result}");
+        assert_eq!(
+            provenance["recorded_by"], "build_external_docs",
+            "{name}: {result}"
+        );
+        assert!(provenance.get("stale").is_none(), "{name}: {result}");
+    }
+    server.send(&call_tool(
+        510,
+        "crate_overview",
+        json!({ "crate": "macros", "target": OTHER_TARGET }),
+    ));
+    let result = server.response(510)["result"].clone();
+    assert!(
+        result["structuredContent"]["warnings"]
+            .to_string()
+            .contains("but the data is for"),
+        "{result}"
+    );
+    // The bin of the member is not its lib, which was recorded.
+    server.send(&call_tool(
+        511,
+        "get_item",
+        json!({ "crate": "app-cli@0.1.0", "path": "main", "target": OTHER_TARGET }),
+    ));
+    let result = server.response(511)["result"].clone();
+    assert_eq!(text_json(&result)["reason"], "no_json", "{result}");
+
+    // The member changes.
+    std::fs::write(
+        project.join("src/lib.rs"),
+        "pub fn everywhere() {}\n#[cfg(target_arch = \"wasm32\")]\npub fn on_wasm() {}\n\
+         pub fn added() {}\n",
+    )
+    .expect("written");
+    server.send(&call_tool(
+        520,
+        "get_item",
+        json!({ "crate": "app", "path": "on_wasm", "target": OTHER_TARGET }),
+    ));
+    let result = server.response(520)["result"].clone();
+    let content = &result["structuredContent"];
+    assert_eq!(content["provenance"]["stale"], true, "{result}");
+    assert_eq!(
+        content["provenance"]["stale_reason"], "inputs_changed",
+        "{result}"
+    );
+    let hints = content["hints"].to_string();
+    assert!(hints.contains("LSP"), "{result}");
+    assert!(hints.contains("build_external_docs"), "{result}");
+    assert!(
+        content["warnings"].to_string().contains("changed since"),
+        "{result}"
+    );
+    // A dependency changes.
+    std::fs::write(
+        project.join("../wasmonly/src/lib.rs"),
+        "pub fn only_wasm() {}\npub fn more() {}\n",
+    )
+    .expect("written");
+    server.send(&call_tool(
+        521,
+        "get_item",
+        json!({ "crate": "wasmonly", "path": "only_wasm", "target": OTHER_TARGET }),
+    ));
+    let result = server.response(521)["result"].clone();
+    assert_eq!(
+        result["structuredContent"]["provenance"]["stale_reason"], "inputs_changed",
+        "{result}"
+    );
 }
 
 /// Asks `server`, of the project of [`workspace_for_wasm`], for its dependencies used for wasm

@@ -539,6 +539,7 @@ async fn planned_outcome(
         | Ok(
             Planned::Unknown(error)
             | Planned::NotForTarget(error)
+            | Planned::OtherTarget { error, .. }
             | Planned::Unnameable { error, .. },
         ) => Some(Outcome::Failed(failure_of(&error))),
         Ok(Planned::Resolving(doing) | Planned::Planning(doing)) => Some(Outcome::Going(doing)),

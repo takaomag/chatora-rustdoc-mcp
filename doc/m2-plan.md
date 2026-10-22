@@ -1439,6 +1439,24 @@ Claude Code 2.1.304、Linux で測った。
   - 照会のツールが読んだら最後に使った日時を更新する (R-CA-5。std の `used` と同じく 1 時間に 1 回)。re-export をたどるときは外の記録を読まない (R-WS-10)。照会のツールの `refresh` は外の失敗を解かない (R-WS-10・§6.4)
   - テストの記録は、E2a が使う `data::external` の書き手で置く
 
+**E4a-3 (照会のツールが他の target の記録を読む。2026-10-22)**:
+
+- `local`: プロジェクトの target でない member と依存は `Member::OtherTarget{error, package, crate_name}` (`NotForTarget` は自前の std などだけに)。`other_target` の案内は外のツールに渡す引数 (`{"crate": "<package>@<版>", "target": …}`)。proc macro の member は、他の target でもプロジェクトの先頭の target で計画する (決定 2。データは host のもので、「求めた target でなく host のデータ」の warning は今の照会の層が付ける)
+- `get_item`: `recorded_elsewhere` が get_item の 5 か所 (`in_member`・`dependency_request`・`explicit_found_member`・`explicit_member`・`built_here_destination`) から呼ばれ、member は鍵を直に、依存は `dependency_elsewhere` (その target で計画し直す。host 向けにだけ作るもので照会のツールが作れるならその build、名指しできない crates.io の依存は `recorded_dependency` で `Key::Release`) で鍵を求めて `recorded::recorded_as` で読む。記録した入力を `freshness::unchanged_as_recorded` で確かめ (ビルドの直前に書かれてハッシュの無いファイルは大きさと時刻が同じなら同じ。入力の無い記録は stale と言わない)、変わっていれば `stale: inputs_changed` と warning、LSP と外のツールを呼び直す hint (決定 3)。外の記録を読む応答の `refresh` は warning を付けて効かせない。スキーマの `stale_reason` に `inputs_changed`
+- 外の記録の鍵 `Key::Target` に crate の名前 (`crate`) を足した (lib と bin を取り違えないため。E4a-2 の記録は読めなくなるが公開前)
+- real_data の外のツールの問いは `x86_64-pc-windows-gnu` (決定 3) と、crate_overview で記録を読む問い。testdata job に `rustup target add x86_64-pc-windows-gnu`
+- テスト: 単体 (`unchanged_as_recorded`・鍵の名前)、stdio の `build_external_docs_documents_the_project_for_another_target` を広げた (作る前の案内・member・版を明示した member・path の依存・crates.io の依存を記録から・proc macro は host のデータ・bin は lib の記録を読まない・member と依存の変更で `inputs_changed`)
+- レビュー (サブエージェント、読むだけ) の対応: (1) lib と bin が同じ鍵 → 鍵に crate (2) host 向けの依存で、照会のツールの計画のエラーを返していた → 外のツールと同じく作れないなら host の記録 (3) 名指しできない crates.io の依存の記録を読まず案内が回る → `Key::Release` を読む (4) 入力の無い記録をいつも stale にしていた (5) crates.io の経路の `refresh` の warning (6) `inputs_changed` の warning を応答の JSON に付け、re-export の行き先に移らないように (7) `NotForTarget` の説明。残したもの: 版を省いた bin の名前はプロジェクトの crate として引かれない (前から)。host 向けの依存・名指しできない依存の他の target のテストは無い
+
+**E4a-3 の下調べと決定 (2026-10-22)**:
+
+- 下調べ (サブエージェント、読むだけ。要点は scratchpad の e4a3-research.md): 照会のツールの「(in a later version)」は `local::other_target` (member と依存の `Member::NotForTarget`) から、get_item の 5 か所 (`in_member`・`dependency_request`・`explicit_found_member`・`explicit_member`・`built_here_destination`) と `search_across` に出る。`ProjectPackage` は id を持たないので鍵は `Found` だけからは作れない。記録の `BuildRecord.inputs` は入力のダイジェストで、`freshness::unchanged` はプロセスを起こさずに確かめられる。proc macro の member は、外のツールが「照会のツールが作る」と答えるのに照会のツールが「後の版」と答えて食い違っている
+- 利用者が決めたこと:
+  1. stale (`inputs_changed`) は、記録した入力を照会のたびに確かめる (stat して変わったものだけハッシュし直す。プロセスを起こさない。新しいファイル・環境変数・toolchain の更新は見ない)
+  2. proc macro の member を他の target で引かれたら、プロジェクトのビルドで作る host 向けのデータを「求めた target でなく host のデータ」の warning 付きで返す
+  3. real_data の外のツールの問いは `x86_64-pc-windows-gnu` に替え、testdata job に `rustup target add x86_64-pc-windows-gnu` を足し、作った後に get_item で引く問いも足す
+- 聞かずに決めたこと (下調べの推奨と前の決めどおり): 依存の鍵はその target の `cargo tree` で計画し直して求める (`dependency_for` の `Built::Elsewhere`。host 向けにだけ作るものは host の鍵、照会のツールが作るなら `Built::Here`)。member (proc macro でない) は鍵を直に作る。記録が無ければ `reason: no_json` (既定のプロジェクトの中、要件) で外のツールに渡す引数 (`{"crate": "<package>@<版>", "target": …}`) を案内。`refresh` は warning を付けて効かせない。crate なしの検索は記録を読まない (E1b)
+
 **E4a-1・E4a-2 (外のツールで既定のプロジェクトを他の target で作る。2026-10-22)**:
 
 - E4a-1 (データと計画): `TargetDir::for_target` ((workspace, target) ごとの target dir、決定 2)、外の記録の鍵 `Key::Target{workspace, package (cargo metadata の id), target, hidden}` (`ext/v1/target/<digest>`)、`Told.in_project` (プロジェクトの中のビルドは `RUSTC_BOOTSTRAP` の warning を残す)、`local::member_for`・`dependency_for` と `Built::{Here, Elsewhere}` (Elsewhere は `targets_built` の関所を通さず、その target の `cargo tree` で計画し、他の target 用の target dir で)、`Metadata::platform_conditions` (member から依存までの道で最初に限られた辺の cfg・target)。E4a-1 は使う側が無いので E4a-2 と一緒にコミットする

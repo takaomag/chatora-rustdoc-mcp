@@ -47,10 +47,11 @@ use crate::{
 };
 
 /// The key of the record of the build that `wanted` plans in `workspace`.
-fn key_of(workspace: &Workspace, wanted: &LocalWanted) -> Key {
+pub(super) fn key_of(workspace: &Workspace, wanted: &LocalWanted) -> Key {
     Key::Target {
         workspace: workspace.root.display().to_string().into(),
         package: wanted.plan.package.0.clone(),
+        name: wanted.plan.crate_name.clone(),
         target: wanted.target.as_str().into(),
         hidden: false,
     }
@@ -260,7 +261,7 @@ async fn for_built_target(
         Ok(Member::Resolving(doing) | Member::Planning(doing)) => {
             planning(found, Some(built), doing)
         },
-        Ok(Member::NotForTarget(error)) if reason_of(&error) == Some("no_json") => {
+        Ok(Member::OtherTarget { .. }) => {
             external_build::not_used_for(dependency, built, &conditions(metadata, dependency))
         },
         Err(error) if reason_of(&error) == Some("build_unsupported") => {
@@ -399,9 +400,12 @@ async fn built_planned(
         Ok(Member::Resolving(doing) | Member::Planning(doing)) => {
             planning(found, Some(target), doing)
         },
-        Ok(Member::NotForTarget(error) | Member::Unknown(error)) | Err(error) => {
-            external_build::external_body_of(&error)
-        },
+        Ok(
+            Member::NotForTarget(error)
+            | Member::Unknown(error)
+            | Member::OtherTarget { error, .. },
+        )
+        | Err(error) => external_build::external_body_of(&error),
         Ok(Member::Unnameable { .. }) => super::build_external_docs::not_yet(
             &format!("{what}, a dependency that cargo rustdoc -p cannot name, for {target}"),
             "look it up with get_item for a target that the project builds for",
@@ -638,7 +642,12 @@ pub(super) async fn members(
             Ok(Member::Resolving(doing) | Member::Planning(doing)) => {
                 return planning((&workspace, project_from), Some(&target), doing);
             },
-            Ok(Member::NotForTarget(error) | Member::Unknown(error)) | Err(error) => {
+            Ok(
+                Member::NotForTarget(error)
+                | Member::Unknown(error)
+                | Member::OtherTarget { error, .. },
+            )
+            | Err(error) => {
                 return external_build::external_body_of(&error);
             },
             Ok(Member::Unnameable { error, .. }) => return *error,

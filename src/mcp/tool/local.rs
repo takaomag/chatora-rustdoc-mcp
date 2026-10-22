@@ -17,13 +17,13 @@ use tokio::time::Instant;
 use super::{ToolState, error_result, get_item, project, project::BuildTargets};
 use crate::{
     data::{
-        build::{self, Bootstrap, Plan, TargetDir},
+        build::{self, Bootstrap, Documented, Plan, TargetDir},
         build_scope::{Buildable, ScopeError},
         cargo::Failure,
         crate_file,
         crate_name::CrateName,
         flight::{Doing, Joined},
-        metadata::{CargoError, Package, Resolution},
+        metadata::{CargoError, Package, PackageId, Resolution},
         packages::{ProjectPackage, Source},
         project::Workspace,
         rustdoc_json::ParseError,
@@ -117,10 +117,21 @@ pub(super) enum Member {
     /// A member's crate, whose build cargo is still planning past the deadline of the call: it
     /// reads the features of the project's build (`cargo tree`), as this says.
     Planning(Doing),
-    /// A member's crate or a dependency, which is not built for the target asked for, as the
-    /// project does not build for it, or builds for a target of its own: the error to return
-    /// (requirements R-MCP-3 and R-TG-1, decided in M2's D7).
+    /// A member's crate or a dependency, which is not built here, as the project builds for a
+    /// target of its own: the error to return (requirements R-MCP-3 and R-TG-1, decided in M2's
+    /// D7).
     NotForTarget(Box<CallToolResult>),
+    /// A member's crate or a dependency, of the package `package`, which the project does not
+    /// build for the target asked for: `build_external_docs` may have recorded it for the target
+    /// (decided in M2e's E4a). `error` tells that it is not built here, and how to build it.
+    OtherTarget {
+        /// The error, unless it was recorded.
+        error: Box<CallToolResult>,
+        /// The package.
+        package: PackageId,
+        /// Its crate, as code writes it: its lib, or a member's bin, whose records differ.
+        crate_name: Box<str>,
+    },
     /// A dependency that `cargo rustdoc -p` cannot name (requirement R-WS-5): the error to return,
     /// unless `build_external_docs` recorded the release of crates.io that it is for `target`, the
     /// target asked for, or the host's for one that the project's build builds only for the host
@@ -204,11 +215,18 @@ pub(super) async fn member_for(
         Ok(targets) => targets,
         Err(error) => return Ok(Member::NotForTarget(error)),
     };
-    if built == Built::Here && !targets.contains(target) {
-        return Ok(Member::NotForTarget(Box::new(other_target(
-            &what, target, &targets,
-        ))));
-    }
+    // A proc macro is built for the host, whatever the target: as the project's build for its
+    // target builds it (decided in M2e's E4a-3, 2).
+    let asked_target = target;
+    let target = match targets.first() {
+        _ if built == Built::Elsewhere || targets.contains(target) => target,
+        Some(first) if documented == (Documented::Lib { proc_macro: true }) => first,
+        Some(_) | None => {
+            let crate_name = build::documented_name(package, &documented);
+            let crate_of = (package, crate_name.as_str());
+            return Ok(other_target_member(crate_of, asked_target, &targets));
+        },
+    };
     // The member's features in the build of the whole workspace, as rust-analyzer checks it and
     // `enabled_in_project` tells (requirement R-FT-3, decided in M2's D3), or else cargo's default.
     let (features, mut warnings) = match features_of(state, workspace, target, package, until).await
@@ -368,11 +386,7 @@ pub(super) async fn dependency_for(
         Err(error) => return Ok(Member::NotForTarget(error)),
     };
     let host = state.host().await.triple.clone();
-    let not_for_target = || {
-        Ok(Member::NotForTarget(Box::new(other_target(
-            &what, target, &targets,
-        ))))
-    };
+    let not_for_target = || Ok(other_target_member((found, &crate_name), target, &targets));
     let scope_target = match targets.first() {
         _ if targets.contains(target) || built == Built::Elsewhere => target,
         Some(first) if *target == host => first,
@@ -475,11 +489,35 @@ pub(super) async fn targets_built(
     }
 }
 
-/// `docs_unavailable` for `what`, which is not built here for `target`, as the project builds for
-/// `targets`: a build for another target would run what the project's own build does not, as the
-/// build scripts of the dependencies for that target (requirement R-MCP-3, decided in M2's D7,
-/// for a member too).
-fn other_target(what: &str, target: &TargetTriple, targets: &[TargetTriple]) -> CallToolResult {
+/// [`Member::OtherTarget`] for the crate `crate_name` of `package`, which the project, building for
+/// `targets`, does not build for `target`.
+fn other_target_member(
+    (package, crate_name): (&Package, &str),
+    target: &TargetTriple,
+    targets: &[TargetTriple],
+) -> Member {
+    let what = format!("{} {}", package.name, package.version);
+    Member::OtherTarget {
+        error: Box::new(other_target(
+            (&what, &package.name, &package.version),
+            target,
+            targets,
+        )),
+        package: package.id.clone(),
+        crate_name: crate_name.into(),
+    }
+}
+
+/// `docs_unavailable` for `what`, the package `name` at `version`, which is not built here for
+/// `target`, as the project builds for `targets`: a build for another target would run what the
+/// project's own build does not, as the build scripts of the dependencies for that target
+/// (requirement R-MCP-3, decided in M2's D7, for a member too); `build_external_docs` builds it
+/// (decided in M2e's E4a).
+fn other_target(
+    (what, name, version): (&str, &str, &Version),
+    target: &TargetTriple,
+    targets: &[TargetTriple],
+) -> CallToolResult {
     let names: Vec<&str> = targets.iter().map(TargetTriple::as_str).collect();
     let give = match names.as_slice() {
         [one] => format!("give {one} as \"target\", or leave it out"),
@@ -498,7 +536,11 @@ fn other_target(what: &str, target: &TargetTriple, targets: &[TargetTriple]) -> 
         "retryable": false,
         "suggestions": [
             give,
-            "document it for another target with build_external_docs (in a later version)",
+            format!(
+                "or document it for {target} with build_external_docs, passing {}, which runs \
+                 its build scripts and proc macros, and then look it up again",
+                json!({ "crate": format!("{name}@{version}"), "target": target.as_str() })
+            ),
         ],
         "reason": "no_json",
     }))

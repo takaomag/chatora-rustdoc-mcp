@@ -281,9 +281,7 @@ async fn unnameable(
             (workspace, package, *project_from),
             target,
         ))),
-        Member::NotForTarget(error) if body_of(&error).get("reason") == Some(&json!("no_json")) => {
-            other_target(state, used, (target, asked), until).await
-        },
+        Member::OtherTarget { .. } => other_target(state, used, (target, asked), until).await,
         Member::NotForTarget(error) | Member::Unknown(error) => {
             Err(Box::new(external_body_of(&error)))
         },

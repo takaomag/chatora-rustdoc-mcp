@@ -287,6 +287,27 @@ pub fn unchanged(inputs: &Inputs) -> bool {
     })
 }
 
+/// Whether the files of `inputs` are as they were when they were taken, as a lookup tells it of a
+/// record.
+///
+/// A record is told stale rather than built again (decided in M2e's E4a-3): a file that has a
+/// digest has the same; one without, which changed close to the build, has the same size and
+/// time.
+#[must_use]
+pub fn unchanged_as_recorded(inputs: &Inputs) -> bool {
+    let paths: Vec<PathBuf> = inputs.files.iter().map(|file| file.path.clone()).collect();
+    collect(&paths, &[], Some(inputs)).is_ok_and(|now| {
+        now.files.len() == inputs.files.len()
+            && now.files.iter().zip(&inputs.files).all(|(now, then)| {
+                now.path == then.path
+                    && match &then.sha256 {
+                        Some(_) => now.sha256 == then.sha256,
+                        None => (now.len, now.modified) == (then.len, then.modified),
+                    }
+            })
+    })
+}
+
 /// When the file at `path` last changed as the OS keeps it apart from its time of change, which
 /// `cp -p` and `mv` keep: its status (ctime).
 #[cfg(unix)]
@@ -739,6 +760,35 @@ mod tests {
         let inputs = collect(&[path, missing.clone()], &[], None).expect("collected");
         fs::write(&missing, "").expect("written");
         assert!(!unchanged(&inputs));
+    }
+
+    #[test]
+    fn a_record_is_as_recorded_while_a_file_without_a_digest_keeps_its_size_and_time() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (path, missing) = (dir.path().join("lib.rs"), dir.path().join("gone.rs"));
+        fs::write(&path, "a").expect("written");
+        let mut inputs = collect(&[path.clone(), missing.clone()], &[], None).expect("collected");
+        // Written close to the build, as a `.crate` unpacked by it.
+        for file in &mut inputs.files {
+            file.sha256 = None;
+        }
+        assert!(!unchanged(&inputs), "a build checks it again");
+        assert!(unchanged_as_recorded(&inputs));
+        let at = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .expect("a time");
+        fs::write(&path, "b").expect("written");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(at + Duration::from_secs(1)))
+            .expect("dated");
+        assert!(!unchanged_as_recorded(&inputs));
+        // A file with a digest, as `unchanged`.
+        let inputs = collect(&[path, missing.clone()], &[], None).expect("collected");
+        assert!(unchanged_as_recorded(&inputs));
+        fs::write(&missing, "").expect("written");
+        assert!(!unchanged_as_recorded(&inputs));
     }
 
     #[test]

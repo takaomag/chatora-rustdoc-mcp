@@ -233,26 +233,41 @@ fn questions() -> Vec<Question> {
             ..question
         }),
     );
-    // `build_external_docs` builds the other workspace from M2e's E4b, and the project's crates for
-    // another target from E4a.
+    // `build_external_docs` builds the other workspace from M2e's E4b.
+    questions.push(Question {
+        local: true,
+        later: true,
+        ..question(
+            "build_external_docs",
+            "what is the API of this other workspace?",
+            json!({ "project": "poc/m0a-a10" }),
+            |result| result["data"]["built"] == true,
+        )
+    });
+    // The project's tokio for another target than it builds for, which docs.rs has no JSON of, and
+    // which is not the host of any system the tests run on (decided in M2e's E4a-3, 3); then the
+    // query tools read what it recorded.
+    let windows = "x86_64-pc-windows-gnu";
     questions.extend(
         [
             question(
                 "build_external_docs",
-                "what is the API of this other workspace?",
-                json!({ "project": "poc/m0a-a10" }),
+                "which items does this crate have on Windows?",
+                json!({ "crate": "tokio", "target": windows }),
                 |result| result["data"]["built"] == true,
             ),
             question(
-                "build_external_docs",
-                "which items does this crate have on Windows?",
-                json!({ "crate": "tokio", "target": "x86_64-pc-windows-msvc" }),
-                |result| result["data"]["built"] == true,
+                "crate_overview",
+                "what is this crate, and how is it organized?",
+                json!({ "crate": "tokio", "target": windows }),
+                |result| {
+                    result["provenance"]["recorded_by"] == "build_external_docs"
+                        && result["provenance"]["target"] == "x86_64-pc-windows-gnu"
+                },
             ),
         ]
         .map(|question| Question {
             local: true,
-            later: true,
             ..question
         }),
     );
