@@ -524,7 +524,6 @@ async fn planned_outcome(
     until: Instant,
 ) -> Option<Outcome> {
     match planned {
-        Err(error) => Some(Outcome::Failed(failure_of(&error))),
         Ok(Planned::Is { wanted, .. }) => {
             // `build.wait_secs` from now, within the call's deadline (decided in M2's D3).
             let until_built = Instant::now()
@@ -536,9 +535,12 @@ async fn planned_outcome(
                 Err(result) => outcome_of(&result),
             })
         },
-        Ok(Planned::Unknown(error) | Planned::NotForTarget(error)) => {
-            Some(Outcome::Failed(failure_of(&error)))
-        },
+        Err(error)
+        | Ok(
+            Planned::Unknown(error)
+            | Planned::NotForTarget(error)
+            | Planned::Unnameable { error, .. },
+        ) => Some(Outcome::Failed(failure_of(&error))),
         Ok(Planned::Resolving(doing) | Planned::Planning(doing)) => Some(Outcome::Going(doing)),
         Ok(Planned::Not | Planned::OtherVersion(_)) => None,
     }

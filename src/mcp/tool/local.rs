@@ -43,6 +43,15 @@ pub(super) enum LocalSource {
     Wanted(Box<LocalWanted>),
     /// Built, for the lookups in it after the first, as when a re-export is not followed.
     Built(Arc<LocalBuilt>),
+    /// Built and recorded by `build_external_docs`, for its first lookup, which tells how it was
+    /// built (decided in M2e's E1b and E2b): of a dependency of the project that `cargo rustdoc
+    /// -p` cannot name if `of_project`, else of a release that the project does not use.
+    Recorded {
+        /// The build.
+        built: Arc<LocalBuilt>,
+        /// Whether it stands for a dependency of the project, whose build may differ.
+        of_project: bool,
+    },
 }
 
 impl LocalSource {
@@ -51,7 +60,7 @@ impl LocalSource {
     pub(super) fn is_member(&self) -> bool {
         match self {
             Self::Wanted(wanted) => wanted.plan.document_private,
-            Self::Built(built) => built.record.private,
+            Self::Built(built) | Self::Recorded { built, .. } => built.record.private,
         }
     }
 
@@ -59,7 +68,7 @@ impl LocalSource {
     pub(super) fn package(&self) -> &str {
         match self {
             Self::Wanted(wanted) => &wanted.plan.package.0,
-            Self::Built(built) => &built.record.package,
+            Self::Built(built) | Self::Recorded { built, .. } => &built.record.package,
         }
     }
 
@@ -112,6 +121,16 @@ pub(super) enum Member {
     /// project does not build for it, or builds for a target of its own: the error to return
     /// (requirements R-MCP-3 and R-TG-1, decided in M2's D7).
     NotForTarget(Box<CallToolResult>),
+    /// A dependency that `cargo rustdoc -p` cannot name (requirement R-WS-5): the error to return,
+    /// unless `build_external_docs` recorded the release of crates.io that it is for `target`, the
+    /// target asked for, or the host's for one that the project's build builds only for the host
+    /// (decided in M2e's E2b).
+    Unnameable {
+        /// The error.
+        error: Box<CallToolResult>,
+        /// The target that it is documented for.
+        target: TargetTriple,
+    },
 }
 
 /// What the crate `name`, as `asked`, is in `workspace`, to build for `target`, waiting for
@@ -262,8 +281,9 @@ async fn features_of(
 /// not have: a path, git or another registry's dependency (decided in M2's D7). It is built in the
 /// workspace's root, with `-p` and cargo's own features for it, which are those of the project's
 /// build, and its public items only (requirement R-WS-5). `Member::Not` when it is not the
-/// project's dependency; the error when `-p` cannot name it (`build_unsupported`), or the scope of
-/// the builds is not known (`scope_unknown`).
+/// project's dependency, or has no lib; `Member::Unnameable` when `-p` cannot name it; the error
+/// when the project's build does not build it for the target, or the scope of the builds is not
+/// known (`scope_unknown`).
 pub(super) async fn dependency(
     state: &ToolState,
     workspace: &Workspace,
@@ -325,12 +345,15 @@ pub(super) async fn dependency(
         .await
     {
         Joined::Done(Ok(scope)) => match scope.buildable(&found.id) {
+            Buildable::Unnameable => {
+                let for_target = scope.get(&found.id).unwrap_or_default().for_target;
+                return Ok(unnameable(&what, package, (target, &host, for_target)));
+            },
             Buildable::ForTarget if scope_target != target => return not_for_target(),
             Buildable::ForTarget => target.clone(),
             // For the host, which the project's build builds it for (decided in M2's D7). The
             // response warns that the data is not for the target asked for, as for a proc macro.
             Buildable::ForHost => host.clone(),
-            Buildable::Unnameable => return Err(Box::new(build_unsupported(&what))),
             Buildable::NotBuilt => return Err(Box::new(not_built_for(&what, scope_target))),
         },
         Joined::Done(Err(error)) => return Err(Box::new(scope_unknown(&what, &error))),
@@ -428,10 +451,42 @@ fn other_target(what: &str, target: &TargetTriple, targets: &[TargetTriple]) -> 
     }))
 }
 
-/// `docs_unavailable` with `build_unsupported` for the dependency `what`, which `cargo rustdoc -p`
-/// cannot name, as the feature resolver would panic (requirement R-WS-5): the project's build
-/// does not reach it by the normal dependencies for the target, nor as a proc macro.
-fn build_unsupported(what: &str) -> CallToolResult {
+/// [`Member::Unnameable`] for the dependency `what`, the project's `package`: for `target`, if the
+/// project's build builds it so (`for_target`), else for `host`, as a build-dependency's or a proc
+/// macro's (decided in M2e's E2b).
+fn unnameable(
+    what: &str,
+    package: &ProjectPackage,
+    (target, host, for_target): (&TargetTriple, &TargetTriple, bool),
+) -> Member {
+    let target = if for_target { target } else { host };
+    Member::Unnameable {
+        error: Box::new(build_unsupported(what, package, target)),
+        target: target.clone(),
+    }
+}
+
+/// `docs_unavailable` with `build_unsupported` for the dependency `what`, the project's `package`,
+/// which `cargo rustdoc -p` cannot name for `target`, as the feature resolver would panic
+/// (requirement R-WS-5): the project's build does not reach it by the normal dependencies for the
+/// target, nor as a proc macro. A release of crates.io, `build_external_docs` documents (decided
+/// in M2e's E2b).
+fn build_unsupported(
+    what: &str,
+    package: &ProjectPackage,
+    target: &TargetTriple,
+) -> CallToolResult {
+    let document = if package.source == Source::CratesIo {
+        format!(
+            "document it with build_external_docs, passing {}, and then look it up again",
+            json!({
+                "crate": format!("{}@{}", package.name, package.version),
+                "target": target.as_str(),
+            })
+        )
+    } else {
+        "document it with build_external_docs (in a later version)".to_owned()
+    };
     error_result(&json!({
         "code": "docs_unavailable",
         "message": format!(
@@ -441,7 +496,7 @@ fn build_unsupported(what: &str) -> CallToolResult {
         ),
         "retryable": false,
         "suggestions": [
-            "document it with build_external_docs (in a later version)",
+            document,
             "look up the items of the crates that use it, which may re-export them",
         ],
         "reason": "build_unsupported",

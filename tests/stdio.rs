@@ -2416,6 +2416,12 @@ fn the_records_of_build_external_docs_are_looked_up_in() {
 /// settings: for the builds of `build_external_docs`.
 #[cfg(all(debug_assertions, feature = "local"))]
 fn server_on(registry: &registry::FakeRegistry, dir: &Path) -> Server {
+    server_in_on(None, registry, dir)
+}
+
+/// [`server_on`], with the default project `project`.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn server_in_on(project: Option<&Path>, registry: &registry::FakeRegistry, dir: &Path) -> Server {
     let cargo_home = dir.join("cargo-home");
     std::fs::create_dir_all(&cargo_home).expect("made");
     std::fs::write(cargo_home.join("config.toml"), registry.cargo_config()).expect("written");
@@ -2427,7 +2433,7 @@ fn server_on(registry: &registry::FakeRegistry, dir: &Path) -> Server {
         cargo_home.display().to_string(),
         gitconfig.display().to_string(),
     );
-    Server::start_with(None, &[
+    Server::start_with(project, &[
         ("CHATORA_RUSTDOC_TEST_DOCS_RS_URL", base),
         ("CHATORA_RUSTDOC_TEST_INDEX_URL", &index),
         ("CHATORA_RUSTDOC_TEST_STATIC_URL", base),
@@ -2629,6 +2635,116 @@ fn failures_in(cache: &Path) -> Vec<(PathBuf, String)> {
     }
     found.sort();
     found
+}
+
+/// A dependency of the project that `cargo rustdoc -p` cannot name, as only its tests use it, is
+/// built by `build_external_docs` as the release alone, which the query tools then read in its
+/// place; one that it can name, the query tools build (decided in M2e's E2b).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn build_external_docs_builds_a_dependency_that_cargo_cannot_name() {
+    use registry::{FakeCrate, FakeRegistry};
+    let registry = FakeRegistry::start();
+    registry
+        .publish(&FakeCrate::new("fixture-norm", "0.1.0").file("src/lib.rs", "pub fn norm() {}\n"));
+    registry
+        .publish(&FakeCrate::new("fixture-dev", "0.1.0").file("src/lib.rs", "pub fn dev() {}\n"));
+    let dir = TempDir::new().expect("a temporary directory");
+    let project = dir.path().join("user");
+    std::fs::create_dir_all(project.join("src")).expect("made");
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"user\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nfixture-norm = \"0.1\"\n\n[dev-dependencies]\nfixture-dev = \"0.1\"\n",
+    )
+    .expect("written");
+    std::fs::write(project.join("src/lib.rs"), "").expect("written");
+    let cargo_home = dir.path().join("cargo-home");
+    std::fs::create_dir_all(&cargo_home).expect("made");
+    std::fs::write(cargo_home.join("config.toml"), registry.cargo_config()).expect("written");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile"])
+        .current_dir(&project)
+        .env("CARGO_HOME", &cargo_home)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = server_in_on(Some(&project), &registry, dir.path());
+    let host = host_triple();
+
+    // The query tools cannot build it, and tell what can.
+    let lookup = json!({ "crate": "fixture-dev", "path": "dev" });
+    let mut told = Value::Null;
+    for id in 1_u64..60 {
+        server.send(&call_tool(id, "get_item", lookup.clone()));
+        told = server.response(id)["result"].clone();
+        if told["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    assert_eq!(told["isError"], true, "{told}");
+    let error = text_json(&told);
+    assert_eq!(error["reason"], "build_unsupported", "{told}");
+    assert!(
+        error["suggestions"]
+            .to_string()
+            .contains("fixture-dev@0.1.0"),
+        "{told}"
+    );
+
+    // Its version and target are the project's.
+    server.send(&call_tool(
+        100,
+        "build_external_docs",
+        json!({ "crate": "fixture-dev" }),
+    ));
+    let response = server.response(100);
+    let content = &response["result"]["structuredContent"];
+    assert!(
+        content["data"]["built"] == true || content["status"] == "building",
+        "{response}"
+    );
+    let mut found = Value::Null;
+    for id in 110_u64..200 {
+        server.send(&call_tool(id, "get_item", lookup.clone()));
+        found = server.response(id)["result"].clone();
+        if found["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    let content = &found["structuredContent"];
+    assert_eq!(
+        content["provenance"]["recorded_by"], "build_external_docs",
+        "{found}"
+    );
+    assert_eq!(content["provenance"]["version"], "0.1.0", "{found}");
+    assert_eq!(content["provenance"]["target"], host.as_str(), "{found}");
+    assert!(
+        content["warnings"]
+            .to_string()
+            .contains("may have other features"),
+        "{found}"
+    );
+
+    // One that `-p` names, the query tools build.
+    server.send(&call_tool(
+        200,
+        "build_external_docs",
+        json!({ "crate": "fixture-norm" }),
+    ));
+    let response = server.response(200);
+    let data = &response["result"]["structuredContent"]["data"];
+    assert_eq!(data["built"], false, "{response}");
+    assert_eq!(data["reason"], "query_tools_build");
+    assert!(server.finish().success());
 }
 
 /// The directory of the record of `name` at `version` for the host in the server's cache.

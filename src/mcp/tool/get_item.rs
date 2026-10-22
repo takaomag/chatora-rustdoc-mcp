@@ -994,7 +994,9 @@ async fn in_member(
             (found.resolved_from, found.project_from, &found.workspace),
             until,
         )),
-        Member::Unknown(error) | Member::NotForTarget(error) => Err(error),
+        Member::Unknown(error) | Member::NotForTarget(error) | Member::Unnameable { error, .. } => {
+            Err(error)
+        },
         Member::Resolving(doing) => Err(Box::new(project::resolving_crate(
             name,
             target,
@@ -1035,7 +1037,18 @@ async fn dependency_request(
             (found.resolved_from, found.project_from, &found.workspace),
             until,
         )),
-        Member::Unknown(error) | Member::NotForTarget(error) => Err(error),
+        // The release of crates.io that it is, if `build_external_docs` recorded it, but not a copy
+        // (decided in M2e's E2b).
+        Member::Unnameable {
+            error,
+            target: documented,
+        } if check == DocsRsCheck::Allowed && found.package.source == Source::CratesIo => {
+            let asked = (name, path, &documented, shape);
+            recorded_dependency(state, found, asked, error, until).await
+        },
+        Member::Unknown(error) | Member::NotForTarget(error) | Member::Unnameable { error, .. } => {
+            Err(error)
+        },
         Member::Resolving(doing) => Err(Box::new(project::resolving_crate(
             name,
             target,
@@ -1053,6 +1066,70 @@ async fn dependency_request(
         },
     }
 }
+
+/// The request for the project's dependency `found`, of crates.io, which `cargo rustdoc -p` cannot
+/// name, in the record of its release that `build_external_docs` made (decided in M2e's E2b); or
+/// the response while it is made, its failure, or else `unsupported`, which tells how to make it.
+#[cfg(feature = "local")]
+async fn recorded_dependency(
+    state: &ToolState,
+    found: &project::Found,
+    (name, path, target, shape): (&CrateName, &str, &TargetTriple, &Shape),
+    unsupported: Box<CallToolResult>,
+    until: Instant,
+) -> Result<Request, Box<CallToolResult>> {
+    let package = &found.package;
+    let Ok(package_name) = package.name.parse::<CrateName>() else {
+        return Err(unsupported);
+    };
+    let provenance = || {
+        let mut provenance = Map::new();
+        provenance.insert("source".to_owned(), json!("local"));
+        provenance.insert("package_source".to_owned(), json!("crates.io"));
+        provenance.insert("crate".to_owned(), json!(package.name));
+        provenance.insert("version".to_owned(), json!(package.version.to_string()));
+        provenance.insert("target".to_owned(), json!(target.as_str()));
+        provenance
+    };
+    let release = (&package_name, &package.version, target);
+    let built = match recorded::recorded(state, release, provenance, &[]).await {
+        recorded::Found::Built(built) => built,
+        recorded::Found::Response(result) => return Err(result),
+        recorded::Found::Missing => return Err(unsupported),
+    };
+    let path = in_lib(name, path, &built.record.crate_name);
+    Ok(Request {
+        name: package_name,
+        version: package.version.clone(),
+        project_from: Some(found.project_from),
+        path,
+        resolved_from: found.resolved_from,
+        target: target.clone(),
+        shape: shape.clone(),
+        checksum: None,
+        build: None,
+        in_build: InBuild {
+            workspace: Some(found.workspace.clone()),
+            sets: None,
+        },
+        hops: 0,
+        index_fetched_at: None,
+        until,
+        here: Here {
+            local: Some(LocalSource::Recorded {
+                built,
+                of_project: true,
+            }),
+            ..Here::default()
+        },
+    })
+}
+
+/// What the response warns about a dependency of the project in the record of `build_external_docs`.
+#[cfg(feature = "local")]
+const RECORDED_FOR_PROJECT: &str = "built by build_external_docs as the release of crates.io alone, \
+                                    with the features that docs.rs builds it with: the project's \
+                                    build of it may have other features";
 
 /// The request for the project's package `found` of crates.io, which docs.rs does not have, as
 /// `check` tells: built here as a dependency, with a warning that tells why (requirement R-VR-2,
@@ -1250,6 +1327,23 @@ async fn explicit_in_project(
     Ok(Some(request))
 }
 
+/// `path`, asked by `name`, in the crate whose name is `lib`, which `[lib] name` may make other
+/// than the package's. A path that the package's name heads, followed by the lib's, as a lookup by
+/// the lib's name makes it, goes on after the lib's, as for docs.rs (`with_root_name`).
+#[cfg(feature = "local")]
+fn in_lib(name: &CrateName, path: &str, lib: &str) -> Box<str> {
+    let path = with_lib_name(name.as_str(), path);
+    match path.split_once("::") {
+        Some((head, rest)) if head != lib => match rest.split_once("::") {
+            Some((next, after)) if next == lib => format!("{lib}::{after}").into(),
+            None if rest == lib => lib.into(),
+            Some(_) | None => format!("{lib}::{rest}").into(),
+        },
+        Some((_, rest)) => format!("{lib}::{rest}").into(),
+        None => lib.into(),
+    }
+}
+
 /// The request for the crate `name` of the workspace member `found`, of the exact version
 /// `version` given, built here, with a warning (requirement R-VR-1, decided in M2's D7): by its
 /// package, so that a lib's name or a bin finds it; or the error, as when `cargo metadata` failed,
@@ -1286,7 +1380,9 @@ async fn explicit_found_member(
                 until,
             )))
         },
-        Member::Unknown(error) | Member::NotForTarget(error) => Err(error),
+        Member::Unknown(error) | Member::NotForTarget(error) | Member::Unnameable { error, .. } => {
+            Err(error)
+        },
         Member::Resolving(doing) => Err(Box::new(project::resolving_crate(
             name,
             target,
@@ -1480,7 +1576,7 @@ async fn explicit_member(
         ))),
         // Not told while cargo resolves, nor when it fails: the release is looked up as asked.
         // The member of that version, which is not built for the target (decided in M2's D7).
-        Ok(Member::NotForTarget(error)) => Err(error),
+        Ok(Member::NotForTarget(error) | Member::Unnameable { error, .. }) => Err(error),
         Ok(Member::Not | Member::Unknown(_) | Member::Resolving(_)) | Err(_) => Ok(None),
     }
 }
@@ -1497,20 +1593,7 @@ fn member_request(
     (resolved_from, project_from, workspace): (ResolvedFrom, &'static str, &Workspace),
     until: Instant,
 ) -> Request {
-    // The crate's name, which `[lib] name` may make other than the package's. A path that the
-    // package's name heads, followed by the lib's, as a lookup by the lib's name makes it, goes on
-    // after the lib's, as for docs.rs (`with_root_name`).
-    let path = with_lib_name(name.as_str(), path);
-    let lib = &*wanted.plan.crate_name;
-    let path = match path.split_once("::") {
-        Some((head, rest)) if head != lib => match rest.split_once("::") {
-            Some((next, after)) if next == lib => format!("{lib}::{after}").into(),
-            None if rest == lib => lib.into(),
-            Some(_) | None => format!("{lib}::{rest}").into(),
-        },
-        Some((_, rest)) => format!("{lib}::{rest}").into(),
-        None => lib.into(),
-    };
+    let path = in_lib(name, path, &wanted.plan.crate_name);
     Request {
         name: package.parse().unwrap_or_else(|_| name.clone()),
         version: wanted.plan.version.clone(),
@@ -2311,7 +2394,7 @@ async fn look_up(
 async fn refresh_release(state: &ToolState, request: &mut Request) {
     match &mut request.here.local {
         Some(LocalSource::Wanted(wanted)) => wanted.refresh = true,
-        Some(LocalSource::Built(_)) => {},
+        Some(LocalSource::Built(_) | LocalSource::Recorded { .. }) => {},
         None => {
             for target in [Some(&request.target), None] {
                 let dir = state
@@ -2348,9 +2431,11 @@ async fn look_up_release(
         let provenance = || local_provenance(&arguments, Some("crates.io"));
         match recorded::recorded(state, release, provenance, &warnings).await {
             recorded::Found::Built(built) => {
-                warnings.extend(built.archived.warnings.iter().cloned());
-                warnings.push(recorded::toolchain_warning(&built));
-                return look_up_member(state, arguments, LocalSource::Built(built), warnings).await;
+                let source = LocalSource::Recorded {
+                    built,
+                    of_project: false,
+                };
+                return look_up_member(state, arguments, source, warnings).await;
             },
             recorded::Found::Response(result) => return *result,
             recorded::Found::Missing => {},
@@ -2471,7 +2556,12 @@ async fn built_instead(
     if let LocalSource::Wanted(wanted) = &mut source {
         wanted.refresh = refresh;
     }
-    warnings.push(format!("{why}, so it is built here").into());
+    let instead = if matches!(source, LocalSource::Recorded { .. }) {
+        "what build_external_docs built is read"
+    } else {
+        "it is built here"
+    };
+    warnings.push(format!("{why}, so {instead}").into());
     let result = Box::pin(look_up_member(state, request, source, warnings)).await;
     if result.is_error == Some(true) {
         told_why(result, why)
@@ -2493,6 +2583,15 @@ async fn look_up_member(
     let package_source = source.package_source();
     let built = match source {
         LocalSource::Built(built) => built,
+        // What it tells of how it was built (decided in M2e's E1b and E2b).
+        LocalSource::Recorded { built, of_project } => {
+            warnings.extend(built.archived.warnings.iter().cloned());
+            warnings.push(recorded::toolchain_warning(&built));
+            if of_project {
+                warnings.push(RECORDED_FOR_PROJECT.into());
+            }
+            built
+        },
         LocalSource::Wanted(wanted) => {
             let provenance = local_provenance(&arguments, package_source);
             // `build.wait_secs` from now, within the call's deadline (decided in M2's D3).
@@ -3615,7 +3714,9 @@ async fn built_here_destination(
             request.hops = origin.hops.saturating_add(1);
             Ok(request)
         },
-        Member::Unknown(error) | Member::NotForTarget(error) => Err(error),
+        Member::Unknown(error) | Member::NotForTarget(error) | Member::Unnameable { error, .. } => {
+            Err(error)
+        },
         Member::Resolving(doing) => Err(Box::new(project::resolving_crate(
             &name,
             &origin.target,

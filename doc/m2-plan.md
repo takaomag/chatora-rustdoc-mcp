@@ -1439,6 +1439,14 @@ Claude Code 2.1.304、Linux で測った。
   - 照会のツールが読んだら最後に使った日時を更新する (R-CA-5。std の `used` と同じく 1 時間に 1 回)。re-export をたどるときは外の記録を読まない (R-WS-10)。照会のツールの `refresh` は外の失敗を解かない (R-WS-10・§6.4)
   - テストの記録は、E2a が使う `data::external` の書き手で置く
 
+**E2b-2 (名指しできない依存。2026-10-22)**:
+
+- 外のツール: 版を省いたら既定のプロジェクトの crates.io のパッケージの版 (Cargo.lock のもの。複数なら `invalid_argument` と候補)。プロジェクトが使うリリース (crates.io で checksum が合うもの) は、`target` を省けばプロジェクトのビルド target (先頭) で、照会のツールと同じ `local::dependency` で振り分ける: `-p` で名指しできれば `built: false`・`reason: query_tools_build` (照会のツールに渡す hint)、名指しできなければ (`Member::Unnameable`) 依存でない crate と同じく仮のプロジェクトで作り、「プロジェクトのビルドと features が違いうる」warning。その target でビルドしない・自前の std などは照会のツールと同じエラー、解決中・計画中は `status: building`
+- 照会のツール: `local::dependency` は名指しできない依存を `Member::Unnameable` で返し (エラーにせず)、`dependency_request` で crates.io の依存 (写しでなく docs.rs に JSON が無いもの) なら外の記録を読む (`recorded_dependency`。作成中・失敗・壊れた記録はその応答、無ければ `build_unsupported`)。`build_unsupported` の案内は crates.io の依存なら `build_external_docs` に渡す JSON (path・git・別のレジストリは「(in a later version)」のまま)。re-export の行き先と `crate` なしの検索は外の記録を読まない (決定どおり)。外の記録から返すときの warnings (記録の warnings・toolchain・プロジェクトの依存なら features の違い) は `LocalSource::Recorded` で `look_up_member` が足す。path の lib 名への付け替えを `in_lib` にまとめた
+- 説明文に「照会のツールが作れないと言う依存 (`reason: build_unsupported`)」を足した
+- テスト: stdio の 1 件 (偽の crates.io の dev-dependency だけの依存: `get_item` は `build_unsupported` と `build_external_docs` の案内、外のツールが版と target をプロジェクトから決めて作り、`get_item` が記録から features の違いの warning 付きで返す。通常の依存は `query_tools_build`)
+- レビュー (サブエージェント、読むだけ) の対応: (1) プロジェクトのビルドが host 向けにだけ作る名指しできない依存 (build script や proc macro だけが使うもの) は host の target で作り記録を引く (`Member::Unnameable{target}`。std の無い target では作れないため。照会のツールの案内も host を渡す) (2) 外のツールの中で、その target でビルドしない依存は、`target` を渡していれば他の target の段 (E4a) の「まだ」、渡していなければ `invalid_argument` (R-WS-10 の表)。照会のツールのエラーは外のツールの案内 (`refresh` を除き呼び直し) に直して返す (3) 既定のプロジェクトに workspace が複数あるとき、版を省いたら `project_not_found` と候補 (黙って最新にしない)、版を渡したら「使うかが分からないのでリリースだけで作る」warning (4) プロジェクトの依存でなかった・lib の無いもの (`Member::Not`) は使わないリリースと同じ扱い (warning を付けない) (6) 記録から読むときの warning を「build_external_docs が作ったものを読む」に、provenance の `crate` はパッケージ名 (7) `local::dependency` の説明、`query_tools_build` の応答に `workspace`・`project_from` (8) テストは Cargo.lock を作ってからサーバーを起こす。残したもの: (5) Cargo.lock の版が yanked のとき照会のツールは外のツールを案内するが、外のツールは yanked を断る (稀)。provenance に「プロジェクトのビルドと features が違いうる」の印は付けず warning だけ。host 向けにだけ作る依存のテストは Linux の host では target と同じになるので無い
+
 **E2b-1 (features のやり直し。2026-10-22)**:
 
 - 仮のプロジェクトは features の組ごとのディレクトリ (`temp_project::Set`: `project` は docs.rs の組、`project-default` は既定の組)。docs.rs の組のビルドがコンパイラのエラー (文書化する crate か依存。`BuildError::is_compiler_error`、照会のツールの D3 の判定と同じ) で落ちたら、docs.rs の組が `default` だけでない限り既定の組で作る。取得・ロック・オフラインの失敗ではやり直さない。`build::Failed` に `compiler_errors` (serde の既定は false) を足し、仮のプロジェクトの失敗の記録に残すので、記録が無くなって作り直すときは docs.rs の組を試さずにすぐ既定の組へ (外の記録が失敗か壊れているときの呼び直しは `refresh` で docs.rs の組から)

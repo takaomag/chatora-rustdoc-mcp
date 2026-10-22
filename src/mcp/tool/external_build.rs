@@ -18,7 +18,7 @@ use super::{
     ToolState,
     error_result,
     get_item::{self, building_response},
-    local,
+    local::{self, Member},
     project,
 };
 use crate::{
@@ -32,8 +32,8 @@ use crate::{
         external::{self, Key, Making, Recorded, Told},
         flight::{Doing, Joined, Stage},
         metadata::{CargoError, Resolution},
-        packages::{DocsRsCheck, PackageGraph},
-        project::workspace_of,
+        packages::{DocsRsCheck, PackageGraph, ProjectPackage},
+        project::{ProjectFrom, Workspace, workspace_of},
         rustdoc_json::ParseError,
         sparse_index::IndexEntry,
         target::TargetTriple,
@@ -77,7 +77,14 @@ pub(super) async fn release(
         Ok(entry) => entry,
         Err(result) => return *result,
     };
-    let spec = spec.unwrap_or(VersionSpec::Latest);
+    // A dependency's, as its Cargo.lock has it (requirement R-WS-10), or else the latest.
+    let spec = match spec {
+        Some(spec) => spec,
+        None => match project_version(&state, &name, until).await {
+            Ok(version) => version.map_or(VersionSpec::Latest, VersionSpec::Exact),
+            Err(result) => return *result,
+        },
+    };
     let resolved = match spec.resolve(&entry.versions) {
         Ok(resolved) => resolved,
         Err(no_version) => {
@@ -97,20 +104,35 @@ pub(super) async fn release(
             .map(|warning| Box::from(warning.as_ref())),
     );
     let published: CrateName = entry.name.parse().unwrap_or(name);
-    match uses(&state, &entry, &version, until).await {
-        Uses::No => {},
-        Uses::Yes => {
-            return super::build_external_docs::not_yet(
-                "a release that the project uses",
-                "look it up with get_item, which builds what docs.rs does not have",
-            );
+    let used = match uses(&state, &entry, &version, until).await {
+        Uses::No => None,
+        Uses::Unknown(why) => {
+            warnings.push(why.into());
+            None
         },
+        Uses::Yes(used) => Some(used),
         Uses::Response(result) => return *result,
-    }
-    let target = match target {
-        Some(target) => target,
-        None => state.host().await.triple.clone(),
     };
+    // A dependency's for the project's build target; else the host's (decided in M2e, 11).
+    let asked = target.is_some();
+    let mut target = match (target, &used) {
+        (Some(target), _) => target,
+        (None, Some(used)) => build_target(&state, &used.0).await,
+        (None, None) => state.host().await.triple.clone(),
+    };
+    // A dependency that the query tools build is not built here: one that `cargo rustdoc -p`
+    // cannot name is, as the release alone, for the target it is built for (decided in M2e's
+    // E2b).
+    if let Some(used) = &used {
+        match unnameable(&state, used, (&target, asked), until).await {
+            Ok(Some(documented)) => {
+                target = documented;
+                warnings.push(FOR_THE_PROJECT.into());
+            },
+            Ok(None) => {},
+            Err(result) => return *result,
+        }
+    }
     let key = Key::Release {
         name: published.cache_key().into(),
         version: version.to_string().into(),
@@ -143,14 +165,192 @@ pub(super) async fn release(
     built(&state, key, release, target, warnings, until).await
 }
 
+/// What the response warns about a dependency of the project built here as the release alone.
+const FOR_THE_PROJECT: &str = "the project's build cannot document it, so it is built as the \
+                               release of crates.io alone, with the features that docs.rs builds \
+                               it with: the project's build of it may have other features";
+
 /// Whether the project uses a release.
 enum Uses {
     /// It does not, or there is no project to tell.
     No,
-    /// It does.
-    Yes,
+    /// It cannot be told, as this tells: as when it does not.
+    Unknown(String),
+    /// It does: its workspace, its package of the release, and where the project came from.
+    Yes(Box<(Workspace, ProjectPackage, ProjectFrom)>),
     /// The response to return, while cargo resolves the project.
     Response(Box<CallToolResult>),
+}
+
+/// The version of the crate `name` that the default project resolves, if it has one from
+/// crates.io; or the error when it has several, or several workspaces, of which one is not told
+/// (requirement R-MCP-3), or the response while cargo resolves it.
+async fn project_version(
+    state: &ToolState,
+    name: &CrateName,
+    until: Instant,
+) -> Result<Option<semver::Version>, Box<CallToolResult>> {
+    let Some((workspace, project_from)) = project::workspace(state.project.as_ref(), None)? else {
+        return Ok(None);
+    };
+    let resolution = match state.resolver.resolve_until(&workspace, until).await {
+        Joined::Done(Ok(resolution)) => resolution,
+        Joined::Done(Err(_)) => return Ok(None),
+        Joined::Ended => return Err(Box::new(get_item::stopped())),
+        Joined::Going(doing) => {
+            return Err(Box::new(resolving(&workspace, project_from, doing)));
+        },
+    };
+    let graph = PackageGraph::new(&resolution);
+    let versions: Vec<&semver::Version> = graph
+        .crates_io_named(name.as_str())
+        .into_iter()
+        .map(|package| &package.version)
+        .collect();
+    match versions.as_slice() {
+        [] => Ok(None),
+        [version] => Ok(Some((*version).clone())),
+        several => Err(Box::new(error_result(&json!({
+            "code": "invalid_argument",
+            "message": format!(
+                "the project has several versions of {name}: give the version, as crate@version"
+            ),
+            "retryable": false,
+            "suggestions": ["give one of the candidates as the version"],
+            "candidates": several.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        })))),
+    }
+}
+
+/// The response while cargo resolves the packages of `workspace`, as `doing` says.
+fn resolving(workspace: &Workspace, project_from: ProjectFrom, doing: Doing) -> CallToolResult {
+    let mut provenance = Map::new();
+    provenance.insert("source".to_owned(), json!("project"));
+    provenance.insert(
+        "workspace".to_owned(),
+        json!(workspace.root.display().to_string()),
+    );
+    provenance.insert("project_from".to_owned(), json!(project_from.as_str()));
+    building_response(
+        provenance,
+        doing,
+        "the project's dependencies are being resolved, to tell whether it uses the release",
+        &[],
+    )
+}
+
+/// The target that the project at `workspace` builds for, the first of several; or the host's.
+async fn build_target(state: &ToolState, workspace: &Workspace) -> TargetTriple {
+    let host = state.host().await.triple.clone();
+    match project::build_targets(state, &workspace.root).await {
+        project::BuildTargets::These(targets) => targets.into_iter().next().unwrap_or(host),
+        project::BuildTargets::OwnTarget(_) => host,
+    }
+}
+
+/// Whether the project's `package` of `workspace`, a dependency, is one that `cargo rustdoc -p`
+/// cannot name for `target`, built here, for the target that it returns (decided in M2e's E2b);
+/// `None` for one that is not the project's after all, or has no lib. Else the response: the query
+/// tools build it, it is not built for the target, which is the step of another target (M2e's E4a)
+/// if `asked`, or else to be given, or cargo plans it still.
+async fn unnameable(
+    state: &ToolState,
+    (workspace, package, project_from): &(Workspace, ProjectPackage, ProjectFrom),
+    (target, asked): (&TargetTriple, bool),
+    until: Instant,
+) -> Result<Option<TargetTriple>, Box<CallToolResult>> {
+    let other_target = || {
+        if asked {
+            super::build_external_docs::not_yet(
+                "a dependency of the project for another target than it builds it for",
+                "look it up with get_item and that target, which reads docs.rs",
+            )
+        } else {
+            error_result(&json!({
+                "code": "invalid_argument",
+                "message": format!(
+                    "the project's build does not build {} {} for {target}: it may use it only \
+                     for another target",
+                    package.name, package.version
+                ),
+                "retryable": false,
+                "suggestions": ["give the target that the project uses it for as `target`"],
+            }))
+        }
+    };
+    let planned = match local::dependency(state, workspace, package, target, until).await {
+        Ok(planned) => planned,
+        // Not built for the target (`not_built_for`).
+        Err(error) if body_of(&error).get("reason") == Some(&json!("build_unsupported")) => {
+            return Err(Box::new(other_target()));
+        },
+        Err(error) => return Err(Box::new(external_body_of(&error))),
+    };
+    match planned {
+        Member::Unnameable { target, .. } => Ok(Some(target)),
+        Member::Not | Member::OtherVersion(_) => Ok(None),
+        Member::Is { .. } => Err(Box::new(the_query_tools_build(
+            (workspace, package, *project_from),
+            target,
+        ))),
+        Member::NotForTarget(error) if body_of(&error).get("reason") == Some(&json!("no_json")) => {
+            Err(Box::new(other_target()))
+        },
+        Member::NotForTarget(error) | Member::Unknown(error) => {
+            Err(Box::new(external_body_of(&error)))
+        },
+        Member::Resolving(doing) | Member::Planning(doing) => {
+            let mut provenance = Map::new();
+            provenance.insert("source".to_owned(), json!("project"));
+            provenance.insert(
+                "workspace".to_owned(),
+                json!(workspace.root.display().to_string()),
+            );
+            provenance.insert("target".to_owned(), json!(target.as_str()));
+            Err(Box::new(building_response(
+                provenance,
+                doing,
+                "the project's build is being planned, to tell whether it documents the release",
+                &[],
+            )))
+        },
+    }
+}
+
+/// The error `result` as this tool tells it: with its suggestions ([`external_body`]).
+fn external_body_of(result: &CallToolResult) -> CallToolResult {
+    error_result(&external_body(body_of(result)))
+}
+
+/// The response for the project's dependency `package` of `workspace`, which the query tools build
+/// for `target` themselves: nothing is built (requirement R-WS-10).
+fn the_query_tools_build(
+    (workspace, package, project_from): (&Workspace, &ProjectPackage, ProjectFrom),
+    target: &TargetTriple,
+) -> CallToolResult {
+    let release = format!("{}@{}", package.name, package.version);
+    CallToolResult::structured(json!({
+        "provenance": {
+            "source": "project",
+            "workspace": workspace.root.display().to_string(),
+            "project_from": project_from.as_str(),
+            "crate": &*package.name,
+            "version": package.version.to_string(),
+            "target": target.as_str(),
+        },
+        "data": {
+            "built": false,
+            "reason": "query_tools_build",
+            "crate": &*package.name,
+            "version": package.version.to_string(),
+            "target": target.as_str(),
+        },
+        "hints": [format!(
+            "nothing was built: the other tools build this dependency of the project themselves; \
+             look it up with get_item or crate_overview, passing {}",
+            json!({ "crate": release, "target": target.as_str() })
+        )],
+    }))
 }
 
 /// Whether the default project uses the release of `entry` at `version`, as the query tools tell
@@ -164,38 +364,35 @@ async fn uses(
     version: &semver::Version,
     until: Instant,
 ) -> Uses {
-    let Ok(Some((workspace, project_from))) = project::workspace(state.project.as_ref(), None)
-    else {
-        return Uses::No;
+    let (workspace, project_from) = match project::workspace(state.project.as_ref(), None) {
+        Ok(Some(found)) => found,
+        Ok(None) => return Uses::No,
+        Err(_) => {
+            return Uses::Unknown(
+                "the project has several workspaces, so whether one uses the release is not told: \
+                 it is built as the release of crates.io alone"
+                    .to_owned(),
+            );
+        },
     };
     match state.resolver.resolve_until(&workspace, until).await {
         Joined::Done(Ok(resolution)) if matches!(&*resolution, Resolution::Metadata { .. }) => {
-            let uses = PackageGraph::new(&resolution)
+            let used = PackageGraph::new(&resolution)
                 .crates_io_named(&entry.name)
                 .into_iter()
-                .any(|package| {
+                .find(|package| {
                     package.version == *version
                         && package.docs_rs_check(entry) == DocsRsCheck::Allowed
-                });
-            if uses { Uses::Yes } else { Uses::No }
+                })
+                .cloned();
+            used.map_or(Uses::No, |package| {
+                Uses::Yes(Box::new((workspace, package, project_from)))
+            })
         },
         Joined::Done(Ok(_) | Err(_)) => Uses::No,
         Joined::Ended => Uses::Response(Box::new(get_item::stopped())),
         Joined::Going(doing) => {
-            let mut provenance = Map::new();
-            provenance.insert("source".to_owned(), json!("project"));
-            provenance.insert(
-                "workspace".to_owned(),
-                json!(workspace.root.display().to_string()),
-            );
-            provenance.insert("project_from".to_owned(), json!(project_from.as_str()));
-            Uses::Response(Box::new(building_response(
-                provenance,
-                doing,
-                "the project's dependencies are being resolved, to tell whether it uses the \
-                 release",
-                &[],
-            )))
+            Uses::Response(Box::new(resolving(&workspace, project_from, doing)))
         },
     }
 }
@@ -699,7 +896,7 @@ async fn build_in_temporary_project(
 /// cannot read, as one cut short, is made again once, but not for what is missing offline.
 async fn resolved(
     state: &ToolState,
-    workspace: &crate::data::project::Workspace,
+    workspace: &Workspace,
     (what, offline): (&str, bool),
     progress: &Stage,
 ) -> Result<Arc<Resolution>, Value> {
