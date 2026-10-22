@@ -1096,6 +1096,47 @@ Claude Code 2.1.304、Linux で測った。
   - テストを広げた: 複数の glob を順に、std の glob があっても typo は `front` の `item_not_found`、lib 名の違う member の lib (`other-pkg` の `other_lib`)
 - 残したもの: member の glob で再公開された item は、`list_module` と検索には出ない (たどるのは `get_item` 系のパスの解決だけ)。glob の行き先の member のビルドに失敗したとき、`refresh` は行き先に届かない (行き先を直接引く案内を付ける)。`dependency_of` は dev・build・target 別の依存を区別しない。glob の連鎖では 1 回の呼び出しで `build.wait_secs` の数倍待ちうる
 
+**D7 の下調べと決定 (2026-10-22)**:
+
+- 下調べ (サブエージェント、読むだけ): path・git・別レジストリ・checksum の不一致の依存は `local_build_required` (`docs_unavailable`)、`crate` なしの検索では `unavailable`。`no_target_json` は既定のプロジェクトの依存かを区別しない。B7 の範囲の判定 (`build_scope::Buildable`) は照会のツールから呼ばれていない (`build_unsupported`・`scope_unknown` はどこからも返さない)。member の計画を依存に使うには、`--manifest-path` を依存の Cargo.toml でなく workspace の根にする (依存の Cargo.toml だと cargo がそれを根にして Cargo.lock を作り直す。R-WS-5)、private と hidden を付けない印、照会の側の「member なので private も出す」(`Origin::Local`) と別の印が要る。独自の target の `target_unsupported` と docs.rs の既定の target へのフォールバックは無い。`crate` なしの検索に workspace の member は入らない。path・git の依存と同じ版を明示すると crates.io の同名を warning 無しで引く
+- 実測 (build-scope の fixture、resolver 2、rustc 1.99.1): `cargo rustdoc -p <依存>` は、`--target` を付けても付けなくても、プロジェクトの通常のビルドの feature の組で文書化する (`shared` は `normal` だけ。build 用の `build` は入らない)。build-dependency だけ・dev-dependency だけ・ほかの target だけの依存は、`--target` の有無によらず feature resolver が panic する。proc-macro の下の依存は通る (B7 の名指しできるかの判定と一致)
+- 利用者が決めたこと:
+  1. D7 を 4 つに分ける: D7a (依存のローカルビルドの計画と path・git・別レジストリ)、D7b (checksum の不一致と `no_target_json` をローカルビルドに)、D7c (実際のビルド target と違う `target` ではビルドしない、独自の target は `target_unsupported` と docs.rs の既定の target)、D7d (`crate` なしの検索に workspace、`sources` の `building`、明示した版の扱い、`real_data` を 3 OS で)
+  2. member でない依存は、ローカルでビルドしても公開の item だけを出す (R-SH-5 のまま。依存の private を出すと、モデルが使えない item を使い、検索と一覧が内部で埋まり、取得元で同じ crate の見え方が変わるため)
+  3. ローカルでビルドした依存の provenance に `package_source` (`path`・`git`・`registry`・`crates.io`) を足す (`source` は `local` のまま。member には付けない)
+- 聞かずに決めたこと: 依存はプロジェクトの workspace の根で `--locked -p <依存>` でビルドし、feature は渡さず cargo の既定 (プロジェクトの通常の組) に任せる。名指しできない依存はビルドの前に B7 の判定で `build_unsupported`、判定できなければ `scope_unknown` (R-WS-5)
+
+**D7a (path・git・別レジストリの依存のローカルビルド。2026-10-22)**:
+
+- 計画 (`Plan`): `document_private` を足し、member は `--document-private-items --document-hidden-items` を付け、依存は付けない (決定 2)。鮮度の鍵の facts の `documents` も `private hidden` か `public`。ビルドの記録に `private` を足した (前の記録は member なので既定は真)
+- 依存の計画 (`mcp::tool::local::dependency`): プロジェクトの package (`project::Found`) のうち member でないものを `cargo metadata` の package (名前・版・取得元) に対応づけ、`Resolver::scope_until` (新設。範囲の判定を期限付きで待つ) で `-p` で名指しできるかを確かめる (名指しできなければ `build_unsupported`、その target で作られなければ `build_unsupported` と target の案内、範囲が分からなければ `scope_unknown`、cargo の解決・計画の途中なら `status: building`)。`--manifest-path` は workspace の根の Cargo.toml (依存の Cargo.toml だと cargo が別の根にして Cargo.lock を作り直す。R-WS-5)、文書化するのは lib (`build::lib_of`)、features は渡さない (実測でプロジェクトの通常の組)、`[package.metadata.docs.rs]` の組と cfg は使わない、入力は member と同じく workspace のファイルと path の package
+- 照会: `get_item` 系の `in_member` で member でない package は `dependency_request` で依存の計画に回す (前は `local_build_required`)。`Origin::Local` に `private` (member なら真) と `package_source` を足し、private の扱い (`is_member`・`public_only`・検索の `restricted`) は `private` で決める。provenance に `package_source` (`path`・`git`・`registry`・`crates.io`。パッケージ id から。決定 3)。出力スキーマに足した
+- テスト: stdio で、workspace の外の path 依存がローカルでビルドされ (`source: local`・`package_source: path`、`visibility` が無い)、private な関数は `item_not_found`、build-dependency だけの path 依存は `build_unsupported` (依存にも private を付けると落ちることを確かめた)
+- レビュー (サブエージェント) の指摘と直し:
+  1. branch・tag・rev を付けた git 依存は、package id の `?branch=main` を cargo が glob と読み、`-p` が `glob patterns on package selection are not supported` で落ちる (cargo 1.99.1)。`PackageId::spec` は、取得元に `?` があれば `git+` と query を外して `<url>#<name>@<version>` を渡す。tests/local に、member と同じ名前・版の git 依存 (branch 指定) を依存の計画でビルドし、公開の item だけが出て member のものが出ないことを確かめるテストを足した (直しを外すと上の文言で落ちることを確かめた)
+  2. member と同じ名前・版の git・別レジストリの依存が、member としてビルドされる。`in_member` は取得元が path でない package を member の判定に回さず依存に回す。同じ名前の member と版が違う path 依存 (`Member::OtherVersion`) も依存に回す (前は `local_build_required`)。re-export の行き先を探すとき、member の依存の表 (`member_named`) は起点が member のビルドのときだけ使う (`LocalSource::is_member`)
+  3. member・依存から path・git の依存への re-export を追わなかった (`NotFromCratesIo`)。行き先がプロジェクトの crates.io でない package で、起点がローカルのビルドなら、依存の計画でビルドして追う (`InProjectBuild::Dependency`、`member_destination` を `built_here_destination` に広げた)。docs.rs の crate からは、docs.rs でビルドに使ったのが crates.io の版なので、今までどおり追わない。依存のビルドの JSON の `html_root_url` も、member と同じく版の手がかりに使わない (`is_built_here`)。stdio のテストに、member の re-export が path 依存に入ること (`package_source: path`) を足した
+  4. feature resolver 1 のとき、build-dependency (proc-macro でない) は名指しできる (`Buildable::ForHost`) が、頼まれた target でビルドしていた。host の target でビルドし、頼まれた target と違えば warning を付ける。stdio のテストに、resolver 1 の build-dependency を `wasm32-unknown-unknown` で引いて host でビルドされることを足した
+  5. `package_source` が古い形式の package id (`name ver (source)`) を見分けなかった。括弧の中を見る。単体テストを足した
+  6. 文言: `build_unsupported` は、host でしか使わない (build script・proc-macro のための) 依存と書き、提案は build_external_docs を先に (path・git は docs.rs に無い)。`scope_unknown` は、失敗を覚えるので `retryable: false` と refresh の提案。`not_built_for` の提案は `target` の引数と書く
+  7. 古い文言: `local_build_required` は「member だけ」をやめ、lib の無い依存か、crates.io の版の写し (D7b まで) と書く。docsrs を外した warning は、依存では rustdoc-args の cfg に触れない。`planning_crate` は feature の組に限らず「プロジェクトのビルドを読んでいる」。ビルド中の応答 (`local_provenance`) にも `package_source`
+  8. (記録だけ) 鮮度の鍵の facts の `RUSTC_BOOTSTRAP` は、依存でも値の全体 (R-WS-4 は依存の分だけを想定していた)。依存の鍵が要らず変わることがあるだけで、正しさには響かない
+- 直しの再レビュー (サブエージェント) の指摘と直し:
+  1. 依存のビルドからの re-export の行き先を名前だけで引き (`look_up`)、member が直接使う版や、同じ名前・版の member に飛んでいた。`PackageGraph` に全 package の依存の辺 (`edges`) を持たせ、`dependency_of` を member に限らず引けるようにした。起点が依存なら、その package id の名前・版の member でない package (`non_member_named`、ひとつに決まるときだけ) の依存の表から引く
+  2. ビルド中・待ち・失敗の応答の provenance に `package_source` が付かなかった (`local_provenance` が見る `arguments.local` は先に取り出されていた)。取り出す前に出どころを求めて渡す (`LocalSource::package_source`)
+  3. `build_unsupported` の文言が dev-dependency だけの依存に当てはまらなかった。「target への通常の依存で届かない (テスト・build script・proc-macro だけが使う)」と書く
+  4. host でビルドする旨の warning を共有の計画 (`LocalWanted.warnings`) に入れていたので、鍵 (host) が同じ別の target の呼び出しと取り違え、記録にも残りえた。この warning はやめ、proc-macro と同じく、頼まれた target とデータの target が違う旨の前からある warning に任せる (呼び出しごとに付く)
+  5. `package_source` の判定を、部分一致から `Source::parse` (取得元の完全一致) に合わせた
+  6. `not_built_for` の案内を「ほかの target で使うなら」と条件付きに (どの target でも作られない依存にも出るため)
+  7. `PackageId::spec` の単体テストの、実在しない形の id の例を直した
+  8. テスト: stdio に、member と同じ名前・版の git 依存 (branch 指定、`file://`、テストの cargo home) を、member の re-export と path 依存の re-export から引き、どちらも git の依存のビルド (`package_source: git`、公開の item だけ) になり、ビルド中の応答にも `package_source` が付くことを足した (1 の直しを外すと path 依存からの方が落ちることを確かめた)
+- 再レビューで残したもの (記録だけ):
+  - `ForHost` の host は、キャッシュのディレクトリでの `rustc -vV` の host で、プロジェクトの toolchain の host ではない (`--target` を省く判定の決定と違う)。プロジェクトの toolchain が別の host 向けのとき (Rosetta の Mac など) だけ食い違う。直すにはビルドの側で `check_target` の host を使う印が要る
+  - 同じ git の URL を別の branch・rev で引いた同じ名前・版の package が 2 つあると、query を外した spec が両方に合い、cargo が曖昧と言って失敗する。cargo 1.77 より前の形式の id も `name@version` に落ちるので、同じ名前・版の member と git 依存では曖昧になる
+  - `FeatureSets` の鍵が名前・版なので、member と同じ名前・版の git 依存の `enabled_in_project` を member の組で判定しうる
+  - member をやめて path 依存にした直後、期限を過ぎた呼び出しは前回の member のビルド (`private: true`) を返す (D4c の決定どおり、ビルドし直すまでの間だけ)
+- 残したもの: 別レジストリの依存の結合テストは無い (path・git と同じ道を通る)。checksum の不一致と `no_target_json` は D7b、`crate` なしの検索の `local_build_required` は D7d
+
 **止まる危険の監査と直し 1 (2026-10-21)**:
 
 - 利用者の指示で、デッドロックと止まって戻らない危険を、コード全体で監査した (サブエージェント、読むだけ。D4b のハングの後)。ロックの循環、ガードを持ったままの `.await` (clippy の `await_holding_lock` も `suspicious` の deny で効いている)、自分の結果を待つ形の循環は無かった。止まって長く戻らない箇所は次のとおり

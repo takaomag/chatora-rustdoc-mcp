@@ -58,16 +58,25 @@ impl PackageId {
 
     /// What `cargo rustdoc -p` takes for it: the id, or `<name>@<version>` for an id of cargo
     /// before 1.77, which a newer cargo, as a nightly that the server chose, does not take
-    /// (decided in M2's D2).
+    /// (decided in M2's D2). A git source with a query (`?branch=main`) is written without it
+    /// and its kind, `file:///r.git#name@1.0.0`: cargo takes a `?` for a glob, which `-p` does not
+    /// take (decided in M2's D7, as cargo 1.99.1 does).
     #[must_use]
     pub fn spec(&self) -> Cow<'_, str> {
-        match self.0.split_once(' ') {
-            Some(_) => self
+        if self.0.contains(' ') {
+            return self
                 .name_and_version()
                 .map_or(Cow::Borrowed(&*self.0), |(name, version)| {
                     Cow::Owned(format!("{name}@{version}"))
-                }),
-            None => Cow::Borrowed(&self.0),
+                });
+        }
+        match self.0.split_once('#') {
+            Some((source, rest)) if source.contains('?') => {
+                let url = source.split('?').next().unwrap_or(source);
+                let url = url.strip_prefix("git+").unwrap_or(url);
+                Cow::Owned(format!("{url}#{rest}"))
+            },
+            Some(_) | None => Cow::Borrowed(&self.0),
         }
     }
 
@@ -569,6 +578,18 @@ impl Resolver {
     pub async fn scope(&self, workspace: &Workspace, target: &TargetTriple) -> Scoped {
         self.shared.scope(workspace, target).await
     }
+
+    /// [`Self::scope`], waiting for it until `until`: the work then goes on, as
+    /// [`Self::resolve_until`]'s does (decided in M2's D7, for a dependency's build).
+    pub async fn scope_until(
+        &self,
+        workspace: &Workspace,
+        target: &TargetTriple,
+        until: tokio::time::Instant,
+    ) -> Joined<Scoped> {
+        let (key, what, start) = self.shared.scope_work(workspace, target);
+        self.shared.scoping.join(&key, &what, until, start).await
+    }
 }
 
 impl Shared {
@@ -699,6 +720,30 @@ impl Shared {
 
     /// [`Resolver::scope`], as work shared by workspace and target.
     async fn scope(&self, workspace: &Workspace, target: &TargetTriple) -> Scoped {
+        let (key, what, start) = self.scope_work(workspace, target);
+        // What cargo does for it is told to the callers of the work that waits for it, as above.
+        let telling = cargo::current_stage();
+        self.scoping
+            .wait_telling(&key, &what, telling.as_deref(), start)
+            .await
+            .unwrap_or_else(|| Err(Arc::new(Arc::new(ResolveError::Stopped).into())))
+    }
+
+    /// The key, the name and the start of the work that reads the scope of the builds of
+    /// `workspace` for `target`.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the start of the work is a closure that only its two callers take"
+    )]
+    fn scope_work(
+        &self,
+        workspace: &Workspace,
+        target: &TargetTriple,
+    ) -> (
+        String,
+        String,
+        impl FnOnce(Arc<Stage>) -> std::pin::Pin<Box<dyn Future<Output = Scoped> + Send>>,
+    ) {
         let key = format!("scope:{}:{target}", workspace.root.display());
         let what = format!(
             "the scope of the builds of {} for {target}",
@@ -711,12 +756,7 @@ impl Shared {
                     cargo::staged(stage, Box::pin(shared.read_scope(&workspace, &target))).await
                 })
             };
-        // What cargo does for it is told to the callers of the work that waits for it, as above.
-        let telling = cargo::current_stage();
-        self.scoping
-            .wait_telling(&key, &what, telling.as_deref(), start)
-            .await
-            .unwrap_or_else(|| Err(Arc::new(Arc::new(ResolveError::Stopped).into())))
+        (key, what, start)
     }
 
     /// The work of [`Self::scope`].
@@ -1015,6 +1055,11 @@ mod tests {
         assert_eq!(path.name_and_version(), Some(("one", "0.1.0")));
         let git = id("git+https://github.com/o/repo?branch=main#tool@0.2.0");
         assert_eq!(git.name_and_version(), Some(("tool", "0.2.0")));
+        // `-p` takes it without its query, which cargo takes for a glob, and its kind.
+        assert_eq!(git.spec(), "https://github.com/o/repo#tool@0.2.0");
+        // Without a query, as with no branch, tag or rev, it is taken as it is.
+        let plain = id("git+https://github.com/o/repo#tool@0.2.0");
+        assert_eq!(plain.spec(), plain.0.as_ref());
         // That of cargo before 1.77, which `-p` of a newer cargo does not take.
         let old = id("one 0.1.0 (path+file:///ws/one)");
         assert_eq!(old.name_and_version(), Some(("one", "0.1.0")));

@@ -23,6 +23,7 @@ use super::{
 #[cfg(feature = "local")]
 use crate::data::{
     features::FeatureSets,
+    metadata::PackageId,
     packages::{DocsRsCheck, Lookup as PackageLookup, PackageGraph, ProjectPackage, Source},
     project::Workspace,
 };
@@ -458,6 +459,7 @@ pub(super) fn provenance_schema() -> Value {
         "type": "object",
         "properties": {
             "source": { "type": "string", "enum": ["docs.rs", "std", "local"] },
+            "package_source": { "type": "string", "enum": ["path", "git", "registry", "crates.io"] },
             "crate": { "type": "string" },
             "version": { "type": "string" },
             "resolved_from": {
@@ -886,11 +888,56 @@ async fn in_member(
     shape: &Shape,
     until: Instant,
 ) -> Result<Request, Box<CallToolResult>> {
+    // A git or another registry's package is no member, which a member of its name and version
+    // must not be taken for (decided in M2's D7).
+    if found.package.source != Source::Local {
+        return dependency_request(state, found, name, (path, target, shape), until).await;
+    }
     let asked = local::Asked::Package {
         name: &found.package.name,
         version: &found.package.version,
     };
     match local::member(state, &found.workspace, (name, asked), target, until).await? {
+        Member::Is { wanted, package } => Ok(member_request(
+            &package,
+            wanted,
+            (name, path),
+            (target, shape),
+            (found.resolved_from, found.project_from, &found.workspace),
+            until,
+        )),
+        Member::Unknown(error) => Err(error),
+        Member::Resolving(doing) => Err(Box::new(project::resolving_crate(
+            name,
+            target,
+            (doing, found.project_from),
+            &[],
+        ))),
+        Member::Planning(doing) => Err(Box::new(project::planning_crate(
+            name,
+            target,
+            (doing, found.project_from),
+            &[],
+        ))),
+        // A dependency that docs.rs does not have, built here, which may have the name of a member
+        // at another version (decided in M2's D7).
+        Member::OtherVersion(_) | Member::Not => {
+            dependency_request(state, found, name, (path, target, shape), until).await
+        },
+    }
+}
+
+/// The request for the project's package `found`, a path, git or another registry's dependency,
+/// built here with its public items (decided in M2's D7), or else the response that tells why not.
+#[cfg(feature = "local")]
+async fn dependency_request(
+    state: &ToolState,
+    found: &project::Found,
+    name: &CrateName,
+    (path, target, shape): (&str, &TargetTriple, &Shape),
+    until: Instant,
+) -> Result<Request, Box<CallToolResult>> {
+    match local::dependency(state, &found.workspace, &found.package, target, until).await? {
         Member::Is { wanted, package } => Ok(member_request(
             &package,
             wanted,
@@ -1370,16 +1417,20 @@ pub(super) fn version_not_found(
 }
 
 /// `docs_unavailable` with `reason: local_build_required`: the project's package is not the one
-/// on crates.io, and this server builds only the workspace's members yet (decided in M1, and in
-/// M2's D2 until D7).
+/// on crates.io, and this server does not build it: a dependency without a lib, or a copy of a
+/// crates.io release yet (decided in M1, and in M2's D2 and D7, until D7b).
 #[cfg(feature = "local")]
 fn local_build_required(package: &ProjectPackage, check: DocsRsCheck) -> CallToolResult {
     let why = not_on_docs_rs(package, check);
+    let not_built = if check == DocsRsCheck::NotCratesIo {
+        "it has no lib that this server documents"
+    } else {
+        "this server does not build such a copy yet"
+    };
     error_result(&json!({
         "code": "docs_unavailable",
         "message": format!(
-            "{}@{} in the project is {why}, so docs.rs does not have it, and this server builds \
-             the documentation of the workspace's members only yet",
+            "{}@{} in the project is {why}, so docs.rs does not have it, and {not_built}",
             package.name, package.version
         ),
         "retryable": false,
@@ -1670,10 +1721,11 @@ async fn look_up_member(
     source: LocalSource,
     mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
+    let package_source = source.package_source();
     let built = match source {
         LocalSource::Built(built) => built,
         LocalSource::Wanted(wanted) => {
-            let provenance = local_provenance(&arguments);
+            let provenance = local_provenance(&arguments, package_source);
             // `build.wait_secs` from now, within the call's deadline (decided in M2's D3).
             let until_built = Instant::now()
                 .checked_add(state.build_wait)
@@ -1706,6 +1758,9 @@ async fn look_up_member(
     let task = crate::task::spawn_blocking(move || {
         let record = &built.record;
         let origin = Origin::Local {
+            private: record.private,
+            // A dependency's, which only its public items have (decided in M2's D7).
+            package_source: (!record.private).then(|| local::package_source(&record.package)),
             resolved_from: arguments.resolved_from,
             project_from: arguments.project_from,
             toolchain: record.toolchain.as_deref(),
@@ -1730,7 +1785,7 @@ async fn look_up_member(
                 rebuilt.unwrap_or_default()
             );
             building_response(
-                local_provenance(&arguments),
+                local_provenance(&arguments, package_source),
                 Doing::Building,
                 &being,
                 &warnings,
@@ -1783,12 +1838,19 @@ fn mark_rebuilding(response: &mut Value, built_at: &str) {
     fields.insert("hints".to_owned(), Value::Array(hints));
 }
 
-/// The provenance of the workspace member's crate that `arguments` names, as far as it is known
-/// before it is built.
+/// The provenance of the crate built here that `arguments` names, a workspace member's or a
+/// dependency's from `package_source`, as far as it is known before it is built.
 #[cfg(feature = "local")]
-fn local_provenance(arguments: &Request) -> Map<String, Value> {
+fn local_provenance(
+    arguments: &Request,
+    package_source: Option<&'static str>,
+) -> Map<String, Value> {
     let mut provenance = docs_rs_provenance(arguments);
     provenance.insert("source".to_owned(), json!("local"));
+    // A dependency's, which only its public items have (decided in M2's D7).
+    if let Some(package_source) = package_source {
+        provenance.insert("package_source".to_owned(), json!(package_source));
+    }
     provenance
 }
 
@@ -2382,7 +2444,7 @@ async fn in_project_destination(
             &[],
         ))));
     }
-    // From a member, a crate that its project does not tell is not taken at crates.io's latest:
+    // From a crate built here, one that its project does not tell is not taken at crates.io's latest:
     // the re-export is shown (decided in M2's D6).
     if origin.local.is_some() && matches!(in_build, InProjectBuild::Elsewhere) {
         return Some(Err(Box::new(super::tool_error(
@@ -2397,16 +2459,21 @@ async fn in_project_destination(
     }
     match in_build {
         InProjectBuild::Release(request) => Some(Ok(*request)),
-        // Another workspace member, built here (decided in M2's D6).
-        InProjectBuild::Member(package, workspace) => {
-            Some(member_destination(state, &package, &workspace, destination, origin).await)
-        },
-        // Not the crate of that name on crates.io, and not a member (until M2's D7).
+        // Another workspace member, or a dependency of the project that is not from crates.io,
+        // built here (decided in M2's D6 and D7).
+        InProjectBuild::Member(package, workspace) => Some(
+            built_here_destination(state, (&package, true), &workspace, destination, origin).await,
+        ),
+        InProjectBuild::Dependency(package, workspace) => Some(
+            built_here_destination(state, (&package, false), &workspace, destination, origin).await,
+        ),
+        // From a crate of docs.rs: not the crate of that name on crates.io, which it was built
+        // with, and not a member.
         InProjectBuild::NotFromCratesIo(package) => Some(Err(Box::new(super::tool_error(
             "docs_unavailable",
             &format!(
-                "{package} in the project is not from crates.io, and a path is not followed \
-                     into it yet"
+                "{package} in the project is not from crates.io, which the crate that re-exports \
+                 the item was built with on docs.rs"
             ),
             false,
             &[&format!("look the item up in {package} itself")],
@@ -2422,7 +2489,11 @@ enum InProjectBuild {
     Release(Box<Request>),
     /// It is a workspace member, of the workspace.
     Member(Box<ProjectPackage>, Box<Workspace>),
-    /// It is the project's package, as `name@version`, which is not from crates.io.
+    /// It is a dependency of the project that is not from crates.io, of the workspace, from a
+    /// crate built here.
+    Dependency(Box<ProjectPackage>, Box<Workspace>),
+    /// It is the project's package, as `name@version`, which is not from crates.io, from a crate
+    /// of docs.rs.
     NotFromCratesIo(String),
     /// The project does not tell.
     Elsewhere,
@@ -2456,12 +2527,21 @@ async fn in_project_build_of(
         return None;
     };
     let graph = PackageGraph::new(&resolution);
-    // From a workspace member, the package that it depends on by that name: its JSON does not
-    // tell the version (decided in M2's D6).
+    // From a crate built here, the package that it depends on by that name: its JSON does not
+    // tell the version (decided in M2's D6). A dependency's package is not a member, which may
+    // have its name and version (decided in M2's D7).
     let from_member = origin
         .local
         .as_ref()
-        .and_then(|_| graph.member_named(origin.name.as_str(), &origin.version))
+        .and_then(|local| {
+            if local.is_member() {
+                graph.member_named(origin.name.as_str(), &origin.version)
+            } else {
+                let id = PackageId(local.package().into());
+                let (name, version) = id.name_and_version()?;
+                graph.non_member_named(name, &version.parse().ok()?)
+            }
+        })
         .and_then(|member| graph.dependency_of(member, &destination.lib_name));
     let built_with = destination.release.as_ref().map(|(_, version)| version);
     let name = destination
@@ -2495,6 +2575,12 @@ async fn in_project_build_of(
             Box::new(workspace.clone()),
         ));
     }
+    if package.source != Source::CratesIo && origin.local.is_some() {
+        return Some(InProjectBuild::Dependency(
+            Box::new(package.clone()),
+            Box::new(workspace.clone()),
+        ));
+    }
     if package.source != Source::CratesIo {
         return Some(InProjectBuild::NotFromCratesIo(format!(
             "{}@{}",
@@ -2523,13 +2609,14 @@ async fn in_project_build_of(
     })))
 }
 
-/// The request for the item that the path goes on to in the workspace member `package`, built here
-/// by the work that the lookups of it share, from the member `origin` (decided in M2's D6); or the
-/// response while cargo resolves or plans it, or the error.
+/// The request for the item that the path goes on to in `package`, a workspace member if
+/// `is_member`, else a dependency, built here by the work that the lookups of it share, from the
+/// crate `origin` built here (decided in M2's D6 and D7); or the response while cargo resolves or
+/// plans it, or the error.
 #[cfg(feature = "local")]
-async fn member_destination(
+async fn built_here_destination(
     state: &ToolState,
-    package: &ProjectPackage,
+    (package, is_member): (&ProjectPackage, bool),
     workspace: &Workspace,
     destination: &Destination,
     origin: &Request,
@@ -2550,15 +2637,19 @@ async fn member_destination(
     };
     let project_from = origin.project_from.unwrap_or("argument");
     let path = destination.path.clone();
-    match local::member(
-        state,
-        workspace,
-        (&name, asked),
-        &origin.target,
-        origin.until,
-    )
-    .await?
-    {
+    let built = if is_member {
+        local::member(
+            state,
+            workspace,
+            (&name, asked),
+            &origin.target,
+            origin.until,
+        )
+        .await?
+    } else {
+        local::dependency(state, workspace, package, &origin.target, origin.until).await?
+    };
+    match built {
         Member::Is { wanted, package } => {
             let mut request = member_request(
                 &package,
@@ -2584,7 +2675,7 @@ async fn member_destination(
             (doing, project_from),
             &[],
         ))),
-        Member::OtherVersion(_) | Member::Not => Err(Box::new(super::tool_error(
+        Member::OtherVersion(_) | Member::Not if is_member => Err(Box::new(super::tool_error(
             "item_not_found",
             &format!(
                 "{name} {} is not a member that is built here",
@@ -2592,6 +2683,10 @@ async fn member_destination(
             ),
             false,
             &[],
+        ))),
+        Member::OtherVersion(_) | Member::Not => Err(Box::new(local_build_required(
+            package,
+            DocsRsCheck::NotCratesIo,
         ))),
     }
 }
@@ -3741,6 +3836,7 @@ mod tests {
         let response = ItemResponse {
             provenance: Provenance {
                 source: Source::DocsRs,
+                package_source: Some("path"),
                 name: "x",
                 version: "1.0.0".into(),
                 resolved_from: Some(ResolvedFrom::Explicit),

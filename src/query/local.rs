@@ -1317,10 +1317,17 @@ fn warnings_of(record: &BuildRecord, mut warnings: Vec<Box<str>>) -> Vec<Box<str
                 .into(),
         );
     }
-    if !record.cfg_docsrs && build::cfg_docsrs() {
+    // A dependency's build has no `--cfg` of its `rustdoc-args` (decided in M2's D7).
+    if !record.cfg_docsrs && build::cfg_docsrs() && record.private {
         warnings.push(
             "built without --cfg docsrs, nor the --cfg of the rustdoc-args of its \
              [package.metadata.docs.rs], as its build failed with them: what the crate documents \
+             only for docs.rs is not shown"
+                .into(),
+        );
+    } else if !record.cfg_docsrs && build::cfg_docsrs() {
+        warnings.push(
+            "built without --cfg docsrs, as its build failed with it: what the crate documents \
              only for docs.rs is not shown"
                 .into(),
         );
@@ -1375,6 +1382,7 @@ mod tests {
             cfg_docsrs: true,
             cfgs: Box::default(),
             features: None,
+            document_private: true,
         }
     }
 

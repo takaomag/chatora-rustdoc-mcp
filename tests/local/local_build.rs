@@ -93,6 +93,7 @@ fn plan(
         cfg_docsrs: true,
         cfgs: Box::default(),
         features: None,
+        document_private: true,
     }
 }
 
@@ -1069,4 +1070,140 @@ async fn the_sources_of_a_package_in_git_are_what_git_does_not_ignore() {
     let (listed, walked) = freshness::sources(std::slice::from_ref(&outside)).await;
     assert_eq!(listed, Vec::<PathBuf>::new());
     assert_eq!(walked, [outside]);
+}
+
+/// The `file://` URL of `path`: `file:///tmp/x`, and `file:///C:/x` on Windows.
+fn file_url(path: &Path) -> String {
+    let path = path.display().to_string().replace('\\', "/");
+    if path.starts_with('/') {
+        format!("file://{path}")
+    } else {
+        format!("file:///{path}")
+    }
+}
+
+/// A workspace in `ws/` of `dir`, with a Cargo.lock, whose member `app` depends on the package
+/// `dep` of the git repository `repo/` on its branch `main`, which has the name and version of the
+/// member `dep`.
+fn git_dependency_of_a_members_name(dir: &Path) -> PathBuf {
+    let write = |path: &str, text: &str| {
+        let path = dir.join(path);
+        fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        fs::write(path, text).expect("written");
+    };
+    let package = |name: &str, rest: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n{rest}")
+    };
+    // A repository on the branch `main`, whose package has the name and version of a member.
+    write("repo/Cargo.toml", &package("dep", ""));
+    write(
+        "repo/src/lib.rs",
+        "/// From git.\npub struct FromGit;\n/// Not public.\nfn inside() {}\n",
+    );
+    let git = |args: &[&str]| {
+        let output = output_within(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .current_dir(dir.join("repo")),
+            std::time::Duration::from_secs(60),
+        );
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&["init", "--quiet", "--initial-branch=main"]);
+    git(&["add", "--all"]);
+    git(&["commit", "--quiet", "--message=fixture"]);
+    write(
+        "ws/Cargo.toml",
+        "[workspace]\nmembers = [\"dep\", \"app\"]\nresolver = \"3\"\n",
+    );
+    write("ws/dep/Cargo.toml", &package("dep", ""));
+    write("ws/dep/src/lib.rs", "pub struct FromMember;\n");
+    write(
+        "ws/app/Cargo.toml",
+        &package(
+            "app",
+            &format!(
+                "[dependencies]\nfromgit = {{ package = \"dep\", git = \"{}\", branch = \
+                 \"main\" }}\n",
+                file_url(&dir.join("repo"))
+            ),
+        ),
+    );
+    write("ws/app/src/lib.rs", "");
+    let root = dir.join("ws");
+    // The repository is fetched from the disk.
+    let output = output_within(
+        Command::new("cargo")
+            .args(["generate-lockfile"])
+            .current_dir(&root),
+        std::time::Duration::from_secs(120),
+    );
+    assert!(output.status.success(), "{output:?}");
+    root
+}
+
+#[tokio::test]
+async fn a_git_dependency_of_a_members_name_is_built_with_its_public_items() {
+    let Some(dir) = in_isolated_child(
+        "local_build::a_git_dependency_of_a_members_name_is_built_with_its_public_items",
+    ) else {
+        return;
+    };
+    let root = git_dependency_of_a_members_name(&dir);
+    let workspace = project::workspace_of(&root).expect("a workspace");
+    let resolver = Resolver::new(true);
+    let resolution = resolver.resolve(&workspace).await.expect("resolved");
+    let Resolution::Metadata { metadata, .. } = &*resolution else {
+        panic!("cargo metadata works offline here: {resolution:?}");
+    };
+    let found = metadata
+        .packages
+        .iter()
+        .find(|found| &*found.name == "dep" && !metadata.workspace_members.contains(&found.id))
+        .expect("the git dependency");
+    // `-p` takes a `?` for a glob (cargo 1.99.1).
+    assert!(found.id.0.contains("?branch=main"), "{:?}", found.id);
+    let (crate_name, documented) = build::lib_of(found).expect("a lib");
+    // As the server plans a dependency's build (`mcp::tool::local::dependency`).
+    let plan = Plan {
+        root: root.clone(),
+        offline: true,
+        toolchain: None,
+        bootstrap: Bootstrap::of(metadata),
+        target_dir: TargetDir::of(&dir.join("cache"), &root),
+        package: found.id.clone(),
+        manifest: root.join("Cargo.toml"),
+        crate_name,
+        documented,
+        version: found.version.clone(),
+        target: None,
+        cfg_docsrs: true,
+        cfgs: Box::default(),
+        features: None,
+        document_private: false,
+    };
+    let cache = Cache::at(&dir.join("cache"));
+    let built = build::build(
+        &cache,
+        &plan,
+        &dir.join("cache/work/test"),
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error:?}"));
+    let items = items(&built);
+    assert!(items.contains("FromGit"), "{items:?}");
+    assert!(
+        !items.contains("FromMember") && !items.contains("inside"),
+        "{items:?}"
+    );
+    assert!(!built.record.private);
 }

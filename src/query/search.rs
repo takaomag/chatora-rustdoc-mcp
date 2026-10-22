@@ -963,7 +963,7 @@ fn hits(
 /// Whether the search of `source` shows its entry `entry`: one that is not public or is hidden only
 /// in a workspace member (requirements R-SR-4 and R-SH-5, decided in M2's D6).
 fn shows(source: &Searched<'_>, entry: u32) -> bool {
-    matches!(source.request.origin, Origin::Local { .. })
+    matches!(source.request.origin, Origin::Local { private: true, .. })
         || entry_at(source.view.search_index(), entry).is_some_and(|found| !found.restricted)
 }
 
@@ -1509,6 +1509,8 @@ mod tests {
             "{paths:?}"
         );
         let member = Origin::Local {
+            private: true,
+            package_source: None,
             resolved_from: ResolvedFrom::Explicit,
             project_from: None,
             toolchain: None,

@@ -1908,6 +1908,266 @@ fn a_member_is_built_as_its_docs_rs_metadata_asks_when_it_may() {
     assert!(server.finish().success());
 }
 
+/// A project in `ws/` of a new temporary directory, which depends on the path dependencies
+/// `libdep`, whose `Shown` it re-exports, and `buildonly`, for its build script; with the feature
+/// resolver `resolver`.
+#[cfg(feature = "local")]
+fn path_dependencies(resolver: &str) -> TempDir {
+    let dir = TempDir::new().expect("a temporary directory");
+    let write = |path: &str, text: &str| {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        std::fs::write(path, text).expect("written");
+    };
+    let package = |name: &str, rest: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n{rest}")
+    };
+    write(
+        "ws/Cargo.toml",
+        &package(
+            "app",
+            &format!(
+                "resolver = \"{resolver}\"\n\n[dependencies]\nlibdep = {{ path = \"../libdep\" }}\n\n\
+                 [build-dependencies]\nbuildonly = {{ path = \"../buildonly\" }}\n"
+            ),
+        ),
+    );
+    write("ws/src/lib.rs", "pub use libdep::Shown;\n");
+    write("ws/build.rs", "fn main() {}\n");
+    write("libdep/Cargo.toml", &package("libdep", ""));
+    write(
+        "libdep/src/lib.rs",
+        "/// Shown.\npub struct Shown;\n/// Hidden.\nfn kept_inside() {}\n",
+    );
+    write("buildonly/Cargo.toml", &package("buildonly", ""));
+    write(
+        "buildonly/src/lib.rs",
+        "/// Only for the build.\npub fn build_helper() {}\n",
+    );
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path().join("ws"))
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    dir
+}
+
+/// A path dependency outside the workspace is built here, its public items only, and told so, and
+/// a member's re-export goes on into it; one that only a build script uses, which `cargo rustdoc
+/// -p` cannot name, is not (requirement R-WS-5, decided in M2's D7).
+#[cfg(feature = "local")]
+#[test]
+fn a_path_dependency_is_built_here_with_its_public_items() {
+    let dir = path_dependencies("3");
+    let mut server = Server::start_in(Some(&dir.path().join("ws")));
+    let shown = built_item(
+        &mut server,
+        1,
+        &json!({ "crate": "libdep", "path": "Shown" }),
+    );
+    assert_ne!(shown["isError"], true, "{shown}");
+    let shown = &shown["structuredContent"];
+    assert_eq!(shown["provenance"]["source"], "local", "{shown}");
+    assert_eq!(shown["provenance"]["package_source"], "path", "{shown}");
+    assert!(
+        shown["data"].get("visibility").is_none(),
+        "public only: {shown}"
+    );
+    // Not its private items, as another crate sees it.
+    let inside = built_item(
+        &mut server,
+        100,
+        &json!({ "crate": "libdep", "path": "kept_inside" }),
+    );
+    assert!(inside.to_string().contains("item_not_found"), "{inside}");
+    let only = built_item(
+        &mut server,
+        200,
+        &json!({ "crate": "buildonly", "path": "build_helper" }),
+    );
+    assert!(only.to_string().contains("build_unsupported"), "{only}");
+    // The member's re-export goes on into the dependency, built here.
+    let followed = built_item(
+        &mut server,
+        300,
+        &json!({ "crate": "app", "path": "Shown" }),
+    );
+    assert_ne!(followed["isError"], true, "{followed}");
+    let followed = &followed["structuredContent"];
+    assert_eq!(followed["provenance"]["crate"], "libdep", "{followed}");
+    assert_eq!(
+        followed["provenance"]["package_source"], "path",
+        "{followed}"
+    );
+    assert!(server.finish().success());
+}
+
+/// With the feature resolver 1, a build dependency is built, for the host, which the project
+/// builds it for (decided in M2's D7).
+#[cfg(feature = "local")]
+#[test]
+fn a_build_dependency_is_built_for_the_host() {
+    let dir = path_dependencies("1");
+    let mut server = Server::start_in(Some(&dir.path().join("ws")));
+    let for_host = built_item(
+        &mut server,
+        1,
+        &json!({
+            "crate": "buildonly",
+            "path": "build_helper",
+            "target": "wasm32-unknown-unknown",
+        }),
+    );
+    assert_ne!(for_host["isError"], true, "{for_host}");
+    assert!(
+        for_host
+            .to_string()
+            .contains("wasm32-unknown-unknown was asked for, but the data is for"),
+        "{for_host}"
+    );
+    assert!(server.finish().success());
+}
+
+/// In a new temporary directory, the git repository `repo/` with the package `dep` on its branch
+/// `main`, the workspace `ws/` whose members are `dep`, of the same name and version, and `app`,
+/// which re-exports the git one's `FromGit` and depends on `libdep/`, which re-exports it as
+/// `Again`; with the environment for cargo and git, which keeps them in the directory.
+#[cfg(feature = "local")]
+fn git_dependency_of_a_members_name() -> (TempDir, [(&'static str, String); 5]) {
+    let dir = TempDir::new().expect("a temporary directory");
+    let write = |path: &str, text: &str| {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        std::fs::write(path, text).expect("written");
+    };
+    let package = |name: &str, rest: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n{rest}")
+    };
+    write("gitconfig", "");
+    let cargo_home = dir.path().join("cargo-home");
+    let gitconfig = dir.path().join("gitconfig");
+    let env = [
+        ("CARGO_HOME", cargo_home.display().to_string()),
+        ("GIT_CONFIG_GLOBAL", gitconfig.display().to_string()),
+        ("GIT_CONFIG_NOSYSTEM", "1".to_owned()),
+        ("GIT_TERMINAL_PROMPT", "0".to_owned()),
+        ("RUSTUP_AUTO_INSTALL", "0".to_owned()),
+    ];
+    write("repo/Cargo.toml", &package("dep", ""));
+    write(
+        "repo/src/lib.rs",
+        "/// From git.\npub struct FromGit;\n/// Not public.\nfn inside() {}\n",
+    );
+    for args in [
+        &["init", "--quiet", "--initial-branch=main"][..],
+        &["add", "--all"],
+        &[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "--message=fixture",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir.path().join("repo"))
+            .envs(env.clone())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    }
+    let url = format!(
+        "file://{}{}",
+        if cfg!(windows) { "/" } else { "" },
+        dir.path()
+            .join("repo")
+            .display()
+            .to_string()
+            .replace('\\', "/")
+    );
+    let git = format!("{{ package = \"dep\", git = \"{url}\", branch = \"main\" }}");
+    write(
+        "ws/Cargo.toml",
+        "[workspace]\nmembers = [\"dep\", \"app\"]\nresolver = \"3\"\n",
+    );
+    write("ws/dep/Cargo.toml", &package("dep", ""));
+    write("ws/dep/src/lib.rs", "pub struct FromMember;\n");
+    write(
+        "ws/app/Cargo.toml",
+        &package(
+            "app",
+            &format!("[dependencies]\nfromgit = {git}\nlibdep = {{ path = \"../../libdep\" }}\n"),
+        ),
+    );
+    write("ws/app/src/lib.rs", "pub use fromgit::FromGit;\n");
+    write(
+        "libdep/Cargo.toml",
+        &package("libdep", &format!("[dependencies]\nfromgit = {git}\n")),
+    );
+    write("libdep/src/lib.rs", "pub use fromgit::FromGit as Again;\n");
+    let status = Command::new("cargo")
+        .arg("generate-lockfile")
+        .current_dir(dir.path().join("ws"))
+        .envs(env.clone())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    (dir, env)
+}
+
+/// A git dependency of the name and version of a member is built here, by the re-export of a
+/// member and by the re-export of a path dependency, its public items only, and told so (decided
+/// in M2's D7). The repository is reached by `file://`, and cargo keeps it in a cargo home of the
+/// test.
+#[cfg(feature = "local")]
+#[test]
+fn a_git_dependency_of_a_members_name_is_built_here() {
+    let (dir, env) = git_dependency_of_a_members_name();
+    let env: Vec<(&str, &str)> = env
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+    let mut server = Server::start_with(Some(&dir.path().join("ws")), &env);
+    for (first, arguments) in [
+        (1, json!({ "crate": "app", "path": "FromGit" })),
+        (100, json!({ "crate": "libdep", "path": "Again" })),
+    ] {
+        // While it is built, as when it is not yet, it is told a dependency from git.
+        let mut found = Value::Null;
+        for id in first..first + 30 {
+            server.send(&call_tool(id, "get_item", arguments.clone()));
+            found = server.response(id)["result"]["structuredContent"].clone();
+            if found["provenance"]["crate"] == "dep" {
+                assert_eq!(found["provenance"]["package_source"], "git", "{found}");
+            }
+            if found["status"] != "building" {
+                break;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        assert_eq!(found["provenance"]["crate"], "dep", "{arguments}: {found}");
+        assert_eq!(found["provenance"]["source"], "local", "{found}");
+        assert_eq!(found["provenance"]["package_source"], "git", "{found}");
+        assert!(found["data"].get("visibility").is_none(), "{found}");
+        assert!(found.to_string().contains("From git."), "{found}");
+    }
+    assert!(server.finish().success());
+}
+
 /// A workspace whose member `front` re-exports the items of the other members: `middle`, which
 /// depends on `back` as `renamed`; `a` and `b`, by globs; `other-pkg`, whose lib is `other_lib`
 /// and whose bin is `other-pkg`; and std's `collections`, by a glob.

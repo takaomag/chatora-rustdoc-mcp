@@ -118,8 +118,14 @@ pub enum Origin<'a> {
         /// How docs.rs built it, if its `.crate` could be read (requirement R-FT-1).
         build: Option<&'a DocsRsBuild>,
     },
-    /// A build of a workspace member here (decided in M2's D2).
+    /// A build here: of a workspace member (decided in M2's D2), or of a dependency that docs.rs
+    /// does not have (decided in M2's D7).
     Local {
+        /// Whether it has the private and hidden items, as a member's does, which are shown.
+        private: bool,
+        /// Where a dependency came from: `path`, `git`, `registry` or `crates.io`. `None` for a
+        /// member (decided in M2's D7).
+        package_source: Option<&'static str>,
         /// How the version was chosen.
         resolved_from: ResolvedFrom,
         /// Where the project came from.
@@ -168,6 +174,10 @@ pub struct ItemResponse<'a> {
 pub struct Provenance<'a> {
     /// The source that returned the data.
     pub source: Source,
+    /// Where a dependency built here came from: `path`, `git`, `registry` or `crates.io`
+    /// (decided in M2's D7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_source: Option<&'static str>,
     /// The crate, as requested.
     #[serde(rename = "crate")]
     pub name: &'a str,
@@ -215,6 +225,7 @@ pub struct Provenance<'a> {
 /// What the provenance tells of where the data came from, by its origin.
 struct FromWhere<'a> {
     source: Source,
+    package_source: Option<&'static str>,
     resolved_from: Option<ResolvedFrom>,
     project_from: Option<&'static str>,
     toolchain: Option<&'a str>,
@@ -233,6 +244,7 @@ const fn from_where(origin: Origin<'_>) -> FromWhere<'_> {
             ..
         } => FromWhere {
             source: Source::DocsRs,
+            package_source: None,
             resolved_from: Some(resolved_from),
             project_from,
             toolchain: None,
@@ -242,14 +254,17 @@ const fn from_where(origin: Origin<'_>) -> FromWhere<'_> {
             features_effective: None,
         },
         Origin::Local {
+            package_source,
             resolved_from,
             project_from,
             toolchain,
             built_at,
             features_requested,
             features_effective,
+            ..
         } => FromWhere {
             source: Source::Local,
+            package_source,
             resolved_from: Some(resolved_from),
             project_from,
             toolchain,
@@ -265,6 +280,7 @@ const fn from_where(origin: Origin<'_>) -> FromWhere<'_> {
             ..
         } => FromWhere {
             source: Source::Std,
+            package_source: None,
             resolved_from: None,
             project_from: None,
             toolchain: Some(toolchain),
@@ -799,8 +815,10 @@ impl<'a> Query<'a> {
             request,
             view,
             index: view.index(),
-            renderer: Renderer::new(view)
-                .public_only(!matches!(request.origin, Origin::Local { .. })),
+            renderer: Renderer::new(view).public_only(!matches!(request.origin, Origin::Local {
+                private: true,
+                ..
+            })),
             warnings: Vec::new(),
             hints: Vec::new(),
         }
@@ -890,6 +908,7 @@ impl<'a> Query<'a> {
         }
         let FromWhere {
             source,
+            package_source,
             resolved_from,
             project_from,
             toolchain,
@@ -900,6 +919,7 @@ impl<'a> Query<'a> {
         } = from_where(self.request.origin);
         Provenance {
             source,
+            package_source,
             name: self.request.name.as_str(),
             version,
             resolved_from,
@@ -1300,6 +1320,12 @@ impl<'a> Query<'a> {
     /// Whether the crate is a workspace member's, built here with its private items (decided in
     /// M2's D2).
     pub(super) const fn is_member(&self) -> bool {
+        matches!(self.request.origin, Origin::Local { private: true, .. })
+    }
+
+    /// Whether the crate is built here, a workspace member's or a dependency's, whose version the
+    /// project decides (decided in M2's D7).
+    const fn is_built_here(&self) -> bool {
         matches!(self.request.origin, Origin::Local { .. })
     }
 
@@ -1504,9 +1530,9 @@ impl<'a> Query<'a> {
                 .path
                 .components()
                 .any(|component| component.as_os_str() == "rustlib");
-        let name: Box<str> = if self.is_member() {
-            // By its crate's name, as the workspace member's JSON names it, whose version the
-            // project decides: the JSON's `html_root_url` may be old (decided in M2's D6).
+        let name: Box<str> = if self.is_built_here() {
+            // By its crate's name, as the JSON of the crate built here names it, whose version the
+            // project decides: the JSON's `html_root_url` may be old (decided in M2's D6 and D7).
             external.name.as_str().into()
         } else if let Some((name, version)) =
             external.html_root_url.as_deref().and_then(docs_rs_release)
@@ -1538,13 +1564,14 @@ impl<'a> Query<'a> {
         };
         let summary = self.view.summary(crossing.reexport.target)?;
         let external = self.view.external_crate(summary.crate_id)?;
-        // A workspace member's JSON has the `html_root_url` that a crate writes itself, if any,
-        // which may be old: the project's build tells the version (decided in M2's D6).
+        // The JSON of a crate built here has the `html_root_url` that a crate writes itself, if
+        // any, which may be old: the project's build tells the version (decided in M2's D6 and
+        // D7).
         let release = external
             .html_root_url
             .as_deref()
             .and_then(docs_rs_release)
-            .filter(|_| !self.is_member());
+            .filter(|_| !self.is_built_here());
         let is_std = external
             .html_root_url
             .as_deref()

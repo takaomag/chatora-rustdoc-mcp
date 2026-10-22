@@ -393,6 +393,20 @@ pub fn member_crate<'a>(metadata: &'a Metadata, name: &str) -> Option<(&'a Packa
     lib.or_else(bin).or_else(by_package)
 }
 
+/// The lib of the dependency `package`, which a lookup of it is in, with its crate's name (decided
+/// in M2's D7). `None` when it has none.
+#[must_use]
+pub fn lib_of(package: &Package) -> Option<(Box<str>, Documented)> {
+    let target = package
+        .targets
+        .iter()
+        .find(|target| target.kind.iter().any(|kind| LIB_KINDS.contains(&&**kind)))?;
+    let proc_macro = target.kind.iter().any(|kind| &**kind == "proc-macro");
+    Some((crate_name(&target.name).into(), Documented::Lib {
+        proc_macro,
+    }))
+}
+
 /// The crate of the member `package` that a lookup of `name`, with `_` for `-`, is in: its lib
 /// or bin of that name, else its lib, else its bin if it has one alone (decided in M2's D2).
 #[must_use]
@@ -559,6 +573,10 @@ pub struct Plan {
     /// `--no-default-features --features` (requirement R-FT-3, decided in M2's D3), or `None` for
     /// cargo's default of `-p`.
     pub features: Option<Vec<Box<str>>>,
+    /// Whether the private and hidden items are documented: a workspace member's, not a
+    /// dependency's, which shows its public items only (requirements R-WS-3 and R-SH-5, decided
+    /// in M2's D6 and D7).
+    pub document_private: bool,
 }
 
 impl Plan {
@@ -608,10 +626,12 @@ impl Plan {
                 command.arg("--cfg").arg(&**cfg);
             }
         }
+        // A member's private items too (requirement R-WS-3), and those of `#[doc(hidden)]`,
+        // which its own code uses as well (decided in M2's D6).
+        if self.document_private {
+            command.args(["--document-private-items", "--document-hidden-items"]);
+        }
         command
-            // A member's private items too (requirement R-WS-3), and those of `#[doc(hidden)]`,
-            // which its own code uses as well (decided in M2's D6).
-            .args(["--document-private-items", "--document-hidden-items"])
             .env("RUSTC_BOOTSTRAP", self.bootstrap.value())
             .env("CARGO_TARGET_DIR", self.target_dir.target())
             .env("CARGO_BUILD_BUILD_DIR", self.target_dir.build());
@@ -681,7 +701,7 @@ impl Plan {
             "environment": *ENVIRONMENT,
             // What the command documents besides the public items, which a build before
             // `--document-hidden-items` (M2's D6) lacks.
-            "documents": "private hidden",
+            "documents": if self.document_private { "private hidden" } else { "public" },
         });
         facts.to_string()
     }
@@ -785,6 +805,12 @@ fn is_of(json: &Path, record: &BuildRecord) -> bool {
 
 /// The record of a published build, next to its JSON.
 const RECORD: &str = "record.json";
+
+/// Whether a record that does not tell documented the private items: one of a member's, as all
+/// were before M2's D7.
+const fn documented_private() -> bool {
+    true
+}
 
 /// The record of the last build that failed, where its JSON would be published.
 const FAILED: &str = "failed.json";
@@ -905,9 +931,13 @@ pub struct Built {
 
 /// What is recorded of a build, `record.json` next to its JSON, for the provenance (requirement
 /// R-OUT-9).
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is a fact of the build that its record keeps"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildRecord {
-    /// The package id of the member.
+    /// The package id of the member, or of the dependency (decided in M2's D7).
     pub package: Box<str>,
     /// The crate, with `_` for `-`.
     pub crate_name: Box<str>,
@@ -956,6 +986,10 @@ pub struct BuildRecord {
     /// with the same toolchain, begins as this one ended (decided in M2's D4).
     #[serde(default)]
     pub planned: Option<Planned>,
+    /// Whether it documents the private and hidden items, as a workspace member's build does
+    /// ([`Plan::document_private`]). The records before M2's D7, of members only, did.
+    #[serde(default = "documented_private")]
+    pub private: bool,
 }
 
 /// What a build was planned with, of what the tries change (decided in M2's D3 and D4).
@@ -1192,6 +1226,7 @@ pub async fn build(
         deps: fresh.map(|fresh| fresh.deps.clone()).unwrap_or_default(),
         dep_info: false,
         planned: None,
+        private: plan.document_private,
     };
     let dir = plan.published_dir(cache.dir(), target.as_ref());
     let path = dir.join(format!("{}.json", header.format_version));
@@ -1894,6 +1929,7 @@ mod tests {
             cfg_docsrs: true,
             cfgs: Box::default(),
             features: None,
+            document_private: true,
         }
     }
 
@@ -2263,6 +2299,7 @@ mod tests {
             cfg_docsrs: true,
             cfgs: Box::from([Box::from("tokio_unstable")]),
             features: Some(vec!["default".into(), "extra".into()]),
+            document_private: true,
         };
         let command = plan.command();
         let command = command.as_std();
@@ -2342,6 +2379,7 @@ mod tests {
             cfg_docsrs: false,
             cfgs: Box::from([Box::from("tokio_unstable")]),
             features: None,
+            document_private: true,
         };
         let command = plan.command();
         let args: Vec<_> = command

@@ -18,11 +18,13 @@ use super::{ToolState, error_result, get_item, project};
 use crate::{
     data::{
         build::{self, Bootstrap, Plan, TargetDir},
+        build_scope::{Buildable, ScopeError},
         cargo::Failure,
         crate_file,
         crate_name::CrateName,
         flight::{Doing, Joined},
         metadata::{CargoError, Package, Resolution},
+        packages::{ProjectPackage, Source},
         project::Workspace,
         rustdoc_json::ParseError,
         target::TargetTriple,
@@ -41,6 +43,30 @@ pub(super) enum LocalSource {
     Wanted(Box<LocalWanted>),
     /// Built, for the lookups in it after the first, as when a re-export is not followed.
     Built(Arc<LocalBuilt>),
+}
+
+impl LocalSource {
+    /// Whether it is a workspace member's build, with its private items, not a dependency's
+    /// (decided in M2's D7).
+    pub(super) fn is_member(&self) -> bool {
+        match self {
+            Self::Wanted(wanted) => wanted.plan.document_private,
+            Self::Built(built) => built.record.private,
+        }
+    }
+
+    /// The package id of what is built.
+    pub(super) fn package(&self) -> &str {
+        match self {
+            Self::Wanted(wanted) => &wanted.plan.package.0,
+            Self::Built(built) => &built.record.package,
+        }
+    }
+
+    /// Where a dependency came from, for its provenance; `None` for a member (decided in M2's D7).
+    pub(super) fn package_source(&self) -> Option<&'static str> {
+        (!self.is_member()).then(|| package_source(self.package()))
+    }
 }
 
 /// What a lookup asks for, to tell whether it is in a workspace member.
@@ -158,6 +184,8 @@ pub(super) async fn member(
         cfg_docsrs: build::cfg_docsrs(),
         cfgs: docs_rs.cfgs,
         features,
+        // A member's own code (requirement R-WS-3).
+        document_private: true,
     };
     Ok(Member::Is {
         wanted: Box::new(LocalWanted {
@@ -214,6 +242,147 @@ async fn features_of(
         Vec::new()
     };
     Ok((features, warnings))
+}
+
+/// The build of the project's package `package` that is not a workspace member and that docs.rs does
+/// not have: a path, git or another registry's dependency (decided in M2's D7). It is built in the
+/// workspace's root, with `-p` and cargo's own features for it, which are those of the project's
+/// build, and its public items only (requirement R-WS-5). `Member::Not` when it is not the
+/// project's dependency; the error when `-p` cannot name it (`build_unsupported`), or the scope of
+/// the builds is not known (`scope_unknown`).
+pub(super) async fn dependency(
+    state: &ToolState,
+    workspace: &Workspace,
+    package: &ProjectPackage,
+    target: &TargetTriple,
+    until: Instant,
+) -> Result<Member, Box<CallToolResult>> {
+    let resolution = match state.resolver.resolve_until(workspace, until).await {
+        Joined::Done(Ok(resolution)) => resolution,
+        Joined::Done(Err(error)) => {
+            return Err(Box::new(project::resolve_error(workspace, &error)));
+        },
+        Joined::Ended => return Err(Box::new(get_item::stopped())),
+        Joined::Going(doing) => return Ok(Member::Resolving(doing)),
+    };
+    let metadata = match &*resolution {
+        Resolution::Metadata { metadata, .. } => metadata,
+        Resolution::CargoLockRaw { because, .. } => {
+            let Ok(name) = package.name.parse::<CrateName>() else {
+                return Ok(Member::Not);
+            };
+            return Ok(Member::Unknown(Box::new(metadata_failed(&name, because))));
+        },
+    };
+    let Some(found) = metadata.packages.iter().find(|found| {
+        found.name == package.name
+            && found.version == package.version
+            && Source::parse(found.source.as_deref()) == package.source
+            && !metadata.workspace_members.contains(&found.id)
+    }) else {
+        return Ok(Member::Not);
+    };
+    let Some((crate_name, documented)) = build::lib_of(found) else {
+        return Ok(Member::Not);
+    };
+    let what = format!("{} {}", found.name, found.version);
+    // Whether `-p` can name it for the target (requirement R-WS-5).
+    let built_for = match state.resolver.scope_until(workspace, target, until).await {
+        Joined::Done(Ok(scope)) => match scope.buildable(&found.id) {
+            Buildable::ForTarget => target.clone(),
+            // For the host, which the project's build builds it for (decided in M2's D7). The
+            // response warns that the data is not for the target asked for, as for a proc macro.
+            Buildable::ForHost => state.host().await.triple.clone(),
+            Buildable::Unnameable => return Err(Box::new(build_unsupported(&what))),
+            Buildable::NotBuilt => return Err(Box::new(not_built_for(&what, target))),
+        },
+        Joined::Done(Err(error)) => return Err(Box::new(scope_unknown(&what, &error))),
+        Joined::Ended => return Err(Box::new(get_item::stopped())),
+        Joined::Going(doing) => return Ok(Member::Planning(doing)),
+    };
+    let root = &workspace.root;
+    let plan = Plan {
+        root: root.clone(),
+        offline: state.resolver.offline_in(root).await,
+        toolchain: None,
+        bootstrap: Bootstrap::of(metadata),
+        target_dir: TargetDir::of(state.cache.dir(), root),
+        package: found.id.clone(),
+        // The workspace's, as cargo would take the dependency's for a root of its own and write
+        // another Cargo.lock (requirement R-WS-5).
+        manifest: root.join("Cargo.toml"),
+        crate_name,
+        documented,
+        version: found.version.clone(),
+        target: None,
+        cfg_docsrs: build::cfg_docsrs(),
+        cfgs: Box::default(),
+        features: None,
+        document_private: false,
+    };
+    Ok(Member::Is {
+        wanted: Box::new(LocalWanted {
+            plan,
+            target: built_for,
+            project_sets_target: project::sets_build_target(state, root).await,
+            cargo_home: state.resolver.cargo_home().map(Path::to_path_buf),
+            docs_rs_features: None,
+            warnings: Vec::new(),
+            input_files: state.resolver.input_files(root, metadata).await,
+            input_packages: build::source_packages(metadata, found),
+            refresh: false,
+        }),
+        package: found.name.clone(),
+    })
+}
+
+/// `docs_unavailable` with `build_unsupported` for the dependency `what`, which `cargo rustdoc -p`
+/// cannot name, as the feature resolver would panic (requirement R-WS-5): the project's build
+/// does not reach it by the normal dependencies for the target, nor as a proc macro.
+fn build_unsupported(what: &str) -> CallToolResult {
+    error_result(&json!({
+        "code": "docs_unavailable",
+        "message": format!(
+            "{what} cannot be built here: the project's build does not reach it by the normal \
+             dependencies for the target (it is used only by tests, build scripts or proc \
+             macros), and cargo cannot document it alone"
+        ),
+        "retryable": false,
+        "suggestions": [
+            "document it with build_external_docs (in a later version)",
+            "look up the items of the crates that use it, which may re-export them",
+        ],
+        "reason": "build_unsupported",
+    }))
+}
+
+/// `docs_unavailable` with `build_unsupported` for the dependency `what`, which the project's
+/// build does not build for `target` (requirement R-WS-5).
+fn not_built_for(what: &str, target: &TargetTriple) -> CallToolResult {
+    error_result(&json!({
+        "code": "docs_unavailable",
+        "message": format!("the project's build for {target} does not build {what}"),
+        "retryable": false,
+        "suggestions": [
+            "if the project uses it for another target, give that target as \"target\"",
+        ],
+        "reason": "build_unsupported",
+    }))
+}
+
+/// `docs_unavailable` with `scope_unknown` for the dependency `what`, as which packages the
+/// project's build builds is not known (requirement R-MCP-3).
+fn scope_unknown(what: &str, error: &ScopeError) -> CallToolResult {
+    error_result(&json!({
+        "code": "docs_unavailable",
+        "message": format!("{what} is not built here, as the scope of the project's build is not known: {error}"),
+        "retryable": false,
+        "suggestions": [
+            "run `cargo tree` in the project's terminal to see why it fails",
+            "once it is fixed, call again with \"refresh\": true",
+        ],
+        "reason": "scope_unknown",
+    }))
 }
 
 /// What a member's `[package.metadata.docs.rs]` asks of its build here.
@@ -360,6 +529,25 @@ pub(super) async fn built(
                     warnings,
                 ))
             }),
+    }
+}
+
+/// Where the package of `id`, a package id of either format, came from: `path`, `git`,
+/// `registry` or `crates.io` (decided in M2's D7).
+pub(super) fn package_source(id: &str) -> &'static str {
+    // `<name> <version> (<source>)` of cargo before 1.77, else `<source>#…`.
+    let source = id
+        .split_once(" (")
+        .map_or(id, |(_, source)| source.strip_suffix(')').unwrap_or(source));
+    let source = source.split('#').next().unwrap_or(source);
+    if source.starts_with("path+") {
+        return "path";
+    }
+    match Source::parse(Some(source)) {
+        Source::Local => "path",
+        Source::CratesIo => "crates.io",
+        Source::Git(_) => "git",
+        Source::Registry(_) => "registry",
     }
 }
 
@@ -622,5 +810,29 @@ mod tests {
         assert!(told.get("retry_after_secs").is_none(), "{told}");
         // How it is tried again once fixed.
         assert_eq!(told["suggestions"], json!(["fix it", REFRESH_ONCE_FIXED]));
+    }
+
+    #[test]
+    fn where_a_package_came_from_is_told_by_its_id_of_either_format() {
+        for (id, source) in [
+            ("path+file:///w/a#0.1.0", "path"),
+            ("path+file:///w/b#a@0.1.0", "path"),
+            ("git+https://h/r.git?branch=main#a@0.1.0", "git"),
+            (
+                "registry+https://github.com/rust-lang/crates.io-index#a@1.0.0",
+                "crates.io",
+            ),
+            ("sparse+https://index.crates.io/#a@1.0.0", "crates.io"),
+            ("sparse+https://r.example/index/#a@1.0.0", "registry"),
+            ("a 0.1.0 (path+file:///w/a)", "path"),
+            ("a 0.1.0 (git+https://h/r.git?branch=main#0123abcd)", "git"),
+            (
+                "a 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+                "crates.io",
+            ),
+            ("a 1.0.0 (registry+https://r.example/index)", "registry"),
+        ] {
+            assert_eq!(package_source(id), source, "{id}");
+        }
     }
 }

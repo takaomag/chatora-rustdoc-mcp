@@ -118,16 +118,18 @@ pub struct PackageGraph {
     members: Box<[usize]>,
     /// The dependencies of the members.
     direct: Box<[Direct]>,
+    /// The dependencies of every package, the members' too.
+    edges: Box<[Direct]>,
     /// For each package, the packages that depend on it.
     dependents: Box<[Box<[usize]>]>,
 }
 
-/// A dependency of a member.
-#[derive(Debug)]
+/// A dependency of a package, as of a member.
+#[derive(Debug, Clone)]
 struct Direct {
-    /// The member, by index into `packages`.
+    /// The package that depends on it, by index into `packages`.
     member: usize,
-    /// The name the member uses for it in code. When only Cargo.lock is known, the lib name,
+    /// The name the package uses for it in code. When only Cargo.lock is known, the lib name,
     /// as renames are not recorded there.
     extern_name: Box<str>,
     /// The package depended on.
@@ -219,7 +221,7 @@ impl PackageGraph {
             .iter()
             .filter_map(index_of)
             .collect();
-        let mut direct = Vec::new();
+        let mut edges = Vec::new();
         let mut dependents = vec![BTreeSet::new(); packages.len()];
         for node in metadata.resolve.iter().flat_map(|resolve| &resolve.nodes) {
             let Some(from) = index_of(&node.id) else {
@@ -232,16 +234,14 @@ impl PackageGraph {
                 if let Some(users) = dependents.get_mut(to) {
                     users.insert(from);
                 }
-                if members.contains(&from) {
-                    direct.push(Direct {
-                        member: from,
-                        extern_name: dep.name.clone(),
-                        package: to,
-                    });
-                }
+                edges.push(Direct {
+                    member: from,
+                    extern_name: dep.name.clone(),
+                    package: to,
+                });
             }
         }
-        Self::with(packages, members, direct, dependents)
+        Self::with(packages, members, edges, dependents)
     }
 
     /// The packages that Cargo.lock lists, when `cargo metadata` failed. Renames and lib names
@@ -266,7 +266,7 @@ impl PackageGraph {
             .filter(|(_, package)| package.source == Source::Local)
             .map(|(index, _)| index)
             .collect();
-        let mut direct = Vec::new();
+        let mut edges = Vec::new();
         let mut dependents = vec![BTreeSet::new(); packages.len()];
         for (from, locked) in lock.packages.iter().enumerate() {
             for dependency in &locked.dependencies {
@@ -276,10 +276,8 @@ impl PackageGraph {
                 if let Some(users) = dependents.get_mut(to) {
                     users.insert(from);
                 }
-                if let Some(package) = packages.get(to)
-                    && members.contains(&from)
-                {
-                    direct.push(Direct {
+                if let Some(package) = packages.get(to) {
+                    edges.push(Direct {
                         member: from,
                         extern_name: package.lib_name.clone(),
                         package: to,
@@ -287,19 +285,25 @@ impl PackageGraph {
                 }
             }
         }
-        Self::with(packages, members, direct, dependents)
+        Self::with(packages, members, edges, dependents)
     }
 
     fn with(
         packages: Box<[ProjectPackage]>,
         members: Box<[usize]>,
-        direct: Vec<Direct>,
+        edges: Vec<Direct>,
         dependents: Vec<BTreeSet<usize>>,
     ) -> Self {
+        let direct = edges
+            .iter()
+            .filter(|edge| members.contains(&edge.member))
+            .cloned()
+            .collect();
         Self {
             packages,
             members,
-            direct: direct.into(),
+            direct,
+            edges: edges.into(),
             dependents: dependents
                 .into_iter()
                 .map(|users| users.into_iter().collect())
@@ -318,14 +322,15 @@ impl PackageGraph {
             })
     }
 
-    /// The package that the workspace member `member`, one of [`Self::packages`], depends on as
-    /// `name`: the name that it uses in its code, which may rename it, or the lib name, which
-    /// rustdoc names the crate by (requirement R-PR-4, decided in M2's D6). The name in code first.
+    /// The package that `member`, one of [`Self::packages`], a workspace member or another,
+    /// depends on as `name`: the name that it uses in its code, which may rename it, or the lib
+    /// name, which rustdoc names the crate by (requirement R-PR-4, decided in M2's D6 and D7).
+    /// The name in code first.
     #[must_use]
     pub fn dependency_of(&self, member: &ProjectPackage, name: &str) -> Option<&ProjectPackage> {
         let member = self.index_of(member)?;
         let key = normalize(name);
-        let of_member = || self.direct.iter().filter(|direct| direct.member == member);
+        let of_member = || self.edges.iter().filter(|edge| edge.member == member);
         of_member()
             .find(|direct| normalize(&direct.extern_name) == key)
             .or_else(|| {
@@ -336,6 +341,19 @@ impl PackageGraph {
                 })
             })
             .and_then(|direct| self.packages.get(direct.package))
+    }
+
+    /// The package `name` at `version`, by its package name, that is not a workspace member, if
+    /// only one is: packages of other sources may have them both (decided in M2's D7).
+    #[must_use]
+    pub fn non_member_named(&self, name: &str, version: &Version) -> Option<&ProjectPackage> {
+        let mut found = self.packages.iter().enumerate().filter(|(index, package)| {
+            !self.members.contains(index)
+                && normalize(&package.name) == normalize(name)
+                && package.version == *version
+        });
+        let (_, package) = found.next()?;
+        found.next().is_none().then_some(package)
     }
 
     /// Whether `package`, one of [`Self::packages`], is a workspace member.

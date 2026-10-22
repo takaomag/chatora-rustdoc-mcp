@@ -440,9 +440,9 @@ pub(super) fn resolving_crate(
     resolving(provenance, doing, warnings)
 }
 
-/// The response while cargo reads the features of the build of the project from `project_from`,
-/// past the deadline of the call, as `doing` says, to plan the build of its member's crate `name`
-/// for `target` (requirement R-OUT-9).
+/// The response while cargo reads the build of the project from `project_from`, its features or
+/// which packages it builds, past the deadline of the call, as `doing` says, to plan the build of
+/// its member's or dependency's crate `name` for `target` (requirement R-OUT-9).
 #[cfg(feature = "local")]
 pub(super) fn planning_crate(
     name: &CrateName,
@@ -457,11 +457,11 @@ pub(super) fn planning_crate(
     provenance.insert("source".to_owned(), json!("local"));
     let being = match doing {
         Doing::WaitingForLock => {
-            "cargo waits for a lock that another cargo holds, to read the features of the \
-             project's build"
+            "cargo waits for a lock that another cargo holds, to read the project's build, which \
+             the build of the crate is planned by"
         },
         Doing::Fetching | Doing::Indexing | Doing::Building | Doing::WaitingForSlot => {
-            "cargo is reading the features of the project's build"
+            "cargo is reading the project's build, which the build of the crate is planned by"
         },
     };
     super::get_item::building_response(provenance, doing, being, warnings)
