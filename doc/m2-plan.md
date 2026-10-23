@@ -1856,6 +1856,11 @@ Claude Code 2.1.304、Linux で測った。
 - 確かめたこと (claude を呼ばずに、部品と bench のサーバーで): 写しと worktree と other の写し、`build` の下準備、`env` の `BUILD__WAIT_SECS=1`。待ち 1 秒でも fixture の member の作り直しは 0.3 秒で済み (依存は前のビルドの結果が使われる)、tokio の feature を変えても待ちの内に終わったので、stale の問いは「先にビルド → 5 秒待つ build.rs を書く → lib を書き足す」で `stale: rebuilding` になることを確かめた (ビルド中の問いも build.rs を先に書けば `building`)
 - `eval/bench.py` の `Server` で、渡した環境変数とログの設定が重なると落ちたので、後に渡したものが勝つ形に
 
+**F4a-3 (eval のケース。2026-10-23)**:
+
+- `eval/cases.json` に 9 問を足した (決定 7): `own-traits` (member の型の trait、list_impls)・`own-private` (private な関数のシグネチャと可視性)・`own-unnamed` (名指しなしの自分の item、組み込みのツールあり、3 回)・`own-search` (名前を知らずに自分の item を探す)・`own-building` (5 秒の build.rs と待ち 1 秒で `building` を受け、呼び直すか)・`own-stale` (先にビルドしてから build.rs と lib を書き換え、`stale` を受ける)・`outside-workspace` (other-workspace の写しを `build_external_docs` で)・`other-target` (tokio の x86_64-pc-windows-gnu)・`worktree` (worktree の `project` を渡すか)。全部で 27 問、くり返しを含めて 29 回
+- dry run で 9 問の写しと下準備と claude の引数を確かめた。答えの照合は識別子 (`Greeter`・`retries`・`u32` など) を主にし、利用者の CLAUDE.md で答えが日本語になっても通るように
+
 **F5a・F5b (手元の測定。2026-10-23)**:
 
 - 道具 `eval/build_bench.py` (`prepare` でこのリポジトリを利用者の git の設定を読まずに clone し、`eval/fixture` と `tests/fixtures/local-build` を写して `target/f5/src` に。`run` で空のキャッシュからの冷えたビルドを 1 回の呼び出しで (`build.wait_secs` 600・`limits.request_timeout_secs` 900・`network.offline`)、続けて member の lib の末尾に関数を足しての作り直しを、前の dep-info が記録されてから。作り直した unit は fingerprint のディレクトリの中のファイルの時刻で数える (cargo はファイルを書き直すのでディレクトリの時刻は変わらない)。`diagnostics` で写しを壊して生のエラーとサーバーの応答を見る)。`eval/bench.py` の `Server` に cwd と環境変数を足し、アーカイブの形式の指定を `v*t*` に (古い `v5t*` のままだった)

@@ -126,5 +126,76 @@
     "tools": ["get_item"],
     "answer": ["item_not_found"],
     "shape": "error"
+  },
+  {
+    "id": "own-traits",
+    "question": "M2f F4a",
+    "prompt": "Which traits does `Config` in this project implement?",
+    "tools": ["list_impls"],
+    "answer": ["Greeter", "Default"]
+  },
+  {
+    "id": "own-private",
+    "question": "M2f F4a",
+    "prompt": "What is the signature of the function `backoff` in this project, and can other crates call it?",
+    "tools": ["get_item", "search_items"],
+    "answer": ["async fn backoff", "private|crate|cannot|can't|not public|できない|非公開"]
+  },
+  {
+    "id": "own-unnamed",
+    "question": "M2f F4a",
+    "prompt": "What fields does `Config` in this project have, and which of them can code outside the crate set directly?",
+    "tools": ["get_item", "search_items", "list_impls", "list_methods", "list_module", "crate_overview"],
+    "answer": ["\\bname\\b", "retries"],
+    "builtin": true,
+    "repeat": 3
+  },
+  {
+    "id": "own-search",
+    "question": "M2f F4a",
+    "prompt": "Is there something in this project for greeting someone? I don't know what it is called.",
+    "tools": ["search_items"],
+    "answer": ["Greeter"]
+  },
+  {
+    "id": "own-building",
+    "question": "M2f F4a",
+    "prompt": "Which traits does `Config` in this project implement?",
+    "tools": ["list_impls", "get_item"],
+    "answer": ["Greeter"],
+    "env": {"CHATORA_RUSTDOC_MCP_BUILD__WAIT_SECS": "1"},
+    "setup": [{"write": ["build.rs", "fn main() {\n    // Slow, so that a build goes past the wait of a call (BUILD__WAIT_SECS).\n    std::thread::sleep(std::time::Duration::from_secs(5));\n}\n"]}],
+    "retry": true
+  },
+  {
+    "id": "own-stale",
+    "question": "M2f F4a",
+    "prompt": "What does the method `Config::retries` in this project return?",
+    "tools": ["get_item", "list_methods"],
+    "answer": ["u32"],
+    "env": {"CHATORA_RUSTDOC_MCP_BUILD__WAIT_SECS": "1"},
+    "setup": ["build", {"write": ["build.rs", "fn main() {\n    // Slow, so that a build goes past the wait of a call (BUILD__WAIT_SECS).\n    std::thread::sleep(std::time::Duration::from_secs(5));\n}\n"]}, {"append": ["src/lib.rs", "\n/// Added since the last build.\npub fn added_since() {}\n"]}]
+  },
+  {
+    "id": "outside-workspace",
+    "question": "M2f F4a",
+    "prompt": "What is the public API of the Rust workspace at {other}? It is not this project.",
+    "tools": ["build_external_docs"],
+    "answer": ["greet", "Word"]
+  },
+  {
+    "id": "other-target",
+    "question": "M2f F4a",
+    "prompt": "Which items does the tokio that this project uses have on the target x86_64-pc-windows-gnu but not on Linux? Name a few.",
+    "tools": ["build_external_docs", "get_item", "search_items", "list_module"],
+    "answer": ["windows|Windows"]
+  },
+  {
+    "id": "worktree",
+    "question": "P5",
+    "prompt": "I am working in the git worktree {worktree} of this project, as a subagent would. What fields does `Config` have there?",
+    "tools": ["get_item", "search_items", "list_impls", "list_methods", "list_module", "crate_overview"],
+    "answer": ["\\bname\\b", "retries"],
+    "arguments": {"project": "{worktree}"}
   }
 ]
