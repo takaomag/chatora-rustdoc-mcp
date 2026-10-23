@@ -1795,6 +1795,7 @@ Claude Code 2.1.304、Linux で測った。
 - 同時実行のテストの 1 度の `building` (20 秒) は、`building` が 5 秒を超えたら応答とサーバーのログを写す仕掛けを一時的に入れ、stdio 全体を 3 本並べて 3 回と、3 本並べた横でこのテストだけを 10 回走らせても再現しなかった (5 秒を超えた呼び出しも無し)。負荷による一時的な遅れと見て追うのをやめた。テストは `building` の間は呼び直す (90 秒まで)。再び落ちたら、このときの仕掛け (応答とログを写す) を入れて見る
 - 揺れるテストの直しと F1c-2 の CI の直しは 222f34a
 - Windows の孫のテスト (`dropping_a_child_stops_its_grandchildren`): 失敗は 1 回 (遅い runner で、子の PowerShell が 30 秒以内に孫の pid を書かなかった。stderr を捨て子の終了も見ていないので、遅さか途中の失敗かは見分けられなかった)。Windows の子を PowerShell からテストのバイナリ自身 (`start_a_grandchild_for_another_test`、`#[ignore]`) に替え、stdin の 1 行を待ってから `ping` を孫として起動し、pid を書いて名前を付ける。テストは子が Job Object に入った後 (`spawn` の後) に 1 行を送るので、速い子でも孫はジョブの中。生きているかの確かめは `tasklist` に。待ちの間に子が終わったら、その stderr (`grandchild.err`) を付けてすぐ落とす。Unix の側は今のまま (pid のファイルは改行まで読む形にそろえた)。Windows のコードは手元で組み立てられない (mingw の C コンパイラが無い) ので CI で確かめる
+- 6652ae2 の CI: Windows の check は今回の Windows だけのコードの lint (`std::io::stdin` の余分な修飾、`io` は読み込み済み) で落ちた。直した (手元では Windows を組み立てられない)。ubuntu の check で tests/local の `a_build_script_that_writes_in_its_package_does_not_make_it_built_again` が落ちた (local_build.rs:934、dep-info を待つ `told` の結果が最初のビルドと別: 作り直された)。今回の変更とは関わらず、これまでの CI では通っていた。3 つ目の揺れるテストの候補
 - 利用者が決めたこと: 子を Job Object に入れる前に子が起動したプロセスがジョブの外に出る製品の隙間 (起動から割り当てまでの一瞬) は、M3 以降に回す (`CREATE_SUSPENDED` で起動し、割り当ての後にスレッドを再開する形。Windows だけの API を手元で確かめられないまま M2 の終わりに入れない)。§7 で要件の残りに書く
 
 **F3 の下調べと F3a (2026-10-23)**:

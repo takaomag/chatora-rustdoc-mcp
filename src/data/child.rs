@@ -623,7 +623,7 @@ mod tests {
             return;
         };
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).expect("a line");
+        io::stdin().read_line(&mut line).expect("a line");
         let mut grandchild = std::process::Command::new("ping")
             .args(["-n", "300", "127.0.0.1"])
             .stdin(Stdio::null())
