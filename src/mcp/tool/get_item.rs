@@ -391,6 +391,9 @@ struct Here {
     /// The arguments of `build_external_docs` that build again its record for another target,
     /// when what the record is made from changed since (decided in M2e's E4a, 3).
     inputs_changed: Option<Box<str>>,
+    /// When `build_external_docs` recorded the workspace outside the default project that it is
+    /// of, whose directory is gone since (decided in M2e's E4b-3, 2).
+    project_missing: Option<Box<str>>,
 }
 
 impl Request {
@@ -585,13 +588,15 @@ pub(super) fn provenance_schema() -> Value {
             },
             "stale_reason": {
                 "type": "string",
-                "enum": ["rebuilding", "ref_ttl_expired", "inputs_changed"],
+                "enum": ["rebuilding", "ref_ttl_expired", "inputs_changed", "project_missing"],
                 "description": "rebuilding: a workspace member is being built again, as what it \
                                 is made from changed; this is the build before, of built_at. \
                                 ref_ttl_expired: a branch or a tag of git was resolved more than \
                                 a day ago, at resolved_at. inputs_changed: what a build of \
                                 build_external_docs is made from changed since built_at, or the \
-                                workspace outside the default project that it recorded.",
+                                workspace outside the default project that it recorded. \
+                                project_missing: the directory of that workspace is gone; this \
+                                is its record.",
             },
             "features_requested": {
                 "type": "array",
@@ -1663,7 +1668,7 @@ async fn explicit_workspace(
     project: Option<&std::path::Path>,
     warnings: &mut Vec<Box<str>>,
 ) -> Option<(Workspace, data::project::ProjectFrom)> {
-    match project::place(state.project.as_ref(), project) {
+    match project::place_for_lookup(state, project).await {
         Ok(project::Place::Here(workspace, project_from)) => Some((workspace, project_from)),
         Ok(project::Place::Outside(workspace)) => {
             if super::recorded_workspace::read(state, &workspace)
@@ -1710,7 +1715,10 @@ pub(super) async fn explicit_found(
     // Nor is cargo waited for when the project's Cargo.lock has no package of that name and
     // version: a crate that the project does not use is looked up at once (a lib's name other
     // than its package's is not told then).
-    if !metadata::lock_may_have(&workspace.root, name.as_str(), version).await {
+    // Outside the default project, the record tells at once (decided in M2e's E4b-3b).
+    if !super::recorded_workspace::is_outside(state, &workspace)
+        && !metadata::lock_may_have(&workspace.root, name.as_str(), version).await
+    {
         return Ok(None);
     }
     let resolution = match project::resolve_until(state, &workspace, until).await {
@@ -1967,7 +1975,7 @@ async fn recorded_elsewhere(
     request_of_record(
         state,
         (workspace, &key, package),
-        (again, false),
+        (again, super::recorded_workspace::Since::Same, None),
         error,
         (name, path, target, shape),
         (resolved_from, project_from),
@@ -1984,7 +1992,7 @@ async fn recorded_elsewhere(
 async fn request_of_record(
     state: &ToolState,
     (workspace, key, package): (&Workspace, &data::external::Key, &PackageId),
-    (again, changed): (String, bool),
+    (again, since, recorded_at): (String, super::recorded_workspace::Since, Option<Box<str>>),
     error: Box<CallToolResult>,
     (name, path, target, shape): (&CrateName, &str, &TargetTriple, &Shape),
     (resolved_from, project_from): (ResolvedFrom, &'static str),
@@ -1992,7 +2000,13 @@ async fn request_of_record(
 ) -> Result<Request, Box<CallToolResult>> {
     let (package_name, version) = package.name_and_version().unwrap_or((name.as_str(), ""));
     let what = format!("{package_name} {version} for {target}");
-    let call_again = format!("call build_external_docs with {again} to build it again");
+    let missing = since == super::recorded_workspace::Since::Missing;
+    // Not where it was, which is gone (decided in M2e's E4b-3, 2).
+    let call_again = if missing {
+        super::recorded_workspace::MOVED.to_owned()
+    } else {
+        format!("call build_external_docs with {again} to build it again")
+    };
     let provenance = || {
         let mut provenance = Map::new();
         provenance.insert("source".to_owned(), json!("local"));
@@ -2007,10 +2021,13 @@ async fn request_of_record(
         recorded::Found::Response(result) => return Err(result),
         recorded::Found::Missing => return Err(error),
     };
-    let unchanged = !changed
-        && !inputs_changed(&built)
-            .await
-            .ok_or_else(|| Box::new(shutting_down()))?;
+    // Of a workspace whose directory is gone, what is told of that instead (decided in M2e's
+    // E4b-3, 2).
+    let unchanged = missing
+        || (since == super::recorded_workspace::Since::Same
+            && !inputs_changed(&built)
+                .await
+                .ok_or_else(|| Box::new(shutting_down()))?);
     let path = in_lib(name, path, &built.record.crate_name);
     Ok(Request {
         name: package_name.parse().unwrap_or_else(|_| name.clone()),
@@ -2039,6 +2056,7 @@ async fn request_of_record(
                 of_project: false,
             }),
             inputs_changed: (!unchanged).then(|| again.into()),
+            project_missing: recorded_at.filter(|_| missing),
             ..Here::default()
         },
     })
@@ -2061,13 +2079,14 @@ async fn recorded_outside(
         package,
         target,
         again,
-        changed,
+        recorded_at,
+        since,
         error,
     } = *recorded;
     request_of_record(
         state,
         (workspace, &key, &package),
-        (again.into(), changed),
+        (again.into(), since, Some(recorded_at)),
         error,
         (name, path, &target, shape),
         made,
@@ -2080,7 +2099,7 @@ async fn recorded_outside(
 /// keeps it (decided in M2e's E4a-3, 1): not told when the record does not keep it, as when it
 /// could not be read. `None` when the task did not end.
 #[cfg(feature = "local")]
-async fn inputs_changed(built: &Arc<crate::query::local::LocalBuilt>) -> Option<bool> {
+pub(super) async fn inputs_changed(built: &Arc<crate::query::local::LocalBuilt>) -> Option<bool> {
     let recorded = Arc::clone(built);
     crate::task::spawn_blocking(move || {
         !recorded
@@ -3413,6 +3432,12 @@ async fn look_up_member(
         if let (Some(again), Ok(response)) = (&arguments.here.inputs_changed, &mut looked_up) {
             mark_inputs_changed(response, &record.built_at, again);
         }
+        // Of a workspace whose directory is gone (decided in M2e's E4b-3, 2).
+        if let (Some(recorded_at), Ok(response)) = (&arguments.here.project_missing, &mut looked_up)
+        {
+            let missing = super::recorded_workspace::Since::Missing;
+            super::recorded_workspace::mark_changed(response, recorded_at, "", missing);
+        }
         (looked_up, arguments)
     });
     match task.await {
@@ -3831,12 +3856,13 @@ async fn conclude(
     if let Ok(response) = &mut looked_up
         && arguments.resolved_from == ResolvedFrom::External
         && arguments.here.inputs_changed.is_none()
+        && arguments.here.project_missing.is_none()
         && let Some(workspace) = &arguments.in_build.workspace
-        && let Some((recorded_at, again)) =
+        && let Some((recorded_at, again, since)) =
             super::recorded_workspace::changed_since(state, workspace, Some(&arguments.target))
                 .await
     {
-        super::recorded_workspace::mark_changed(response, &recorded_at, &again);
+        super::recorded_workspace::mark_changed(response, &recorded_at, &again, since);
     }
     match looked_up {
         Err(Failure::Item(GetItemError::Elsewhere(destination))) => {

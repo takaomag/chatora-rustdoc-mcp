@@ -177,6 +177,13 @@ pub fn workspace_file(cache: &Cache, root: &Path) -> PathBuf {
     workspace_key(root).dir(cache.dir()).join(WORKSPACE)
 }
 
+/// The file of the record of the workspace at `root` for `target` in `cache`, whose length and
+/// time tell that it was recorded again.
+#[must_use]
+pub fn target_file(cache: &Cache, root: &Path, target: &str) -> PathBuf {
+    target_key(root, target).dir(cache.dir()).join(TARGET)
+}
+
 /// The record of the workspace at `root` in `cache`, without waiting; for the holder of its lock,
 /// `making`, which is not told that it is being made.
 ///

@@ -109,11 +109,12 @@ fn output_schema() -> JsonObject {
                     "stale": { "type": "boolean" },
                     "stale_reason": {
                         "type": "string",
-                        "enum": ["ref_ttl_expired", "inputs_changed"],
+                        "enum": ["ref_ttl_expired", "inputs_changed", "project_missing"],
                         "description": "ref_ttl_expired: a branch or a tag of git was resolved \
                                         more than a day ago, at resolved_at. inputs_changed: the \
                                         workspace outside the default project that \
-                                        build_external_docs recorded changed since.",
+                                        build_external_docs recorded changed since. \
+                                        project_missing: its directory is gone.",
                     },
                 },
                 // Before the version is known, a response while it is resolved has no `version`
@@ -340,12 +341,12 @@ async fn of_changed_record(
     else {
         return result;
     };
-    let Some((recorded_at, again)) =
+    let Some((recorded_at, again, since)) =
         super::recorded_workspace::changed_since(state, workspace, Some(target)).await
     else {
         return result;
     };
-    super::recorded_workspace::mark_changed(&mut response, &recorded_at, &again);
+    super::recorded_workspace::mark_changed(&mut response, &recorded_at, &again, since);
     CallToolResult::structured(response)
 }
 

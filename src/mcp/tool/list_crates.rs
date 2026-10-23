@@ -117,7 +117,10 @@ fn output_schema() -> JsonObject {
                     },
                     "target": { "type": "string" },
                     "stale": { "type": "boolean" },
-                    "stale_reason": { "type": "string", "enum": ["inputs_changed"] },
+                    "stale_reason": {
+                        "type": "string",
+                        "enum": ["inputs_changed", "project_missing"],
+                    },
                 },
                 "required": ["source", "target"],
             },
@@ -402,10 +405,10 @@ async fn list(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
     response.insert("page".to_owned(), page);
     let mut response = Value::Object(response);
     // Of a record of a workspace that changed since (decided in M2e's E4b-3, 1).
-    if let Some((recorded_at, again)) =
+    if let Some((recorded_at, again, since)) =
         recorded_workspace::changed_since(&state, &workspace, Some(target)).await
     {
-        recorded_workspace::mark_changed(&mut response, &recorded_at, &again);
+        recorded_workspace::mark_changed(&mut response, &recorded_at, &again, since);
     }
     CallToolResult::structured(response)
 }

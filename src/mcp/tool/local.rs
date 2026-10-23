@@ -168,8 +168,10 @@ pub(super) struct RecordedCrate {
     pub(super) target: TargetTriple,
     /// The arguments of `build_external_docs` that record it again, as JSON.
     pub(super) again: Box<str>,
-    /// Whether what the workspace is resolved from changed since it was recorded.
-    pub(super) changed: bool,
+    /// When the workspace was recorded, in RFC 3339.
+    pub(super) recorded_at: Box<str>,
+    /// What became of the workspace since it was recorded.
+    pub(super) since: recorded_workspace::Since,
     /// The error when it has no record, which tells how to make one.
     pub(super) error: Box<CallToolResult>,
 }

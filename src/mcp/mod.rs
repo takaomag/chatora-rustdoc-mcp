@@ -278,6 +278,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
             workspaces: Flights::handing_over(),
             #[cfg(feature = "local")]
             recorded_workspaces: parking_lot::Mutex::default(),
+            #[cfg(feature = "local")]
+            outsides: parking_lot::Mutex::default(),
             calls: tool::CallLimit::from_settings(settings),
             wait,
             #[cfg(feature = "local")]

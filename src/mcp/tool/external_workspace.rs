@@ -217,7 +217,28 @@ async fn record_workspace(
                 record.recorded_at = before.recorded_at;
             }
             external_workspace::record_workspace(&cache, &root, &record, &making)?;
-            let mut aliases: Vec<&Path> = members.iter().map(PathBuf::as_path).collect();
+            // The members under the path given, too, as it was written: the root and the members'
+            // paths that cargo tells have symbolic links resolved, as `/private/var` on macOS.
+            let given_dir = if given.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+                given.parent().unwrap_or(&given).to_path_buf()
+            } else {
+                given.clone()
+            };
+            let under_given: Vec<PathBuf> =
+                if dunce::canonicalize(&given_dir).ok() == Some(root.clone()) {
+                    members
+                        .iter()
+                        .filter_map(|member| member.strip_prefix(&root).ok())
+                        .map(|relative| given_dir.join(relative))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            let mut aliases: Vec<&Path> = members
+                .iter()
+                .chain(&under_given)
+                .map(PathBuf::as_path)
+                .collect();
             aliases.push(&given);
             external_workspace::record_aliases(&cache, &aliases, &root)?;
             Ok::<_, std::io::Error>(record)

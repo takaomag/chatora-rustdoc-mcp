@@ -804,6 +804,14 @@ pub fn write_file<T: Serialize>(
 /// The records noted as read, and when, in this process.
 static NOTED: Mutex<Vec<(PathBuf, Instant)>> = Mutex::new(Vec::new());
 
+/// Notes that the record of `key` in `cache` is read now, as when it was read before and kept
+/// (requirement R-CA-5), at most once in a while, as the reads of the files do.
+///
+/// It may write a file, so it is for a blocking thread.
+pub fn note_read(cache: &Cache, key: &Key) {
+    note_use(&key.dir(cache.dir()));
+}
+
 /// Notes that the record in `dir` is read now, at most once in [`NOTE_EVERY`] in this process
 /// (requirement R-CA-5). A note that cannot be written is logged.
 fn note_use(dir: &Path) {

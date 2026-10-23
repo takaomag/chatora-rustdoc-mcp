@@ -17,8 +17,6 @@ struct Question {
     answers: fn(&Value) -> bool,
     /// The question is about the project, which only a build with local features reads.
     local: bool,
-    /// The tool answers it in a later step of M2e, until when it is not asked.
-    later: bool,
 }
 
 const fn question(
@@ -33,7 +31,6 @@ const fn question(
         arguments,
         answers,
         local: false,
-        later: false,
     }
 }
 
@@ -233,17 +230,32 @@ fn questions() -> Vec<Question> {
             ..question
         }),
     );
-    // `build_external_docs` builds the other workspace from M2e's E4b.
-    questions.push(Question {
-        local: true,
-        later: true,
-        ..question(
-            "build_external_docs",
-            "what is the API of this other workspace?",
-            json!({ "project": "poc/m0a-a10" }),
-            |result| result["data"]["built"] == true,
-        )
-    });
+    // A workspace outside the project, which `build_external_docs` records and builds, and the
+    // query tools then read from its records (decided in M2e's E4b, 3).
+    questions.extend(
+        [
+            question(
+                "build_external_docs",
+                "what is the API of this other workspace?",
+                json!({ "project": OTHER_WORKSPACE }),
+                |result| result["data"]["built"] == true,
+            ),
+            question(
+                "crate_overview",
+                "what is this crate, and how is it organized?",
+                json!({ "crate": "greet", "project": OTHER_WORKSPACE }),
+                |result| {
+                    result["provenance"]["recorded_by"] == "build_external_docs"
+                        && result["provenance"]["resolved_from"] == "external"
+                        && has(&result["data"], "greet")
+                },
+            ),
+        ]
+        .map(|question| Question {
+            local: true,
+            ..question
+        }),
+    );
     // The project's tokio for another target than it builds for, which docs.rs has no JSON of, and
     // which is not the host of any system the tests run on (decided in M2e's E4a-3, 3); then the
     // query tools read what it recorded.
@@ -272,6 +284,41 @@ fn questions() -> Vec<Question> {
         }),
     );
     questions
+}
+
+/// What the arguments of a question name the workspace outside the project by, which the test
+/// copies from `tests/fixtures/other-workspace` into a temporary directory, as the fixtures are not
+/// built where they are.
+const OTHER_WORKSPACE: &str = "<other workspace>";
+
+/// `arguments` with [`OTHER_WORKSPACE`] replaced by `other`.
+fn with_other(arguments: &Value, other: &Path) -> Value {
+    match arguments {
+        Value::String(text) if text == OTHER_WORKSPACE => json!(other.display().to_string()),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| with_other(value, other))
+            .collect(),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| (key.clone(), with_other(value, other)))
+            .collect(),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => arguments.clone(),
+    }
+}
+
+/// Copies the directory `from` into `to`.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("made");
+    for entry in std::fs::read_dir(from).expect("readable") {
+        let entry = entry.expect("readable");
+        let path = entry.path();
+        if path.is_dir() {
+            copy_dir(&path, &to.join(entry.file_name()));
+        } else {
+            std::fs::copy(&path, to.join(entry.file_name())).expect("copied");
+        }
+    }
 }
 
 /// The questions in `description`: the quoted ones after "Answers questions such as".
@@ -330,14 +377,20 @@ fn every_question_promised_has_a_case() {
 #[ignore = "needs the JSON of testdata/docs-rs-json.txt in the cache, and the network"]
 fn every_question_promised_is_answered() {
     let logs = tempfile::tempdir().expect("a temporary directory");
+    let other = tempfile::tempdir().expect("a temporary directory");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/other-workspace"),
+        other.path(),
+    );
     // The project is this package.
     let mut client = Client::start(Some(Path::new(env!("CARGO_MANIFEST_DIR"))), logs.path());
     let mut unanswered = Vec::new();
     for question in questions() {
-        if (question.local && !cfg!(feature = "local")) || question.later {
+        if question.local && !cfg!(feature = "local") {
             continue;
         }
-        let answer = client.call(question.tool, &question.arguments);
+        let arguments = with_other(&question.arguments, other.path());
+        let answer = client.call(question.tool, &arguments);
         let answered = match &answer {
             crate::client::Answer::Ok(result) => (question.answers)(result),
             crate::client::Answer::Error(_) => false,

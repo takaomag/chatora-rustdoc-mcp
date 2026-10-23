@@ -1,0 +1,5 @@
+# A workspace of its own, outside the project of the tests: what `build_external_docs` documents
+# and the query tools then read from its records (tests/real_data, decided in M2e's E4b, 3).
+[workspace]
+members = ["greet", "words"]
+resolver = "3"

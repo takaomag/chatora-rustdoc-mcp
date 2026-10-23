@@ -432,7 +432,7 @@ async fn project_target(
     warnings: &mut Vec<Box<str>>,
     own: &mut Option<String>,
 ) -> Option<TargetTriple> {
-    let workspace = match place(state.project.as_ref(), project) {
+    let workspace = match place_for_lookup(state, project).await {
         Ok(Place::Here(workspace, _)) => workspace,
         // As `build_external_docs` recorded it, the first of the targets that it builds for
         // (decided in M2e's E4b-3).
@@ -519,7 +519,7 @@ pub(super) async fn located(
     state: &ToolState,
     project: Option<&Path>,
 ) -> Result<Option<(Workspace, ProjectFrom)>, Box<CallToolResult>> {
-    match place(state.project.as_ref(), project)? {
+    match place_for_lookup(state, project).await? {
         Place::Here(workspace, project_from) => Ok(Some((workspace, project_from))),
         Place::Outside(workspace) => {
             recorded_workspace::read(state, &workspace).await?;
@@ -527,6 +527,27 @@ pub(super) async fn located(
         },
         Place::Nowhere => Ok(None),
     }
+}
+
+/// [`place`], for the query tools: a workspace outside the default project whose directory is gone
+/// is found by the paths that `build_external_docs` recorded as its aliases, when it recorded it,
+/// to read that record (decided in M2e's E4b-3, 2); else the error of [`place`].
+#[cfg(feature = "local")]
+pub(super) async fn place_for_lookup(
+    state: &ToolState,
+    project: Option<&Path>,
+) -> Result<Place, Box<CallToolResult>> {
+    let error = match place(state.project.as_ref(), project) {
+        Ok(place) => return Ok(place),
+        Err(error) => error,
+    };
+    let Some(project) = project else {
+        return Err(error);
+    };
+    let path = project_path(state.project.as_ref(), project);
+    recorded_workspace::aliased(state, &path)
+        .await
+        .map_or_else(|| Err(error), |workspace| Ok(Place::Outside(workspace)))
 }
 
 /// Where a project is.

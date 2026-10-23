@@ -16,12 +16,15 @@ use serde_json::{Map, Value, json};
 #[cfg(feature = "local")]
 use tokio::time::Instant;
 
-#[cfg(feature = "local")]
-use super::local::{self, Member as Planned};
 use super::{
     ErrorChain,
     ToolState,
     get_item::{self, Searching, StdUnready},
+};
+#[cfg(feature = "local")]
+use super::{
+    local::{self, Member as Planned},
+    recorded_workspace,
 };
 use crate::{
     data::{
@@ -66,7 +69,7 @@ impl Member {
     /// than its package's, or else its name.
     fn root(&self) -> &str {
         #[cfg(feature = "local")]
-        if let Outcome::Built(built) = &self.outcome {
+        if let Outcome::Built(built) | Outcome::Recorded(built, _) = &self.outcome {
             return &built.record.crate_name;
         }
         self.name.as_str()
@@ -92,6 +95,10 @@ enum Outcome {
     /// Built here, a workspace member's or a dependency's (decided in M2's D7).
     #[cfg(feature = "local")]
     Built(Arc<LocalBuilt>),
+    /// Built by `build_external_docs`, a crate of a workspace outside the default project, with
+    /// whether what it is made from changed since (decided in M2e's E4b-3).
+    #[cfg(feature = "local")]
+    Recorded(Arc<LocalBuilt>, bool),
 }
 
 impl Outcome {
@@ -105,7 +112,7 @@ impl Outcome {
     )]
     const fn is_built(&self) -> bool {
         #[cfg(feature = "local")]
-        if let Self::Built(_) = self {
+        if let Self::Built(_) | Self::Recorded(..) = self {
             return true;
         }
         false
@@ -122,11 +129,7 @@ async fn build_sets(
     until: Instant,
     warnings: &mut Vec<Box<str>>,
 ) -> Option<Arc<FeatureSets>> {
-    match state
-        .resolver
-        .features_until(workspace, target, until)
-        .await
-    {
+    match super::project::features_until(state, workspace, target, until).await {
         Joined::Done(Ok(sets)) => Some(sets),
         Joined::Done(Err(error)) => {
             warnings.push(
@@ -183,21 +186,21 @@ pub(super) async fn dependencies(
         triple: target,
         docs_rs_default,
     } = target;
-    let (workspace, project_from) =
-        match super::project::workspace(state.project.as_ref(), project.as_deref()) {
-            Ok(Some(found)) => found,
-            Ok(None) => {
-                return super::tool_error(
-                    "invalid_argument",
-                    "there is no project here whose dependencies to search, so `crate` is \
+    let (workspace, project_from) = match super::project::located(&state, project.as_deref()).await
+    {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return super::tool_error(
+                "invalid_argument",
+                "there is no project here whose dependencies to search, so `crate` is \
                      required",
-                    false,
-                    &[r#"pass the crate to search, for example {"crate": "tokio"}"#],
-                );
-            },
-            Err(error) => return *error,
-        };
-    let resolution = match state.resolver.resolve_until(&workspace, until).await {
+                false,
+                &[r#"pass the crate to search, for example {"crate": "tokio"}"#],
+            );
+        },
+        Err(error) => return *error,
+    };
+    let resolution = match super::project::resolve_until(&state, &workspace, until).await {
         Joined::Done(Ok(resolution)) => resolution,
         Joined::Done(Err(error)) => return super::project::resolve_error(&workspace, &error),
         Joined::Ended => return get_item::stopped(),
@@ -210,6 +213,15 @@ pub(super) async fn dependencies(
             return super::project::resolving(provenance, doing, &warnings);
         },
     };
+    // Of a workspace outside the default project, what `build_external_docs` recorded for the
+    // target, or else what tells to record it, or that it is being recorded (decided in M2e's
+    // E4b-3b, 1).
+    let outside = recorded_workspace::is_outside(&state, &workspace);
+    if outside
+        && let Err(result) = recorded_workspace::for_target_of(&state, &workspace, &target).await
+    {
+        return *result;
+    }
     let sets = build_sets(&state, &workspace, &target, until, &mut warnings).await;
     let graph = PackageGraph::new(&resolution);
     // The workspace's members (decided in M2's D7), and its direct dependencies.
@@ -235,25 +247,42 @@ pub(super) async fn dependencies(
     }
     let at = (&target, docs_rs.as_ref());
     let members = project_all(&state, &workspace, scope, at, until, &mut warnings).await;
+    let resolved_from = match &*resolution {
+        // As `build_external_docs` recorded it (decided in M2e's E4b-3).
+        crate::data::metadata::Resolution::Metadata { .. } if outside => ResolvedFrom::External,
+        crate::data::metadata::Resolution::Metadata { .. } => ResolvedFrom::CargoLock,
+        crate::data::metadata::Resolution::CargoLockRaw { .. } => ResolvedFrom::CargoLockRaw,
+    };
+    // Not where it was, which is gone, and which the top-level tells (decided in M2e's E4b-3, 2).
+    let gone = outside
+        && recorded_workspace::since_recorded(&state, &workspace).await
+            == Some(recorded_workspace::Since::Missing);
     let context = Context {
-        target,
+        recorded: (outside && !gone)
+            .then(|| recorded_workspace::again(&workspace.root, Some(&target))),
+        target: target.clone(),
         docs_rs_default,
         project_from: Some(project_from.as_str()),
-        resolved_from: resolution_from(&resolution),
+        resolved_from,
         sets,
         std: None,
         detail,
         searching,
     };
-    respond(members, context, warnings).await
-}
-
-/// How the project's versions were resolved.
-#[cfg(feature = "local")]
-const fn resolution_from(resolution: &crate::data::metadata::Resolution) -> ResolvedFrom {
-    match resolution {
-        crate::data::metadata::Resolution::Metadata { .. } => ResolvedFrom::CargoLock,
-        crate::data::metadata::Resolution::CargoLockRaw { .. } => ResolvedFrom::CargoLockRaw,
+    let result = respond(members, context, warnings).await;
+    // Of the record of a workspace that changed since (decided in M2e's E4b-3b, 3).
+    let Some((recorded_at, again, since)) =
+        recorded_workspace::changed_since(&state, &workspace, Some(&target)).await
+    else {
+        return result;
+    };
+    match &result.structured_content {
+        Some(response) if result.is_error != Some(true) => {
+            let mut response = response.clone();
+            recorded_workspace::mark_changed(&mut response, &recorded_at, &again, since);
+            CallToolResult::structured(response)
+        },
+        Some(_) | None => result,
     }
 }
 
@@ -324,6 +353,7 @@ pub(super) async fn std(
         })
         .collect();
     let context = Context {
+        recorded: None,
         target,
         docs_rs_default: false,
         project_from: None,
@@ -348,6 +378,9 @@ struct StdContext {
 
 /// What the search of the scope shares.
 struct Context {
+    /// For a workspace outside the default project, the arguments of `build_external_docs` that
+    /// record it for the target, which the hints tell (decided in M2e's E4b-3b).
+    recorded: Option<String>,
     target: TargetTriple,
     /// Whether docs.rs's JSON of each crate is of its default target there, not of `target`
     /// (decided in M2's D7).
@@ -507,7 +540,8 @@ async fn project_outcome(
                         outcome @ (Outcome::Loaded(_)
                         | Outcome::Failed(_)
                         | Outcome::Going(_)
-                        | Outcome::Built(_)) => (Some(outcome), !unchecked),
+                        | Outcome::Built(_)
+                        | Outcome::Recorded(..)) => (Some(outcome), !unchecked),
                     }
                 },
             }
@@ -542,11 +576,45 @@ async fn planned_outcome(
             | Planned::OtherTarget { error, .. }
             | Planned::Unnameable { error, .. },
         ) => Some(Outcome::Failed(failure_of(&error))),
-        // Of a workspace outside the default project, which this search does not reach yet
-        // (decided in M2e's E4b-3, 3).
-        Ok(Planned::Recorded(recorded)) => Some(Outcome::Failed(failure_of(&recorded.error))),
+        Ok(Planned::Recorded(recorded)) => Some(recorded_outcome(state, *recorded).await),
         Ok(Planned::Resolving(doing) | Planned::Planning(doing)) => Some(Outcome::Going(doing)),
         Ok(Planned::Not | Planned::OtherVersion(_)) => None,
+    }
+}
+
+/// The outcome of what `build_external_docs` recorded of a crate of a workspace outside the default
+/// project, as `recorded` tells: its build, with whether what it is made from changed since; while
+/// it is made, as building; its failure; or else unavailable, with no record (decided in M2e's
+/// E4b-3b).
+#[cfg(feature = "local")]
+async fn recorded_outcome(state: &ToolState, recorded: local::RecordedCrate) -> Outcome {
+    let (name, version) = recorded
+        .package
+        .name_and_version()
+        .unwrap_or((&recorded.package.0, ""));
+    let what = format!("{name} {version} for {}", recorded.target);
+    // Not where it was, which is gone (decided in M2e's E4b-3, 2).
+    let call_again = if recorded.since == recorded_workspace::Since::Missing {
+        recorded_workspace::MOVED.to_owned()
+    } else {
+        format!(
+            "call build_external_docs with {} to build it again",
+            recorded.again
+        )
+    };
+    let provenance = Map::new;
+    match super::recorded::recorded_as(state, (&recorded.key, &what, &call_again), provenance, &[])
+        .await
+    {
+        // Of the crate itself: what the workspace became is told of the whole search (decided in
+        // M2e's E4b-3b, 3).
+        super::recorded::Found::Built(built) => {
+            let changed = recorded.since != recorded_workspace::Since::Missing
+                && get_item::inputs_changed(&built).await.unwrap_or(false);
+            Outcome::Recorded(built, changed)
+        },
+        super::recorded::Found::Response(result) => outcome_of(&result),
+        super::recorded::Found::Missing => Outcome::Failed(failure_of(&recorded.error)),
     }
 }
 
@@ -671,7 +739,9 @@ fn search_members(
         .filter_map(|member| match &member.outcome {
             Outcome::Loaded(mapped) => Some((member, CrateView::new(mapped.get()))),
             #[cfg(feature = "local")]
-            Outcome::Built(built) => Some((member, CrateView::new(built.archived.mapped.get()))),
+            Outcome::Built(built) | Outcome::Recorded(built, _) => {
+                Some((member, CrateView::new(built.archived.mapped.get())))
+            },
             Outcome::Failed(_) | Outcome::Going(_) => None,
         })
         .collect();
@@ -704,6 +774,7 @@ fn search_members(
     };
     let (sources, failed, fetching, rebuilding) = sources(&found.provenances, members, context);
     let broke = failed_here(&sources);
+    let no_record = sources.iter().any(|source| source["reason"] == "no_record");
     if failed > 0 || fetching > 0 {
         warnings.insert(
             0,
@@ -752,6 +823,7 @@ fn search_members(
         &found.hints,
         (nothing_yet, to_come > 0 && found.page.has_more),
         (broke, rebuilding),
+        (context.recorded.as_deref(), no_record),
     );
     if !hints.is_empty() {
         response.insert("hints".to_owned(), Value::Array(hints));
@@ -773,7 +845,7 @@ fn request_of<'a>(
         origin: match (&context.std, toolchain) {
             // Built here, a member's with its private items (decided in M2's D7).
             #[cfg(feature = "local")]
-            _ if let Outcome::Built(built) = &member.outcome => {
+            _ if let Outcome::Built(built) | Outcome::Recorded(built, _) = &member.outcome => {
                 let record = &built.record;
                 Origin::Local {
                     private: record.private,
@@ -804,8 +876,24 @@ fn request_of<'a>(
         project_features: project_features(context, member),
         follow: false,
         target: (!context.docs_rs_default || member.outcome.is_built())
-            .then(|| context.target.as_str()),
+            .then(|| recorded_target(member).unwrap_or(context.target.as_str())),
     }
+}
+
+/// The target of what `build_external_docs` recorded of `member`, which is the host's for a proc
+/// macro (decided in M2e's E4b-3b).
+#[cfg(feature = "local")]
+fn recorded_target(member: &Member) -> Option<&str> {
+    if let Outcome::Recorded(built, _) = &member.outcome {
+        return built.record.target.as_deref();
+    }
+    None
+}
+
+/// Without local features, nothing is recorded.
+#[cfg(not(feature = "local"))]
+const fn recorded_target(_member: &Member) -> Option<&str> {
+    None
 }
 
 /// The provenance of the response: what the crates searched share, and each one's `sources`
@@ -838,10 +926,14 @@ fn failed_here(sources: &[Value]) -> bool {
 
 /// The hints of the response: those of the search, and what to do when crates are still being
 /// loaded and nothing was found (`nothing_yet`) or there is a next page (`cursor_while_loading`).
+///
+/// For a workspace outside the default project, which `build_external_docs` recorded as
+/// `recorded` tells, what failed or has no record is made by that tool (decided in M2e's E4b-3b).
 fn hints(
     found: &[Box<str>],
     (nothing_yet, cursor_while_loading): (bool, bool),
     (broke, rebuilding): (bool, usize),
+    (recorded, no_record): (Option<&str>, bool),
 ) -> Vec<Value> {
     let mut hints: Vec<Value> = found.iter().map(|hint| json!(hint)).collect();
     if rebuilding > 0 {
@@ -850,11 +942,23 @@ fn hints(
              call again in about {RETRY_AFTER_SECS} seconds for the new build"
         )));
     }
-    if broke {
-        hints.push(json!(
+    match (broke, recorded) {
+        (true, Some(again)) => hints.push(json!(format!(
+            "for a crate whose status is failed, once the cause is fixed, call build_external_docs \
+             with {again} to build it again"
+        ))),
+        (true, None) => hints.push(json!(
             "for a crate whose status is failed, once the cause is fixed, call get_item with that \
              crate and \"refresh\": true to build it again"
-        ));
+        )),
+        (false, _) => {},
+    }
+    if let (true, Some(again)) = (no_record, recorded) {
+        hints.push(json!(format!(
+            "for a crate whose reason is no_record, call build_external_docs with {again}, and for \
+             a dependency of crates.io that docs.rs has no JSON of, with its crate too, as \
+             name@version"
+        )));
     }
     if nothing_yet {
         hints.push(json!(format!(
@@ -960,6 +1064,17 @@ fn sources(
                 searched = searched.saturating_add(1);
                 continue;
             },
+            // What it is made from changed since: not to come, as only that tool makes it again
+            // (decided in M2e's E4b-3b, 3).
+            #[cfg(feature = "local")]
+            Outcome::Recorded(_, changed) => {
+                if *changed && let Some(Value::Object(source)) = sources.get_mut(searched) {
+                    source.insert("stale".to_owned(), json!(true));
+                    source.insert("stale_reason".to_owned(), json!("inputs_changed"));
+                }
+                searched = searched.saturating_add(1);
+                continue;
+            },
             Outcome::Failed(failure) => {
                 failed = failed.saturating_add(1);
                 // What cannot be documented here, rather than what failed to be (decided in
@@ -977,6 +1092,7 @@ fn sources(
                                     | "scope_unknown"
                                     | "no_json"
                                     | "no_target_json"
+                                    | "no_record"
                             )
                         });
                 let status = if unavailable { "unavailable" } else { "failed" };

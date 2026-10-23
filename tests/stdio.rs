@@ -979,6 +979,10 @@ fn lookups_start_nothing_for_a_project_outside_the_default_one() {
                 "crate_overview",
                 json!({ "crate": "demo", "project": elsewhere }),
             ),
+            (
+                "search_items",
+                json!({ "query": "demo", "project": elsewhere }),
+            ),
         ];
         for (id, (tool, arguments)) in (100_u64..).zip(calls) {
             server.send(&call_tool(id, tool, arguments));
@@ -3673,6 +3677,7 @@ fn the_query_tools_read_a_workspace_outside_the_default_project_as_recorded() {
     );
     let built = built_by_external(&mut server, 10, &json!({ "project": project }));
     assert_eq!(built["structuredContent"]["data"]["built"], true, "{built}");
+    searched_outside(&mut server, 50, &project);
     let lookups = [
         ("get_item", everywhere.clone()),
         (
@@ -3718,6 +3723,10 @@ fn the_query_tools_read_a_workspace_outside_the_default_project_as_recorded() {
     for (id, (tool, arguments)) in (500_u64..).zip([
         ("get_item", everywhere),
         ("list_crates", json!({ "project": project })),
+        (
+            "search_items",
+            json!({ "query": "everywhere", "project": project }),
+        ),
     ]) {
         server.send(&call_tool(id, tool, arguments));
         let result = server.response(id)["result"].clone();
@@ -3732,7 +3741,52 @@ fn the_query_tools_read_a_workspace_outside_the_default_project_as_recorded() {
             "{tool}: {result}"
         );
     }
+    // A manifest that cannot be read tells its own error, not the record (decided in M2e's
+    // E4b-3b).
+    std::fs::write(&manifest, "[package\n").expect("written");
+    server.send(&call_tool(
+        600,
+        "list_crates",
+        json!({ "project": project }),
+    ));
+    let result = server.response(600)["result"].clone();
+    assert_eq!(result["isError"], true, "{result}");
+    assert_eq!(text_json(&result)["code"], "project_not_found", "{result}");
     assert!(server.finish().success());
+}
+
+/// Searches in `server` the workspace of [`workspace_for_wasm`] at `project`, outside the default
+/// project, without a crate, from `id` on, once `build_external_docs` recorded it for the host:
+/// its members, as that tool recorded them, without running cargo there (decided in M2e's
+/// E4b-3b).
+#[cfg(all(debug_assertions, feature = "local"))]
+fn searched_outside(server: &mut Server, id: u64, project: &str) {
+    let mut searched = Value::Null;
+    for id in id..id.saturating_add(40) {
+        server.send(&call_tool(
+            id,
+            "search_items",
+            json!({ "query": "everywhere", "project": project }),
+        ));
+        searched = server.response(id)["result"].clone();
+        // Once nothing is to come.
+        if searched["structuredContent"]
+            .get("retry_after_secs")
+            .is_none()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let content = &searched["structuredContent"];
+    assert!(
+        content["data"].to_string().contains("app::everywhere"),
+        "{searched}"
+    );
+    let sources = content["provenance"]["sources"].to_string();
+    assert!(sources.contains("\"external\""), "{searched}");
+    assert!(sources.contains("build_external_docs"), "{searched}");
+    assert!(content["provenance"].get("stale").is_none(), "{searched}");
 }
 
 /// Looks up in `server` the crates of the workspace of [`workspace_for_wasm`] at `project`,
@@ -3741,6 +3795,12 @@ fn the_query_tools_read_a_workspace_outside_the_default_project_as_recorded() {
 /// built it in the workspace when asked for it (decided in M2e's E4b, 4).
 #[cfg(all(debug_assertions, feature = "local"))]
 fn looked_up_outside_for_another_target(server: &mut Server, project: &str) {
+    // Not recorded for it yet: the whole search tells how to (decided in M2e's E4b-3b, 1).
+    let search = json!({ "query": "only_wasm", "project": project, "target": OTHER_TARGET });
+    server.send(&call_tool(190, "search_items", search));
+    let result = server.response(190)["result"].clone();
+    assert_eq!(result["isError"], true, "{result}");
+    assert_eq!(text_json(&result)["reason"], "no_record", "{result}");
     let for_wasm = json!({ "project": project, "target": OTHER_TARGET });
     built_by_external(server, 200, &for_wasm);
     server.send(&call_tool(
@@ -3790,6 +3850,109 @@ fn looked_up_outside_for_another_target(server: &mut Server, project: &str) {
         result["structuredContent"]["provenance"]["source"], "local",
         "{result}"
     );
+}
+
+/// Once the directory of a workspace outside the default project is gone, the query tools read what
+/// `build_external_docs` recorded of it by the paths that it recorded, its root's and its
+/// members', and tell it (`project_missing`); not by a path that it moved to, nor a path that it
+/// did not record; `build_external_docs` does not find it either (decided in M2e's E4b-3, 2 and
+/// E4b-3b).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn the_record_of_a_workspace_whose_directory_is_gone_is_read() {
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let outside = workspace_for_wasm(dir.path(), &registry);
+    let default = workspace_of("user");
+    let mut server = server_in_on(Some(default.path()), &registry, dir.path());
+    // Through a symbolic link, as a temporary directory is on macOS: cargo tells the paths of the
+    // members with it resolved, and the paths under the one given are found too.
+    #[cfg(unix)]
+    let given = {
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&outside, &link).expect("linked");
+        link
+    };
+    #[cfg(not(unix))]
+    let given = outside.clone();
+    let project = given.display().to_string();
+    let built = built_by_external(&mut server, 1, &json!({ "project": project }));
+    assert_eq!(built["structuredContent"]["data"]["built"], true, "{built}");
+    let moved = dir.path().join("moved");
+    std::fs::rename(&outside, &moved).expect("moved");
+    let member = given.join("macros").display().to_string();
+    let manifest = given.join("Cargo.toml").display().to_string();
+    let lookups = [
+        (
+            "get_item",
+            json!({ "crate": "app", "path": "everywhere", "project": project }),
+        ),
+        (
+            "crate_overview",
+            json!({ "crate": "app", "project": member }),
+        ),
+        ("list_crates", json!({ "project": manifest })),
+        (
+            "resolve_version",
+            json!({ "crate": "app", "project": project }),
+        ),
+        (
+            "search_items",
+            json!({ "query": "everywhere", "project": project }),
+        ),
+    ];
+    for (id, (tool, arguments)) in (100_u64..).zip(lookups) {
+        server.send(&call_tool(id, tool, arguments));
+        let result = server.response(id)["result"].clone();
+        assert_ne!(result["isError"], true, "{tool}: {result}");
+        let provenance = &result["structuredContent"]["provenance"];
+        assert_eq!(provenance["stale"], true, "{tool}: {result}");
+        assert_eq!(
+            provenance["stale_reason"], "project_missing",
+            "{tool}: {result}"
+        );
+    }
+    // Not recorded for another target: not where it was, which is gone.
+    server.send(&call_tool(
+        150,
+        "search_items",
+        json!({ "query": "only_wasm", "project": project, "target": "wasm32-wasip1" }),
+    ));
+    let result = server.response(150)["result"].clone();
+    let error = text_json(&result);
+    assert_eq!(error["reason"], "no_record", "{result}");
+    assert!(
+        error["suggestions"].to_string().contains("new path"),
+        "{result}"
+    );
+    let refused = [
+        // Where it moved to: another workspace, not recorded.
+        (
+            "list_crates",
+            json!({ "project": moved.display().to_string() }),
+            "no_record",
+        ),
+        // A path that was never recorded.
+        (
+            "list_crates",
+            json!({ "project": dir.path().join("nothing").display().to_string() }),
+            "project_not_found",
+        ),
+        (
+            "build_external_docs",
+            json!({ "project": project }),
+            "project_not_found",
+        ),
+    ];
+    for (id, (tool, arguments, why)) in (200_u64..).zip(refused) {
+        server.send(&call_tool(id, tool, arguments));
+        let result = server.response(id)["result"].clone();
+        assert_eq!(result["isError"], true, "{tool}: {result}");
+        let error = text_json(&result);
+        let told = error["reason"].as_str().or_else(|| error["code"].as_str());
+        assert_eq!(told, Some(why), "{tool}: {result}");
+    }
+    assert!(server.finish().success());
 }
 
 /// `build_external_docs` does not write the Cargo.lock of a workspace outside the default project

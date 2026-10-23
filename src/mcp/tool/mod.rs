@@ -134,6 +134,9 @@ pub(super) struct ToolState {
     /// they are recorded again (decided in M2e's E4b-3).
     #[cfg(feature = "local")]
     pub(super) recorded_workspaces: recorded_workspace::Kept,
+    /// Whether workspaces are outside the default project, by root, for the process.
+    #[cfg(feature = "local")]
+    pub(super) outsides: recorded_workspace::Outsides,
     /// The calls being handled, at most `limits.concurrent_calls` (requirement R-SEC-7).
     pub(super) calls: CallLimit,
     /// How long a call waits for work that goes on without it, such as fetching and indexing a
