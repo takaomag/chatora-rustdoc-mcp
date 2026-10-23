@@ -1853,9 +1853,32 @@ Claude Code 2.1.304、Linux で測った。
 - 編集の後の作り直し (5 回ずつ、`-j` 6): このリポジトリ 6.7〜7.4 秒、eval 0.3 秒、local-build 0.2 秒。作り直したのはどれも member の 1 unit だけ。応答の後の dep-info の記録はこのリポジトリで約 6 秒
 - 診断 (F5b、場面ごとに写しを壊す): D-1 シグネチャの誤り 1 件 (生のエラー 1 件・178 文字、応答 651 文字)。D-2 広く使う型の改名 (27 件・371〜621 文字、中央値 411、応答 1,272 文字で 2 件と `diagnostics_omitted` 25)。D-3 path 依存の本体の長い trait 境界 (1 件・1,265 文字、応答 1,731 文字)。D-4 文書化する crate の本体だけの誤りはビルドが失敗しない (rustdoc は本体を型検査しない、を確かめた)。D-5 build.rs の panic (JSON の診断なし、応答は stderr の末尾 3,416 文字で 3,866 文字)。どれも 1 件 3,500・合計 8,000 文字の上限に収まり、切れたものは無い
 
+**F5c・F5d (2026-10-23)**:
+
+- F5c: 手で回すときだけ動く workflow `.github/workflows/measure.yml` (3 OS、`build_bench.py` の `run --online` をこのリポジトリと eval の fixture に `-j` 1・2・4 と作り直し 2 回、`deps --online` で eval の fixture の依存 tokio・axum・serde の最初の照会)。`build_bench.py` を 3 OS で動くように (大きさは Python で数えハードリンクを 1 回、負荷は読めれば)。7c99549
+- 利用者が決めたこと (F5d):
+  1. `build.wait_secs` は 10 秒のまま (編集の後の作り直しはこのリポジトリで約 7 秒で収まる。冷えた初回は実効の上限 20 秒でも 1 回では返らない。長くすると readOnlyHint false のツールが 1 つずつ実行される (R-MCP-4) 間、同じメッセージの他の照会が止まる。CI の runner で作り直しが 10 秒を越えるなら見直す)
+  2. 診断の上限 (件数 2・1 件 3,500 文字・合計 8,000 文字、文字数は定数) は据え置く (測った場面ではどれも切れず、連鎖したエラーの 3 件目以降はほぼ同じ形)
+- F5c の結果 (run 39923041776、各 1 回、runner の速さは揺れる): CPU は ubuntu 4・macOS 3 (arm64)・Windows 4。このリポジトリの冷えたビルド (秒) は ubuntu `-j` 1: 97・2: 55・4: 48、macOS 181・128・102、Windows 231・142・114。編集の後の作り直しは ubuntu 6.2、macOS 7.8〜15.1、Windows 10.9〜13.9 (いずれも member の 1 unit、応答の後の dep-info は 5.5〜14.6 秒)。eval の fixture の冷えたビルドは ubuntu 24・14・13、macOS 41・21・12、Windows 53・31・25。target dir はこのリポジトリで ubuntu 542MB・macOS 319MB・Windows 395MB。eval の fixture の依存の最初の照会は、ubuntu は docs.rs (tokio 1.1 秒ほか 0.2 秒以下)、macOS はローカルビルドで tokio 7.6・axum 14.3・serde 1.9 秒、Windows は tokio 11.1・axum 16.5・serde 2.7 秒 (後のものは target dir を共有)
+- 利用者が決めたこと (F5d の続き):
+  3. `build.jobs` の既定は「CPU の半分、2 つ以上あれば 2 以上」(`build::default_jobs`。3 CPU の macOS の runner で `-j` 1 は 181 秒、2 は 128 秒。手元の 12 CPU では半分から全部にしても 11% しか速くない)
+  4. 決定 1 の見直しの条件 (CI の runner で作り直しが 10 秒を越える) に当たったので、`build.wait_secs` の既定を 15 秒に (macOS・Windows の作り直しの多くと tokio 級の依存のローカルビルドが 1 回で返る。axum 級はまだ `building`)
+- 実装: `build::default_jobs` と単体テスト、`DEFAULT_BUILD_WAIT_SECS` を 15 に、README の設定の表。要件 (R-WS-6 の「既定 10 秒。M2 で測って決める」、R-WS-1 の `-j`、R-WS-7 の診断の上限) は §7 で「F5 で測って決めた」に改める
+- CI の testdata のサーバーのキャッシュのパス (決定 6) は `$RUNNER_TEMP` の下に (`GITHUB_ENV` に書く。job の env では runner の文脈が使えない)。F5 完了
+
 **F4a の下調べ (2026-10-23)**:
 
 - 下調べ (サブエージェント、読むだけ。要点は scratchpad の f4a-research.md、判断の候補 12 件。判断は F5 の後に聞く): 今の eval は組み込みのツールを外して回す (`--tools ""`) ので、モデルが grep や LSP でなくこのサーバーを選ぶかを原理的に測れない。instructions (`src/mcp/mod.rs:59-103`、1,319 文字、上限 2,048) の 1 文目は「crates from docs.rs and of the standard library」のまま、78-81 行が自分の workspace の item を rust-analyzer へ誘導 (§9.9 と逆。試しで MCP が使われなかった件の最も有力な原因)、`build_external_docs`・building の呼び直し・stale・refresh に触れていない。説明文は `get_item.md`・`search_items.md` が上限まで残り数文字。`version`・`target` の既定の書き方がツールで食い違い、no-local の構成でも使えない引数を案内。fixture に自分の型が無く、R-QA-6 の必須の「ビルド中の応答」のケースが無い。分け方の案: F4a-1 (文言と検査)・F4a-2 (eval の道具)・F4a-3 (ケースと README)・F4b (回す)
+- 利用者が決めたこと:
+  1. instructions の LSP の文 (`src/mcp/mod.rs:78-81`) は §9.9 の境界に書き直す: この workspace の item もパス・名前で引くならこのツール (member は private も含めてビルドする)、LSP は位置 (行・桁)・参照・診断・`built_at` の後に編集したコード
+  2. instructions に 4 つ足す: 1 文目を「この workspace の crate (ここでビルド、private も)・その依存 (Cargo.lock の版)・std・docs.rs」に、`status: building`・`partial` は `retry_after_secs` の後に呼び直すことと `stale` の読み方、外の workspace・git・Cargo.lock に無い版・他の target は先に `build_external_docs` (信頼するコードだけ)、既定の target は `build.target`、無ければ host
+  3. 説明文の上限は 2,048 のまま、繰り返しを削って空ける (7 つで繰り返す docs.rs の 2025-05-23 の注記、`get_item` の std の nightly の詳しい説明)
+  4. 説明文の食い違いと no-local も直す: 書き出しに member、list_* に「member は private も」、`version`・`target` の既定、「20 seconds」を固定で書かない、ローカルビルドの機能が無い構成用の説明文を分ける
+  5. eval は両方: 組み込みのツールを外したケースは残し、Read・Grep・Glob・LSP と ToolSearch を有効にした「選ぶ側」のケースを足す (Bash は外す)。MCP の照会のツールを使ったかで合否、最初の呼び出しが MCP かも記録
+  6. 利用者の `~/.claude/rules` (LSP と ferritin を勧める) は、回す前に `claude --help` で読まない手段を探し、無ければそのまま回して結果に書く (利用者のファイルは変えない)
+  7. ケースは 9 問足す (member の型の trait・private な item・名指しなしの自分の item (組み込みのツールあり、3 回)・名前を知らずに探す・ビルド中・stale・外の workspace・他の target・worktree の安い形)。git の crate は通信と第三者の build.rs を動かすので外し、理由を記録
+  8. 予算は 1 回の全体で 5〜8 USD (1 問の上限 1 USD のまま)
+- 聞かずに決めたこと (下調べの推奨のとおり): 回すモデルは Claude Code の既定。alwaysLoad (R-MCP-8、M5 の予定) は入れず、選ぶ側のケースでツールが読み込まれたかを記録。段は F4a-1 (instructions・説明文・引数の説明と検査、`tests/real_data/questions.rs` の約束の対応)・F4a-2 (eval の道具: fixture の member の型、写した一時ディレクトリとケースごとの env と下準備、選ぶ側のモード、採点の追加)・F4a-3 (cases.json と eval/README.md)・F4b (回して記録、応答の形の課題を直す)。private なフィールドに印が無い件 (M2d の試し) は F4b で答えに影響するかを見てから
 
 **F1〜F6 の外の残りの行き先 (2026-10-23、利用者が 1 件ずつ決めた)**:
 
@@ -1898,6 +1921,7 @@ Claude Code 2.1.304、Linux で測った。
    - R-SEC-7: 呼び出しの上限を超えたときは `busy` のまま (「ビルドを待っているなら `status: building`」を消す。M2f の残りの決定 2)。出力のサニタイズは M2f の F7 の実装に合わせる
    - §9 と R-DS-1・R-SR-2: `search.scope`・`build.prefer_local` は M3 以降 (M2f の残りの決定 3)。「(in a later version)」の 9 か所は M3 以降で対応を検討 (決定 4)
    - R-CA-5・R-DIST-2・§9 (F1): キャッシュの CLI (`cache ls`・`gc`・`clear`)、所有マーカー `chatora-rustdoc-mcp.cache` と引き取りの条件、`used` の印、2 つの上限と日数 (0 は誤り)、F1 の決定 1〜10 と F1a の決定
+   - R-WS-6・R-WS-1・R-WS-7・§9 (F5): `build.wait_secs` の既定を 15 秒に (「既定 10 秒。M2 で測って決める」を改める)、`build.jobs` の既定を「CPU の半分、2 つ以上あれば 2 以上」に、診断の上限 (件数 2・1 件 3,500・合計 8,000 文字) は測って据え置いた。測った条件と数字 (手元と CI の 3 OS) は §6.7 の F5。§9.1 にローカルビルドの時間の目安 (冷えた初回・作り直し・依存のローカルビルド) を足すか
    - §12 の M2 の到達点と、M3 以降に回したもの
 3. README を合わせる (F6)。公開は M3 の後にまとめて行う (P9。利用者が行う)
 4. M3 の計画を立てる

@@ -84,9 +84,14 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    env:
-      CHATORA_RUSTDOC_MCP_CACHE__DIR: ${{ github.workspace }}/../rustdoc-json-cache
     steps:
+      # サーバーのキャッシュは runner の一時ディレクトリに。actions/cache は `..` を含むパスを断り、
+      # `${{ github.workspace }}/../…` では一度も保存されていなかった (doc/m2-plan.md の F5)。
+      # checkout の中には置かない (real_data はこのリポジトリを既定のプロジェクトにし、git に載らない
+      # ファイルも鮮度の判定の入力に入りうる)。job の env では runner の文脈が使えないので、ここで書く。
+      - name: The cache of the server
+        shell: bash
+        run: echo "CHATORA_RUSTDOC_MCP_CACHE__DIR=$RUNNER_TEMP/rustdoc-json-cache" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
       # build_external_docs がプロジェクトの tokio を他の target で作る問い (M2e の E4a-3。どの OS の

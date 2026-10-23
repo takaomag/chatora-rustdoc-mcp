@@ -174,17 +174,25 @@ pub fn max_diagnostics() -> usize {
 /// `build.max_diagnostics`, once read.
 static MAX_DIAGNOSTICS: OnceLock<usize> = OnceLock::new();
 
-/// The jobs of a build (`-j`): `build.jobs`, or half the CPUs (requirement R-WS-1, decided in
-/// M2's D2 until F5 measures it).
+/// The jobs of a build (`-j`): `build.jobs`, or [`default_jobs`] of the CPUs (requirement R-WS-1,
+/// decided in M2's D2 and F5).
 #[must_use]
 pub fn jobs() -> NonZeroUsize {
     JOBS.get().copied().unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map_or(1, NonZeroUsize::get)
-            .checked_div(2)
-            .and_then(NonZeroUsize::new)
-            .unwrap_or(NonZeroUsize::MIN)
+        default_jobs(std::thread::available_parallelism().map_or(1, NonZeroUsize::get))
     })
+}
+
+/// The jobs of a build on a machine with `cpus`: half of them, which leaves the rest to the
+/// editor's rust-analyzer, but two at least where there are two, as one is much slower.
+///
+/// Decided in M2f's F5: a cold build of this repository took 114 s with one job and 75 s with two
+/// on a machine of twelve CPUs, and 181 s and 128 s on a runner of macOS with three, while all
+/// twelve were only 11% faster than half.
+#[must_use]
+pub fn default_jobs(cpus: usize) -> NonZeroUsize {
+    let half = cpus.checked_div(2).unwrap_or_default();
+    NonZeroUsize::new(half.max(cpus.min(2))).unwrap_or(NonZeroUsize::MIN)
 }
 
 /// The value of `RUSTC_BOOTSTRAP` of the builds of a workspace (requirement R-WS-8).
@@ -1860,6 +1868,12 @@ impl Header {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_build_takes_half_the_cpus_but_two_at_least() {
+        let jobs = |cpus| default_jobs(cpus).get();
+        assert_eq!([0, 1, 2, 3, 4, 5, 12].map(jobs), [1, 1, 2, 2, 2, 2, 6]);
+    }
 
     /// `cargo metadata` of a workspace of the members `app` (a lib `app` and a bin `my-app`),
     /// `macros` (a proc-macro) and `tool` (only a bin `tool`), with the dependencies `serde`

@@ -186,9 +186,12 @@ pub(super) fn wait_for_work(settings: &Settings) -> Duration {
         .unwrap_or_default()
 }
 
-/// `build.wait_secs` unless set (requirement R-WS-6, initial value).
+/// `build.wait_secs` unless set (requirement R-WS-6, decided in M2f's F5): long enough for the
+/// rebuild after an edit of this repository's lib (7 s here, 8 to 15 s on the runners of macOS and
+/// Windows) and for a dependency as tokio built locally (8 to 11 s there), not much longer, as a
+/// client may wait for a tool that is not read-only before it runs the others (R-MCP-4).
 #[cfg(feature = "local")]
-const DEFAULT_BUILD_WAIT_SECS: u64 = 10;
+const DEFAULT_BUILD_WAIT_SECS: u64 = 15;
 
 /// How long a call waits for a local build, from when it starts to wait for it: the setting
 /// `build.wait_secs` (requirement R-WS-6, decided in M2's D3), but no longer than a call waits for
@@ -904,7 +907,7 @@ mod tests {
         };
         assert_eq!(
             wait_for_builds(&settings(""), wait),
-            Duration::from_secs(10)
+            Duration::from_secs(15)
         );
         assert_eq!(
             wait_for_builds(&settings("[build]\nwait_secs = 5\n"), wait),
