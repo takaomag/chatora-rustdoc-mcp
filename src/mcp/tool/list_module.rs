@@ -59,12 +59,17 @@ pub(super) fn definition() -> Tool {
             },
             "version": {
                 "type": "string",
-                "description": "The version: exact, a semver requirement or latest. Defaults to \
-                                the project's, or the latest.",
+                "description": const_format::concatcp!(
+                    "The version: exact, a semver requirement or latest.",
+                    super::VERSION_DEFAULT
+                ),
             },
             "target": {
                 "type": "string",
-                "description": "The target triple to document for. Defaults to the host's.",
+                "description": const_format::concatcp!(
+                    "The target triple to document for.",
+                    super::TARGET_DEFAULT
+                ),
             },
             "project": {
                 "type": "string",
@@ -111,7 +116,7 @@ pub(super) fn definition() -> Tool {
         },
         "required": ["crate"],
     }));
-    Tool::new(NAME, DESCRIPTION, input_schema)
+    Tool::new(NAME, super::for_this_build(DESCRIPTION), input_schema)
         .with_title("List a Rust module")
         .with_raw_output_schema(Arc::new(super::with_building(output_schema())))
         .with_annotations(super::annotations())
@@ -348,7 +353,7 @@ mod tests {
 
     #[test]
     fn the_description_fits_the_limit() {
-        let len = DESCRIPTION.chars().count();
+        let len = super::super::for_this_build(DESCRIPTION).chars().count();
         assert!(len <= 2048, "{len} characters");
     }
 

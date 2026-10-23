@@ -497,6 +497,67 @@ const GIT_ARGUMENTS_TO_BUILD: &[(&str, &str)] = &[
     ("tag", "With `git`: the tag, resolved anew on each call."),
 ];
 
+/// `text`, a tool's description, for this build: what is between `⟨` and `⟩` only with local
+/// features, what is between `⟪` and `⟫` only without them, so that a description does not tell of
+/// arguments and crates that the build does not have (decided in M2f's F4a, 4).
+///
+/// # Panics
+///
+/// Panics in a debug build, as in the tests, if a mark is not closed, or is in another.
+pub(super) fn for_this_build(text: &str) -> String {
+    let local = cfg!(feature = "local");
+    let mut kept = String::with_capacity(text.len());
+    let (mut only_local, mut only_without) = (false, false);
+    for c in text.chars() {
+        let open = only_local || only_without;
+        match c {
+            '⟨' => {
+                debug_assert!(!open, "a mark in another: {text}");
+                only_local = true;
+            },
+            '⟩' => {
+                debug_assert!(only_local, "a mark closed that is not open: {text}");
+                only_local = false;
+            },
+            '⟪' => {
+                debug_assert!(!open, "a mark in another: {text}");
+                only_without = true;
+            },
+            '⟫' => {
+                debug_assert!(only_without, "a mark closed that is not open: {text}");
+                only_without = false;
+            },
+            _ if (only_local && !local) || (only_without && local) => {},
+            _ => kept.push(c),
+        }
+    }
+    debug_assert!(!only_local && !only_without, "a mark not closed: {text}");
+    kept
+}
+
+/// The end of every tool's description of `version`: what decides it when it is left out.
+#[cfg(feature = "local")]
+const VERSION_DEFAULT: &str =
+    " Defaults to the version in the project's Cargo.lock, or the latest.";
+#[cfg(not(feature = "local"))]
+const VERSION_DEFAULT: &str = " Defaults to the latest.";
+
+/// The end of the description of `target` of the tools that look an item up: what it is when it
+/// is left out (decided in M2's D7c, and in M2e, 11, the host for a crate that the project does
+/// not use).
+#[cfg(feature = "local")]
+const TARGET_DEFAULT: &str = " Defaults to the project's build.target for the crates it uses, or \
+                              else the host's.";
+#[cfg(not(feature = "local"))]
+const TARGET_DEFAULT: &str = " Defaults to the host's.";
+
+/// [`TARGET_DEFAULT`] for the tools that tell of the project's build (`list_crates`) or of a
+/// release for it (`resolve_version`): the project's target, whatever the crate.
+#[cfg(feature = "local")]
+const PROJECT_TARGET_DEFAULT: &str = " Defaults to the project's build.target, or else the host's.";
+#[cfg(not(feature = "local"))]
+const PROJECT_TARGET_DEFAULT: &str = TARGET_DEFAULT;
+
 /// The end of every tool's description of `project` (doc/m2-plan.md §5, P5): the server sees only
 /// the directory that Claude Code was opened in, not the worktree of a subagent, so one that works
 /// in a worktree has to pass it.
@@ -896,6 +957,17 @@ fn error_result(body: &Value) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_description_keeps_what_is_for_this_build() {
+        let text = "Of crates⟨ of this workspace⟩⟪ from docs.rs⟫, with `crate`⟨ and `project`⟩.";
+        let expected = if cfg!(feature = "local") {
+            "Of crates of this workspace, with `crate` and `project`."
+        } else {
+            "Of crates from docs.rs, with `crate`."
+        };
+        assert_eq!(for_this_build(text), expected);
+    }
 
     #[cfg(feature = "local")]
     #[test]

@@ -56,38 +56,52 @@ const INITIALIZE_REJECTED_MESSAGE: &str = const_format::concatcp!(
      MCP_SDK_GENERATION=v1.",
 );
 
-/// The server's `instructions` (requirement R-MCP-6): the order of calls, the rules for versions
-/// and targets, and where the language server is the better tool. What each tool answers is in
+/// The server's `instructions` (requirement R-MCP-6): what it documents, the order of calls, the
+/// rules for versions and targets, what to do with an answer that is not ready, and where the
+/// language server is the better tool (§9.9, decided in M2f's F4a). What each tool answers is in
 /// its description. Only tools of this build are named (requirement R-QA-5).
 pub(crate) const INSTRUCTIONS: &str = const_format::concatcp!(
-    "Rust API documentation of crates from docs.rs and of the standard library, ",
-    VERSIONS_OF,
-    ". Use these tools instead of answering from memory.\n\n",
+    WHAT,
+    " Use these tools instead of answering from memory.\n\n",
     "- Order of calls: to find an item, ",
     FIND,
     "`crate_overview`, `list_module` or `search_items`; for the item itself, `get_item`; for \
      what a type or trait has, `list_methods`, `list_impls` or `list_implementors`. None needs an \
-     earlier call: give the path, such as `tokio::sync::Mutex`, directly.\n",
+     earlier call (but see below): give the path, such as `tokio::sync::Mutex`, directly.",
+    EXTERNAL,
+    "\n",
     VERSIONS,
-    "- Targets: the data is that of the host's target unless `target` names another, so items \
-     for other platforms may be missing. std, core and alloc are those of a nightly toolchain: \
-     check an item's `stability` before relying on it.\n",
-    "- For the code of this workspace itself (its own items, the type at a position, \
-     references, diagnostics), use the language server (rust-analyzer). These tools document \
-     crates as published.",
+    TARGETS,
+    "- An answer with `status: building`, or `partial` with `retry_after_secs`, is not ready: \
+     call again after it.",
+    STALE,
+    "\n",
+    LANGUAGE_SERVER,
 );
 
-/// Whose versions the documentation is of.
+/// What the documentation is of.
 #[cfg(feature = "local")]
-const VERSIONS_OF: &str = "at the versions that the project uses";
+const WHAT: &str = "Rust API documentation of this workspace's crates, built here with their \
+                    private items, of their dependencies at the versions that the project uses, \
+                    of the standard library and of crates on docs.rs.";
 #[cfg(not(feature = "local"))]
-const VERSIONS_OF: &str = "at the versions asked for";
+const WHAT: &str = "Rust API documentation of crates from docs.rs and of the standard library, at \
+                    the versions asked for.";
 
 /// The tools that find an item, before those of every build.
 #[cfg(feature = "local")]
-const FIND: &str = "`list_crates` (the project's dependencies), ";
+const FIND: &str = "`list_crates` (the project's crates and dependencies), ";
 #[cfg(not(feature = "local"))]
 const FIND: &str = "";
+
+/// When `build_external_docs` goes first.
+#[cfg(feature = "local")]
+const EXTERNAL: &str = " For a workspace outside the project or a crate of a git repository, call \
+                        `build_external_docs` first; for a release or a target that docs.rs has \
+                        no data of, when an answer says to. It runs build scripts: only for code \
+                        you trust.";
+#[cfg(not(feature = "local"))]
+const EXTERNAL: &str = "";
 
 /// The rule for versions.
 #[cfg(feature = "local")]
@@ -101,6 +115,36 @@ const VERSIONS: &str = "- Versions: without a version, a tool uses the one in th
 const VERSIONS: &str = "- Versions: without a version, a tool uses the latest release, as this \
                         server is built without reading projects: give the version that the \
                         project's Cargo.lock has. `provenance` tells which version was used.\n";
+
+/// The rule for targets.
+#[cfg(feature = "local")]
+const TARGETS: &str = "- Targets: the data is for the project's `build.target` for the crates it \
+                       uses, else the host's, unless `target` names another, so items for other \
+                       platforms may be missing. std, core and alloc are those of a nightly toolchain: check an \
+                       item's `stability` before relying on it.\n";
+#[cfg(not(feature = "local"))]
+const TARGETS: &str = "- Targets: the data is that of the host's target unless `target` names \
+                       another, so items for other platforms may be missing. std, core and alloc \
+                       are those of a nightly toolchain: check an item's `stability` before \
+                       relying on it.\n";
+
+/// How to read a stale answer.
+#[cfg(feature = "local")]
+const STALE: &str = " One with `stale` is of an earlier build: `stale_reason` and the hints tell \
+                     why and what to do; an item may have changed, and its lines moved.";
+#[cfg(not(feature = "local"))]
+const STALE: &str = "";
+
+/// Where the language server is the better tool.
+#[cfg(feature = "local")]
+const LANGUAGE_SERVER: &str = "- Look up this workspace's own items here too, by path or name, as \
+                               its dependencies'. Use the language server (rust-analyzer) for \
+                               what is at a position (line and column), references, diagnostics, \
+                               and code edited after an answer's `built_at`.";
+#[cfg(not(feature = "local"))]
+const LANGUAGE_SERVER: &str = "- For the code of this workspace itself (its own items, the type at \
+                               a position, references, diagnostics), use the language server \
+                               (rust-analyzer). These tools document crates as published.";
 
 /// How long clients may cache `server/discover` and `tools/list` (requirement R-MCP-5).
 const LIST_TTL_MS: u64 = 60 * 60 * 1000;

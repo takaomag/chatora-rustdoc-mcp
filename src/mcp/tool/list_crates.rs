@@ -65,8 +65,10 @@ pub(super) fn definition() -> Tool {
             },
             "target": {
                 "type": "string",
-                "description": "The target triple whose build is looked at. Defaults to the \
-                                host's.",
+                "description": const_format::concatcp!(
+                    "The target triple whose build is looked at.",
+                    super::PROJECT_TARGET_DEFAULT
+                ),
             },
             "scope": {
                 "type": "string",
@@ -90,7 +92,7 @@ pub(super) fn definition() -> Tool {
             },
         },
     }));
-    Tool::new(NAME, DESCRIPTION, input_schema)
+    Tool::new(NAME, super::for_this_build(DESCRIPTION), input_schema)
         .with_title("List the project's crates")
         .with_raw_output_schema(Arc::new(super::with_building(output_schema())))
         .with_annotations(super::annotations())
@@ -569,7 +571,7 @@ mod tests {
 
     #[test]
     fn the_description_fits_the_limit() {
-        let len = DESCRIPTION.chars().count();
+        let len = super::super::for_this_build(DESCRIPTION).chars().count();
         assert!(len <= 2048, "{len} characters");
     }
 

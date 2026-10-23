@@ -224,6 +224,18 @@ fn questions() -> Vec<Question> {
                 json!({ "crate": "tokio" }),
                 |result| result["provenance"]["resolved_from"] == "cargo_lock",
             ),
+            // A member of the project, this package, which the server builds, with its private
+            // fields; for the host, which the member is built for on each OS.
+            question(
+                "get_item",
+                "what does a type of this workspace hold?",
+                json!({ "crate": "chatora_rustdoc_mcp", "path": "data::cache::Cache", "target": null }),
+                |result| {
+                    result["provenance"]["source"] == "local"
+                        && has(&result["data"], "root")
+                        && has(&result["data"], "locks")
+                },
+            ),
         ]
         .map(|question| Question {
             local: true,
@@ -344,7 +356,7 @@ fn promised(description: &str) -> Vec<String> {
 
 /// Every question that a description of this build promises has a case, and every case is for a
 /// question that is promised. Questions about the project are left out without local features,
-/// where the descriptions still ask them (the remote build of M6 will have its own).
+/// whose descriptions do not ask them (decided in M2f's F4a, 4).
 #[test]
 fn every_question_promised_has_a_case() {
     let questions = questions();
@@ -358,6 +370,11 @@ fn every_question_promised_has_a_case() {
         }
     }
     for question in &questions {
+        // Without local features, the descriptions do not ask of the project (decided in M2f's
+        // F4a, 4).
+        if question.local && !cfg!(feature = "local") {
+            continue;
+        }
         let Some(tool) = tools().get(question.tool) else {
             assert!(question.local, "no tool {}", question.tool);
             continue;

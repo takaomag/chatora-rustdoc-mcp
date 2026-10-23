@@ -129,6 +129,25 @@ fn descriptions_have_their_parts_within_the_length() {
     }
 }
 
+/// A description tells only of what this build has (decided in M2f's F4a, 4): without local
+/// features, which read no project, the descriptions tell nothing of a project, its workspace or
+/// its members, nor the instructions of `project`, which is not declared then. That the marks of
+/// the text for one build only are each closed, and not in another, `for_this_build` checks.
+#[test]
+fn descriptions_are_of_this_build() {
+    for tool in tools() {
+        let text = description(&tool);
+        if !cfg!(feature = "local") {
+            for word in ["project", "workspace", "member"] {
+                assert!(!text.contains(word), "{}: {word} in {text}", tool.name);
+            }
+        }
+    }
+    if !cfg!(feature = "local") {
+        assert!(!INSTRUCTIONS.contains("`project`"), "{INSTRUCTIONS}");
+    }
+}
+
 #[test]
 fn the_instructions_are_within_the_length() {
     let len = INSTRUCTIONS.chars().count();
