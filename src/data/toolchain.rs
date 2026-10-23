@@ -491,7 +491,7 @@ fn nightly(date: Option<&NightlyDate>) -> String {
 
 /// The directory of what the probes of toolchains found, in the cache, for the format of its
 /// records (decided in M2's C1).
-pub const PROBES_DIR: &str = "toolchains/v1";
+pub const PROBES_DIR: &str = const_format::concatcp!(super::layout::TOOLCHAINS, "/v1");
 
 /// What the probe of a toolchain found, kept in the cache by the commit of its rustdoc.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

@@ -38,7 +38,7 @@ use crate::config::Settings;
 const MAX_BOOTSTRAP_BYTES: usize = 30_000;
 
 /// The directory of the target directories, in the cache (decided in M2's D2).
-pub const TARGET_DIRS: &str = "t";
+pub const TARGET_DIRS: &str = super::layout::TARGETS;
 
 /// The file that marks a target directory that is not to be used, as what a stopped server's
 /// build left running may still hold cargo's lock there (decided in M2's D2).
@@ -789,7 +789,7 @@ static ENVIRONMENT: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// The directory of the published builds, in the cache (decided in M2's D2).
-pub const LOCAL_DIR: &str = "local";
+pub const LOCAL_DIR: &str = super::layout::LOCAL;
 
 /// The format of the records of the published builds, which their path has (decided in C1 and
 /// M2's D4).
@@ -838,7 +838,7 @@ fn is_of(json: &Path, record: &BuildRecord) -> bool {
 }
 
 /// The record of a published build, next to its JSON.
-const RECORD: &str = "record.json";
+const RECORD: &str = super::layout::LOCAL_RECORD;
 
 /// Whether a record that does not tell documented the private items: one of a member's, as all
 /// were before M2's D7.
@@ -1549,7 +1549,41 @@ async fn take_turn(
     let name = plan.target_dir.name();
     let using = hold(cache.dir(), &target_key(&name), LockMode::Shared, on_doing).await;
     let writing = hold(cache.dir(), &doc_key(&name), LockMode::Exclusive, on_doing).await;
+    note_target_dir(cache, plan).await;
     (using, writing, slots().take(on_doing).await)
+}
+
+/// The file in a target directory that tells what it is the target directory of, for `cache ls`
+/// (decided in M2f's F1a).
+pub const ABOUT: &str = super::layout::TARGET_ABOUT;
+
+/// Notes that the target directory of `plan` is used now, and what it is the target directory of
+/// ([`ABOUT`]), for the garbage collection (decided in M2f's F1, 3): once in a while, under the
+/// lock of the build, which the collection takes to remove it. Not what the temporary projects of
+/// `build_external_docs` share, which are in the cache.
+async fn note_target_dir(cache: &Cache, plan: &Plan) {
+    let dir = plan.target_dir.path().to_path_buf();
+    if !super::used::due(&dir) {
+        return;
+    }
+    let about = (!plan.root.starts_with(cache.dir())).then(|| {
+        serde_json::json!({
+            "workspace": plan.root.display().to_string(),
+            "target": plan.target.as_ref().map(TargetTriple::as_str),
+        })
+    });
+    let noted = crate::task::spawn_blocking(move || {
+        let written = about.map_or(Ok(()), |about| {
+            serde_json::to_vec_pretty(&about)
+                .map_err(io::Error::other)
+                .and_then(|text| cache::write_atomically(&dir.join(ABOUT), &text))
+        });
+        if let Err(error) = written {
+            tracing::warn!(path = %dir.display(), %error, "what a target directory is of could not be written");
+        }
+        super::used::write(&dir);
+    });
+    drop(noted.await);
 }
 
 /// Takes the lock of `key` in the cache at `root` in `mode`, telling `on_doing` while it waits.

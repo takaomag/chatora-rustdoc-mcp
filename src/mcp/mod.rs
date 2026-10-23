@@ -237,6 +237,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
     // After the first line of the log file, which starts what this run logs.
     settings.report();
     let cache = cache?;
+    // Before the server puts anything in it, which would make a new cache look like another's.
+    claim(&cache).await;
     #[cfg(feature = "local")]
     sweep_in_background(&cache);
     #[cfg(feature = "local")]
@@ -388,6 +390,28 @@ const STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// How long the sweep at startup may take (decided in C4).
 #[cfg(feature = "local")]
 const SWEEP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Tells whether the cache directory is this server's, and makes it so when it may: made with its
+/// marker, or adopted when an earlier version made it (decided in M2f's F1, 5, and F1a, 3). One that
+/// is not is logged, and its garbage collection removes nothing. It reads a directory and writes
+/// two small files, once, before the server puts anything in it.
+async fn claim(cache: &Cache) {
+    let root = cache.dir().to_path_buf();
+    let claimed = crate::task::spawn_blocking(move || match crate::data::layout::claim(&root) {
+        Ok(crate::data::layout::Ownership::Foreign(names)) => tracing::warn!(
+            root = %root.display(),
+            ?names,
+            "the cache directory is not this server's: nothing in it is removed"
+        ),
+        Ok(ownership) => {
+            tracing::debug!(root = %root.display(), ?ownership, "the cache directory is this server's");
+        },
+        Err(error) => {
+            tracing::warn!(root = %root.display(), %error, "whether the cache directory is this server's could not be told");
+        },
+    });
+    drop(claimed.await);
+}
 
 /// Starts this server as the owner of what it leaves in the cache, and removes, in the background
 /// for at most [`SWEEP_LIMIT`], what the servers that have stopped left: the server answers at

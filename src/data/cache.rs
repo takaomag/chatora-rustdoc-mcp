@@ -303,7 +303,7 @@ impl Cache {
         target: Option<&TargetTriple>,
     ) -> PathBuf {
         self.root
-            .join("docs.rs")
+            .join(super::layout::DOCS_RS)
             .join(name.cache_key())
             .join(version.to_string())
             .join(target.map_or(DEFAULT_TARGET_DIR, TargetTriple::as_str))
@@ -330,12 +330,16 @@ impl Cache {
                     .any(|file| json_format(&file.file_name()).is_some())
             })
         };
-        let mut versions: Vec<Version> =
-            subdirectories(&self.root.join("docs.rs").join(name.cache_key()))
-                .iter()
-                .filter(|entry| has_json(&entry.path()))
-                .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
-                .collect();
+        let mut versions: Vec<Version> = subdirectories(
+            &self
+                .root
+                .join(super::layout::DOCS_RS)
+                .join(name.cache_key()),
+        )
+        .iter()
+        .filter(|entry| has_json(&entry.path()))
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .collect();
         versions.sort_by(|a, b| b.cmp(a));
         versions
     }
@@ -352,7 +356,7 @@ impl Cache {
     #[must_use]
     pub fn crate_file_path(&self, name: &CrateName, version: &Version) -> PathBuf {
         self.root
-            .join("static.crates.io")
+            .join(super::layout::STATIC_CRATES)
             .join(name.cache_key())
             .join(version.to_string())
             .join(format!("{name}-{version}.crate"))
@@ -362,7 +366,7 @@ impl Cache {
     /// of how it was fetched is next to it, with `.meta.json` added (no crate name has a `.`).
     #[must_use]
     pub fn sparse_index_path(&self, index_path: &str) -> PathBuf {
-        self.root.join("index.crates.io").join(index_path)
+        self.root.join(super::layout::INDEX).join(index_path)
     }
 
     /// Reads the rustdoc JSON fetched from docs.rs in `dir` ([`Self::docs_rs_dir`]) whose

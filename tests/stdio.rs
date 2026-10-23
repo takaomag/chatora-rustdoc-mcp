@@ -225,6 +225,9 @@ struct Server {
     child: Child,
     /// The server's cache directory, removed when the server is dropped.
     cache: TempDir,
+    /// The server's config file and logs, out of its cache, which is then this server's alone
+    /// (decided in M2f's F1a).
+    state: TempDir,
     stdin: Option<ChildStdin>,
     /// Lines from stdout: a parsed message, or a line that is not a JSON-RPC message.
     lines: Receiver<Result<Value, String>>,
@@ -256,8 +259,9 @@ impl Server {
     /// [`Self::start_with`], with the cache `cache`, which [`test_cache`] made.
     fn start_with_cache(cache: TempDir, project: Option<&Path>, env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"));
+        let state = TempDir::new().expect("a temporary directory");
         // Not the config file of the user who runs the tests (requirement R-DIST-3).
-        let config = cache.path().join("config.toml");
+        let config = state.path().join("config.toml");
         std::fs::write(&config, "").expect("written");
         command.env("CHATORA_RUSTDOC_MCP_CONFIG", config);
         // The tool for testing (`sleep`) in a debug build.
@@ -274,7 +278,7 @@ impl Server {
             // (requirement R-SEC-1).
             .env("CHATORA_RUSTDOC_MCP_LOG__FILTER", "debug")
             .env("CHATORA_RUSTDOC_MCP_CACHE__DIR", cache.path())
-            .env("CHATORA_RUSTDOC_MCP_LOG__DIR", cache.path().join(LOG_DIR))
+            .env("CHATORA_RUSTDOC_MCP_LOG__DIR", state.path().join(LOG_DIR))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -299,6 +303,7 @@ impl Server {
         Self {
             child,
             cache,
+            state,
             stdin,
             lines,
             pending: Vec::new(),
@@ -328,7 +333,7 @@ impl Server {
 
     /// The lines of the server's log files as they are now.
     fn log_now(&self) -> Vec<Value> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(self.cache.path().join(LOG_DIR))
+        let mut files: Vec<PathBuf> = std::fs::read_dir(self.state.path().join(LOG_DIR))
             .expect("the log directory")
             .map(|entry| entry.expect("an entry").path())
             .filter(|path| {
@@ -527,6 +532,93 @@ fn initialize_is_rejected_with_a_message_for_old_clients() {
     assert_eq!(error["data"]["supported"], json!([PROTOCOL_VERSION]));
     // rmcp ends the session after a failed initialize.
     assert_eq!(server.finish().code(), Some(1));
+}
+
+/// `cache ls` tells what the cache has, by class with its limits, and its largest places, without
+/// making or marking a cache that is not there; what it does not take is a usage error, and `help`
+/// tells the usage (requirement R-DIST-2, decided in M2f's F1, 1 and 10).
+#[test]
+fn cache_ls_tells_what_the_cache_has() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "").expect("written");
+    let run = |cache: &Path, args: &[&str], env: &[(&str, &str)]| {
+        Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"))
+            .args(args)
+            .env("CHATORA_RUSTDOC_MCP_CONFIG", &config)
+            .env("CHATORA_RUSTDOC_MCP_CACHE__DIR", cache)
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .output()
+            .expect("the binary runs")
+    };
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    let none = dir.path().join("none");
+    let listed = run(&none, &["cache", "ls"], &[]);
+    assert!(listed.status.success(), "{listed:?}");
+    assert!(text(&listed.stdout).contains("No cache at"), "{listed:?}");
+    assert!(!none.exists());
+
+    let cache = dir.path().join("cache");
+    let write = |path: &str, bytes: usize| {
+        let path = cache.join(path);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+        std::fs::write(path, vec![b'x'; bytes]).expect("written");
+    };
+    write("chatora-rustdoc-mcp.cache", 0);
+    write("docs.rs/serde/1.0.0/_default/61.json", 2_000);
+    write("t/0123456789ab/target/debug/x", 1_000_000);
+    let listed = run(&cache, &["cache", "ls"], &[(
+        "CHATORA_RUSTDOC_MCP_CACHE__TARGET_MAX_SIZE",
+        "1GB",
+    )]);
+    assert!(listed.status.success(), "{listed:?}");
+    let stdout = text(&listed.stdout);
+    assert!(stdout.contains("(owned)"), "{stdout}");
+    let line = |name: &str| {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(name))
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<&str>>()
+            .join(" ")
+    };
+    assert_eq!(line("docs"), "docs 2.0 kB 5.0 GB 1", "{stdout}");
+    assert_eq!(line("targets"), "targets 1.0 MB 1.0 GB 1 0", "{stdout}");
+    assert!(stdout.contains("t/0123456789ab"), "{stdout}");
+
+    let wrong = run(&cache, &["cache", "nonsense"], &[]);
+    assert_eq!(wrong.status.code(), Some(2), "{wrong:?}");
+    assert!(text(&wrong.stderr).contains("cache ls"), "{wrong:?}");
+    let help = run(&cache, &["help"], &[]);
+    assert!(help.status.success(), "{help:?}");
+    assert!(text(&help.stdout).contains("Usage:"), "{help:?}");
+}
+
+/// The server makes its cache directory its own: the cache of the tests, which an earlier version
+/// would have made, has its marker and the tag of a cache directory once the server started
+/// (requirement R-CA-5, decided in M2f's F1, 5, and F1a).
+#[test]
+fn the_server_owns_its_cache_directory() {
+    let server = Server::start();
+    let (marker, tag) = (
+        server.cache.path().join("chatora-rustdoc-mcp.cache"),
+        server.cache.path().join("CACHEDIR.TAG"),
+    );
+    for _ in 0..100 {
+        if marker.is_file() && tag.is_file() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(marker.is_file(), "no marker");
+    let tag = std::fs::read_to_string(tag).expect("the tag");
+    assert!(
+        tag.starts_with("Signature: 8a477f597d28d172789f06886806bc55"),
+        "{tag}"
+    );
+    assert!(server.finish().success());
 }
 
 #[test]

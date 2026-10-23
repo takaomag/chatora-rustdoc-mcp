@@ -20,7 +20,7 @@ use std::{
 };
 
 /// The directory of the lock files in the cache directory, which GC and `cache clear` leave.
-pub const LOCKS_DIR: &str = "locks";
+pub const LOCKS_DIR: &str = super::layout::LOCKS;
 
 /// The first pause between tries to take a lock that another holds.
 const MIN_PAUSE: Duration = Duration::from_millis(5);

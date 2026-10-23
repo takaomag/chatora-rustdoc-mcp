@@ -33,6 +33,8 @@ pub mod format_version;
 pub mod freshness;
 pub mod git_source;
 mod http;
+pub mod inventory;
+pub mod layout;
 #[cfg(feature = "local")]
 pub mod local_std;
 #[cfg(feature = "local")]
@@ -58,6 +60,7 @@ pub(crate) mod test_http;
 mod tool;
 #[cfg(feature = "local")]
 pub mod toolchain;
+pub mod used;
 pub mod version;
 pub mod waits;
 

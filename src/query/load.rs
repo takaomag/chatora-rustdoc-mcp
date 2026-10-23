@@ -24,6 +24,7 @@ use crate::data::{
     rustdoc_json::{self, ParseError},
     std_json::{self, Chosen},
     target::TargetTriple,
+    used,
 };
 
 /// Why a crate could not be loaded from its JSON.
@@ -506,6 +507,8 @@ pub fn open_archived(cache: &Cache, dir: &Path) -> io::Result<Option<Arc<Mapped<
     let Some((format, sha256)) = cache.docs_rs_source(dir)? else {
         return Ok(None);
     };
+    // For the garbage collection, which removes the least recently used (decided in M2f's F1, 3).
+    used::note(dir);
     let path = archive_path(dir, format, &sha256);
     if let Some(mapped) = opened(&path) {
         return Ok(Some(mapped));

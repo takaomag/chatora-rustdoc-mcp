@@ -431,7 +431,7 @@ pub async fn std_docs(
     })?;
     let dir = cache
         .dir()
-        .join("std")
+        .join(super::layout::STD)
         .join(short_hash)
         .join(triple.as_str());
     // Another call that wants the same nightly goes first, and this one then finds it unpacked
@@ -516,7 +516,7 @@ async fn summary(
     date: Option<&NightlyDate>,
     warnings: &mut Vec<Box<str>>,
 ) -> Result<Summary, DistError> {
-    let path = cache.dir().join("std").join(date.map_or_else(
+    let path = cache.dir().join(super::layout::STD).join(date.map_or_else(
         || "nightly.json".to_owned(),
         |date| format!("nightly-{date}.json"),
     ));

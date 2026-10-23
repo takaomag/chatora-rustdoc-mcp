@@ -16,10 +16,9 @@ use std::{
     fs,
     io,
     path::{Component, Path, PathBuf},
-    time::{Duration, Instant, SystemTime},
+    time::SystemTime,
 };
 
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -30,19 +29,13 @@ use super::{
 };
 
 /// The directory of the records in the cache.
-pub const EXT_DIR: &str = "ext";
+pub const EXT_DIR: &str = super::layout::EXTERNAL;
 
 /// The format of the records, which their path has: a server of another format finds none.
 const INDEX_FORMAT: u32 = 1;
 
 /// The index of a record in its directory.
 const INDEX: &str = "record.json";
-
-/// The file whose time tells when a record was last read, for the GC (requirement R-CA-5).
-const USED: &str = "used";
-
-/// How often a read of a record is noted, at most, for each record in a process.
-const NOTE_EVERY: Duration = Duration::from_hours(1);
 
 /// What the external tool builds, as the query tools look it up (requirement R-WS-10).
 ///
@@ -801,9 +794,6 @@ pub fn write_file<T: Serialize>(
     }
 }
 
-/// The records noted as read, and when, in this process.
-static NOTED: Mutex<Vec<(PathBuf, Instant)>> = Mutex::new(Vec::new());
-
 /// Notes that the record of `key` in `cache` is read now, as when it was read before and kept
 /// (requirement R-CA-5), at most once in a while, as the reads of the files do.
 ///
@@ -812,23 +802,10 @@ pub fn note_read(cache: &Cache, key: &Key) {
     note_use(&key.dir(cache.dir()));
 }
 
-/// Notes that the record in `dir` is read now, at most once in [`NOTE_EVERY`] in this process
+/// Notes that the record in `dir` is read now, at most once in a while in this process
 /// (requirement R-CA-5). A note that cannot be written is logged.
 fn note_use(dir: &Path) {
-    {
-        let mut noted = NOTED.lock();
-        if noted
-            .iter()
-            .any(|(noted, at)| noted == dir && at.elapsed() < NOTE_EVERY)
-        {
-            return;
-        }
-        noted.retain(|(noted, _)| noted != dir);
-        noted.push((dir.to_path_buf(), Instant::now()));
-    }
-    if let Err(error) = fs::write(dir.join(USED), b"") {
-        tracing::warn!(path = %dir.display(), %error, "the use of an external record could not be noted");
-    }
+    super::used::note(dir);
 }
 
 #[cfg(test)]
@@ -898,7 +875,7 @@ mod tests {
             panic!("not found");
         };
         assert_eq!(found.record.sha256, built.record.sha256);
-        assert!(key.dir(dir.path()).join(USED).is_file());
+        assert!(key.dir(dir.path()).join(crate::data::used::USED).is_file());
         // Another build published there since.
         publish(dir.path(), b"{ }");
         assert!(matches!(read(&cache, &key), Recorded::Broken(_)));

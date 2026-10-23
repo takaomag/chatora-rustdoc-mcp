@@ -1714,6 +1714,32 @@ Claude Code 2.1.304、Linux で測った。
 9. `cache clear crate@版` は、その release の docs.rs の JSON (全 target)・派生物・`.crate` と展開・外のツールの記録を消す。版を省いた `cache clear crate` はその crate の全版
 10. `cache ls` は人向けの表 (分類ごとの合計と上限に対する使用量、大きいもの上位 N 件)。JSON は出さない
 
+**F1a の下調べと決定 (2026-10-23)**:
+
+- 下調べ (サブエージェント、読むだけ。要点は scratchpad の f1a-research.md): キャッシュの直下は `docs.rs`・`index.crates.io`・`static.crates.io`・`std`・`toolchains`・`locks`・`procs`・`work`・`t`・`local`・`ext` の 11 個 (ログは state の側)。最後に使った時刻の印 (`used`) は `std` と `ext` だけにあり、`docs.rs`・`t`・`local` に無い。設定の `cache.docs_max_size`・`cache.target_max_size`・`cache.target_max_age_days` はまだ無い (容量の読み方 `parse_size` はある)。CLI は `serve` だけの手書きの解析。大きさを数える部品は無い (このリポジトリの target/ 5.6 万ファイルを温まった状態で 0.16 秒)
+- 利用者が決めたこと:
+  1. 所有マーカーは見えるファイル `chatora-rustdoc-mcp.cache` (中身は人向けの説明)。通常のファイルとしてあることだけで判じる。`CACHEDIR.TAG` は別に置く (cargo の target dir も持つので印にしない)
+  2. `cache.target_max_age_days` の 0 は誤りとして既定 (30) に戻す (`log.retention_days` と同じ)
+  3. マーカーの無い既存のキャッシュの引き取りは、サーバーの起動時に裏で (ローカルビルドの機能が無い構成でも)。新しいキャッシュには最初から書く
+- 聞かずに決めたこと (下調べの推奨のとおり): 引き取るときの既知の名前は 11 個とマーカーと `CACHEDIR.TAG`、それらの一時ファイル、OS が作るもの (`.DS_Store`・`Thumbs.db`・`desktop.ini`)。stdio のテストがキャッシュに置く `config.toml`・`logs/` は外に移す。大きさは見かけの大きさ (Unix は hard link を 1 回)。target dir にはビルドの番で `used` と表示用の `about.json` (workspace と target) を書く。index と `.crate` は `used` を書かず `.meta.json` と取得時の mtime で判じる。`cache ls` の上位は 10 件で固定。表示は 1000 の冪 (設定の `"5GB"` と同じ)。`toolchains/` は docs に数えるが LRU では消さない
+
+**F1a (印と `cache ls`。2026-10-23)**:
+
+- `data::layout`: 直下の名前の定数 (既存の `TARGET_DIRS`・`LOCAL_DIR`・`EXT_DIR`・`WORK_DIR`・`RECORDS_DIR`・`LOCKS_DIR` はその別名に、`docs.rs` などの直書きも置き換えた)・`Class {Docs, Targets, Kept}` と `class_of`・所有マーカーと `CACHEDIR.TAG`・`claim` (無いか空なら作る、マーカーがあれば持ち主、知っている名前だけなら引き取る、知らない名前があれば `Foreign` で何も書かない)・`unknown_names`・`Limits` (3 つの設定、誤りは既定に戻す)。サーバーは起動時に裏で `claim` する (ローカルビルドの機能が無くても)
+- `data::used`: `used` の印を 1 か所に (プロセスの中で場所ごとに 1 時間に 1 回、消えた場所は作り直さない、`last_used` は `used` が無ければ中の最新の時刻)。std と外の記録の 2 つの写しをこれに寄せた。印を書く場所を足した: アーカイブを開くとき (`load::open_archived`・`archived`・`archive_from`。docs.rs と照会のツールのローカルビルド)、target dir の番 (`build::take_turn` → `note_target_dir`。`about.json` に workspace と target)
+- `data::inventory`: 場所ごとの在庫 (種類・分類・大きさ・最後に使った時刻・説明)。symlink をたどらず、Unix は hard link を 1 回だけ数える。期限を過ぎたら `complete: false`。旧配置 (`docs.rs/<名前>/<版>/rustdoc.json` など) と他の形式の版 (`local/v2` など) を見分ける
+- CLI: `src/cli.rs` の `cache ls` (分類ごとの使用量と上限、target dir の日数を超えた数、大きいもの 10 件と最後の使用と説明)。出力は文字列で返し、バイナリが書く (stdout は `serve` の MCP のためなので、ライブラリは書かない)。`help`・`-h`・`--help` は使い方を stdout に。手元のキャッシュで読めることを確かめた (旧配置の rustdoc.json も見分けた)
+- テスト: 単体 (claim の 4 つの場合・cargo の target dir を引き取らない・Limits・used の間引き・在庫の分類と大きさと symlink と hard link と期限・表の整形)、stdio (`cache_ls_tells_what_the_cache_has`・`the_server_owns_its_cache_directory`)。stdio のテストのサーバーの設定とログをキャッシュの外 (`Server.state`) に移した
+- レビュー (サブエージェント、読むだけ) の対応: (1) `cache ls` のパスは OS によらず `/` でつなぐ (Windows で `\` になり stdio のテストが落ちる見込みだった) (2) `ext/v1/alias`・`ext/v1/git_commits` は今の版のもの (ファイルなので古い配置と見えていた。消すと名前を変えた workspace の照会が壊れる)。`local/v1`・`ext/v1` の想定の外のものは古い配置でなく知らないもの (触らない)。古い配置は知っている形 (`docs.rs/<名前>/<版>/rustdoc.json`) だけ (3) `used` の 1 時間の枠を std の置き場で取り合っていた (load の印が先に取ると、std の「ロックの下で書く」と古い nightly の片付けが飛ぶ)。load の `archived`・`archive_from` では印さず、照会のツールのビルドは query/local.rs の `archive`・`rebuilding` で印す (4) `cache ls` で上限の設定の誤りが出なかった (`report` の後に読んでいた) (5) 大きな日数で `Duration::from_hours` が panic する。秒に飽和で (6) 自分のものでないディレクトリ (誤って $HOME を指すなど) をたどって数えない: 知らないものは大きさを数えない (表では `-`) (7) 一番上の `local`・`ext`・`std` が symlink でもたどっていた。一番上の symlink は知らないものとして触らない (8) `t`・`work` のような他の道具も使う名前だけのディレクトリは引き取らない: `docs.rs`・`index.crates.io`・`static.crates.io`・`toolchains`・`procs` のどれかが要る。これに伴い、起動時の引き取りを、サーバーが `locks`・`work` を作る前に待って済ませる形にした (裏で走らせると、新しいキャッシュが `locks`・`work` だけになって判定がぶれる) (9) `about.json` はビルドのロックを持っている間に書く (消された target dir を作り直さない)。仮のプロジェクトが共有する target dir には書かない (10) `PROBES_DIR` も `layout::TOOLCHAINS` から
+
+**F1〜F6 の外の残りの行き先 (2026-10-23、利用者が 1 件ずつ決めた)**:
+
+1. 出力のサニタイズ (R-SEC-7 の MUST、未実装) は M2f に入れる。F6 (README) の前に段を 1 つ足す (F7 とする)
+2. 呼び出しの上限を超えたとき「ビルドを待っているなら `status: building`」(R-SEC-7) は入れず、要件を `busy` (`retry_after_secs: 1`) のままに改める (上限を超えた応答は何を待つかを知る前に返すため)
+3. 設定 `search.scope`・`build.prefer_local` は M2 の後 (M3 以降) に回し、要件にそう書く。README の設定の表には載せない
+4. 「(in a later version)」を返す 9 か所 (名指しできない path・git の依存など) は文言を残し、どの版かは書かない。要件と m2-plan に「M3 以降で対応を検討」と書く
+5. 揺れるテスト 2 件 (Windows の孫のテスト、stdio のテストを並べたときだけ落ちる building のテスト) は M2f の中で原因を直す
+
 ## 7. M2 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める
@@ -1744,6 +1770,9 @@ Claude Code 2.1.304、Linux で測った。
    - R-MCP-3 の鍵と照合の文 (634 行の「記録の種類ごとの鍵の組、照合の絞り込み、プロジェクトのディレクトリが消えたときの扱いは M2 で決める」): 鍵の組は上と E1〜E4 の `Key` の一覧で、照合は記録した入力の digest (ファイルの長さか時刻が変わったものだけ hash し直す) と `members` の glob。workspace の入力が変わったら古い記録で答えて `stale: inputs_changed` (E4b-3 の決定 1)
    - §7.3・§8・R-MCP-3 の project_missing (847 行の「扱いは M2」と 877 行の `project_not_found` の「M2 で決める」): root の Cargo.toml が消えたら、記録した別名 (渡したパス・root・member のディレクトリ・渡したパスの下の member) で引き、記録で答えて `stale: project_missing` と、移した先のパスで `build_external_docs` を呼ぶ案内 (E4b-3 の決定 2)。member のディレクトリだけ消えたら `inputs_changed`。Cargo.toml が壊れているときは別名に落ちず `project_not_found`。別名はあるが記録が無いパスと、記録の無いパスは `project_not_found`。移した先の新しいパスは別の workspace (`no_record`。E4b-3b の決定 2)。外のツールは消えたパスを `project_not_found` で断る
    - R-QA-5 (E4b-4): real_data は `tests/fixtures/other-workspace` を一時ディレクトリに写して外の workspace の問いをする (fixture の場で cargo を動かさない)
+   - R-SEC-7: 呼び出しの上限を超えたときは `busy` のまま (「ビルドを待っているなら `status: building`」を消す。M2f の残りの決定 2)。出力のサニタイズは M2f の F7 の実装に合わせる
+   - §9 と R-DS-1・R-SR-2: `search.scope`・`build.prefer_local` は M3 以降 (M2f の残りの決定 3)。「(in a later version)」の 9 か所は M3 以降で対応を検討 (決定 4)
+   - R-CA-5・R-DIST-2・§9 (F1): キャッシュの CLI (`cache ls`・`gc`・`clear`)、所有マーカー `chatora-rustdoc-mcp.cache` と引き取りの条件、`used` の印、2 つの上限と日数 (0 は誤り)、F1 の決定 1〜10 と F1a の決定
    - §12 の M2 の到達点と、M3 以降に回したもの
 3. README を合わせる (F6)。公開は M3 の後にまとめて行う (P9。利用者が行う)
 4. M3 の計画を立てる

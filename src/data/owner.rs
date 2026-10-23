@@ -22,11 +22,11 @@ use super::{
 };
 
 /// The directory of the work directories in the cache, one directory for each server.
-pub const WORK_DIR: &str = "work";
+pub const WORK_DIR: &str = super::layout::WORK;
 
 /// The directory of the records of the servers' children in the cache. The records of each
 /// format are in a directory `v<format>` of their own (decided in C1).
-pub const RECORDS_DIR: &str = "procs";
+pub const RECORDS_DIR: &str = super::layout::RECORDS;
 
 /// The format of the records that this version writes.
 pub const RECORDS_FORMAT: u32 = 1;

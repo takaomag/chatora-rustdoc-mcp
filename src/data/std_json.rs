@@ -6,10 +6,9 @@ use std::{
     fs::{self, File},
     io::{self, Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
-use parking_lot::Mutex;
 use semver::Version;
 
 #[cfg(feature = "local")]
@@ -33,13 +32,7 @@ const MAX_DAYS_BACK: u32 = 30;
 const UNUSED_FOR: Duration = Duration::from_hours(7 * 24);
 
 /// The file in the directory of a nightly's std whose time tells when it was last used.
-const USED_FILE: &str = "used";
-
-/// How often the use of a nightly is noted, and the old ones looked for, by a process.
-const NOTE_EVERY: Duration = Duration::from_hours(1);
-
-/// When this process last noted a use, by directory.
-static NOTED: Mutex<Vec<(PathBuf, Instant)>> = Mutex::new(Vec::new());
+const USED_FILE: &str = super::used::USED;
 
 /// The JSON of std that was chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +84,7 @@ impl StdJson {
             Self::Local(local) => {
                 let dir = cache
                     .dir()
-                    .join("std")
+                    .join(super::layout::STD)
                     .join("local")
                     .join(&*local.rustc.commit_hash)
                     .join(local.rustc.host.as_str());
@@ -281,19 +274,11 @@ async fn local(
 }
 
 /// Notes that the std in `dir` (that of one nightly for one target) is used now, and removes the
-/// std of the nightlies unused for [`UNUSED_FOR`], at most once in [`NOTE_EVERY`] for each
-/// directory, on a blocking thread that the call does not wait for.
+/// std of the nightlies unused for [`UNUSED_FOR`], at most once in [`super::used::NOTE_EVERY`] for
+/// each directory, on a blocking thread that the call does not wait for.
 fn note_use(cache: &Cache, dir: PathBuf) {
-    {
-        let mut noted = NOTED.lock();
-        if noted
-            .iter()
-            .any(|(noted, at)| *noted == dir && at.elapsed() < NOTE_EVERY)
-        {
-            return;
-        }
-        noted.retain(|(noted, _)| *noted != dir);
-        noted.push((dir.clone(), Instant::now()));
+    if !super::used::due(&dir) {
+        return;
     }
     let cache = cache.clone();
     drop(crate::task::spawn_blocking(move || {
@@ -303,8 +288,12 @@ fn note_use(cache: &Cache, dir: PathBuf) {
             tracing::warn!(path = %dir.display(), %error, "the use of a nightly's std could not be noted");
         }
         drop(held);
-        if let Err(error) = remove_unused(&cache, &cache.dir().join("std"), &dir, SystemTime::now())
-        {
+        if let Err(error) = remove_unused(
+            &cache,
+            &cache.dir().join(super::layout::STD),
+            &dir,
+            SystemTime::now(),
+        ) {
             tracing::warn!(%error, "the std of old nightlies could not all be removed");
         }
     }));
@@ -435,7 +424,10 @@ async fn readable_nightly(
     let Some(format) = format_in(&latest.dir).filter(|format| !readable(*format)) else {
         return latest;
     };
-    let kept = cache.dir().join("std").join(format!("readable-{target}"));
+    let kept = cache
+        .dir()
+        .join(super::layout::STD)
+        .join(format!("readable-{target}"));
     let remembered = {
         let (cache, kept) = (cache.clone(), kept.clone());
         crate::task::spawn_blocking(move || match cache.read_verified(&kept) {

@@ -29,6 +29,7 @@ use crate::data::{
     rustdoc_json,
     target::TargetTriple,
     toolchain::{self, ChooseError, Chosen, Kind, Mismatch, Missing, Programs, ProgramsError},
+    used,
 };
 
 /// What a member's build is made for.
@@ -272,6 +273,8 @@ pub async fn rebuilding(cache: &Cache, wanted: &LocalWanted) -> Option<LocalBuil
         .map(|(_, before)| Arc::clone(before))?;
     let Built { json, record, .. } = Built::clone(&before);
     let dir = json.parent().unwrap_or(&json).to_path_buf();
+    // For the garbage collection, which removes the least recently used (decided in M2f's F1, 3).
+    used::note_later(&dir);
     let mapped = load::archived(
         cache,
         &dir,
@@ -1337,6 +1340,8 @@ async fn archive(
         record.format_version.to_string(),
     );
     let (path, dir) = (json.clone(), json.parent().unwrap_or(&json).to_path_buf());
+    // For the garbage collection, which removes the least recently used (decided in M2f's F1, 3).
+    used::note_later(&dir);
     let checked = sha256.clone();
     let mapped = load::archive_from(&cache, &dir, &stem, &sha256, move || {
         read_checked(&path, &checked)

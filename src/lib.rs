@@ -7,6 +7,7 @@
 //! [`mcp`] → [`query`] → [`data`]. [`config`], [`logging`] and [`task`] are shared by all of
 //! them.
 
+pub mod cli;
 pub mod config;
 pub mod data;
 pub mod logging;
