@@ -63,9 +63,16 @@ impl Client {
     pub(crate) fn start(project: Option<&Path>, logs: &Path) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"));
         // Not the config file of the user who runs the tests (requirement R-DIST-3). The cache
-        // is still the one of the environment.
+        // is still the one of the environment. A call waits for builds for minutes, as a slow
+        // runner builds the workspace outside the project for longer than the default, and
+        // `build_external_docs` then answers that its crates are still built rather than
+        // `status: building`, which a call is made again for.
         let config = logs.join("config.toml");
-        std::fs::write(&config, "").expect("written");
+        std::fs::write(
+            &config,
+            "[limits]\nrequest_timeout_secs = 300\n\n[build]\nwait_secs = 180\n",
+        )
+        .expect("written");
         command.env("CHATORA_RUSTDOC_MCP_CONFIG", config);
         match project {
             Some(project) => command.env("CLAUDE_PROJECT_DIR", project),
