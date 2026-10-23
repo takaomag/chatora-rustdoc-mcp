@@ -688,19 +688,34 @@ async fn a_member_that_failed_as_its_sources_were_edited_is_not_found_failed() {
     };
     let members = Members::in_dir(&dir).await;
     let package = dir.join("local-build/ws/one");
-    // A build script that sleeps, so that the sources are edited after the key is taken, and
-    // before rustdoc reads them.
+    // A build script that tells that it started and waits to be let go, so that the sources are
+    // edited after the key is taken, and before rustdoc reads them, however long each step takes.
+    let signals = dir.join("signals");
+    fs::create_dir_all(&signals).expect("made");
     fs::write(
         package.join("build.rs"),
-        "fn main() { std::thread::sleep(std::time::Duration::from_secs(3)); }\n",
+        format!(
+            "fn main() {{\n    let signals = std::path::Path::new(r\"{}\");\n    \
+             std::fs::write(signals.join(\"started\"), \"\").unwrap();\n    \
+             for _ in 0..1200 {{\n        if signals.join(\"go\").exists() {{\n            \
+             return;\n        }}\n        \
+             std::thread::sleep(std::time::Duration::from_millis(100));\n    }}\n}}\n",
+            signals.display()
+        ),
     )
     .expect("written");
     let source = package.join("src/lib.rs");
     let fine = fs::read_to_string(&source).expect("readable");
     let broken = format!("{fine}\npub fn broken() -> Missing {{}}\n");
     let (joined, ()) = tokio::join!(members.joined("one"), async {
-        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        for _ in 0..1200 {
+            if signals.join("started").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         fs::write(&source, &broken).expect("written");
+        fs::write(signals.join("go"), "").expect("written");
     });
     let Joined::Done(Err(error)) = &joined else {
         panic!("failed: {joined:?}");

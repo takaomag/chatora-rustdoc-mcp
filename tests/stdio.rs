@@ -3850,6 +3850,79 @@ fn looked_up_outside_for_another_target(server: &mut Server, project: &str) {
         result["structuredContent"]["provenance"]["source"], "local",
         "{result}"
     );
+    // Searched for it, the proc macro is the host's record (decided in M2e's E4b-3b).
+    let search = json!({ "query": "only_wasm", "project": project, "target": OTHER_TARGET });
+    server.send(&call_tool(410, "search_items", search));
+    let result = server.response(410)["result"].clone();
+    let sources = result["structuredContent"]["provenance"]["sources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let target_of = |krate: &str| {
+        sources
+            .iter()
+            .find(|source| source["crate"] == krate)
+            .map(|source| source["target"].clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(target_of("macros"), host_triple(), "{result}");
+    assert_eq!(target_of("wasmonly"), OTHER_TARGET, "{result}");
+}
+
+/// A search of a workspace outside the default project tells of each crate what became of it as
+/// `build_external_docs` recorded it: one whose build failed is failed, with how to build it again
+/// with that tool, and one whose sources changed since is stale, while the workspace is not
+/// (decided in M2e's E4b-3b, 3).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn a_search_of_a_workspace_outside_tells_what_became_of_each_crate() {
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let outside = workspace_for_wasm(dir.path(), &registry);
+    std::fs::write(
+        outside.join("macros/src/lib.rs"),
+        "pub fn broken() -> Missing {}\n",
+    )
+    .expect("written");
+    let default = workspace_of("user");
+    let mut server = server_in_on(Some(default.path()), &registry, dir.path());
+    let project = outside.display().to_string();
+    built_by_external(&mut server, 1, &json!({ "project": project }));
+    std::fs::write(
+        outside.join("src/lib.rs"),
+        "pub fn everywhere() {}\n#[cfg(target_arch = \"wasm32\")]\npub fn on_wasm() {}\n\
+         pub fn added() {}\n",
+    )
+    .expect("written");
+    let search = json!({ "query": "everywhere", "project": project });
+    server.send(&call_tool(100, "search_items", search));
+    let result = server.response(100)["result"].clone();
+    let content = &result["structuredContent"];
+    assert!(content["provenance"].get("stale").is_none(), "{result}");
+    let sources = content["provenance"]["sources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let of = |krate: &str| {
+        sources
+            .iter()
+            .find(|source| source["crate"] == krate)
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert_eq!(of("app")["stale_reason"], "inputs_changed", "{result}");
+    assert_eq!(of("macros")["status"], "failed", "{result}");
+    assert!(
+        content["hints"]
+            .to_string()
+            .contains("call build_external_docs with"),
+        "{result}"
+    );
+    assert!(
+        !content["hints"].to_string().contains("refresh"),
+        "{result}"
+    );
+    assert!(server.finish().success());
 }
 
 /// Once the directory of a workspace outside the default project is gone, the query tools read what
