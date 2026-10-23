@@ -570,6 +570,11 @@ mod tests {
 
     /// A command that starts a grandchild that runs for minutes, writes the grandchild's process
     /// ID to `pid_file`, and waits for it.
+    ///
+    /// On Windows, it is this test binary ([`start_a_grandchild_for_another_test`]), which starts
+    /// at once, where PowerShell took more than 30 seconds on a busy runner, and which tells why
+    /// it failed in the file next to `pid_file` with `.err`. It starts the grandchild once it
+    /// reads a line, which the test writes when the child is in its job.
     fn with_grandchild(pid_file: &Path) -> tokio::process::Command {
         #[cfg(unix)]
         let mut command = {
@@ -578,47 +583,82 @@ mod tests {
                 "-c",
                 &format!("sleep 300 & echo $! > '{}'; wait", pid_file.display()),
             ]);
+            command.stdin(Stdio::null()).stderr(Stdio::null());
             command
         };
         #[cfg(windows)]
         let mut command = {
-            let mut command = tokio::process::Command::new("powershell");
-            command.args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "$p = Start-Process -PassThru -NoNewWindow ping -ArgumentList '-n','300',\
-                     '127.0.0.1'; Set-Content -Path '{}' -Value $p.Id; Wait-Process -Id $p.Id",
-                    pid_file.display()
-                ),
-            ]);
+            let mut command =
+                tokio::process::Command::new(std::env::current_exe().expect("the test binary"));
+            command
+                .args([
+                    "data::child::tests::start_a_grandchild_for_another_test",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(PID_FILE, pid_file)
+                .stdin(Stdio::piped())
+                .stderr(std::fs::File::create(pid_file.with_extension("err")).expect("created"));
             command
         };
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        command.stdout(Stdio::null());
         prepare(&mut command);
         command
+    }
+
+    /// The environment variable that tells [`start_a_grandchild_for_another_test`] where to write
+    /// the grandchild's process ID.
+    #[cfg(windows)]
+    const PID_FILE: &str = "CHATORA_RUSTDOC_TEST_PID_FILE";
+
+    /// Not a test by itself: the child of [`dropping_a_child_stops_its_grandchildren`] on
+    /// Windows, which starts a grandchild once it reads a line, writes its process ID, and waits
+    /// for it.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "started by dropping_a_child_stops_its_grandchildren"]
+    fn start_a_grandchild_for_another_test() {
+        let Some(pid_file) = std::env::var_os(PID_FILE) else {
+            return;
+        };
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).expect("a line");
+        let mut grandchild = std::process::Command::new("ping")
+            .args(["-n", "300", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the grandchild starts");
+        let pid_file = Path::new(&pid_file);
+        // Written whole, then named, so that it is not read in part.
+        let written = pid_file.with_extension("tmp");
+        std::fs::write(&written, format!("{}\n", grandchild.id())).expect("written");
+        std::fs::rename(&written, pid_file).expect("named");
+        // Until the test stops it with its job.
+        grandchild.wait().expect("waited");
     }
 
     /// Whether the process `pid` runs.
     fn alive(pid: &str) -> bool {
         #[cfg(unix)]
-        let mut check = std::process::Command::new("sh");
-        #[cfg(unix)]
-        check.args(["-c", &format!("kill -0 {pid} 2>/dev/null")]);
+        {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+                .status()
+                .expect("the check runs")
+                .success()
+        }
+        // Not PowerShell, which may take long to start.
         #[cfg(windows)]
-        let mut check = std::process::Command::new("powershell");
-        #[cfg(windows)]
-        check.args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} exit 1"
-            ),
-        ]);
-        check.status().expect("the check runs").success()
+        {
+            let output = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+                .output()
+                .expect("the check runs");
+            String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+        }
     }
 
     /// Whether the process `pid` runs, not as a zombie: one that was killed and waits for this
@@ -712,16 +752,30 @@ mod tests {
     async fn dropping_a_child_stops_its_grandchildren() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let pid_file = dir.path().join("grandchild");
-        let child = spawn(with_grandchild(&pid_file)).await.expect("started");
+        let mut child = spawn(with_grandchild(&pid_file)).await.expect("started");
+        // In its job now, which what it starts is in too.
+        #[cfg(windows)]
+        {
+            use tokio::io::AsyncWriteExt as _;
+            let mut stdin = child.child.stdin.take().expect("piped");
+            stdin.write_all(b"go\n").await.expect("written");
+        }
         let read = || {
             std::fs::read_to_string(&pid_file)
                 .ok()
+                .filter(|pid| pid.ends_with('\n'))
                 .map(|pid| pid.trim().to_owned())
-                .filter(|pid| !pid.is_empty())
         };
+        let mut ended = None;
+        let started = wait_for(Duration::from_secs(30), || {
+            ended = child.child.try_wait().ok().flatten();
+            ended.is_some() || read().is_some()
+        })
+        .await;
         assert!(
-            wait_for(Duration::from_secs(30), || read().is_some()).await,
-            "the grandchild started"
+            started && read().is_some(),
+            "the grandchild started; the child ended with {ended:?}: {}",
+            std::fs::read_to_string(pid_file.with_extension("err")).unwrap_or_default()
         );
         let pid = read().expect("its ID");
         assert!(alive(&pid), "the grandchild runs");
