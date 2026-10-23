@@ -537,6 +537,34 @@ impl Members {
     }
 }
 
+/// Waits until the dep-info of `built` is recorded, and returns when its inputs were taken then:
+/// by its record only, not by a call, whose check of the sources reads them while the run for the
+/// dep-info may write one again (a build script writes `src/gen.rs`), which a check that reads it
+/// half written takes for a change, and builds again.
+async fn taken_once_told(built: &chatora_rustdoc_mcp::query::local::LocalBuilt) -> u128 {
+    let dir = built.json.parent().expect("a directory").to_path_buf();
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(120))
+        .expect("a time");
+    loop {
+        if let Some(published) = build::published(&dir)
+            && published.record.dep_info
+        {
+            return published
+                .record
+                .inputs
+                .as_ref()
+                .expect("the inputs are recorded")
+                .taken_at;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dep-info is not recorded"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// When the inputs of `built` were taken: the same for the same build.
 fn taken(built: &chatora_rustdoc_mcp::query::local::LocalBuilt) -> u128 {
     built
@@ -930,8 +958,7 @@ async fn a_build_script_that_writes_in_its_package_does_not_make_it_built_again(
     )
     .expect("written");
     let first = members.built("one").await;
-    let told = members.told("one").await;
-    assert_eq!(taken(&told), taken(&first));
+    assert_eq!(taken_once_told(&first).await, taken(&first));
     for _ in 0..3 {
         assert_eq!(taken(&*members.built("one").await), taken(&first));
     }

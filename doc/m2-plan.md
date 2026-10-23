@@ -1796,6 +1796,9 @@ Claude Code 2.1.304、Linux で測った。
 - 揺れるテストの直しと F1c-2 の CI の直しは 222f34a
 - Windows の孫のテスト (`dropping_a_child_stops_its_grandchildren`): 失敗は 1 回 (遅い runner で、子の PowerShell が 30 秒以内に孫の pid を書かなかった。stderr を捨て子の終了も見ていないので、遅さか途中の失敗かは見分けられなかった)。Windows の子を PowerShell からテストのバイナリ自身 (`start_a_grandchild_for_another_test`、`#[ignore]`) に替え、stdin の 1 行を待ってから `ping` を孫として起動し、pid を書いて名前を付ける。テストは子が Job Object に入った後 (`spawn` の後) に 1 行を送るので、速い子でも孫はジョブの中。生きているかの確かめは `tasklist` に。待ちの間に子が終わったら、その stderr (`grandchild.err`) を付けてすぐ落とす。Unix の側は今のまま (pid のファイルは改行まで読む形にそろえた)。Windows のコードは手元で組み立てられない (mingw の C コンパイラが無い) ので CI で確かめる
 - 6652ae2 の CI: Windows の check は今回の Windows だけのコードの lint (`std::io::stdin` の余分な修飾、`io` は読み込み済み) で落ちた。直した (手元では Windows を組み立てられない)。ubuntu の check で tests/local の `a_build_script_that_writes_in_its_package_does_not_make_it_built_again` が落ちた (local_build.rs:934、dep-info を待つ `told` の結果が最初のビルドと別: 作り直された)。今回の変更とは関わらず、これまでの CI では通っていた。3 つ目の揺れるテストの候補
+- 58f54f4 の CI: Windows の孫のテストは通った (PowerShell に頼る揺れは直った)。Windows の check は別のテスト `toolchain::tests::the_format_of_the_rustdoc_here_is_probed_and_kept` で落ちた (`rustdoc -vV did not finish in 10 seconds`、スイートの開始直後の負荷)
+- tests/local の揺れ (`a_build_script_that_writes_in_its_package_does_not_make_it_built_again`) の原因: dep-info を待つ `told` が呼び出し (鮮度の判定) を繰り返し、dep-info の実行で build script が `src/gen.rs` を書き直す途中 (空にしてから書く) を読むと、変わったと見て作り直す。鮮度の判定は正しく、余分な作り直しが一度起きるだけ。テストは dep-info の記録を置き場の記録のファイルだけで待つ (`taken_once_told`)。build script が空にしてから 0.5 秒待って書く形で、直す前は 5 回とも落ち、直した後は 5 回とも通ることを確かめた
+- 利用者が決めたこと: `rustc -vV`・`rustdoc -vV` の上限 10 秒 (R-TG-1) は製品ではそのまま。形式の調べのテストは、時間切れのときだけ覚えた失敗 (60 秒) を忘れさせて 1 回試し直す。(選択肢の説明で「失敗は覚えない」と書いたのは誤りで、正しくは 60 秒覚える。利用者に伝えた)
 - 利用者が決めたこと: 子を Job Object に入れる前に子が起動したプロセスがジョブの外に出る製品の隙間 (起動から割り当てまでの一瞬) は、M3 以降に回す (`CREATE_SUSPENDED` で起動し、割り当ての後にスレッドを再開する形。Windows だけの API を手元で確かめられないまま M2 の終わりに入れない)。§7 で要件の残りに書く
 
 **F3 の下調べと F3a (2026-10-23)**:

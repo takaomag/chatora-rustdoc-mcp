@@ -1064,13 +1064,23 @@ mod tests {
     }
 
     /// The rustdoc here writes a format, which is kept by its commit (decided in M2's D1).
+    ///
+    /// Tried once more when it does not answer within the limit, as rustup on a busy Windows
+    /// runner took longer: the limit stays that of the product (decided in M2f).
     #[tokio::test]
     async fn the_format_of_the_rustdoc_here_is_probed_and_kept() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let cache = Cache::at(dir.path());
-        let format = format_of(Path::new("rustdoc"), None, dir.path(), &cache, dir.path())
-            .await
-            .expect("probed");
+        let probe = || format_of(Path::new("rustdoc"), None, dir.path(), &cache, dir.path());
+        let format = match probe().await {
+            Err(ProbeError::Failed(why)) if why.contains("did not finish") => {
+                // Kept for a minute, as every failure of rustdoc here.
+                tool::forget_failures();
+                probe().await
+            },
+            probed => probed,
+        }
+        .expect("probed");
         assert!(format >= *rustdoc_json::SUPPORTED.start(), "{format}");
         let kept: Vec<_> = std::fs::read_dir(dir.path().join(PROBES_DIR))
             .expect("kept")
