@@ -1,0 +1,30 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+extra = ["dep:optdep"]
+
+# Built for every target: the positive control.
+[dependencies]
+inscope = { path = "../../deps/inscope" }
+# Only with the features of `[package.metadata.docs.rs]`, which the query tools do not build with.
+optdep = { path = "../../deps/optdep", optional = true }
+
+# Only for another target than the host's.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasmonly = { path = "../../deps/wasmonly" }
+
+# Build-dependencies, built for the host, whose cfg cargo takes of the host, whatever
+# `build.target` is: `hostcfg` is built, the positive control, and `wasmbuild` is not, even when
+# `build.target` is wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.build-dependencies]
+hostcfg = { path = "../../deps/hostcfg" }
+
+[target.'cfg(target_arch = "wasm32")'.build-dependencies]
+wasmbuild = { path = "../../deps/wasmbuild" }
+
+[package.metadata.docs.rs]
+features = ["extra"]

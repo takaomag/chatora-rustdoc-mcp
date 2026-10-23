@@ -1,0 +1,6 @@
+# The workspace of the trap tests (doc/m2-plan.md F2): each dependency's build script writes a
+# mark, which the test puts in place, so that what the query tools build is seen. The test copies
+# it, sets `resolver` to "1" and "2", and may set `build.target` to another target than the host.
+[workspace]
+members = ["app"]
+resolver = "2"

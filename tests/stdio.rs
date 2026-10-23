@@ -1004,6 +1004,207 @@ fn lookups_start_nothing_for_a_project_outside_the_default_one() {
     assert!(server.finish().success());
 }
 
+/// The dependencies of the fixture of the trap tests, whose build scripts mark that they ran.
+#[cfg(feature = "local")]
+const TRAPPED: [&str; 5] = ["hostcfg", "inscope", "optdep", "wasmbuild", "wasmonly"];
+
+/// Copies the directory `from` into `to`.
+#[cfg(feature = "local")]
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("made");
+    for entry in std::fs::read_dir(from).expect("readable") {
+        let entry = entry.expect("readable");
+        let path = entry.path();
+        if path.is_dir() {
+            copy_tree(&path, &to.join(entry.file_name()));
+        } else {
+            std::fs::copy(&path, to.join(entry.file_name())).expect("copied");
+        }
+    }
+}
+
+/// The workspace of the trap tests (`tests/fixtures/traps`) in a new temporary directory, with the
+/// feature resolver `resolver`, `build.target` set to `target` if given, and a Cargo.lock: the
+/// build script of each of its dependencies ([`TRAPPED`]) writes a mark of its name in the
+/// directory of marks, which is returned with the temporary directory (doc/m2-plan.md F2).
+#[cfg(feature = "local")]
+fn trap_workspace(resolver: &str, target: Option<&str>) -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("a temporary directory");
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/traps"),
+        dir.path(),
+    );
+    let ws = dir.path().join("ws");
+    let manifest = std::fs::read_to_string(ws.join("Cargo.toml")).expect("readable");
+    std::fs::write(
+        ws.join("Cargo.toml"),
+        manifest.replace("resolver = \"2\"", &format!("resolver = \"{resolver}\"")),
+    )
+    .expect("written");
+    let marks = dir.path().join("marks");
+    std::fs::create_dir_all(&marks).expect("made");
+    for dependency in TRAPPED {
+        std::fs::write(
+            dir.path().join("deps").join(dependency).join("build.rs"),
+            format!(
+                "fn main() {{\n    std::fs::write({:?}, \"\").unwrap();\n}}\n",
+                marks.join(dependency).to_str().expect("UTF-8")
+            ),
+        )
+        .expect("written");
+    }
+    if let Some(target) = target {
+        set_cargo_settings(&ws, &format!("[build]\ntarget = \"{target}\"\n"));
+    }
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&ws)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    (dir, marks)
+}
+
+/// Calls `tool` with `arguments` in `server`, from `id` on, again while it tells `status:
+/// building`; returns its result.
+#[cfg(feature = "local")]
+fn called_until_done(server: &mut Server, id: u64, tool: &str, arguments: &Value) -> Value {
+    let mut result = Value::Null;
+    for next in id..id.saturating_add(90) {
+        server.send(&call_tool(next, tool, arguments.clone()));
+        result = server.response(next)["result"].clone();
+        if result["structuredContent"]["status"] != "building"
+            && result["structuredContent"]
+                .get("retry_after_secs")
+                .is_none()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    assert_ne!(
+        result["structuredContent"]["status"], "building",
+        "{tool}: {result}"
+    );
+    result
+}
+
+/// The marks of the build scripts that ran, in the directory `marks`, sorted.
+#[cfg(feature = "local")]
+fn marks_in(marks: &Path) -> Vec<String> {
+    let mut found: Vec<String> = std::fs::read_dir(marks)
+        .expect("readable")
+        .map(|entry| {
+            entry
+                .expect("readable")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Asks the query tools in the project at `ws`, offline, as it has path dependencies only: for its
+/// member, which they answer for, warning that the features of its `[package.metadata.docs.rs]`
+/// would build `optdep`, which they do not build with; and for each of `refused`, a dependency
+/// that its build does not build, which they refuse, as the reason tells. Then waits until the
+/// build scripts that ran, in the directory `marks`, are done marking.
+#[cfg(feature = "local")]
+fn asked_of_the_trap_workspace(ws: &Path, marks: &Path, refused: &[(&str, &str)]) {
+    let mut server = Server::start_with(Some(ws), &[(
+        "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE",
+        "true",
+    )]);
+    let answered = [
+        ("get_item", json!({ "crate": "app", "path": "app" })),
+        ("crate_overview", json!({ "crate": "app" })),
+        ("search_items", json!({ "query": "app" })),
+        ("list_crates", json!({ "scope": "all" })),
+    ];
+    for (id, (tool, arguments)) in (1_u64..).step_by(100).zip(&answered) {
+        let result = called_until_done(&mut server, id, tool, arguments);
+        assert_ne!(result["isError"], true, "{tool}: {result}");
+        if *tool == "get_item" {
+            let content = &result["structuredContent"];
+            assert!(warns(content, "would build optdep 0.1.0"), "{result}");
+        }
+    }
+    for (id, (dependency, reason)) in (1_000_u64..).step_by(100).zip(refused) {
+        let arguments = json!({ "crate": dependency, "path": dependency });
+        let result = called_until_done(&mut server, id, "get_item", &arguments);
+        assert_eq!(result["isError"], true, "{dependency}: {result}");
+        assert_eq!(
+            text_json(&result)["reason"],
+            *reason,
+            "{dependency}: {result}"
+        );
+    }
+    // What goes on after the answers, as the inputs of the builds, is done first.
+    let mut seen = None;
+    for _ in 0..60 {
+        let now = marks_in(marks);
+        if seen.as_ref() == Some(&now) {
+            break;
+        }
+        seen = Some(now);
+        thread::sleep(Duration::from_secs(2));
+    }
+    assert!(server.finish().success());
+}
+
+/// The query tools run the build scripts of the dependencies that the project's build builds, the
+/// positive control, but not of those that it does not: one for another target only, a
+/// build-dependency whose cfg the host does not meet, nor an optional one that only the features
+/// of `[package.metadata.docs.rs]` enable; with the feature resolver 1 and 2 (requirements R-QA-5
+/// and R-MCP-3, doc/m2-plan.md F2).
+#[cfg(feature = "local")]
+#[test]
+fn the_query_tools_run_no_build_script_outside_the_scope() {
+    for resolver in ["1", "2"] {
+        let (dir, marks) = trap_workspace(resolver, None);
+        asked_of_the_trap_workspace(&dir.path().join("ws"), &marks, &[
+            ("wasmonly", "build_unsupported"),
+            ("wasmbuild", "build_unsupported"),
+        ]);
+        assert_eq!(
+            marks_in(&marks),
+            ["hostcfg", "inscope"],
+            "resolver {resolver}"
+        );
+    }
+}
+
+/// For a project whose `build.target` is another target than the host, the query tools build for
+/// that target: they run the build scripts of its dependencies for it, the positive control, but
+/// not of a build-dependency for that target, whose cfg cargo takes of the host, which does not
+/// meet it; with the feature resolver 1 and 2 (requirements R-QA-5 and R-MCP-3, doc/m2-plan.md
+/// F2).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn the_query_tools_run_no_build_script_outside_the_scope_of_the_build_target() {
+    if !has_other_target() {
+        return;
+    }
+    for resolver in ["1", "2"] {
+        let (dir, marks) = trap_workspace(resolver, Some(OTHER_TARGET));
+        asked_of_the_trap_workspace(&dir.path().join("ws"), &marks, &[(
+            "wasmbuild",
+            "build_unsupported",
+        )]);
+        assert_eq!(
+            marks_in(&marks),
+            ["hostcfg", "inscope", "wasmonly"],
+            "resolver {resolver}"
+        );
+    }
+}
+
 /// Without a version, the project decides it (requirements R-MCP-3 and R-VR-2). The project here
 /// is the package itself, which docs.rs does not have: its documentation is built here, for the
 /// host, while every line of stdout stays a JSON-RPC message (requirement R-SEC-1, decided in

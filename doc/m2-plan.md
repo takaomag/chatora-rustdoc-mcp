@@ -1688,7 +1688,31 @@ Claude Code 2.1.304、Linux で測った。
 
 ### 6.7 M2f
 
-(まだ無い)
+**M2f の下調べと進め方 (2026-10-23)**:
+
+- 下調べ (サブエージェント、読むだけ。要点は scratchpad の m2f-research.md): F1 (CLI の `cache` と GC) はまだ無く大きい。F2 は M1 の罠 (Unix だけ) と範囲の判定のテストがあるが、build.rs を実際に動かす罠は無い。F3 の canary は nightly だけ。F4 は、サーバーの instructions が自分の workspace を LSP へ誘導している (`src/mcp/mod.rs` の「For the code of this workspace itself … use the language server」) のが、D4d・M2d の試しでモデルが自分の item に MCP を使わなかった件の原因の候補。F5 は仮の値のまま。F6 の README は M1 のまま。F1〜F6 の外の残り (出力のサニタイズ (R-SEC-7 の MUST) が未実装でどの段にも無い、上限でビルドを待つときの `status: building`、`search.scope`・`build.prefer_local`、「(in a later version)」の 9 か所、要件とのずれ、テストの抜け、揺れるテスト) は M2 を閉じる前に行き先を決める
+- 順 (利用者が了承): F2 → F1a (印と `cache ls`)・F1b (`cache gc`)・F1c (`cache clear` と古い配置) → F3 → F5 → F4a (instructions と説明文、ケース)・F4b (eval を回す) → F6 → §7 の要件への反映。判断はその段に入るときに 1 件ずつ
+
+**F2 (罠のテスト。2026-10-23)**:
+
+- 利用者が決めたこと: build.rs の罠は 3 つの OS で、`build.rustc`・`rustc-wrapper` の罠 (外の workspace で何も起動しないこと) は今どおり Unix だけ (照会の経路は OS によらないので Unix で確かめれば足りる。実行ファイルを 3 OS 分用意するとテストにビルドが増える)
+- fixture `tests/fixtures/traps` (範囲の判定のテストの fixture は期待する集合が細かいので別に): member `app` と path 依存 5 つ。各依存の build.rs はテストが印を書く形に置き換える。範囲の中 (陽性の対照): `inscope` (通常の依存)・`hostcfg` (`cfg(not(target_arch = "wasm32"))` の build-dependency)。範囲の外: `wasmonly` (wasm32 だけの依存)・`wasmbuild` (`cfg(target_arch = "wasm32")` の build-dependency)・`optdep` (`[package.metadata.docs.rs]` の `extra` でだけ有効な optional の依存)
+- 実測 (cargo 1.99、resolver 1・2 とも): build-dependency の `[target.'cfg(…)']` は `build.target` ではなく host で評価される。`--target wasm32-wasip1` でも `hostcfg` は作られ、`wasmbuild` は作られない。要件の「host と違う `build.target` での target 用の build-dependency」はこの `wasmbuild` の形で置いた (target で評価する素朴な実装ならこれを作る)。最初は `hostcfg` を範囲の外と見込んでテストが落ち、cargo 自身が作ることを写しで確かめて fixture と期待を直した
+- テスト (stdio): `the_query_tools_run_no_build_script_outside_the_scope` (host、resolver 1・2。get_item・crate_overview・search_items・list_crates と、範囲の外の依存を名指しした照会の後で、印は `hostcfg`・`inscope` だけ) と `..._of_the_build_target` (`build.target = wasm32-wasip1`、その std があるときだけ。印は `hostcfg`・`inscope`・`wasmonly` だけ)
+- レビュー (サブエージェント、読むだけ) の対応: (1) 応答を確かめていなかった: member の照会は誤りでないこと、get_item の応答に docs.rs の組が `optdep` を作る旨の warning (D3e) が出ること (`optdep` の罠を効かせているのはこの判定。`optdep` を名指しした照会は cargo metadata に出ず範囲の判定に届かない空振りだったので外した)、範囲の外を名指しした照会は `build_unsupported` で断られること (2) サーバーをオフラインで起動 (path 依存だけ。名指しした照会が crates.io や docs.rs に出ていかないように) (3) 応答の後に裏で続く仕事の印を見逃さないよう、印の集合が変わらなくなるまで待ってから終える (4) 待ちの上限まで `building` のままなら落とす (6) build.rs の印のパスを Rust の文字列のリテラルで書く (`{:?}`)。残したもの: (5) 罠の fixture の cargo を `Isolated::apply` の隔離した環境で動かす約束 (tests/fixtures の README) に対し、stdio のテストは既存のものと同じく利用者の `HOME`・`CARGO_HOME` で動く (利用者の `~/.cargo/config.toml` に `build.target` などがあると期待が崩れうる)
+
+**F1 の決定 (2026-10-23、利用者が 1 件ずつ決めた)**:
+
+1. CLI (`cache ls`・`cache gc`・`cache clear [crate[@版]]`) の引数は、今の手書きの解析を広げる (コマンドは 4 つで、依存とビルド時間を増やさない。M0 の D3)
+2. GC は CLI の `cache gc` と、サーバーの裏 (起動時の掃除の後に時間を区切って 1 回、ビルドを公開した後に間引いて) で走らせる
+3. 最後に使った時刻は、std と外の記録と同じ `used` のファイル (読んだときに 1 時間に 1 回まで書く) で判じる
+4. 照会のツールのローカルビルド (`local/v1`) は、容量の上限では target dir の側 (20GB) に数える (ビルドでしか作り直せない)
+5. 所有マーカーの無い既存のキャッシュ (M1 の版が作ったもの) は、中身がこのサーバーの置き場の名前だけならマーカーを書いて引き取る。知らないものがあれば引き取らず、ログを出して何も消さない (`cache.dir` を誤って別の場所に向けたときの守り)
+6. 古い配置は、この版が知っている古い形だけを消す。他の形式の版の置き場は N 日使われていなければ消す。知らない名前には触らない (新しい版のサーバーの置き場を守る)
+7. Windows で使用中などで消せないものは、残して次の GC で試す (std の片付けと同じ)
+8. サーバーが動いている間の `cache clear`・`cache gc` は、置き場ごとのロックを試し取りし、使用中のものは飛ばして表示する
+9. `cache clear crate@版` は、その release の docs.rs の JSON (全 target)・派生物・`.crate` と展開・外のツールの記録を消す。版を省いた `cache clear crate` はその crate の全版
+10. `cache ls` は人向けの表 (分類ごとの合計と上限に対する使用量、大きいもの上位 N 件)。JSON は出さない
 
 ## 7. M2 の終わり方
 
