@@ -59,9 +59,14 @@ impl Answer {
 
 impl Client {
     /// Starts a server with the default project `project`, logging to `logs`. The cache is that
-    /// of the environment (`CHATORA_RUSTDOC_MCP_CACHE__DIR`).
+    /// of the environment (`CHATORA_RUSTDOC_MCP_CACHE__DIR`). Without a project, it runs outside
+    /// any: in `logs`, as a user who asks of crates.io and docs.rs only, not in this repository,
+    /// which it would else find from where the tests run.
     pub(crate) fn start(project: Option<&Path>, logs: &Path) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"));
+        if project.is_none() {
+            command.current_dir(logs);
+        }
         // Not the config file of the user who runs the tests (requirement R-DIST-3). The cache
         // is still the one of the environment. A call waits for builds for minutes, as a slow
         // runner builds the workspace outside the project for longer than the default, and

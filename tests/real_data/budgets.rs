@@ -28,6 +28,7 @@ const BUDGETS: &[(&str, &str, usize)] = &[
 #[ignore = "needs the JSON of testdata/docs-rs-json.txt in the cache, and std"]
 fn representative_items_stay_within_their_budgets() {
     let logs = tempfile::tempdir().expect("a temporary directory");
+    // Outside any project: the releases named are those of docs.rs.
     let mut client = Client::start(None::<&Path>, logs.path());
     let mut over = Vec::new();
     for &(release, path, budget) in BUDGETS {

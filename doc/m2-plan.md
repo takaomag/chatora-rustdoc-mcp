@@ -1777,6 +1777,16 @@ Claude Code 2.1.304、Linux で測った。
 - テスト: 単体 4 件 (crate の版と全版と index と綴り・全体で残るもの・使用中・外の記録の種類と照合)、stdio (`cache_clear_removes_what_it_is_asked_to`: 使い方の誤り 4 つ・dry run・版・当たらない・別のプロセスがロックを持つと 1・全体)
 - レビュー (サブエージェント、読むだけ) の対応: (1) 2 つ以上の記録が指す本体を、引数なしの clear が記録と別に消し、記録が使用中で残ると `record_broken` を残しえた。名指しでは記録がすべて消えても本体が残った。記録が指す本体は単独では選ばず、1 つの記録だけが指すものは記録と組で、2 つ以上が指すものは指す記録がすべて消えた後に消す (2) 版を省いた clear で index の `.miss.json` が残った (決定 4 の漏れ)。接尾辞を外して照合 (3) `Std`・`CORE`・`proc-macro` が std の判定を通った。cache key で比べる (4) clear が `gc` のロックなしで `work/gc` を空にし、裏の GC の rename と競合しえた。`gc` のロックを試し取りできたときだけ空にし、rename は移し先が消えていればもう 1 回 (5) git の記録の版を読む本体のパスの検査が弱かった (Windows の `\..`)。gc と同じ `gc::published_body` (6) `local/v1`・`ext/v1` が link だとたどり、clear がキャッシュの外を消しえた。`v1` が link なら知らないもの (7) dry run はロックを試さないので、使用中は実行したときにだけ出る旨を説明に。テストを足した: 共有の本体の 2 つの場合・`.miss.json`・std の綴り違い・`v1` の link (Unix)
 - fa769c7 (real_data の直し) の CI は Windows の testdata が緑になったが、Windows の check で stdio の 3 件 (`build_external_docs_documents_the_project_for_another_target` など) が同じ形で落ちた (`built: false`、member が `building`)。f2f163c では通っていたので runner の遅さの揺れ。テストの `built_by_external` は最上位の `status: building` だけを呼び直していた。member か依存に `building` が残る間も呼び直す (呼び直しは進んでいるビルドに加わる)
+- F1c-1 は 14972b5 (CI 11 job 緑)。F1c-2 (F1 の終わりの印のテスト: サーバーと CLI の同時実行・ロック中の target dir の stdio・Windows の写像) は残り
+
+**F3 の下調べと F3a (2026-10-23)**:
+
+- 下調べ (サブエージェント、読むだけ。要点は scratchpad の f3-research.md、判断の候補 12 件): canary (`.github/workflows/canary.yml`、毎日、ubuntu、nightly) は 2026-10-22 から落ち、Issue #1 が開いたまま。`docs_rs_serves_what_this_server_expects` は tokio の `aarch64-apple-darwin` に `no_target_json` を待つが `no_json` が返る。原因は docs.rs でなく M2 の変化: テストのクライアントは cwd を変えずに起動するので、このリポジトリが既定のプロジェクトになり、tokio は依存として D7 の経路 (他の target) を通る。canary のテストは ci.yml で回らないので、サーバーの変更で壊れても定期実行まで分からない。beta の canary (R-QA-4) は無い。ローカルビルドは形式の試しで JSON が出ないと nightly に info のログだけで切り替える、`--cfg docsrs` で壊れると外して warning で通る (beta の壊れが隠れる経路が 2 つ)
+- 段は F3a (Issue #1 の直し) と F3b (beta の canary) に分ける
+- 利用者が決めたこと:
+  1. smoke test はプロジェクトの外で回し、期待は `no_target_json` のまま (docs.rs の今の配り方を見る目的のまま)
+  2. canary のテストに関わる変更 (応答を変える段) を push したら、`gh workflow run canary.yml` で手で回して結果を見る (ci.yml では回さない)
+- F3a: テストのクライアント (`tests/real_data/client.rs`) の `Client::start(None, …)` は、ログのディレクトリを cwd にしてプロジェクトの外で起動する。`None` で起動するのは canary の smoke test と real_data の `budgets` だけで、どちらも docs.rs の版を引く (budgets も名指しの版を docs.rs から読むのが意図)。手元で空のキャッシュで smoke test が通ることを確かめた
 
 **F1〜F6 の外の残りの行き先 (2026-10-23、利用者が 1 件ずつ決めた)**:
 

@@ -213,6 +213,8 @@ fn docs_rs_serves_what_this_server_expects() {
             Some("no_target_json"),
         ),
     ];
+    // Outside any project, so that what is asked of is the latest release on docs.rs, not the
+    // dependency of this repository that the server would find from where the tests run.
     let logs = tempfile::tempdir().expect("a temporary directory");
     let mut client = Client::start(None, logs.path());
     let mut unexpected = Vec::new();
