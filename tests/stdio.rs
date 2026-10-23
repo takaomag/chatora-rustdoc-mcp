@@ -596,6 +596,137 @@ fn cache_ls_tells_what_the_cache_has() {
     assert!(text(&help.stdout).contains("Usage:"), "{help:?}");
 }
 
+/// Writes the place `path` of the cache at `cache`, with a file in it, last used `days` ago: what
+/// is in it was last written then too, as the garbage collection looks at that.
+fn old_place(cache: &Path, path: &str, days: u64) {
+    let dir = cache.join(path);
+    std::fs::create_dir_all(dir.join("target")).expect("made");
+    std::fs::write(dir.join("target/x"), vec![b'x'; 1_000]).expect("written");
+    std::fs::write(dir.join("used"), "").expect("written");
+    let at = std::time::SystemTime::now()
+        .checked_sub(Duration::from_hours(days.saturating_mul(24)))
+        .expect("a time");
+    set_time(&dir, at);
+}
+
+/// Sets the time of what is at `path`, and of all that is in it, to `at`.
+fn set_time(path: &Path, at: std::time::SystemTime) {
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path).expect("read").flatten() {
+            set_time(&entry.path(), at);
+        }
+    }
+    let mut options = std::fs::File::options();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // `FILE_WRITE_ATTRIBUTES`, and `FILE_FLAG_BACKUP_SEMANTICS`, without which a directory
+        // does not open.
+        options.access_mode(0x100).custom_flags(0x0200_0000);
+    }
+    #[cfg(not(windows))]
+    options.read(true);
+    options
+        .open(path)
+        .and_then(|file| file.set_modified(at))
+        .expect("set");
+}
+
+/// Writes the file `path` of the cache at `cache`, last written `days` ago.
+fn old_file(cache: &Path, path: &str, days: u64) {
+    let file = cache.join(path);
+    std::fs::create_dir_all(file.parent().expect("a parent")).expect("made");
+    std::fs::write(&file, "{}").expect("written");
+    let at = std::time::SystemTime::now()
+        .checked_sub(Duration::from_hours(days.saturating_mul(24)))
+        .expect("a time");
+    set_time(&file, at);
+}
+
+/// `cache gc` removes what is unused for longer than the cache keeps it, and of a layout of an
+/// earlier version, and keeps what was just used; with `--dry-run`, it tells what it would remove,
+/// and removes nothing; a directory that is not this server's is not touched (requirement R-CA-5,
+/// decided in M2f's F1b, 1). A server without local builds leaves what builds make (M2f's F1b).
+#[test]
+fn cache_gc_removes_what_is_old() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "").expect("written");
+    let run = |cache: &Path, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"))
+            .args(args)
+            .env("CHATORA_RUSTDOC_MCP_CONFIG", &config)
+            .env("CHATORA_RUSTDOC_MCP_CACHE__DIR", cache)
+            .stdin(Stdio::null())
+            .output()
+            .expect("the binary runs")
+    };
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    let cache = dir.path().join("cache");
+    std::fs::create_dir_all(&cache).expect("made");
+    std::fs::write(cache.join("chatora-rustdoc-mcp.cache"), "").expect("written");
+    old_place(&cache, "t/0123456789ab", 40);
+    old_place(&cache, "t/ba9876543210", 0);
+    old_file(&cache, "docs.rs/old/0.1.0/rustdoc.json", 1);
+    let builds = cfg!(feature = "local");
+    let places = if builds { 2 } else { 1 };
+    let dry = run(&cache, &["cache", "gc", "--dry-run"]);
+    assert!(dry.status.success(), "{dry:?}");
+    assert!(
+        text(&dry.stdout).contains(&format!("Would remove {places} places")),
+        "{dry:?}"
+    );
+    assert!(
+        text(&dry.stdout).contains("docs.rs/old/0.1.0/rustdoc.json"),
+        "{dry:?}"
+    );
+    assert_eq!(
+        text(&dry.stdout).contains("t/0123456789ab"),
+        builds,
+        "{dry:?}"
+    );
+    assert!(cache.join("t/0123456789ab").exists());
+    assert!(cache.join("docs.rs/old/0.1.0/rustdoc.json").exists());
+    let collected = run(&cache, &["cache", "gc"]);
+    assert!(collected.status.success(), "{collected:?}");
+    assert!(
+        text(&collected.stdout).contains(&format!("Removed {places} places")),
+        "{collected:?}"
+    );
+    assert_eq!(cache.join("t/0123456789ab").exists(), !builds);
+    assert!(cache.join("t/ba9876543210").exists());
+    assert!(!cache.join("docs.rs/old").exists());
+
+    let foreign = dir.path().join("home");
+    std::fs::create_dir_all(&foreign).expect("made");
+    std::fs::write(foreign.join("notes.txt"), "mine").expect("written");
+    let refused = run(&foreign, &["cache", "gc"]);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(
+        text(&refused.stderr).contains("not this server's"),
+        "{refused:?}"
+    );
+    assert!(foreign.join("notes.txt").exists());
+}
+
+/// The server collects the garbage of its cache when it starts, in the background (decided in
+/// M2f's F1, 2).
+#[test]
+fn the_server_collects_its_cache_when_it_starts() {
+    let cache = test_cache();
+    old_file(cache.path(), "docs.rs/old/0.1.0/rustdoc.json", 1);
+    let old = cache.path().join("docs.rs/old/0.1.0/rustdoc.json");
+    let server = Server::start_with_cache(cache, None, &[]);
+    for _ in 0..100 {
+        if !old.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!old.exists(), "not collected");
+    assert!(server.finish().success());
+}
+
 /// The server makes its cache directory its own: the cache of the tests, which an earlier version
 /// would have made, has its marker and the tag of a cache directory once the server started
 /// (requirement R-CA-5, decided in M2f's F1, 5, and F1a).
@@ -6447,7 +6578,8 @@ fn a_search_that_finds_nothing_while_crates_are_fetched_is_building() {
 
 /// At startup, the server removes the work directories that a server that has stopped left in
 /// the cache, in the background, and when it stops it leaves none of its own, nor its lock
-/// (requirements R-WS-6 and R-CA-4, decided in C4).
+/// (requirements R-WS-6 and R-CA-4, decided in C4). The lock of the garbage collection that it
+/// ran at startup stays, as every lock file but a server's own does (decided in M2f's F1b, 6).
 #[cfg(feature = "local")]
 #[test]
 fn a_server_removes_what_stopped_servers_left_and_leaves_nothing() {
@@ -6469,9 +6601,11 @@ fn a_server_removes_what_stopped_servers_left_and_leaves_nothing() {
         TempDir::new().expect("a temporary directory"),
     );
     assert!(server.finish().success());
+    let collecting = chatora_rustdoc_mcp::data::process_lock::lock_path(cache.path(), "gc");
     let left_locks: Vec<_> = std::fs::read_dir(cache.path().join("locks"))
         .expect("the server made its lock")
         .flatten()
+        .filter(|entry| entry.path() != collecting)
         .map(|entry| entry.file_name())
         .collect();
     assert!(left_locks.is_empty(), "{left_locks:?}");

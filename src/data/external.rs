@@ -47,7 +47,7 @@ pub enum Key {
     /// A release of a crate from crates.io that the project does not use: not a dependency, or a
     /// version that its Cargo.lock does not have.
     Release {
-        /// The crate, by its cache key (`-` as `_`, in lower case).
+        /// The crate, by its cache key (`CrateName::cache_key`: lowercase, `_` written as `-`).
         #[serde(rename = "crate")]
         name: Box<str>,
         /// The exact version.

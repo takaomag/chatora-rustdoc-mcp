@@ -288,28 +288,13 @@ fn note_use(cache: &Cache, dir: PathBuf) {
             tracing::warn!(path = %dir.display(), %error, "the use of a nightly's std could not be noted");
         }
         drop(held);
-        if let Err(error) = remove_unused(
-            &cache,
-            &cache.dir().join(super::layout::STD),
-            &dir,
-            SystemTime::now(),
-        ) {
-            tracing::warn!(%error, "the std of old nightlies could not all be removed");
+        let std = cache.dir().join(super::layout::STD);
+        for (path, error) in remove_unused(&cache, (&std, &dir), SystemTime::now(), false).left {
+            tracing::warn!(path = %path.display(), %error, "the std of an old nightly could not all be removed");
         }
     }));
 }
 
-/// Removes the directories of a nightly's std under `std_dir` (`<commit>/<target>` and
-/// `local/<commit>/<target>`) last used longer than [`UNUSED_FOR`] before `now`, except `keep`,
-/// and then their parents left empty. Only directories that this server made (with the mark that
-/// the unpacking is complete, or archives) are removed, and symbolic links are not followed.
-/// Each that cannot be removed is left (Windows does not remove a file that another process
-/// maps), and the last error is returned after the rest are done.
-///
-/// A directory is removed under its lock in `cache`, taken without waiting: one that another
-/// task or process holds is in use and left, and one that was used while this waited is seen so
-/// (requirement R-CA-4). The mark that the unpacking is complete goes first, so that what is left
-/// when the rest cannot all be removed counts as not unpacked.
 /// Removes the files in `dir` that remembered failures to fetch, once they are no longer
 /// remembered (requirement R-ERR-3): one stays next to an archive that could not be fetched.
 fn remove_expired_failures(cache: &Cache, dir: &Path) {
@@ -324,7 +309,33 @@ fn remove_expired_failures(cache: &Cache, dir: &Path) {
     }
 }
 
-fn remove_unused(cache: &Cache, std_dir: &Path, keep: &Path, now: SystemTime) -> io::Result<()> {
+/// What [`remove_unused`] removed, or would remove in a dry run.
+#[derive(Debug, Default)]
+pub(super) struct Unused {
+    /// The directories, with how much they took.
+    pub removed: Vec<(PathBuf, u64)>,
+    /// Those that could not all be removed, with why.
+    pub left: Vec<(PathBuf, io::Error)>,
+}
+
+/// Removes the directories of a nightly's std under `std_dir` (`<commit>/<target>` and
+/// `local/<commit>/<target>`) last used longer than [`UNUSED_FOR`] before `now`, except `keep`,
+/// and then their parents left empty; in a dry run, only tells them. Only directories that this
+/// server made (with the mark that the unpacking is complete, or archives) are removed, and
+/// symbolic links are not followed. Each that cannot be removed is left (Windows does not remove a
+/// file that another process maps), and told.
+///
+/// A directory is removed under its lock in `cache`, taken without waiting: one that another
+/// task or process holds is in use and left, and one that was used while this waited is seen so
+/// (requirement R-CA-4). The mark that the unpacking is complete goes first, so that what is left
+/// when the rest cannot all be removed counts as not unpacked. The garbage collection of the cache
+/// applies this rule too (decided in M2f's F1b, 4).
+pub(super) fn remove_unused(
+    cache: &Cache,
+    (std_dir, keep): (&Path, &Path),
+    now: SystemTime,
+    dry_run: bool,
+) -> Unused {
     let subdirectories = |dir: &Path| -> Vec<PathBuf> {
         fs::read_dir(dir)
             .into_iter()
@@ -342,10 +353,15 @@ fn remove_unused(cache: &Cache, std_dir: &Path, keep: &Path, now: SystemTime) ->
             nightlies.push(dir);
         }
     }
-    let mut failed = None;
+    let mut unused_std = Unused::default();
     for nightly in nightlies {
         for dir in subdirectories(&nightly) {
             if dir == keep || !made_here(&dir) || !unused(&dir, now) {
+                continue;
+            }
+            if dry_run {
+                let bytes = super::inventory::size_of(&dir);
+                unused_std.removed.push((dir, bytes));
                 continue;
             }
             let Some(_held) = cache.try_lock(&dir) else {
@@ -354,21 +370,27 @@ fn remove_unused(cache: &Cache, std_dir: &Path, keep: &Path, now: SystemTime) ->
             if !unused(&dir, now) {
                 continue;
             }
+            let bytes = super::inventory::size_of(&dir);
             let removed = match fs::remove_file(dir.join(dist::COMPLETE_FILE)) {
                 Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
                 Ok(()) | Err(_) => fs::remove_dir_all(&dir),
             };
-            if let Err(error) = removed {
-                failed = Some(error);
+            match removed {
+                Ok(()) => unused_std.removed.push((dir, bytes)),
+                Err(error) => unused_std.left.push((dir, error)),
             }
         }
-        remove_expired_failures(cache, &nightly);
-        // Gone when nothing is left in it; an error means it is not empty.
-        drop(fs::remove_dir(&nightly));
+        if !dry_run {
+            remove_expired_failures(cache, &nightly);
+            // Gone when nothing is left in it; an error means it is not empty.
+            drop(fs::remove_dir(&nightly));
+        }
     }
-    // Those of the manifests of the nightly channel.
-    remove_expired_failures(cache, std_dir);
-    failed.map_or(Ok(()), Err)
+    if !dry_run {
+        // Those of the manifests of the nightly channel.
+        remove_expired_failures(cache, std_dir);
+    }
+    unused_std
 }
 
 /// Whether `dir` holds the std of a nightly that this server unpacked or archived.
@@ -616,7 +638,11 @@ mod tests {
         );
         let cache = Cache::at(std_dir);
         let holding = cache.try_lock(&held).expect("free");
-        remove_unused(&cache, std_dir, &in_use, now).expect("no error");
+        assert!(
+            remove_unused(&cache, (std_dir, &in_use), now, false)
+                .left
+                .is_empty()
+        );
         assert!(!old.exists() && !std_dir.join("aaaaaaaaa").exists());
         assert!(!local.exists() && !std_dir.join("local/0123abcd").exists());
         assert!(recent.exists() && in_use.exists() && not_ours.exists());

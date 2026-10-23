@@ -560,6 +560,29 @@ fn settle(root: &Path, record: &Path, until: Instant) -> Settled {
     }
 }
 
+/// The target directories in `t/` of the cache at `root` that the children recorded there build in.
+///
+/// What they left running may still use them, which the garbage collection does not remove
+/// (decided in M2f's F1b). The records of servers that run are of children that run.
+///
+/// It reads files, so it is for a blocking thread.
+#[cfg(unix)]
+#[must_use]
+pub fn recorded_target_dirs(root: &Path) -> std::collections::HashSet<String> {
+    let records = root.join(RECORDS_DIR).join(format!("v{RECORDS_FORMAT}"));
+    owned(&records)
+        .into_iter()
+        .filter_map(|(_, path)| {
+            let record: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+            let dir = record.get("target_dir")?.as_str()?;
+            let name = dir
+                .strip_prefix(super::build::TARGET_DIRS)?
+                .strip_prefix('/')?;
+            is_target_dir_name(name).then(|| name.to_owned())
+        })
+        .collect()
+}
+
 /// Marks the target directory of the cache at `root` that the child of `record` built in, if it
 /// did, as not to be used: what still runs may hold cargo's lock there, and the next build uses
 /// another (decided in M2's D2).

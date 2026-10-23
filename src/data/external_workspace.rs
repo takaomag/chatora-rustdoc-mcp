@@ -13,6 +13,7 @@ use std::{
     fs,
     io,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use serde::{Deserialize, Serialize};
@@ -280,6 +281,31 @@ pub fn record_aliases(cache: &Cache, paths: &[&Path], root: &Path) -> io::Result
         cache::write_atomically(&file, &serde_json::to_vec(&alias)?)?;
     }
     Ok(())
+}
+
+/// The aliases in the cache at `root` whose workspace has no record any more, last written before
+/// `before`, with the key of that record.
+///
+/// The garbage collection removes them under its lock (decided in M2f's F1b). One that cannot be
+/// read is not among them.
+///
+/// It reads files, so it is for a blocking thread.
+#[must_use]
+pub fn orphan_aliases(root: &Path, before: SystemTime) -> Vec<(PathBuf, Key)> {
+    fs::read_dir(external::records_dir(root).join(ALIASES))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() || metadata.modified().ok()? >= before {
+                return None;
+            }
+            let alias: Alias = serde_json::from_slice(&fs::read(entry.path()).ok()?).ok()?;
+            let key = workspace_key(Path::new(&*alias.root));
+            (!key.dir(root).exists()).then(|| (entry.path(), key))
+        })
+        .collect()
 }
 
 /// The root of the workspace that `path` is an alias of in `cache`, if it is one: as it reads

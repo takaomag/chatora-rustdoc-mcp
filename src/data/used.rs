@@ -69,16 +69,14 @@ pub fn write(dir: &Path) {
     }
 }
 
-/// When `dir` was last used: the time of its file [`USED`], or else the latest time of what is
-/// directly in it, or of itself. `None` when it cannot be read.
+/// When `dir` was last used: the latest time of itself and of what is directly in it, its file
+/// [`USED`] among them. `None` when it cannot be read.
+///
+/// What was written again in it was used too, as a record made again over an old [`USED`].
 ///
 /// It reads the file system, so it is for a blocking thread.
 #[must_use]
 pub fn last_used(dir: &Path) -> Option<SystemTime> {
-    if let Ok(used) = fs::symlink_metadata(dir.join(USED)).and_then(|metadata| metadata.modified())
-    {
-        return Some(used);
-    }
     let own = fs::symlink_metadata(dir)
         .and_then(|metadata| metadata.modified())
         .ok()?;
@@ -127,5 +125,26 @@ mod tests {
         let noted = last_used(&place).expect("a time");
         assert!(noted >= found);
         assert!(last_used(&dir.path().join("nothing")).is_none());
+    }
+
+    /// A record written again in a place whose use was noted long ago tells that it was used then
+    /// (M2f's F1b).
+    #[test]
+    fn what_was_written_after_the_note_tells_it() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let place = dir.path().join("place");
+        fs::create_dir_all(&place).expect("made");
+        write(&place);
+        let long_ago = SystemTime::now()
+            .checked_sub(Duration::from_hours(24 * 40))
+            .expect("a time");
+        fs::File::options()
+            .write(true)
+            .open(place.join(USED))
+            .and_then(|file| file.set_modified(long_ago))
+            .expect("set");
+        fs::write(place.join("record.json"), b"{}").expect("written");
+        let found = last_used(&place).expect("a time");
+        assert!(found > long_ago, "{found:?}");
     }
 }

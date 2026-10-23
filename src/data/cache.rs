@@ -273,6 +273,19 @@ impl Cache {
         }
     }
 
+    /// [`Self::try_lock`], but `None` also when the OS cannot lock it: for the garbage collection,
+    /// which removes only what it holds (decided in M2f's F1b).
+    #[must_use]
+    pub fn try_lock_held(&self, path: &Path) -> Option<PathGuard> {
+        let within = self.locks.of(path).try_lock_owned().ok()?;
+        let across = process_lock::try_lock(&self.root, &self.lock_key(path), LockMode::Exclusive)
+            .ok()??;
+        Some(PathGuard {
+            _within: within,
+            _across: Some(across),
+        })
+    }
+
     /// The key of the OS lock of `path`: `cache:` and its path in the cache with `/`, the same
     /// in every process and on every OS. The kind before `:` keeps it apart from the locks of
     /// other things (`process_lock`).

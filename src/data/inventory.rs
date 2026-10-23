@@ -20,6 +20,9 @@ use super::{
     used,
 };
 
+/// What is added to the name of a file of the sparse index to name its record.
+const INDEX_META: &str = ".meta.json";
+
 /// What a place of the cache is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -170,7 +173,7 @@ impl Taking<'_> {
             layout::DOCS_RS => self.levels(name, (Kind::DocsRs, 3), Kind::OldLayout),
             layout::STD => self.std(),
             layout::STATIC_CRATES => self.levels(name, (Kind::Crate, 2), Kind::Crate),
-            layout::INDEX => self.place(Path::new(name), Kind::Index, class),
+            layout::INDEX => self.index(),
             layout::TOOLCHAINS => self.place(Path::new(name), Kind::Toolchains, class),
             layout::TARGETS => self.levels(name, (Kind::TargetDir, 1), Kind::TargetDir),
             layout::LOCAL => self.versioned(name, Kind::Local, 4),
@@ -231,6 +234,46 @@ impl Taking<'_> {
         }
     }
 
+    /// Takes in each file of the sparse index with its record of how it was fetched
+    /// (`<file>.meta.json`), which tells when it was last used, as it is written again when the
+    /// file is checked again (decided in M2f's F1b).
+    fn index(&mut self) {
+        let class = layout::class_of(layout::INDEX);
+        let mut pending = vec![PathBuf::from(layout::INDEX)];
+        while let Some(relative) = pending.pop() {
+            if self.out_of_time() {
+                return;
+            }
+            for child in self.children(&relative) {
+                let path = relative.join(&child);
+                let absolute = self.root.join(&path);
+                let Ok(metadata) = fs::symlink_metadata(&absolute) else {
+                    continue;
+                };
+                if metadata.is_dir() {
+                    pending.push(path);
+                } else if metadata.is_file() && !child.ends_with(INDEX_META) {
+                    let meta = absolute.with_file_name(format!("{child}{INDEX_META}"));
+                    let meta_metadata = fs::symlink_metadata(&meta).ok();
+                    let bytes = metadata
+                        .len()
+                        .saturating_add(meta_metadata.as_ref().map_or(0, fs::Metadata::len));
+                    let last_used = meta_metadata
+                        .and_then(|meta| meta.modified().ok())
+                        .or_else(|| metadata.modified().ok());
+                    self.inventory.entries.push(Entry {
+                        kind: Kind::Index,
+                        class,
+                        path,
+                        bytes,
+                        last_used,
+                        about: None,
+                    });
+                }
+            }
+        }
+    }
+
     /// Takes in the std of each nightly for each target, the nightlies of the local toolchains
     /// too, and each file about the nightlies.
     fn std(&mut self) {
@@ -284,16 +327,20 @@ impl Taking<'_> {
         let absolute = self.root.join(relative);
         // Not what this server does not know, which may be large, as a home directory that the
         // cache was set to by mistake.
-        let bytes = if kind == Kind::Unknown {
-            0
+        let (bytes, newest) = if kind == Kind::Unknown {
+            (0, None)
         } else {
             size(&absolute, &mut self.seen)
         };
-        let last_used = used::last_used(&absolute).or_else(|| {
-            fs::symlink_metadata(&absolute)
-                .and_then(|metadata| metadata.modified())
-                .ok()
-        });
+        // What was written anywhere in it is used too, as the builds of a newer version of this
+        // server in a place of another format.
+        let last_used = used::last_used(&absolute)
+            .or_else(|| {
+                fs::symlink_metadata(&absolute)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+            })
+            .max(newest);
         let about = about(&absolute, kind);
         self.inventory.entries.push(Entry {
             kind,
@@ -337,17 +384,33 @@ fn about(path: &Path, kind: Kind) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// How much what is at `path` takes, in bytes, without following symbolic links, counting a file
-/// whose hard links `seen` has once. What cannot be read counts for nothing.
+/// How much what is at `path` takes, in bytes, as an inventory counts it.
 ///
 /// It reads the file system, so it is for a blocking thread.
-fn size(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
+#[must_use]
+pub fn size_of(path: &Path) -> u64 {
+    size(path, &mut HashSet::new()).0
+}
+
+/// How much what is at `path` takes, in bytes, without following symbolic links, counting a file
+/// whose hard links `seen` has once, and the latest time that it was written, not of what tells
+/// a time to come, as a file unpacked from an archive. What cannot be read counts for nothing.
+///
+/// It reads the file system, so it is for a blocking thread.
+fn size(path: &Path, seen: &mut HashSet<(u64, u64)>) -> (u64, Option<SystemTime>) {
+    let now = SystemTime::now();
     let mut total = 0_u64;
+    let mut newest = None;
     let mut pending = vec![path.to_path_buf()];
     while let Some(path) = pending.pop() {
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
+        if let Ok(modified) = metadata.modified()
+            && modified <= now
+        {
+            newest = newest.max(Some(modified));
+        }
         if metadata.is_dir() {
             pending.extend(
                 fs::read_dir(&path)
@@ -360,7 +423,7 @@ fn size(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
             total = total.saturating_add(metadata.len());
         }
     }
-    total
+    (total, newest)
 }
 
 /// Whether the file of `metadata` is counted for the first time: not when another of its hard
@@ -374,7 +437,7 @@ fn first_link(metadata: &fs::Metadata, seen: &mut HashSet<(u64, u64)>) -> bool {
 /// Whether the file of `metadata` is counted for the first time: always, where its hard links are
 /// not told.
 #[cfg(not(unix))]
-fn first_link(_metadata: &fs::Metadata, _seen: &mut HashSet<(u64, u64)>) -> bool {
+const fn first_link(_metadata: &fs::Metadata, _seen: &mut HashSet<(u64, u64)>) -> bool {
     true
 }
 
@@ -408,6 +471,7 @@ mod tests {
         write(root, "std/nightly.json", 1);
         write(root, "static.crates.io/serde/1.0.0/serde-1.0.0.crate", 30);
         write(root, "index.crates.io/se/rd/serde", 2);
+        write(root, "index.crates.io/se/rd/serde.meta.json", 3);
         write(root, "t/0123456789ab/target/debug/a", 100);
         write(root, "local/v1/ws/pkg/x86_64/lib/61.json", 40);
         write(root, "local/v2/whatever", 3);
@@ -434,6 +498,15 @@ mod tests {
             7
         );
         assert_eq!(entry(&inventory, "std/nightly.json").kind, Kind::Std);
+        let index = entry(&inventory, "index.crates.io/se/rd/serde");
+        assert_eq!((index.kind, index.bytes), (Kind::Index, 5));
+        assert!(
+            inventory
+                .entries
+                .iter()
+                .all(|entry| !entry.path.ends_with("serde.meta.json")),
+            "{inventory:?}"
+        );
         assert_eq!(
             entry(&inventory, "static.crates.io/serde/1.0.0").kind,
             Kind::Crate
@@ -481,6 +554,43 @@ mod tests {
         write(dir.path(), "t/a/x", 1);
         let inventory = take(dir.path(), Some(Instant::now())).expect("taken");
         assert!(!inventory.complete);
+    }
+
+    /// A place of another format, where a newer version of this server builds deep inside, is used
+    /// when it last wrote there; a time to come does not count (M2f's F1b).
+    #[cfg(unix)]
+    #[test]
+    fn a_place_is_used_when_anything_in_it_was_written() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        write(root, "local/v2/ws/pkg/lib/61.json", 1);
+        write(root, "local/v2/ws/pkg/lib/later.json", 1);
+        let set = |path: &str, at: SystemTime| {
+            fs::File::open(root.join(path))
+                .and_then(|file| file.set_modified(at))
+                .expect("set");
+        };
+        let now = SystemTime::now();
+        let ago = |days: u64| {
+            now.checked_sub(std::time::Duration::from_hours(days.saturating_mul(24)))
+                .expect("a time")
+        };
+        set("local/v2/ws/pkg/lib/61.json", ago(2));
+        set(
+            "local/v2/ws/pkg/lib/later.json",
+            now.checked_add(std::time::Duration::from_hours(24 * 400))
+                .expect("a time"),
+        );
+        for path in [
+            "local/v2/ws/pkg/lib",
+            "local/v2/ws/pkg",
+            "local/v2/ws",
+            "local/v2",
+        ] {
+            set(path, ago(40));
+        }
+        let inventory = take(root, None).expect("taken");
+        assert_eq!(entry(&inventory, "local/v2").last_used, Some(ago(2)));
     }
 
     #[cfg(unix)]

@@ -1300,11 +1300,11 @@ pub async fn build(
     let dir = plan.published_dir(cache.dir(), target.as_ref());
     let path = dir.join(format!("{}.json", header.format_version));
     let publishing = cache.lock(&dir).await;
-    let (cache, published, recorded) = (cache.clone(), path.clone(), record.clone());
+    let (writing, published, recorded) = (cache.clone(), path.clone(), record.clone());
     super::blocking(move || {
         // As long as its inputs, made off the async threads.
         let record_json = serde_json::to_vec_pretty(&recorded).map_err(io::Error::from)?;
-        cache.write_verified(&published, &contents)?;
+        writing.write_verified(&published, &contents)?;
         let written = cache::write_atomically(&dir.join(RECORD), &record_json);
         // The failure before is not of this build (requirement R-WS-7).
         if written.is_ok() {
@@ -1315,6 +1315,8 @@ pub async fn build(
     })
     .await
     .map_err(BuildError::Io)?;
+    // Once in a while after a build, which may have made the cache larger (decided in M2f's F1b, 6).
+    super::gc::after_build(cache);
     Ok(Built {
         json: path,
         record,

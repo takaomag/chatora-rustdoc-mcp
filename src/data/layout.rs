@@ -178,32 +178,49 @@ pub fn is_owned(root: &Path) -> bool {
 ///
 /// Returns an error when the directory cannot be read, or the marker cannot be written.
 pub fn claim(root: &Path) -> io::Result<Ownership> {
-    let ownership = if is_owned(root) {
-        Ownership::Owned
-    } else {
-        let (names, unknown) = names_in(root)?;
-        if !unknown.is_empty() {
-            return Ok(Ownership::Foreign(unknown));
-        }
-        // Not names that other tools use too alone, as `t` or `work`.
-        if !names.is_empty()
-            && !names
-                .iter()
-                .any(|name| DISTINCTIVE.contains(&name.as_str()))
-        {
-            return Ok(Ownership::Foreign(names));
-        }
-        cache::write_atomically(&root.join(MARKER), MARKER_TEXT.as_bytes())?;
-        if names.is_empty() {
-            Ownership::Created
-        } else {
-            Ownership::Adopted
-        }
-    };
+    let ownership = ownership(root)?;
+    match ownership {
+        Ownership::Foreign(_) => return Ok(ownership),
+        Ownership::Created | Ownership::Adopted => {
+            cache::write_atomically(&root.join(MARKER), MARKER_TEXT.as_bytes())?;
+        },
+        Ownership::Owned => {},
+    }
     if fs::symlink_metadata(root.join(CACHEDIR_TAG)).is_err() {
         cache::write_atomically(&root.join(CACHEDIR_TAG), CACHEDIR_TAG_TEXT.as_bytes())?;
     }
     Ok(ownership)
+}
+
+/// What [`claim`] finds the cache directory at `root` to be, writing nothing, as a dry run of the
+/// garbage collection tells it.
+///
+/// It reads the file system, so it is for a blocking thread.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be read.
+pub fn ownership(root: &Path) -> io::Result<Ownership> {
+    if is_owned(root) {
+        return Ok(Ownership::Owned);
+    }
+    let (names, unknown) = names_in(root)?;
+    if !unknown.is_empty() {
+        return Ok(Ownership::Foreign(unknown));
+    }
+    // Not names that other tools use too alone, as `t` or `work`.
+    if !names.is_empty()
+        && !names
+            .iter()
+            .any(|name| DISTINCTIVE.contains(&name.as_str()))
+    {
+        return Ok(Ownership::Foreign(names));
+    }
+    Ok(if names.is_empty() {
+        Ownership::Created
+    } else {
+        Ownership::Adopted
+    })
 }
 
 /// The names at the top of the cache directory at `root` that this server does not put there,

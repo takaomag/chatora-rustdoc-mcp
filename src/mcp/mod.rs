@@ -234,6 +234,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
         "pid": std::process::id(),
     }));
     let cache = Cache::open(settings);
+    // Read before the problems of the settings are reported, so that theirs are too.
+    crate::data::gc::set_limits(crate::data::layout::Limits::from_settings(settings));
     // After the first line of the log file, which starts what this run logs.
     settings.report();
     let cache = cache?;
@@ -241,6 +243,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
     claim(&cache).await;
     #[cfg(feature = "local")]
     sweep_in_background(&cache);
+    // When the server starts, in the background, for a while at most (decided in M2f's F1, 2).
+    crate::data::gc::in_background(&cache);
     #[cfg(feature = "local")]
     crate::data::toolchain::Programs::set_this(settings);
     #[cfg(feature = "local")]

@@ -12,13 +12,19 @@ use crate::{
     config::Settings,
     data::{
         cache::Cache,
+        gc::{self, Outcome},
         inventory::{self, Entry, Inventory, Kind},
         layout::{self, Class, Limits},
     },
 };
 
 /// The lines of the usage of the binary for the commands of this module.
-pub const USAGE: &str = "  cache ls  Show what the cache has, and how much of its limits it takes";
+pub const USAGE: &str =
+    "  cache ls            Show what the cache has, and how much of its limits it takes
+  cache gc [--dry-run]  Remove what the cache keeps longest unused, and what is over its limits";
+
+/// How many of the places removed `cache gc` lists.
+const LISTED: usize = 20;
 
 /// How many of the largest places `cache ls` shows (decided in M2f's F1a).
 const LARGEST: usize = 10;
@@ -61,6 +67,8 @@ impl Ran {
 pub fn cache(args: &[OsString], usage: &str) -> Ran {
     match args {
         [command] if command == "ls" => list(),
+        [command] if command == "gc" => collect(false),
+        [command, flag] if command == "gc" && flag == "--dry-run" => collect(true),
         // 2 is the conventional exit code for a usage error.
         _ => Ran::failed(ExitCode::from(2), format!("{usage}\n")),
     }
@@ -98,6 +106,85 @@ fn list() -> Ran {
             Ran::failed(ExitCode::FAILURE, format!("{}: {error}\n", root.display()))
         },
     }
+}
+
+/// `cache gc`: removes what the cache keeps that is old, of a layout of an earlier version, or over
+/// its limits, as the server does in the background, and tells what it removed (decided in M2f's
+/// F1b, 1). In a dry run, it removes nothing and writes nothing. A cache that is not this server's
+/// is not touched, with exit code 1.
+fn collect(dry_run: bool) -> Ran {
+    let settings = Settings::load();
+    warnings_to_stderr();
+    let cache = Cache::open(&settings);
+    let limits = Limits::from_settings(&settings);
+    settings.report();
+    let cache = match cache {
+        Ok(cache) => cache,
+        Err(error) => return Ran::failed(ExitCode::FAILURE, format!("{}\n", error_chain(&error))),
+    };
+    let root = cache.dir();
+    if !root.exists() {
+        return Ran::ok(format!("No cache at {}.\n", root.display()));
+    }
+    match gc::collect(&cache, &limits, None, dry_run) {
+        Ok(outcome) => Ran::ok(collected(root, &outcome, dry_run)),
+        Err(error) => Ran::failed(
+            ExitCode::FAILURE,
+            format!("{}: {}\n", root.display(), error_chain(&error)),
+        ),
+    }
+}
+
+/// What `cache gc` prints of the collection of the cache at `root` that did `outcome`.
+fn collected(root: &Path, outcome: &Outcome, dry_run: bool) -> String {
+    let bytes = outcome
+        .removed
+        .iter()
+        .fold(0_u64, |total, removal| total.saturating_add(removal.bytes));
+    let verb = if dry_run { "Would remove" } else { "Removed" };
+    let mut lines = vec![
+        format!("Cache: {}", root.display()),
+        format!(
+            "{verb} {} places, {}{}",
+            outcome.removed.len(),
+            format_size(bytes),
+            if outcome.removed.is_empty() { "." } else { ":" }
+        ),
+    ];
+    let mut removed: Vec<&gc::Removal> = outcome.removed.iter().collect();
+    removed.sort_by(|a, b| {
+        b.bytes
+            .cmp(&a.bytes)
+            .then_with(|| a.entry.path.cmp(&b.entry.path))
+    });
+    for removal in removed.iter().take(LISTED) {
+        lines.push(format!(
+            "  {:>10}  {:<15} {}  ({})",
+            format_size(removal.bytes),
+            removal.entry.kind.as_str(),
+            slashed(&removal.entry.path),
+            removal.reason.as_str()
+        ));
+    }
+    if let Some(more) = removed.len().checked_sub(LISTED).filter(|more| *more > 0) {
+        lines.push(format!("  and {more} more"));
+    }
+    if !outcome.in_use.is_empty() {
+        let in_use: Vec<String> = outcome.in_use.iter().map(|path| slashed(path)).collect();
+        lines.push(format!("Skipped, as in use: {}", in_use.join(", ")));
+    }
+    for (path, error) in &outcome.left {
+        lines.push(format!(
+            "Left for the next time, as it could not be removed: {} ({error})",
+            slashed(path)
+        ));
+    }
+    if !outcome.complete {
+        lines.push("Not all of the cache could be looked at: only what is old went.".to_owned());
+    }
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
 }
 
 /// Logs the warnings, as of the settings, to stderr: not to the server's log file.
