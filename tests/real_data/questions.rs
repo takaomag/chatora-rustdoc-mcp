@@ -237,13 +237,14 @@ fn questions() -> Vec<Question> {
             question(
                 "build_external_docs",
                 "what is the API of this other workspace?",
-                json!({ "project": OTHER_WORKSPACE }),
+                // For the host, which it is built for on each OS, not the target of the data.
+                json!({ "project": OTHER_WORKSPACE, "target": null }),
                 |result| result["data"]["built"] == true,
             ),
             question(
                 "crate_overview",
                 "what is this crate, and how is it organized?",
-                json!({ "crate": "greet", "project": OTHER_WORKSPACE }),
+                json!({ "crate": "greet", "project": OTHER_WORKSPACE, "target": null }),
                 |result| {
                     result["provenance"]["recorded_by"] == "build_external_docs"
                         && result["provenance"]["resolved_from"] == "external"

@@ -3952,7 +3952,17 @@ fn the_record_of_a_workspace_whose_directory_is_gone_is_read() {
     let built = built_by_external(&mut server, 1, &json!({ "project": project }));
     assert_eq!(built["structuredContent"]["data"]["built"], true, "{built}");
     let moved = dir.path().join("moved");
-    std::fs::rename(&outside, &moved).expect("moved");
+    // On Windows, not while cargo, which the server runs after it answers for the inputs of the
+    // builds, still works in it.
+    let mut renamed = std::fs::rename(&outside, &moved);
+    for _ in 0..60 {
+        if renamed.is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+        renamed = std::fs::rename(&outside, &moved);
+    }
+    renamed.expect("moved");
     let member = given.join("macros").display().to_string();
     let manifest = given.join("Cargo.toml").display().to_string();
     let lookups = [

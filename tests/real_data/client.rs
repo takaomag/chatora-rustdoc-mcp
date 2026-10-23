@@ -148,7 +148,8 @@ impl Client {
 const DATA_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 /// `arguments` with `target` set to [`DATA_TARGET`] if they have none, but for a crate of std,
-/// which this server reads for the host from the Rust distribution on every OS.
+/// which this server reads for the host from the Rust distribution on every OS; or without it,
+/// if they set it to `null`.
 fn with_data_target(arguments: &Value) -> Value {
     let mut arguments = arguments.clone();
     let of_std = arguments
@@ -162,6 +163,14 @@ fn with_data_target(arguments: &Value) -> Value {
                 "std" | "core" | "alloc" | "proc_macro" | "test"
             )
         });
+    // `null` leaves it out: for what is built here, for the host, as a workspace outside the
+    // project that `build_external_docs` documents.
+    if let Some(fields) = arguments.as_object_mut()
+        && fields.get("target") == Some(&Value::Null)
+    {
+        fields.remove("target");
+        return arguments;
+    }
     if let Some(fields) = arguments.as_object_mut()
         && !of_std
         && !fields.contains_key("target")
