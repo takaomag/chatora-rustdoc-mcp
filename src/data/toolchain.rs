@@ -706,6 +706,18 @@ pub enum ChooseError {
     Failed(String),
 }
 
+impl ChooseError {
+    /// Whether trying again may work: when a toolchain's rustdoc or rustc ran longer than a
+    /// command here may, as on a busy machine (decided in M2f).
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Failed(why) => tool::timed_out(why),
+            Self::NotInstalled(_) | Self::NightlyMissing { .. } | Self::TooOld { .. } => false,
+        }
+    }
+}
+
 /// What builds the documentation of the project at `root`, with `work` for the probes (decided in
 /// M2's D1).
 ///
@@ -1061,6 +1073,18 @@ mod tests {
         assert_eq!(nightly(None), "nightly");
         let date: NightlyDate = "2026-06-11".parse().expect("a date");
         assert_eq!(nightly(Some(&date)), "nightly-2026-06-11");
+    }
+
+    /// A rustdoc that ran too long, as on a busy machine, may answer later; one that answered
+    /// otherwise will not (decided in M2f).
+    #[test]
+    fn only_a_rustdoc_that_ran_too_long_is_tried_again() {
+        let timed_out =
+            ChooseError::Failed("rustdoc +nightly -vV did not finish in 10 seconds".into());
+        assert!(timed_out.is_transient());
+        let broken = ChooseError::Failed("rustdoc -vV wrote no version".into());
+        assert!(!broken.is_transient());
+        assert!(!ChooseError::TooOld { found: 40 }.is_transient());
     }
 
     /// The rustdoc here writes a format, which is kept by its commit (decided in M2's D1).

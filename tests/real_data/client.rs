@@ -57,6 +57,16 @@ impl Answer {
     }
 }
 
+/// Whether `result` is a build that failed for a moment: `build_failed` that may pass when tried
+/// again (`retryable`).
+fn failed_for_a_moment(result: &Value) -> bool {
+    result["isError"] == true
+        && result["content"][0]["text"]
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .is_some_and(|error| error["code"] == "build_failed" && error["retryable"] == true)
+}
+
 impl Client {
     /// Starts a server with the default project `project`, logging to `logs`. The cache is that
     /// of the environment (`CHATORA_RUSTDOC_MCP_CACHE__DIR`). Without a project, it runs outside
@@ -135,9 +145,12 @@ impl Client {
         let call = json!({ "name": tool, "arguments": arguments });
         let mut result = self.request("tools/call", call.clone());
         // While the work it needs goes on, as cargo resolving the project on a slow runner, the
-        // answer comes again (requirement R-OUT-9): within a few minutes.
+        // answer comes again (requirement R-OUT-9): within a few minutes. So does a build that
+        // failed for a moment, as when a toolchain's rustdoc ran too long on a busy runner, whose
+        // failure is kept for a minute.
         for _ in 0..30 {
-            if result["structuredContent"]["status"] != "building" {
+            if result["structuredContent"]["status"] != "building" && !failed_for_a_moment(&result)
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_secs(5));

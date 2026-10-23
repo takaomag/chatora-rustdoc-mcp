@@ -271,7 +271,7 @@ def run_case(case: dict, binary: Path, args: argparse.Namespace, out: Path, run:
             problems.append(problem)
     usage = final.get("usage") or {}
     return {
-        "id": case["id"],
+        "id": run,
         "question": case["question"],
         "ok": not problems,
         "problems": problems,

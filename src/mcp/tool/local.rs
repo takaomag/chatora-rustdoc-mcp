@@ -982,9 +982,10 @@ pub(super) fn local_error(what: &str, error: &LocalError) -> CallToolResult {
         )
         | LocalError::Missing(missing_one) => missing_toolchain(what, missing_one, &missing),
         LocalError::Choose(ChooseError::TooOld { found }) => unsupported(what, *found),
-        LocalError::Choose(ChooseError::Failed(why)) => failed(
+        LocalError::Choose(choose @ ChooseError::Failed(why)) => failed(
             format!("the toolchain that builds {what} could not be told: {why}"),
-            false,
+            // A rustdoc that ran too long, as on a busy machine, may answer later.
+            choose.is_transient(),
             &[],
         ),
         LocalError::Failed { failed, kept } => failed_body(failed, *kept),

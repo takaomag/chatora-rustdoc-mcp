@@ -15,6 +15,16 @@ use parking_lot::Mutex;
 /// Longest wait for a command that takes milliseconds when it works.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The end of the error of a command that ran longer than [`TIMEOUT`], which a slow machine may
+/// cause for a moment ([`timed_out`]).
+const TIMED_OUT: &str = "did not finish in 10 seconds";
+
+/// Whether `error`, of a command run here, is that it ran too long: trying again may work.
+#[must_use]
+pub(super) fn timed_out(error: &str) -> bool {
+    error.ends_with(TIMED_OUT)
+}
+
 /// How long [`output_kept`] keeps what a command printed. Toolchains are seldom installed or
 /// switched while a session runs, and running rustc through rustup takes about 25 milliseconds,
 /// twice for each lookup in std, against a target of 50 for a whole lookup (§9.1, decided in M1).
@@ -137,7 +147,7 @@ pub(super) async fn output_with(
     let command = || format!("{program} {}", args.join(" "));
     let output = tokio::time::timeout(TIMEOUT, child.output())
         .await
-        .map_err(|_elapsed| Cow::Owned(format!("{} did not finish in 10 seconds", command())))?
+        .map_err(|_elapsed| Cow::Owned(format!("{} {TIMED_OUT}", command())))?
         .map_err(not_run)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

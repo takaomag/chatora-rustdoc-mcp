@@ -1861,6 +1861,20 @@ Claude Code 2.1.304、Linux で測った。
 - `eval/cases.json` に 9 問を足した (決定 7): `own-traits` (member の型の trait、list_impls)・`own-private` (private な関数のシグネチャと可視性)・`own-unnamed` (名指しなしの自分の item、組み込みのツールあり、3 回)・`own-search` (名前を知らずに自分の item を探す)・`own-building` (5 秒の build.rs と待ち 1 秒で `building` を受け、呼び直すか)・`own-stale` (先にビルドしてから build.rs と lib を書き換え、`stale` を受ける)・`outside-workspace` (other-workspace の写しを `build_external_docs` で)・`other-target` (tokio の x86_64-pc-windows-gnu)・`worktree` (worktree の `project` を渡すか)。全部で 27 問、くり返しを含めて 29 回
 - dry run で 9 問の写しと下準備と claude の引数を確かめた。答えの照合は識別子 (`Greeter`・`retries`・`u32` など) を主にし、利用者の CLAUDE.md で答えが日本語になっても通るように
 
+**F4b (eval を回す。2026-10-23)**:
+
+- 条件: Claude Code 2.1.309、既定のモデル、`eval/results/20261023-214040/` (Git に入れない)。27 問をくり返し込みで 29 回、28 回が合格、費用 2.29 USD (決定 8 の予算 5〜8 USD の内)、最初の要求の入力トークン (固定費) は最小 9,424、`tool_result` は p50 885 文字・p95 6,343 文字
+- M1 の 18 問はすべて合格
+- 自分の item: `own-traits`・`own-private`・`own-search`・`worktree` はどれも MCP で答えた (名指しなしの問いはまず `search_items`)。`worktree` は worktree の `project` を渡した
+- 選ぶ側 (`own-unnamed`、Read・Grep・Glob・LSP・ToolSearch あり、3 回): 3 回とも最初に ToolSearch でこのサーバーのツールを読み込み、2 回は MCP で引いて答え、1 回は読み込んだ後に Grep と Read でソースを読んで答えた (答えは正しい)。M2d の区切りの試し (名指しが無いと MCP を一度も使わなかった) から、instructions の直し (F4a-1) が効いた。2 回目は crate なしの検索で member が「まだビルド中」(`partial`) を受け、crate を名指しして呼び直した
+- ビルド中 (`own-building`): `building` を受けてすぐに呼び直し (headless では待つ手段が無い)、6 回目で答えた。stale (`own-stale`): 前のビルドで答えた
+- 外の workspace (`outside-workspace`): `build_external_docs` を先に呼び、記録を照会のツールで読んだ
+- 他の target (`other-target`): Windows の target で引いて `docs_unavailable` (docs.rs に無く、ここでも作っていない、`build_external_docs` の案内) を受けたが、`build_external_docs` は呼ばずに Linux の docs.rs のデータ (`cfg(windows)` の item も載る) で正しく答えた
+- 決定 12 (private なフィールドの印): `retries` は `pub(crate)` と出る (crate の root の private) が、モデルはどの回も「private で外から触れない」と答えた。印は足さない
+- 直したこと: くり返したケースの表の名前 (`run.py`)。F4 完了
+- 残したもの: 選ぶ側の 1 回は MCP を読み込んでもソースを読んだ (ソースが手元にあるときは誤りではない)。alwaysLoad (R-MCP-8) は M5 の比較で
+- 49de673 の CI は Windows の testdata だけ落ちた (testdata のキャッシュは初めて復元された): F4a-1 で足した real_data のケース (このリポジトリの member) で、`rustdoc +nightly -vV did not finish in 10 seconds` の `build_failed` が `retryable: false` で返った。toolchain の調べの失敗 (`ChooseError::Failed`) は理由を問わず `retryable: false` だった。利用者が決めたこと: 時間切れは一時的なので `retryable: true` で返し (`ChooseError::is_transient`、`tool::timed_out`。上限 10 秒は変えず、失敗は今どおり 60 秒だけ覚える)、real_data のクライアントは `retryable: true` の `build_failed` も 5 秒おきに 30 回まで呼び直す
+
 **F5a・F5b (手元の測定。2026-10-23)**:
 
 - 道具 `eval/build_bench.py` (`prepare` でこのリポジトリを利用者の git の設定を読まずに clone し、`eval/fixture` と `tests/fixtures/local-build` を写して `target/f5/src` に。`run` で空のキャッシュからの冷えたビルドを 1 回の呼び出しで (`build.wait_secs` 600・`limits.request_timeout_secs` 900・`network.offline`)、続けて member の lib の末尾に関数を足しての作り直しを、前の dep-info が記録されてから。作り直した unit は fingerprint のディレクトリの中のファイルの時刻で数える (cargo はファイルを書き直すのでディレクトリの時刻は変わらない)。`diagnostics` で写しを壊して生のエラーとサーバーの応答を見る)。`eval/bench.py` の `Server` に cwd と環境変数を足し、アーカイブの形式の指定を `v*t*` に (古い `v5t*` のままだった)
