@@ -16,6 +16,7 @@ pub mod cargo_lock;
 mod cargo_tree;
 #[cfg(feature = "local")]
 pub mod child;
+pub mod clear;
 pub mod crate_file;
 pub mod crate_name;
 pub mod dist;

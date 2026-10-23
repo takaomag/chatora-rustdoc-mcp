@@ -203,7 +203,12 @@ impl Taking<'_> {
         let class = layout::class_of(name);
         for child in self.children(Path::new(name)) {
             let path = Path::new(name).join(&child);
-            if child == "v1" {
+            // A link, which may lead out of the cache, is not followed.
+            let is_dir =
+                fs::symlink_metadata(self.root.join(&path)).is_ok_and(|metadata| metadata.is_dir());
+            if child == "v1" && !is_dir {
+                self.place(&path, Kind::Unknown, None);
+            } else if child == "v1" {
                 for grandchild in self.children(&path) {
                     let path = path.join(&grandchild);
                     // The aliases of the workspaces and the commits of the repositories, which the
@@ -591,6 +596,28 @@ mod tests {
         }
         let inventory = take(root, None).expect("taken");
         assert_eq!(entry(&inventory, "local/v2").last_used, Some(ago(2)));
+    }
+
+    /// A format of the records or the local builds that is a link is not followed: what it leads
+    /// to is not this cache's.
+    #[cfg(unix)]
+    #[test]
+    fn a_format_that_is_a_link_is_not_followed() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path().join("cache");
+        let elsewhere = dir.path().join("elsewhere");
+        write(&elsewhere, "w/p/t/lib/61.json", 1);
+        fs::create_dir_all(root.join("local")).expect("made");
+        std::os::unix::fs::symlink(&elsewhere, root.join("local/v1")).expect("linked");
+        let inventory = take(&root, None).expect("taken");
+        assert_eq!(entry(&inventory, "local/v1").kind, Kind::Unknown);
+        assert!(
+            inventory
+                .entries
+                .iter()
+                .all(|entry| !entry.path.starts_with("local/v1/w")),
+            "{inventory:?}"
+        );
     }
 
     #[cfg(unix)]

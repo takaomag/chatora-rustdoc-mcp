@@ -46,7 +46,7 @@ const USAGE: &str = const_format::concatcp!(
     " <COMMAND>
 
 Commands:
-  serve     Run the MCP server over stdio
+  serve                 Run the MCP server over stdio
 ",
     chatora_rustdoc_mcp::cli::USAGE
 );

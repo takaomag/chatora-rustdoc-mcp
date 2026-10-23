@@ -709,6 +709,85 @@ fn cache_gc_removes_what_is_old() {
     assert!(foreign.join("notes.txt").exists());
 }
 
+/// `cache clear` removes what it keeps of a crate, of a release or of all its versions, or all
+/// that it keeps, and tells what it removed; with `--dry-run`, it removes nothing; it takes only a
+/// version in full, and not the crates of the standard library (decided in M2f's F1, 9, and F1c).
+#[test]
+fn cache_clear_removes_what_it_is_asked_to() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "").expect("written");
+    let cache = dir.path().join("cache");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"))
+            .args(args)
+            .env("CHATORA_RUSTDOC_MCP_CONFIG", &config)
+            .env("CHATORA_RUSTDOC_MCP_CACHE__DIR", &cache)
+            .stdin(Stdio::null())
+            .output()
+            .expect("the binary runs")
+    };
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    std::fs::create_dir_all(&cache).expect("made");
+    std::fs::write(cache.join("chatora-rustdoc-mcp.cache"), "").expect("written");
+    for path in [
+        "docs.rs/demo/1.0.0/_default/61.json",
+        "docs.rs/demo/2.0.0/_default/61.json",
+        "docs.rs/other/1.0.0/_default/61.json",
+        "locks/a",
+    ] {
+        old_file(&cache, path, 0);
+    }
+    for args in [
+        ["cache", "clear", "std"].as_slice(),
+        &["cache", "clear", "Core"],
+        &["cache", "clear", "proc-macro"],
+        &["cache", "clear", "demo@1.0"],
+        &["cache", "clear", "demo", "other"],
+        &["cache", "clear", "--force"],
+    ] {
+        let refused = run(args);
+        assert_eq!(refused.status.code(), Some(2), "{args:?}: {refused:?}");
+    }
+    let dry = run(&["cache", "clear", "--dry-run", "demo@1.0.0"]);
+    assert!(dry.status.success(), "{dry:?}");
+    assert!(
+        text(&dry.stdout).contains("Would remove 1 places"),
+        "{dry:?}"
+    );
+    assert!(cache.join("docs.rs/demo/1.0.0").exists());
+    let cleared = run(&["cache", "clear", "demo@1.0.0"]);
+    assert!(cleared.status.success(), "{cleared:?}");
+    assert!(!cache.join("docs.rs/demo/1.0.0").exists());
+    assert!(cache.join("docs.rs/demo/2.0.0").exists());
+    let nothing = run(&["cache", "clear", "demo@1.0.0"]);
+    assert!(nothing.status.success(), "{nothing:?}");
+    assert!(
+        text(&nothing.stdout).contains("Nothing of demo@1.0.0 to remove"),
+        "{nothing:?}"
+    );
+    // What another process uses stays, which the exit code tells (decided in M2f's F1c, 7).
+    let using = Cache::at(&cache)
+        .try_lock_held(&cache.join("docs.rs/demo/2.0.0/_default"))
+        .expect("free");
+    let in_use = run(&["cache", "clear", "demo"]);
+    assert_eq!(in_use.status.code(), Some(1), "{in_use:?}");
+    assert!(
+        text(&in_use.stdout).contains("Skipped, as in use"),
+        "{in_use:?}"
+    );
+    drop(using);
+    let cleared = run(&["cache", "clear", "demo"]);
+    assert!(cleared.status.success(), "{cleared:?}");
+    assert!(!cache.join("docs.rs/demo").exists());
+    assert!(cache.join("docs.rs/other").exists());
+    let all = run(&["cache", "clear"]);
+    assert!(all.status.success(), "{all:?}");
+    assert!(!cache.join("docs.rs/other").exists());
+    assert!(cache.join("locks/a").exists());
+    assert!(cache.join("chatora-rustdoc-mcp.cache").exists());
+}
+
 /// The server collects the garbage of its cache when it starts, in the background (decided in
 /// M2f's F1, 2).
 #[test]
@@ -3354,14 +3433,24 @@ fn git_in(dir: &Path, gitconfig: &Path, args: &[&str]) -> String {
 }
 
 /// Calls `build_external_docs` with `arguments` from `id` on, until it no longer tells `status:
-/// building`; returns its result.
+/// building`, nor that a crate is still built, as on a slow runner past the wait for builds (a call
+/// again joins the builds going on); returns its result.
 #[cfg(all(debug_assertions, feature = "local"))]
 fn built_by_external(server: &mut Server, id: u64, arguments: &Value) -> Value {
+    let building = |result: &Value| {
+        let structured = &result["structuredContent"];
+        structured["status"] == "building"
+            || ["members", "dependencies"].iter().any(|crates| {
+                structured["data"][crates]
+                    .as_array()
+                    .is_some_and(|crates| crates.iter().any(|one| one["status"] == "building"))
+            })
+    };
     let mut result = Value::Null;
     for next in id..id.saturating_add(60) {
         server.send(&call_tool(next, "build_external_docs", arguments.clone()));
         result = server.response(next)["result"].clone();
-        if result["structuredContent"]["status"] != "building" {
+        if !building(&result) {
             break;
         }
         thread::sleep(Duration::from_secs(1));

@@ -8,10 +8,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use semver::Version;
+
 use crate::{
     config::Settings,
     data::{
         cache::Cache,
+        clear::{self, Asked},
+        crate_name::CrateName,
         gc::{self, Outcome},
         inventory::{self, Entry, Inventory, Kind},
         layout::{self, Class, Limits},
@@ -20,8 +24,10 @@ use crate::{
 
 /// The lines of the usage of the binary for the commands of this module.
 pub const USAGE: &str =
-    "  cache ls            Show what the cache has, and how much of its limits it takes
-  cache gc [--dry-run]  Remove what the cache keeps longest unused, and what is over its limits";
+    "  cache ls              Show what the cache has, and how much of its limits it takes
+  cache gc [--dry-run]  Remove what the cache keeps longest unused, and what is over its limits
+  cache clear [--dry-run] [<crate>[@<version>]]
+                        Remove all that the cache keeps, or what it keeps of a crate";
 
 /// How many of the places removed `cache gc` lists.
 const LISTED: usize = 20;
@@ -69,8 +75,109 @@ pub fn cache(args: &[OsString], usage: &str) -> Ran {
         [command] if command == "ls" => list(),
         [command] if command == "gc" => collect(false),
         [command, flag] if command == "gc" && flag == "--dry-run" => collect(true),
+        [command, rest @ ..] if command == "clear" => match clear_args(rest) {
+            Ok((asked, dry_run)) => clear(&asked, dry_run),
+            Err(why) => Ran::failed(ExitCode::from(2), format!("{why}\n\n{usage}\n")),
+        },
         // 2 is the conventional exit code for a usage error.
         _ => Ran::failed(ExitCode::from(2), format!("{usage}\n")),
+    }
+}
+
+/// The crates of the standard library, which the cache keeps by nightly, not by crate: by their
+/// cache keys.
+const STD_CRATES: [&str; 5] = ["std", "core", "alloc", "proc-macro", "test"];
+
+/// What `cache clear` with `args` is asked to clear, and whether it is a dry run; or why the
+/// arguments are not taken (decided in M2f's F1c, 5 and 6).
+fn clear_args(args: &[OsString]) -> Result<(Asked, bool), String> {
+    let mut dry_run = false;
+    let mut asked = None;
+    for arg in args {
+        let Some(arg) = arg.to_str() else {
+            return Err(format!("{} is not UTF-8", arg.display()));
+        };
+        if arg == "--dry-run" && !dry_run {
+            dry_run = true;
+        } else if asked.is_none() && !arg.starts_with('-') {
+            asked = Some(crate_asked(arg)?);
+        } else {
+            return Err(format!("{arg} is not taken here"));
+        }
+    }
+    Ok((asked.unwrap_or(Asked::All), dry_run))
+}
+
+/// The crate, and its version if given, of `arg`: `<crate>` or `<crate>@<version>`.
+fn crate_asked(arg: &str) -> Result<Asked, String> {
+    let (name, version) = arg
+        .split_once('@')
+        .map_or((arg, None), |(name, version)| (name, Some(version)));
+    let name: CrateName = name
+        .parse()
+        .map_err(|error| format!("{name} is not the name of a crate: {error}"))?;
+    if STD_CRATES.contains(&name.cache_key().as_str()) {
+        return Err(format!(
+            "{} is of the standard library, which the cache keeps by nightly, not by crate: the \
+             std of a nightly unused for a week is removed, and `cache clear` removes all of it",
+            name.as_str()
+        ));
+    }
+    let version = version
+        .map(|version| {
+            Version::parse(version)
+                .map_err(|error| format!("{version} is not a version in full, as 1.0.228: {error}"))
+        })
+        .transpose()?;
+    Ok(Asked::Crate { name, version })
+}
+
+/// `cache clear`: removes what `asked` names from the cache, as `cache gc` removes it, but even
+/// what was just used, and tells what it removed (decided in M2f's F1, 9, and F1c). In a dry run,
+/// it removes nothing and writes nothing, and tries no lock: what is in use shows only when it
+/// runs, but a target directory that what a stopped server left running uses. It exits with 1 when what it was asked to remove is in
+/// use or could not be removed, and stays (decided in M2f's F1c, 7), or when the cache is not this
+/// server's.
+fn clear(asked: &Asked, dry_run: bool) -> Ran {
+    let settings = Settings::load();
+    warnings_to_stderr();
+    let cache = Cache::open(&settings);
+    settings.report();
+    let cache = match cache {
+        Ok(cache) => cache,
+        Err(error) => return Ran::failed(ExitCode::FAILURE, format!("{}\n", error_chain(&error))),
+    };
+    let root = cache.dir();
+    if !root.exists() {
+        return Ran::ok(format!("No cache at {}.\n", root.display()));
+    }
+    match clear::clear(&cache, asked, dry_run) {
+        Ok(outcome)
+            if outcome.removed.is_empty()
+                && outcome.in_use.is_empty()
+                && outcome.left.is_empty() =>
+        {
+            Ran::ok(format!(
+                "Cache: {}\nNothing of {asked} to remove.\n",
+                root.display()
+            ))
+        },
+        Ok(outcome) => {
+            let text = collected(root, &outcome, dry_run);
+            if outcome.in_use.is_empty() && outcome.left.is_empty() {
+                Ran::ok(text)
+            } else {
+                Ran {
+                    code: ExitCode::FAILURE,
+                    stdout: text,
+                    stderr: String::new(),
+                }
+            }
+        },
+        Err(error) => Ran::failed(
+            ExitCode::FAILURE,
+            format!("{}: {}\n", root.display(), error_chain(&error)),
+        ),
     }
 }
 

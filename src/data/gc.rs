@@ -46,12 +46,12 @@ const TRASH: &str = "gc";
 /// The classes of the cache that a collection removes from: not what builds make, in a server
 /// that does not build, as a server that builds may share the cache (decided in M2f's F1b).
 #[cfg(feature = "local")]
-const COLLECTED: &[Class] = &[Class::Docs, Class::Targets];
+pub const COLLECTED: &[Class] = &[Class::Docs, Class::Targets];
 
 /// The classes of the cache that a collection removes from: not what builds make, in a server
 /// that does not build, as a server that builds may share the cache (decided in M2f's F1b).
 #[cfg(not(feature = "local"))]
-const COLLECTED: &[Class] = &[Class::Docs];
+pub const COLLECTED: &[Class] = &[Class::Docs];
 
 /// How long the server's collection looks at the cache: what it did not see is collected the next
 /// time, by its age only (decided in M2f's F1b, 5).
@@ -75,6 +75,9 @@ pub enum Reason {
     OtherFormat,
     /// The std of a nightly, unused for a week.
     UnusedStd,
+    /// Asked for with `cache clear`, which removes it even when it was just used, if no one uses
+    /// it now (decided in M2f's F1c, 8).
+    Asked,
     /// What builds made, unused for `cache.target_max_age_days`.
     Unused,
     /// The least recently used of its class, which took more than its limit.
@@ -90,6 +93,7 @@ impl Reason {
             Self::OtherFormat => "other format, unused",
             Self::Unused => "unused",
             Self::UnusedStd => "nightly unused for a week",
+            Self::Asked => "asked for",
             Self::OverLimit => "over the limit",
         }
     }
@@ -153,16 +157,7 @@ pub fn collect(
     dry_run: bool,
 ) -> Result<Outcome, NotRun> {
     let root = cache.dir();
-    // A dry run writes nothing, but tells what a cache that would be adopted has.
-    let ownership = if dry_run {
-        layout::ownership(root)?
-    } else {
-        layout::claim(root)?
-    };
-    match ownership {
-        Ownership::Foreign(names) => return Err(NotRun::NotOwned(names)),
-        Ownership::Created | Ownership::Owned | Ownership::Adopted => {},
-    }
+    owned(root, dry_run)?;
     let _collecting = if dry_run {
         None
     } else {
@@ -190,6 +185,26 @@ pub fn collect(
     remove_orphan_aliases(cache, now, dry_run, &mut outcome);
     outcome.complete = inventory.complete;
     Ok(outcome)
+}
+
+/// Whether the cache directory at `root` is this server's, which is made so when it may be adopted;
+/// a dry run writes nothing, but tells what a cache that would be adopted has.
+///
+/// It reads and writes the file system, so it is for a blocking thread.
+///
+/// # Errors
+///
+/// Returns [`NotRun::NotOwned`] when it is not, or why it could not be told.
+pub fn owned(root: &Path, dry_run: bool) -> Result<(), NotRun> {
+    let ownership = if dry_run {
+        layout::ownership(root)?
+    } else {
+        layout::claim(root)?
+    };
+    match ownership {
+        Ownership::Foreign(names) => Err(NotRun::NotOwned(names)),
+        Ownership::Created | Ownership::Owned | Ownership::Adopted => Ok(()),
+    }
 }
 
 /// Removes the std of the nightlies unused for a week, as the reads of std do: the same rule, in
@@ -271,7 +286,8 @@ fn remove_orphan_aliases(cache: &Cache, now: SystemTime, dry_run: bool, outcome:
 
 /// The target directories that what the servers that have stopped left running may still use,
 /// relative to the cache: not removed.
-fn in_use(root: &Path) -> HashSet<PathBuf> {
+#[must_use]
+pub fn in_use(root: &Path) -> HashSet<PathBuf> {
     #[cfg(all(unix, feature = "local"))]
     {
         super::owner::recorded_target_dirs(root)
@@ -300,14 +316,47 @@ pub fn pairs(root: &Path, inventory: &Inventory) -> HashMap<PathBuf, PathBuf> {
             let text = fs::read(root.join(&entry.path).join(layout::LOCAL_RECORD)).ok()?;
             let record: serde_json::Value = serde_json::from_slice(&text).ok()?;
             let published = record.get("published")?.as_str()?;
-            let body: PathBuf = published.split('/').collect();
-            // Only a place of the local builds, as it records, and nothing that leads out of it.
-            let normal = body
-                .components()
-                .all(|component| matches!(component, Component::Normal(_)));
-            (normal && body.starts_with(layout::LOCAL)).then(|| (entry.path.clone(), body))
+            Some((entry.path.clone(), published_body(published)?))
         })
         .collect()
+}
+
+/// The builds of `pairs` that go with their records, by record: those that are places of the
+/// local builds in `inventory`, and that one record alone is of.
+#[must_use]
+pub fn own_bodies<S: BuildHasher>(
+    pairs: &HashMap<PathBuf, PathBuf, S>,
+    inventory: &Inventory,
+) -> HashMap<PathBuf, PathBuf> {
+    let locals: HashSet<&PathBuf> = inventory
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == Kind::Local)
+        .map(|entry| &entry.path)
+        .collect();
+    let records_of = pairs
+        .values()
+        .fold(HashMap::<&PathBuf, usize>::new(), |mut counts, body| {
+            let count = counts.entry(body).or_default();
+            *count = count.saturating_add(1);
+            counts
+        });
+    pairs
+        .iter()
+        .filter(|(_, body)| records_of.get(body) == Some(&1) && locals.contains(body))
+        .map(|(record, body)| (record.clone(), body.clone()))
+        .collect()
+}
+
+/// The build that a record of `build_external_docs` tells it is of, `published`, relative to the
+/// cache: only a place of the local builds, as it records, and nothing that leads out of it.
+#[must_use]
+pub fn published_body(published: &str) -> Option<PathBuf> {
+    let body: PathBuf = published.split('/').collect();
+    let normal = body
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)));
+    (normal && body.starts_with(layout::LOCAL)).then_some(body)
 }
 
 /// What to remove of `inventory`, with `limits`, at `now`.
@@ -331,21 +380,8 @@ pub fn plan<S: BuildHasher, T: BuildHasher>(
         .iter()
         .map(|entry| (&entry.path, entry))
         .collect();
-    let records_of = pairs
-        .values()
-        .fold(HashMap::<&PathBuf, usize>::new(), |mut counts, body| {
-            let count = counts.entry(body).or_default();
-            *count = count.saturating_add(1);
-            counts
-        });
-    let body_of = |record: &PathBuf| {
-        pairs.get(record).filter(|body| {
-            records_of.get(body) == Some(&1)
-                && by_path
-                    .get(body)
-                    .is_some_and(|body| body.kind == Kind::Local)
-        })
-    };
+    let own = own_bodies(pairs, inventory);
+    let body_of = |record: &PathBuf| own.get(record);
     let age_of = |entry: &Entry| {
         entry
             .last_used
@@ -476,7 +512,8 @@ pub fn run(cache: &Cache, removals: Vec<Removal>, dry_run: bool) -> Outcome {
             .is_ok_and(|metadata| metadata.is_dir())
             .then(|| used::last_used(&absolute))
             .flatten();
-        if let (Some(now_used), Some(then)) = (now_used, removal.entry.last_used)
+        if removal.reason != Reason::Asked
+            && let (Some(now_used), Some(then)) = (now_used, removal.entry.last_used)
             && now_used > then
         {
             outcome.in_use.push(path);
@@ -596,8 +633,16 @@ fn remove_place(root: &Path, place: &Path, kind: Kind) -> io::Result<()> {
         }
         return Ok(());
     }
-    let trash = trash(root)?;
-    fs::rename(&path, &trash)?;
+    // Once more when the place to move it to was deleted meanwhile, as a collection empties it.
+    let moved = trash(root).and_then(|trash| fs::rename(&path, &trash).map(|()| trash));
+    let trash = match moved {
+        Err(error) if error.kind() == io::ErrorKind::NotFound && path.exists() => {
+            let trash = trash(root)?;
+            fs::rename(&path, &trash)?;
+            trash
+        },
+        moved => moved?,
+    };
     if let Err(error) = fs::remove_dir_all(&trash) {
         tracing::warn!(path = %trash.display(), %error, "what was removed from the cache could not all be deleted: the next collection deletes it");
     }
@@ -625,7 +670,15 @@ fn trash(root: &Path) -> io::Result<PathBuf> {
     Ok(dir.join(name))
 }
 
-/// Deletes what earlier collections moved to [`TRASH`] in the cache at `root` and could not
+/// Deletes what earlier collections moved to `work/gc` and could not delete, unless a collection
+/// goes on, which moves what it removes there.
+pub fn empty_trash_unless_collecting(root: &Path) {
+    if let Ok(Some(_collecting)) = process_lock::try_lock(root, GC_KEY, LockMode::Exclusive) {
+        empty_trash(root);
+    }
+}
+
+/// Deletes what earlier collections moved to `work/gc` in the cache at `root` and could not
 /// delete.
 fn empty_trash(root: &Path) {
     let dir = root.join(layout::WORK).join(TRASH);
