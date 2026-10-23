@@ -1777,7 +1777,15 @@ Claude Code 2.1.304、Linux で測った。
 - テスト: 単体 4 件 (crate の版と全版と index と綴り・全体で残るもの・使用中・外の記録の種類と照合)、stdio (`cache_clear_removes_what_it_is_asked_to`: 使い方の誤り 4 つ・dry run・版・当たらない・別のプロセスがロックを持つと 1・全体)
 - レビュー (サブエージェント、読むだけ) の対応: (1) 2 つ以上の記録が指す本体を、引数なしの clear が記録と別に消し、記録が使用中で残ると `record_broken` を残しえた。名指しでは記録がすべて消えても本体が残った。記録が指す本体は単独では選ばず、1 つの記録だけが指すものは記録と組で、2 つ以上が指すものは指す記録がすべて消えた後に消す (2) 版を省いた clear で index の `.miss.json` が残った (決定 4 の漏れ)。接尾辞を外して照合 (3) `Std`・`CORE`・`proc-macro` が std の判定を通った。cache key で比べる (4) clear が `gc` のロックなしで `work/gc` を空にし、裏の GC の rename と競合しえた。`gc` のロックを試し取りできたときだけ空にし、rename は移し先が消えていればもう 1 回 (5) git の記録の版を読む本体のパスの検査が弱かった (Windows の `\..`)。gc と同じ `gc::published_body` (6) `local/v1`・`ext/v1` が link だとたどり、clear がキャッシュの外を消しえた。`v1` が link なら知らないもの (7) dry run はロックを試さないので、使用中は実行したときにだけ出る旨を説明に。テストを足した: 共有の本体の 2 つの場合・`.miss.json`・std の綴り違い・`v1` の link (Unix)
 - fa769c7 (real_data の直し) の CI は Windows の testdata が緑になったが、Windows の check で stdio の 3 件 (`build_external_docs_documents_the_project_for_another_target` など) が同じ形で落ちた (`built: false`、member が `building`)。f2f163c では通っていたので runner の遅さの揺れ。テストの `built_by_external` は最上位の `status: building` だけを呼び直していた。member か依存に `building` が残る間も呼び直す (呼び直しは進んでいるビルドに加わる)
-- F1c-1 は 14972b5 (CI 11 job 緑)。F1c-2 (F1 の終わりの印のテスト: サーバーと CLI の同時実行・ロック中の target dir の stdio・Windows の写像) は残り
+- F1c-1 は 14972b5 (CI 11 job 緑)
+
+**F1c-2 (F1 の終わりの印のテスト。2026-10-23)**:
+
+- stdio `the_cache_commands_break_nothing_while_a_server_reads_the_cache`: 偽の docs.rs から読むサーバーが照会している間に、別のプロセスで `cache gc`・`cache clear demo@0.1.0`・`cache clear --dry-run`・`cache clear demo` を順に走らせ、どれも終了コード 0 か 1 (使用中)、サーバーは毎回答え、消されたものは取り直す (docs.rs への要求が 3 回以上)
+- stdio `cache_gc_leaves_a_target_directory_being_built_in`: 別のプロセス (テスト) が `target:` のロックを共有で持つ target dir は `cache gc` が飛ばして `Skipped, as in use` と表示し、放せば消える (ローカルビルドの機能があるときだけ)
+- 単体 `gc::tests::a_place_with_a_mapped_archive_goes_once_it_can`: 写像中のアーカイブがある置き場は、丸ごと残る (OS が移せないとき、Windows を見込む) か丸ごと消える (Unix では必ず。写像は生きたまま) かで、半端には残らず、写像を放した次の GC で消え、`work/gc` も空になる。Windows で rename が実際に失敗するかは CI で分かる (どちらでも通る形)
+- テストのキャッシュの CLI を走らせる部品 `cache_command` を足した (利用者の設定ファイルを読まない)
+- これで F1 の終わりの印 (`cache` の CLI・GC・サーバーとの同時実行・使用中を飛ばす・Windows の消し残し) はそろった。F1 完了
 
 **F3 の下調べと F3a (2026-10-23)**:
 

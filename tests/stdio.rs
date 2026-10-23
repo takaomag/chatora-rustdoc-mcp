@@ -788,6 +788,86 @@ fn cache_clear_removes_what_it_is_asked_to() {
     assert!(cache.join("chatora-rustdoc-mcp.cache").exists());
 }
 
+/// Runs `chatora-rustdoc-mcp` with `args` for the cache at `cache`, without the user's config file.
+fn cache_command(cache: &Path, args: &[&str]) -> std::process::Output {
+    let config = TempDir::new().expect("a temporary directory");
+    let file = config.path().join("config.toml");
+    std::fs::write(&file, "").expect("written");
+    Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"))
+        .args(args)
+        .env("CHATORA_RUSTDOC_MCP_CONFIG", &file)
+        .env("CHATORA_RUSTDOC_MCP_CACHE__DIR", cache)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the binary runs")
+}
+
+/// `cache gc` leaves a target directory that a build in another process uses, which holds its
+/// lock, and tells it; it removes it once the build is done (decided in M2f's F1, 8).
+#[cfg(feature = "local")]
+#[test]
+fn cache_gc_leaves_a_target_directory_being_built_in() {
+    use chatora_rustdoc_mcp::data::process_lock::{self, LockMode};
+    let dir = TempDir::new().expect("a temporary directory");
+    let cache = dir.path().join("cache");
+    std::fs::create_dir_all(&cache).expect("made");
+    std::fs::write(cache.join("chatora-rustdoc-mcp.cache"), "").expect("written");
+    old_place(&cache, "t/0123456789ab", 40);
+    let building = process_lock::try_lock(&cache, "target:0123456789ab", LockMode::Shared)
+        .expect("locked")
+        .expect("free");
+    let skipped = cache_command(&cache, &["cache", "gc"]);
+    assert!(skipped.status.success(), "{skipped:?}");
+    assert!(
+        String::from_utf8_lossy(&skipped.stdout).contains("Skipped, as in use: t/0123456789ab"),
+        "{skipped:?}"
+    );
+    assert!(cache.join("t/0123456789ab/target/x").exists());
+    drop(building);
+    let removed = cache_command(&cache, &["cache", "gc"]);
+    assert!(removed.status.success(), "{removed:?}");
+    assert!(!cache.join("t/0123456789ab").exists());
+}
+
+/// While a server reads its cache, `cache gc` and `cache clear` of it, from other processes,
+/// break nothing: the server answers, fetching again what was cleared (decided in M2f's F1, 8).
+#[cfg(debug_assertions)]
+#[test]
+fn the_cache_commands_break_nothing_while_a_server_reads_the_cache() {
+    let json = serde_json::to_vec(&demo_crate()).expect("serializes");
+    let (docs_rs, requests) = slow_server(json, Duration::ZERO);
+    let mut server = server_with_slow_docs_rs(&docs_rs, "30");
+    let cache = server.cache.path().to_path_buf();
+    let arguments = json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET });
+    let commands: [&[&str]; 4] = [
+        &["cache", "gc"],
+        &["cache", "clear", "demo@0.1.0"],
+        &["cache", "clear", "--dry-run"],
+        &["cache", "clear", "demo"],
+    ];
+    for (id, args) in (1..).zip(commands) {
+        server.send(&call_tool(id, "get_item", arguments.clone()));
+        let result = server.response(id)["result"].clone();
+        assert_eq!(result["isError"], false, "{args:?} before: {result}");
+        assert_ne!(
+            result["structuredContent"]["status"], "building",
+            "{result}"
+        );
+        let ran = cache_command(&cache, args);
+        // What is in use is skipped, which exits with 1.
+        assert!(
+            matches!(ran.status.code(), Some(0 | 1)),
+            "{args:?}: {ran:?}"
+        );
+    }
+    server.send(&call_tool(9, "get_item", arguments));
+    let result = server.response(9)["result"].clone();
+    assert_eq!(result["isError"], false, "after: {result}");
+    // Fetched again after each clear.
+    assert!(requests.load(Ordering::SeqCst) >= 3, "{requests:?}");
+    assert!(server.finish().success());
+}
+
 /// The server collects the garbage of its cache when it starts, in the background (decided in
 /// M2f's F1, 2).
 #[test]

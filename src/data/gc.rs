@@ -1114,6 +1114,53 @@ mod tests {
         drop(reading);
     }
 
+    /// A place with an archive that a process maps is left whole where the OS does not move it, as
+    /// Windows may, for the next collection, which removes it once it is no longer mapped; or it
+    /// goes at once, as on Unix: never in part (decided in M2f's F1, 7).
+    #[test]
+    fn a_place_with_a_mapped_archive_goes_once_it_can() {
+        use crate::data::archive::{self, Header, Mapped};
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        write(root, "docs.rs/a/1/_default/61.json");
+        let cache = Cache::at(root);
+        let archive = root.join("docs.rs/a/1/_default/61.x.rkyv");
+        let header = Header {
+            schema: 1,
+            format_version: 61,
+            types_version: 61,
+            source_sha256: "ab".repeat(32).into(),
+        };
+        let value: Vec<Box<str>> = vec!["a".into()];
+        archive::write(&cache, &archive, &header, &value).expect("written");
+        let mapped = Mapped::<Vec<Box<str>>>::open(&cache, &archive, &header)
+            .expect("opened")
+            .expect("it matches");
+        let removal = Removal {
+            entry: found(root, Kind::DocsRs, "docs.rs/a/1/_default"),
+            reason: Reason::OverLimit,
+            bodies: Vec::new(),
+            bytes: 1,
+        };
+        let outcome = run(&cache, vec![removal.clone()], false);
+        if outcome.left.is_empty() {
+            assert_eq!(outcome.removed.len(), 1, "{outcome:?}");
+            assert!(!root.join("docs.rs/a").exists());
+        } else {
+            assert!(root.join("docs.rs/a/1/_default/61.json").exists());
+            assert!(archive.exists());
+        }
+        assert!(cfg!(not(unix)) || outcome.left.is_empty(), "{outcome:?}");
+        assert_eq!(mapped.get().len(), 1, "still mapped");
+        drop(mapped);
+        let outcome = run(&cache, vec![removal], false);
+        assert!(outcome.left.is_empty(), "{outcome:?}");
+        assert!(!root.join("docs.rs/a").exists());
+        empty_trash(root);
+        let trash = root.join(layout::WORK).join(TRASH);
+        assert!(!trash.exists(), "the trash is emptied");
+    }
+
     /// A target directory that a build uses, which holds its lock across processes, is in use.
     #[test]
     fn a_target_directory_being_built_in_is_skipped() {
