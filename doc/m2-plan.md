@@ -1787,6 +1787,26 @@ Claude Code 2.1.304、Linux で測った。
   1. smoke test はプロジェクトの外で回し、期待は `no_target_json` のまま (docs.rs の今の配り方を見る目的のまま)
   2. canary のテストに関わる変更 (応答を変える段) を push したら、`gh workflow run canary.yml` で手で回して結果を見る (ci.yml では回さない)
 - F3a: テストのクライアント (`tests/real_data/client.rs`) の `Client::start(None, …)` は、ログのディレクトリを cwd にしてプロジェクトの外で起動する。`None` で起動するのは canary の smoke test と real_data の `budgets` だけで、どちらも docs.rs の版を引く (budgets も名指しの版を docs.rs から読むのが意図)。手元で空のキャッシュで smoke test が通ることを確かめた
+- F3a は dbb7571 (CI 11 job 緑、canary の手動の実行 39899477022 も緑)。report の job は定期実行のときだけ動くので、Issue #1 は次の定期実行で閉じる見込み
+
+**F3b の決定 (2026-10-23、利用者が 1 件ずつ決めた)**:
+
+1. beta は canary.yml の別の job `beta` に置き、nightly を入れない (形式の試しが失敗しても nightly に逃げられず落ちる。provenance の確かめと二重の守り)
+2. テストは tests/canary.rs に stdio のサーバー経由で書き、テストのクライアントに隔離した環境 (HOME・CARGO_HOME・git の設定) を渡す口を足す
+3. member の lib・build script の cfg と env・proc-macro・bin を get_item で引き、どれも `source: local`、toolchain が `-beta.` を含む、形式が対応範囲にある、warnings が無いことを確かめる
+4. fixture は tests/fixtures/local-build を写し、`rust-toolchain.toml` (`channel = "beta"`) を置く
+5. beta が対応範囲より新しい形式を出したら落とす
+6. 落ちたときの Issue は job ごとに分ける (タイトルと開閉)
+7. 手元で通すため、この PC に beta (`--profile minimal`) を入れてよい
+
+- 聞かずに決めたこと (下調べの推奨のとおり): CI では `rustup toolchain install beta --profile minimal`。OS は Linux だけ。canary の job に `timeout-minutes` を付ける。記録は m2-plan で、要件 (R-QA-4) は §7 の反映で
+
+**F3b (beta の canary。2026-10-23)**:
+
+- テスト `tests/canary.rs` の `the_beta_builds_the_rustdoc_json_of_a_workspace`: `tests/fixtures/local-build` を隔離した環境 (`tests/common/isolated.rs` の `Isolated`) の一時ディレクトリに写し、`rust-toolchain.toml` (`channel = "beta"`) を置いて Cargo.lock を作り、隔離した環境でサーバーを起動して get_item で `one::answer`・`cfgenv::configured`・`cfgenv::FROM_BUILD`・`macros::same_tokens`・`tool::main` (bin) を host 向けに引く。どれも `source: local`、toolchain が `-beta.` を含む、形式が対応範囲にある、warnings が無いこと。テストのクライアントに起動前のコマンドに手を入れる口 `Client::start_in` を足した
+- workflow (`.github/workflows/canary.yml`): job `beta` (ubuntu、`rustup toolchain install beta --profile minimal`、nightly を入れない、このテストだけ)。nightly の job はこのテストを `--skip`。report は 2 つの job の結果で、タイトルで分けた Issue をそれぞれ開閉する (nightly の側は今の Issue #1 のタイトル)。3 つの job に `timeout-minutes`
+- 手元で beta 1.100.0-beta.7 で通った (約 3〜6 秒。キャッシュの記録でも `bootstrap_all: false`、`cfg_docsrs: true`)。report の script は shellcheck を通し、Issue をタイトルで引く jq は読み取りの `gh issue list` で確かめた
+- レビュー (サブエージェント、読むだけ) の対応: beta を使わずに通る経路は無し (プロジェクトで cargo・rustc・rustdoc を走らせる入口は `RUSTUP_TOOLCHAIN` を外し、nightly に切り替われば provenance の toolchain で落ち、docsrs を外した再試行と `RUSTC_BOOTSTRAP=1` への後退は warnings に出る)。直したもの: (1) m2-plan の番号付きのリストの直後に別の種類のリストが続き MD032 になる (自前の検査も一番上の階層のこの形を見るようにした) (2) beta の job のテスト名が合わなくなると 0 件で通る。`1 passed` を確かめる (3) Issue を閉じるときの文言を job ごとに通じる形に、1 つ目の job の開閉に失敗しても 2 つ目を走らせて終了コードで返す (4) beta のテストのサーバーの cwd を隔離したディレクトリに (このリポジトリの `rust-toolchain.toml` が効かないように)
 
 **F1〜F6 の外の残りの行き先 (2026-10-23、利用者が 1 件ずつ決めた)**:
 

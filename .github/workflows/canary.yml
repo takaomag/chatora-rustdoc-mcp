@@ -22,6 +22,7 @@ env:
 jobs:
   canary:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       # 空のキャッシュで docs.rs の今の配り方を見る。
       CHATORA_RUSTDOC_MCP_CACHE__DIR: ${{ github.workspace }}/../canary-cache
@@ -31,42 +32,75 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # 最新の nightly の rustdoc の JSON (tests/canary.rs) と、手元の nightly の std (tests/std_dist.rs)。
       - run: rustup toolchain install nightly --profile minimal --component rust-docs-json
-      - run: cargo test --locked --release --test canary -- --ignored
+      # beta のテストは下の job で (ここには beta が無い)。
+      - run: cargo test --locked --release --test canary -- --ignored --skip the_beta
       # dist から取る std (最新の nightly と、形式 58〜60 の確認用の 3 日分)。
       - run: cargo test --locked --release --test std_dist -- --ignored
 
-  # 定期実行の結果で Issue を開閉する。手で回したときは触らない。
+  # 次の stable になる beta で、プロジェクトの toolchain のままローカルビルドできるか (要件 R-QA-4、
+  # m2-plan の F3b)。nightly を入れないので、beta で JSON が出なくても nightly に切り替えて通ることはない。
+  beta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CHATORA_RUSTDOC_MCP_CACHE__DIR: ${{ github.workspace }}/../canary-cache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: rustup toolchain install beta --profile minimal
+      # 名前が合わなければ 0 件で通ってしまうので、1 件走ったことも確かめる。
+      - run: |
+          set -euo pipefail
+          cargo test --locked --release --test canary -- --ignored --exact \
+            the_beta_builds_the_rustdoc_json_of_a_workspace | tee test.log
+          grep -q '^test result: ok. 1 passed' test.log
+
+  # 定期実行の結果で Issue を job ごとに開閉する (別の原因の失敗が 1 つの Issue に埋もれないように)。
+  # 手で回したときは触らない。
   report:
-    needs: canary
+    needs: [canary, beta]
     if: always() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       issues: write
     steps:
-      - name: Open, update or close the canary issue
+      - name: Open, update or close the canary issue of each job
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          RESULT: ${{ needs.canary.result }}
+          CANARY: ${{ needs.canary.result }}
+          BETA: ${{ needs.beta.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           gh label create canary --repo "$REPO" --force \
             --color B60205 --description "The scheduled canary (R-QA-4) failed"
-          open=$(gh issue list --repo "$REPO" --state open --label canary \
-            --json number --jq '.[0].number // empty')
-          if [ "$RESULT" = success ]; then
-            if [ -n "$open" ]; then
-              gh issue close "$open" --repo "$REPO" --comment "The canary passed again: $RUN_URL"
-            fi
-          elif [ -n "$open" ]; then
-            gh issue comment "$open" --repo "$REPO" --body "Still failing ($RESULT): $RUN_URL"
-          else
-            gh issue create --repo "$REPO" --label canary \
-              --title "Canary failed: nightly rustdoc, docs.rs or std changed" \
-              --body "The scheduled canary ($RESULT) failed: $RUN_URL
+          report() {
+            local result=$1 title=$2 body=$3 open
+            open=$(TITLE="$title" gh issue list --repo "$REPO" --state open --label canary \
+              --json number,title --jq '[.[] | select(.title == env.TITLE)][0].number // empty') \
+              || return 1
+            if [ "$result" = success ]; then
+              if [ -n "$open" ]; then
+                gh issue close "$open" --repo "$REPO" --comment "The job passed again: $RUN_URL"
+              fi
+            elif [ -n "$open" ]; then
+              gh issue comment "$open" --repo "$REPO" --body "Still failing ($result): $RUN_URL"
+            else
+              gh issue create --repo "$REPO" --label canary --title "$title" \
+                --body "The scheduled canary ($result) failed: $RUN_URL
 
-          It checks what changes outside this repository (requirement R-QA-4): the rustdoc JSON of
-          the latest nightly, what docs.rs serves, and the std of the distribution server. See the
-          failed step for what changed. This issue closes itself when the canary passes again."
-          fi
+          $body See the failed step for what changed. This issue closes itself when the job passes again."
+            fi
+          }
+          # Both, even when the first cannot be told.
+          status=0
+          report "$CANARY" "Canary failed: nightly rustdoc, docs.rs or std changed" \
+            "It checks what changes outside this repository (requirement R-QA-4): the rustdoc JSON of the latest nightly, what docs.rs serves, and the std of the distribution server." \
+            || status=1
+          report "$BETA" "Canary failed: the beta builds otherwise" \
+            "It checks that the beta, the next stable, builds the rustdoc JSON of a workspace with RUSTC_BOOTSTRAP for its crates alone (requirement R-QA-4)." \
+            || status=1
+          exit "$status"

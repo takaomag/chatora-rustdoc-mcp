@@ -63,7 +63,18 @@ impl Client {
     /// any: in `logs`, as a user who asks of crates.io and docs.rs only, not in this repository,
     /// which it would else find from where the tests run.
     pub(crate) fn start(project: Option<&Path>, logs: &Path) -> Self {
+        Self::start_in(project, logs, |_| {})
+    }
+
+    /// [`Client::start`], with the command of the server as `prepare` makes it, as in an isolated
+    /// environment.
+    pub(crate) fn start_in(
+        project: Option<&Path>,
+        logs: &Path,
+        prepare: impl FnOnce(&mut Command),
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"));
+        prepare(&mut command);
         if project.is_none() {
             command.current_dir(logs);
         }
