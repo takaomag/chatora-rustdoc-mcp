@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BINARY = ROOT / "target" / "release" / "chatora-rustdoc-mcp"
+BINARY = ROOT / "target" / "release" / ("chatora-rustdoc-mcp" + (".exe" if os.name == "nt" else ""))
 META = {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}
 # The archives are `*.v<ARCHIVE_SCHEMA of src/query/across.rs>t<rustdoc_types::FORMAT_VERSION>.rkyv`,
 # as `*.v8t61.rkyv`: those of any version are removed, so that this does not go stale.

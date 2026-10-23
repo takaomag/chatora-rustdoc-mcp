@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Measures the local builds of a workspace's member (doc/m2-plan.md, M2f's F5).
 
-Linux only (the load is read from /proc). It uses the release build of the server, copies of the
-workspaces under target/f5 (never /tmp, which is small), an empty cache for each cold build, and
-the user's ~/.cargo offline (decided in F5, 3), so that it needs no network.
+It uses the release build of the server, copies of the workspaces under target/f5 (never /tmp,
+which is small), an empty cache for each cold build, and the user's ~/.cargo offline (decided in
+F5, 3), so that it needs no network; with --online, as in CI (.github/workflows/measure.yml), the
+network. It runs on Linux, macOS and Windows.
 
   prepare   copies this repository (a clone of HEAD, without the user's git config), eval/fixture
             and tests/fixtures/local-build into target/f5/src
@@ -11,6 +12,8 @@ the user's ~/.cargo offline (decided in F5, 3), so that it needs no network.
             waits for it, with the size of what it made; then rebuilds after an edit of the
             member's lib, each once the dep-info of the build before is recorded, with how many
             units cargo built again (the fingerprints newer than the edit)
+  deps      the dependencies of the eval fixture that the server builds locally, as on macOS and
+            Windows, where docs.rs has no JSON for their target: the time of each first lookup
   diagnostics
             breaks a copy of a workspace in a few ways (F5b), and for each tells the errors of the
             compiler as cargo writes them (how many, how long each is as JSON escapes it) and what
@@ -20,6 +23,7 @@ Each run is a line of JSON in target/f5/results.jsonl, or target/f5/diagnostics.
 
 Usage: python3 -I eval/build_bench.py prepare
        python3 -I eval/build_bench.py run --workspaces self,eval --jobs 1,6 --repeat 2 --rebuilds 5
+       python3 -I eval/build_bench.py deps --online
        python3 -I eval/build_bench.py diagnostics
 """
 
@@ -74,11 +78,22 @@ def prepare() -> None:
 
 
 def size(path: Path) -> int:
-    """The bytes of the files under `path`, as `du -sb` counts them."""
-    if not path.exists():
-        return 0
-    output = subprocess.run(["du", "-sb", str(path)], capture_output=True, text=True, check=True)
-    return int(output.stdout.split()[0])
+    """The bytes of the files under `path`, not following links, a file that has hard links once,
+    as `du -sb` counts them: cargo links what it builds into more than one place."""
+    total = 0
+    seen = set()
+    for directory, _, files in os.walk(path):
+        for name in files:
+            try:
+                status = os.lstat(os.path.join(directory, name))
+            except OSError:
+                continue
+            if status.st_nlink > 1:
+                if (status.st_dev, status.st_ino) in seen:
+                    continue
+                seen.add((status.st_dev, status.st_ino))
+            total += status.st_size
+    return total
 
 
 def records(cache: Path) -> list[dict]:
@@ -118,8 +133,9 @@ def rebuilt_units(cache: Path, since: float) -> int:
     )
 
 
-def load() -> float:
-    return float(Path("/proc/loadavg").read_text().split()[0])
+def load() -> float | None:
+    """The load of the last minute, where the OS tells it (not Windows)."""
+    return os.getloadavg()[0] if hasattr(os, "getloadavg") else None
 
 
 def answered(server: Server, member: str) -> tuple[float, dict]:
@@ -137,7 +153,24 @@ def record(line: dict) -> None:
     print(json.dumps(shown), flush=True)
 
 
-def run_one(name: str, jobs: int, repeat: int, rebuilds: int) -> None:
+def settings(place: Path, cache: Path, online: bool, jobs: int | None = None) -> dict:
+    """The environment of a server whose cache is `cache`, with settings that are not the user's,
+    in which one call waits for the whole build, whose time is that call's."""
+    config = place / "config.toml"
+    config.write_text("")
+    env = {
+        "CHATORA_RUSTDOC_MCP_CONFIG": str(config),
+        "CHATORA_RUSTDOC_MCP_CACHE__DIR": str(cache),
+        "CHATORA_RUSTDOC_MCP_BUILD__WAIT_SECS": "600",
+        "CHATORA_RUSTDOC_MCP_LIMITS__REQUEST_TIMEOUT_SECS": "900",
+        "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE": "false" if online else "true",
+    }
+    if jobs is not None:
+        env["CHATORA_RUSTDOC_MCP_BUILD__JOBS"] = str(jobs)
+    return env
+
+
+def run_one(name: str, jobs: int, repeat: int, rebuilds: int, online: bool) -> None:
     root, member, lib = WORKSPACES[name]
     place = F5 / "runs" / f"{name}-j{jobs}-{repeat}"
     if place.exists():
@@ -145,18 +178,7 @@ def run_one(name: str, jobs: int, repeat: int, rebuilds: int) -> None:
     cache, logs = place / "cache", place / "logs"
     cache.mkdir(parents=True)
     logs.mkdir()
-    config = place / "config.toml"
-    config.write_text("")
-    env = {
-        # Not the user's settings.
-        "CHATORA_RUSTDOC_MCP_CONFIG": str(config),
-        "CHATORA_RUSTDOC_MCP_CACHE__DIR": str(cache),
-        # One call waits for the whole build, whose time is that call's.
-        "CHATORA_RUSTDOC_MCP_BUILD__WAIT_SECS": "600",
-        "CHATORA_RUSTDOC_MCP_LIMITS__REQUEST_TIMEOUT_SECS": "900",
-        "CHATORA_RUSTDOC_MCP_BUILD__JOBS": str(jobs),
-        "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE": "true",
-    }
+    env = settings(place, cache, online, jobs)
     source = root / lib
     original = source.read_text()
     server = Server(logs, cwd=root, env=env)
@@ -204,6 +226,40 @@ def run_one(name: str, jobs: int, repeat: int, rebuilds: int) -> None:
 
 
 DIAGNOSTICS = F5 / "diagnostics.jsonl"
+
+# Dependencies of the eval fixture, with an item each, whose docs.rs builds are for Linux alone.
+DEPENDENCIES = [("tokio", "sync::Mutex"), ("axum", "Router"), ("serde", "Serialize")]
+
+
+def deps(online: bool) -> None:
+    """Each dependency's first lookup in the eval fixture, for the host: the time that it takes, of
+    docs.rs or of a local build when docs.rs has no JSON for the host (macOS and Windows), the
+    builds after the first sharing the target directory."""
+    root, _, _ = WORKSPACES["eval"]
+    place = F5 / "runs" / "deps"
+    if place.exists():
+        shutil.rmtree(place)
+    cache, logs = place / "cache", place / "logs"
+    cache.mkdir(parents=True)
+    logs.mkdir()
+    server = Server(logs, cwd=root, env=settings(place, cache, online))
+    try:
+        for crate, path in DEPENDENCIES:
+            seconds, result = server.call("get_item", {"crate": crate, "path": path})
+            provenance = result.get("provenance", {})
+            record({
+                "workspace": "eval",
+                "kind": "dependency",
+                "crate": crate,
+                "seconds": round(seconds, 2),
+                "source": provenance.get("source"),
+                "status": result.get("status"),
+                "target": provenance.get("target"),
+                "target_dir_mb": round(size(cache / "t") / 1e6, 1),
+            })
+    finally:
+        server.close()
+        shutil.rmtree(place, ignore_errors=True)
 
 # A path dependency of the eval fixture whose body has a long error of a trait bound, as a handler
 # of axum that is not one (cargo checks the dependencies' bodies, not rustdoc the documented
@@ -374,15 +430,7 @@ def diagnostics() -> None:
             cache, logs = place / "cache", place / "logs"
             cache.mkdir(parents=True, exist_ok=True)
             logs.mkdir(exist_ok=True)
-            config = place / "config.toml"
-            config.write_text("")
-            server = Server(logs, cwd=copy, env={
-                "CHATORA_RUSTDOC_MCP_CONFIG": str(config),
-                "CHATORA_RUSTDOC_MCP_CACHE__DIR": str(cache),
-                "CHATORA_RUSTDOC_MCP_BUILD__WAIT_SECS": "600",
-                "CHATORA_RUSTDOC_MCP_LIMITS__REQUEST_TIMEOUT_SECS": "900",
-                "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE": "true",
-            })
+            server = Server(logs, cwd=copy, env=settings(place, cache, online=False))
             try:
                 served = answered_raw(server, member)
             finally:
@@ -401,7 +449,8 @@ def diagnostics() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["prepare", "run", "diagnostics"])
+    parser.add_argument("command", choices=["prepare", "run", "deps", "diagnostics"])
+    parser.add_argument("--online", action="store_true", help="let cargo and the server fetch")
     parser.add_argument("--workspaces", default="self,eval,local-build")
     parser.add_argument("--jobs", default="6")
     parser.add_argument("--repeat", type=int, default=1)
@@ -413,6 +462,9 @@ def main() -> None:
     if args.command == "diagnostics":
         diagnostics()
         return
+    if args.command == "deps":
+        deps(args.online)
+        return
     if not BINARY.exists():
         sys.exit(f"build the server first: cargo build --release --locked ({BINARY})")
     if not SOURCES.exists():
@@ -420,7 +472,7 @@ def main() -> None:
     for name in args.workspaces.split(","):
         for jobs in [int(jobs) for jobs in args.jobs.split(",")]:
             for repeat in range(args.repeat):
-                run_one(name, jobs, repeat, args.rebuilds)
+                run_one(name, jobs, repeat, args.rebuilds, args.online)
 
 
 if __name__ == "__main__":

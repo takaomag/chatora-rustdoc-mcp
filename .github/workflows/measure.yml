@@ -1,0 +1,54 @@
+# ローカルビルドの時間を 3 つの OS で測る (doc/m2-plan.md の M2f の F5c)。手で回すときだけ動く。
+# 測り方は eval/build_bench.py (手元の測定と同じ道具)。runner の速さは揺れるので、数字は
+# OS の間の比と、手元の結果との比で見る。結果は job のログに出す。
+# action はコミットの SHA で固定し、コメントに版を書く (ci.yml と同じ)。
+
+name: Measure
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --release --locked
+      - name: The machine
+        run: |
+          python=$(command -v python3 || command -v python)
+          "$python" -c "import os, platform; print(platform.platform(), os.cpu_count(), 'CPUs')"
+      - name: Prepare the copies
+        run: |
+          python=$(command -v python3 || command -v python)
+          "$python" -I eval/build_bench.py prepare
+      # このリポジトリと eval の fixture の冷えたビルドを -j 1・2・4 で、続けて編集の後の作り直しを 2 回。
+      # runner の ~/.cargo は空なので、依存は取得する (--online)。
+      - name: Cold builds and rebuilds
+        run: |
+          python=$(command -v python3 || command -v python)
+          "$python" -I eval/build_bench.py run --online --workspaces self,eval --jobs 1,2,4 --rebuilds 2
+      # macOS と Windows では docs.rs に host の JSON が無い依存をローカルビルドする (Linux は docs.rs)。
+      - name: Dependencies built locally
+        run: |
+          python=$(command -v python3 || command -v python)
+          "$python" -I eval/build_bench.py deps --online
+      - name: Results
+        if: always()
+        run: cat target/f5/results.jsonl || true
