@@ -26,8 +26,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BINARY = ROOT / "target" / "release" / "chatora-rustdoc-mcp"
 META = {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}
-# ARCHIVE_SCHEMA in src/query/across.rs and rustdoc_types::FORMAT_VERSION: the archives are `*.v5t61.rkyv`.
-SCHEMA = "v5t*"
+# The archives are `*.v<ARCHIVE_SCHEMA of src/query/across.rs>t<rustdoc_types::FORMAT_VERSION>.rkyv`,
+# as `*.v8t61.rkyv`: those of any version are removed, so that this does not go stale.
+SCHEMA = "v*t*"
 
 # Crates whose archives are made again: (release, an item to ask for). Sizes of their JSON vary.
 NORMALIZED = [
@@ -59,10 +60,14 @@ LIST_METHODS = [
 
 
 class Server:
-    """A server process asked one request at a time, with its anonymous memory sampled."""
+    """A server process asked one request at a time, with its anonymous memory sampled.
 
-    def __init__(self, logs: Path):
-        env = dict(os.environ, CHATORA_RUSTDOC_MCP_LOG__DIR=str(logs))
+    It runs in `cwd`, `logs` unless given, which is its default project when it is one, with the
+    environment variables `env` too (eval/build_bench.py).
+    """
+
+    def __init__(self, logs: Path, cwd: Path | None = None, env: dict | None = None):
+        env = dict(os.environ, CHATORA_RUSTDOC_MCP_LOG__DIR=str(logs), **(env or {}))
         env.pop("CLAUDE_PROJECT_DIR", None)
         self.process = subprocess.Popen(
             [str(BINARY), "serve"],
@@ -71,7 +76,7 @@ class Server:
             stderr=subprocess.DEVNULL,
             text=True,
             env=env,
-            cwd=logs,
+            cwd=cwd or logs,
         )
         self.next_id = 1
         self.peak_anon_kb = 0

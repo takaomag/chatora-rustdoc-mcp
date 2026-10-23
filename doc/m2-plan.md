@@ -1753,7 +1753,7 @@ Claude Code 2.1.304、Linux で測った。
 - F1a の CI の落ち (Windows の clippy: Windows だけの `inventory::first_link` が `const fn` にできる) もこの段で直した
 - レビュー (サブエージェント、読むだけ) の対応: (1) 最後の使用が今より後 (GC の最中のビルド、時計のずれ) を「使用が分からない = 古い」と扱い、使ったばかりの target dir を消しえた。今使ったと扱い、計画の `now` は在庫を取った後に取る (2) `used` の印は 1 時間に 1 回なので、猶予 1 時間 (決定 3) を印の古さで判じると直前に使ったものを消しうる。印の古さで 2 時間 (`GRACE` + `used::NOTE_EVERY`) にした (3) 他の形式の版 (`local/v2` など) の使用を浅い時刻で判じ、新しい版のサーバーが深くで使う置き場を 30 日で消しえた。在庫の大きさを数える走査で一番新しい時刻も取り、使用時刻はそれとの大きいほう (未来の時刻は数えない)。決定 2 はそのまま (4) 外の記録の `published` を確かめずに本体とし、`local/..` などでキャッシュの外や `local/` 全体を消しえた。Normal の component だけで `local` で始まり、在庫に `local/v1` の場所としてあり、1 つの記録だけが指すものだけを組にする (2 つの記録が指す本体は残し、記録だけを消す) (5) `used` があると後から書き直した `record.json` を見ず、作り直したばかりの外の記録を古いと判じえた。`used::last_used` は `used` を含む直下と自身の時刻の最新に (6) 記録を消せなくても本体を消し `record_broken` を残しえた。順に消し、最初の失敗で止める (7) Windows で写像中のアーカイブがあると、完了の印だけ消えて置き場が半端に残り、作り直しも写像で失敗しえた。ディレクトリはまずキャッシュの `work/gc/` へ rename し、そこで消す (Windows は中のファイルが開いていれば rename が失敗し、置き場は丸ごと残る。消し残しは次の GC が `work/gc/` ごと消す。`work` が link なら使わない)。完了の印を先に消す手順は要らなくなった (8) 直下のファイルごとにロックファイルを作り続けた。書き手が自分のパスでロックする `.rkyv` と `.crate` (F1c の下調べで分かった) だけに (9) dry run の持ち主の判定が `claim` の「`t` や `work` だけは引き取らない」とずれた。書かずに判じる `layout::ownership` を `claim` と共有 (10) 聞かずに決めた「ローカルビルドの機能が無い構成は docs の側だけ」が入っていなかった (`COLLECTED`) (11) 本体の親の空のディレクトリも片付ける (12) std の 7 日の規則で消したものが表示に出なかった。`std_json::remove_unused` が消したもの (dry run では消すもの) を返し、`nightly unused for a week` として出す (13) 記録の消えた外の workspace の別名を残し続けた。`external_workspace::orphan_aliases` で、2 時間より前に書かれ workspace の記録が無いものを、その記録のロックの下で消す (聞かずに決めた「記録と別名を 1 組に」はこの形で)。`after_build` は上限が未設定なら時刻を進めない。テストを足した: 未来の時刻と印の猶予・分類・本体の検証と共有・index の組・プロセスをまたぐ target のロック・`.crate` のロック・dry run の判定・別名・深い時刻 (Unix)。stdio のテストの置き場は中まで時刻を戻す (Windows はディレクトリを `FILE_FLAG_BACKUP_SEMANTICS` で開く)。残したもの: 親の片付け (`prune`) と書き手の `create_dir_all` の狭い競合 (書き手が 1 回 NotFound で失敗しうる。GC は 1 時間に 1 回)、記録を消せないときに止まることのテスト (失敗を移植性よく作れない)
 - F1c の下調べ (scratchpad の f1c-research.md) で見つかった `Key::Release` の名前の説明の誤り (`-` を `_` と読める) も直した
-- F1b (f2f163c) の CI は Windows の testdata だけ落ちた: real_data の `build_external_docs` の問いで、外の workspace の 2 つの member が待ち (`build.wait_secs` の既定 10 秒) を越えて `building` のまま返り、`built: false` で答えなしとされた (クライアントが呼び直すのは最上位の `status: building` だけ)。それまでの 3 回は通っていた。起動時の GC が、CI の復元したキャッシュ (鍵が変わらず、保存した日の時刻のまま) の古い target dir を消す I/O がビルドと重なったと推測 (確かめていない)。テストが runner の速さに頼っていたので、real_data のサーバーの設定で `limits.request_timeout_secs = 300`・`build.wait_secs = 180` にした
+- F1b (f2f163c) の CI は Windows の testdata だけ落ちた: real_data の `build_external_docs` の問いで、外の workspace の 2 つの member が待ち (`build.wait_secs` の既定 10 秒) を越えて `building` のまま返り、`built: false` で答えなしとされた (クライアントが呼び直すのは最上位の `status: building` だけ)。それまでの 3 回は通っていた。起動時の GC が、CI の復元したキャッシュの古い target dir を消す I/O がビルドと重なったと推測したが、誤り: CI の testdata のキャッシュは一度も保存されていない (F5 の下調べで分かった。パスの `..` を actions/cache が断る) ので、復元したキャッシュは無く、real_data は毎回冷えたビルド。runner の遅さの揺れ。テストが runner の速さに頼っていたので、real_data のサーバーの設定で `limits.request_timeout_secs = 300`・`build.wait_secs = 180` にした
 
 **F1c の下調べと決定 (2026-10-23)**:
 
@@ -1829,6 +1829,33 @@ Claude Code 2.1.304、Linux で測った。
 - workflow (`.github/workflows/canary.yml`): job `beta` (ubuntu、`rustup toolchain install beta --profile minimal`、nightly を入れない、このテストだけ)。nightly の job はこのテストを `--skip`。report は 2 つの job の結果で、タイトルで分けた Issue をそれぞれ開閉する (nightly の側は今の Issue #1 のタイトル)。3 つの job に `timeout-minutes`
 - 手元で beta 1.100.0-beta.7 で通った (約 3〜6 秒。キャッシュの記録でも `bootstrap_all: false`、`cfg_docsrs: true`)。report の script は shellcheck を通し、Issue をタイトルで引く jq は読み取りの `gh issue list` で確かめた
 - レビュー (サブエージェント、読むだけ) の対応: beta を使わずに通る経路は無し (プロジェクトで cargo・rustc・rustdoc を走らせる入口は `RUSTUP_TOOLCHAIN` を外し、nightly に切り替われば provenance の toolchain で落ち、docsrs を外した再試行と `RUSTC_BOOTSTRAP=1` への後退は warnings に出る)。直したもの: (1) m2-plan の番号付きのリストの直後に別の種類のリストが続き MD032 になる (自前の検査も一番上の階層のこの形を見るようにした) (2) beta の job のテスト名が合わなくなると 0 件で通る。`1 passed` を確かめる (3) Issue を閉じるときの文言を job ごとに通じる形に、1 つ目の job の開閉に失敗しても 2 つ目を走らせて終了コードで返す (4) beta のテストのサーバーの cwd を隔離したディレクトリに (このリポジトリの `rust-toolchain.toml` が効かないように)
+
+**F5 の下調べと決定 (2026-10-23)**:
+
+- 下調べ (サブエージェント、読むだけ。要点は scratchpad の f5-research.md): 決める値は `build.wait_secs` (既定 10 秒、実効の上限は `limits.request_timeout_secs` 30 秒の 3 分の 2)・`build.jobs` (既定 max(1, 並列度の半分)、この PC で 6)・診断の上限 (件数 2・1 件 3,500 文字・合計 8,000 文字、文字数は定数)。キャッシュの上限 (5GB・20GB・30 日) は R-CA-5 で M5 に見直すので、F5 では target dir の大きさを記録するだけ。測ってあるもの: このリポジトリの member の冷えた初回 52.3 秒・編集後 4.9 秒 (D4d)、Claude Code の試しで `building` を 2 回返して約 63 秒、このリポジトリの target dir 516MB、CI の real_data (冷えたビルド込み) ubuntu 13.0・macOS 18.6・Windows 32.0 秒。まだのもの: `-j` の比較、eval の fixture、作り直しの範囲、診断の長さの分布、macOS・Windows で host 向けの依存のローカルビルド。副産物: CI の testdata の job のサーバーのキャッシュ (`docs-rs-json-v2-*`) は 3 OS とも一度も保存されていない (ci.yml の `${{ github.workspace }}/../rustdoc-json-cache` の `..` を actions/cache が `Relative pathing '.' and '..' is not allowed` で断る)。`eval/bench.py` のアーカイブの形式の指定 (`v5t*`) が今の版と合わない (F4a の下調べ)
+- 利用者が決めたこと:
+  1. 手元 (この PC、12 コア) で主に測り、macOS・Windows は手動の workflow で 1〜2 回
+  2. 道具は `eval/build_bench.py` として残す (`eval/bench.py` のサーバーの包みを使い回す)
+  3. cargo のホームは利用者の `~/.cargo` をオフラインで (未展開の crate を `registry/src` に展開しうる)
+  4. 測って値を変える根拠が薄ければ初期値のまま、測った条件と数字を記録し、要件の「M2 で測って決める」を「F5 で測って据え置いた」に改める (§7)
+  5. 作り直しの範囲は製品を変えず、target dir の fingerprint の更新時刻で数える
+  6. CI のキャッシュのパスを `..` を含まない形に直す (CI で冷えたビルドを測る F5c の後に)
+  7. 大きな公開の workspace は測らない (このリポジトリ、Cargo.lock に 274 package で兼ねる)
+  8. 段は F5a (道具と手元の時間・`-j`・大きさ)・F5b (診断)・F5c (CI の手動の測定)・F5d (値を決めて記録)。値の判断 (wait_secs・`-j`・診断) は F5d で数字を見てから 1 件ずつ
+- 置き場は `target/f5/` の下 (/tmp は小さい)。このリポジトリは `git clone --no-hardlinks` で写し利用者の git の設定は読まない。fixture も写してから cargo を走らせる
+
+**F5a・F5b (手元の測定。2026-10-23)**:
+
+- 道具 `eval/build_bench.py` (`prepare` でこのリポジトリを利用者の git の設定を読まずに clone し、`eval/fixture` と `tests/fixtures/local-build` を写して `target/f5/src` に。`run` で空のキャッシュからの冷えたビルドを 1 回の呼び出しで (`build.wait_secs` 600・`limits.request_timeout_secs` 900・`network.offline`)、続けて member の lib の末尾に関数を足しての作り直しを、前の dep-info が記録されてから。作り直した unit は fingerprint のディレクトリの中のファイルの時刻で数える (cargo はファイルを書き直すのでディレクトリの時刻は変わらない)。`diagnostics` で写しを壊して生のエラーとサーバーの応答を見る)。`eval/bench.py` の `Server` に cwd と環境変数を足し、アーカイブの形式の指定を `v*t*` に (古い `v5t*` のままだった)
+- 条件: この PC (12 コア、Linux)、release のサーバー、rustc 1.99.1 (stable)、利用者の `~/.cargo` をオフラインで
+- 冷えたビルド (秒、member の 1 回の呼び出し): このリポジトリ (Cargo.lock に 274 package) は `-j` 1: 113・115、2: 76・73、3: 65・65、6 (今の既定): 58・58・56、12: 51・51。eval の fixture は 2: 19.0・19.2、6: 15.1・15.0・15.1、12: 14.1・14.1。local-build は 0.8 前後 (`-j` によらない)
+- 大きさ: target dir はこのリポジトリ 535MB・eval 178MB・local-build 5MB、`local/v1` の記録と JSON はこのリポジトリ 47MB
+- 編集の後の作り直し (5 回ずつ、`-j` 6): このリポジトリ 6.7〜7.4 秒、eval 0.3 秒、local-build 0.2 秒。作り直したのはどれも member の 1 unit だけ。応答の後の dep-info の記録はこのリポジトリで約 6 秒
+- 診断 (F5b、場面ごとに写しを壊す): D-1 シグネチャの誤り 1 件 (生のエラー 1 件・178 文字、応答 651 文字)。D-2 広く使う型の改名 (27 件・371〜621 文字、中央値 411、応答 1,272 文字で 2 件と `diagnostics_omitted` 25)。D-3 path 依存の本体の長い trait 境界 (1 件・1,265 文字、応答 1,731 文字)。D-4 文書化する crate の本体だけの誤りはビルドが失敗しない (rustdoc は本体を型検査しない、を確かめた)。D-5 build.rs の panic (JSON の診断なし、応答は stderr の末尾 3,416 文字で 3,866 文字)。どれも 1 件 3,500・合計 8,000 文字の上限に収まり、切れたものは無い
+
+**F4a の下調べ (2026-10-23)**:
+
+- 下調べ (サブエージェント、読むだけ。要点は scratchpad の f4a-research.md、判断の候補 12 件。判断は F5 の後に聞く): 今の eval は組み込みのツールを外して回す (`--tools ""`) ので、モデルが grep や LSP でなくこのサーバーを選ぶかを原理的に測れない。instructions (`src/mcp/mod.rs:59-103`、1,319 文字、上限 2,048) の 1 文目は「crates from docs.rs and of the standard library」のまま、78-81 行が自分の workspace の item を rust-analyzer へ誘導 (§9.9 と逆。試しで MCP が使われなかった件の最も有力な原因)、`build_external_docs`・building の呼び直し・stale・refresh に触れていない。説明文は `get_item.md`・`search_items.md` が上限まで残り数文字。`version`・`target` の既定の書き方がツールで食い違い、no-local の構成でも使えない引数を案内。fixture に自分の型が無く、R-QA-6 の必須の「ビルド中の応答」のケースが無い。分け方の案: F4a-1 (文言と検査)・F4a-2 (eval の道具)・F4a-3 (ケースと README)・F4b (回す)
 
 **F1〜F6 の外の残りの行き先 (2026-10-23、利用者が 1 件ずつ決めた)**:
 
