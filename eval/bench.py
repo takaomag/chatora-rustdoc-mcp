@@ -67,7 +67,7 @@ class Server:
     """
 
     def __init__(self, logs: Path, cwd: Path | None = None, env: dict | None = None):
-        env = dict(os.environ, CHATORA_RUSTDOC_MCP_LOG__DIR=str(logs), **(env or {}))
+        env = {**os.environ, "CHATORA_RUSTDOC_MCP_LOG__DIR": str(logs), **(env or {})}
         env.pop("CLAUDE_PROJECT_DIR", None)
         self.process = subprocess.Popen(
             [str(BINARY), "serve"],

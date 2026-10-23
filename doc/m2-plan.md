@@ -1844,6 +1844,18 @@ Claude Code 2.1.304、Linux で測った。
   8. 段は F5a (道具と手元の時間・`-j`・大きさ)・F5b (診断)・F5c (CI の手動の測定)・F5d (値を決めて記録)。値の判断 (wait_secs・`-j`・診断) は F5d で数字を見てから 1 件ずつ
 - 置き場は `target/f5/` の下 (/tmp は小さい)。このリポジトリは `git clone --no-hardlinks` で写し利用者の git の設定は読まない。fixture も写してから cargo を走らせる
 
+**F4a-2 (eval の道具。2026-10-23)**:
+
+- fixture (`eval/fixture/src/lib.rs`) に自前の型を足した: `Config` (pub の `name` と private の `retries`)・`Config::new`・`Default`・trait `Greeter` とその impl・pub の `call` と private の `backoff`。依存と Cargo.lock は変えていない
+- `eval/run.py`:
+  - 問いごとに fixture を `eval/results/<時刻>/cases/<問い>/fixture` に写して git のリポジトリにし (1 回コミット)、そこで回す (前は fixture の場で回していた)。`prompt` の `{fixture}`・`{other}` (other-workspace の写し)・`{worktree}` (写しの git worktree) を置き換える
+  - 問いの `env` をサーバーに渡し、`setup` を順に行う: `build` (別のサーバーで member を先にビルド)、`write`・`append`・`replace` (写しを書き換える)
+  - `"builtin": true` の問いは Read・Grep・Glob・LSP・ToolSearch を使えるようにし、`--setting-sources user,project` (LSP の server は利用者のプラグインから)。Bash は外す
+  - 採点に、最初のツール・組み込みのツールの呼び出しの数・`status: building` の後に呼び直したか (`retry`)・照会のツールに渡った引数 (`arguments`) を足した。`repeat` で同じ問いを何度か。`--dry-run` で写しと下準備だけをし claude の引数を表示する (利用料なし)
+- `claude --help` (2.1.309) で、利用者の CLAUDE.md と rules を読まない手段を探した: `--bare` は CLAUDE.md の自動の読み込みを外すが、LSP と利用者のログイン (OAuth) も外れ、`ANTHROPIC_API_KEY` が要る。選ぶ側の問いには使えないので、決定 6 のとおり読まれる前提で回して結果に書く (README に書いた)
+- 確かめたこと (claude を呼ばずに、部品と bench のサーバーで): 写しと worktree と other の写し、`build` の下準備、`env` の `BUILD__WAIT_SECS=1`。待ち 1 秒でも fixture の member の作り直しは 0.3 秒で済み (依存は前のビルドの結果が使われる)、tokio の feature を変えても待ちの内に終わったので、stale の問いは「先にビルド → 5 秒待つ build.rs を書く → lib を書き足す」で `stale: rebuilding` になることを確かめた (ビルド中の問いも build.rs を先に書けば `building`)
+- `eval/bench.py` の `Server` で、渡した環境変数とログの設定が重なると落ちたので、後に渡したものが勝つ形に
+
 **F5a・F5b (手元の測定。2026-10-23)**:
 
 - 道具 `eval/build_bench.py` (`prepare` でこのリポジトリを利用者の git の設定を読まずに clone し、`eval/fixture` と `tests/fixtures/local-build` を写して `target/f5/src` に。`run` で空のキャッシュからの冷えたビルドを 1 回の呼び出しで (`build.wait_secs` 600・`limits.request_timeout_secs` 900・`network.offline`)、続けて member の lib の末尾に関数を足しての作り直しを、前の dep-info が記録されてから。作り直した unit は fingerprint のディレクトリの中のファイルの時刻で数える (cargo はファイルを書き直すのでディレクトリの時刻は変わらない)。`diagnostics` で写しを壊して生のエラーとサーバーの応答を見る)。`eval/bench.py` の `Server` に cwd と環境変数を足し、アーカイブの形式の指定を `v*t*` に (古い `v5t*` のままだった)
