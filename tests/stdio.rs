@@ -845,14 +845,27 @@ fn the_cache_commands_break_nothing_while_a_server_reads_the_cache() {
         &["cache", "clear", "--dry-run"],
         &["cache", "clear", "demo"],
     ];
-    for (id, args) in (1..).zip(commands) {
-        server.send(&call_tool(id, "get_item", arguments.clone()));
-        let result = server.response(id)["result"].clone();
-        assert_eq!(result["isError"], false, "{args:?} before: {result}");
-        assert_ne!(
-            result["structuredContent"]["status"], "building",
-            "{result}"
-        );
+    // Called again while it is fetched, as a client does, though for long on a busy machine.
+    let mut id = 0;
+    let mut answer = |server: &mut Server, when: &str| {
+        let started = Instant::now();
+        loop {
+            id += 1;
+            server.send(&call_tool(id, "get_item", arguments.clone()));
+            let result = server.response(id)["result"].clone();
+            assert_eq!(result["isError"], false, "{when}: {result}");
+            if result["structuredContent"]["status"] != "building" {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(90),
+                "{when}: still {result}"
+            );
+            thread::sleep(Duration::from_millis(500));
+        }
+    };
+    for args in commands {
+        answer(&mut server, &format!("before {args:?}"));
         let ran = cache_command(&cache, args);
         // What is in use is skipped, which exits with 1.
         assert!(
@@ -860,11 +873,12 @@ fn the_cache_commands_break_nothing_while_a_server_reads_the_cache() {
             "{args:?}: {ran:?}"
         );
     }
-    server.send(&call_tool(9, "get_item", arguments));
-    let result = server.response(9)["result"].clone();
-    assert_eq!(result["isError"], false, "after: {result}");
-    // Fetched again after each clear.
-    assert!(requests.load(Ordering::SeqCst) >= 3, "{requests:?}");
+    answer(&mut server, "after");
+    // Fetched again after each clear, where what the server maps can be moved away; Windows leaves
+    // it whole instead (decided in M2f's F1, 7).
+    let fetched = requests.load(Ordering::SeqCst);
+    assert!(cfg!(windows) || fetched >= 3, "{fetched}");
+    assert!(fetched >= 1, "{fetched}");
     assert!(server.finish().success());
 }
 
@@ -6281,17 +6295,20 @@ fn a_crate_that_takes_long_to_fetch_is_building_and_then_answered() {
 /// that only docs.rs is asked. Only a debug build takes the test server for docs.rs.
 #[cfg(debug_assertions)]
 fn server_with_slow_docs_rs(docs_rs: &str, timeout_secs: &str) -> Server {
-    server_in_with_slow_docs_rs(None, docs_rs, timeout_secs)
+    server_in_with_slow_docs_rs(None, docs_rs, timeout_secs, &[])
 }
 
-/// [`server_with_slow_docs_rs`] whose default project is `project`, if any.
+/// [`server_with_slow_docs_rs`] whose default project is `project`, if any, with more environment
+/// variables `env`.
 #[cfg(debug_assertions)]
 fn server_in_with_slow_docs_rs(
     project: Option<&Path>,
     docs_rs: &str,
     timeout_secs: &str,
+    env: &[(&str, &str)],
 ) -> Server {
-    let server = Server::start_with(project, &[
+    let mut all = env.to_vec();
+    all.extend([
         ("CHATORA_RUSTDOC_TEST_DOCS_RS_URL", docs_rs),
         (
             "CHATORA_RUSTDOC_MCP_LIMITS__REQUEST_TIMEOUT_SECS",
@@ -6300,6 +6317,7 @@ fn server_in_with_slow_docs_rs(
         ("NO_PROXY", "127.0.0.1"),
         ("no_proxy", "127.0.0.1"),
     ]);
+    let server = Server::start_with(project, &all);
     std::fs::remove_dir_all(server.cache.path().join("docs.rs")).expect("removed");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6696,21 +6714,39 @@ fn a_project_for_a_target_of_its_own_is_not_built() {
 /// A search of the project's dependencies that finds nothing while they are still being fetched
 /// is `status: building`, not an answer that nothing matches; the next search finds the item
 /// (requirement R-OUT-9).
+///
+/// The project is resolved first, so that what the search waits for is the fetch alone, which
+/// docs.rs makes slow here, not cargo, which waits for the lock of its package cache while other
+/// tests run it: in a cargo home of its own, too (decided in M2f, 5).
 #[cfg(all(debug_assertions, feature = "local"))]
 #[test]
 fn a_search_that_finds_nothing_while_crates_are_fetched_is_building() {
     let json = serde_json::to_vec(&demo_crate()).expect("serializes");
     let (docs_rs, requests) = slow_server(json, Duration::from_secs(2));
     let project = workspace_using_demo();
-    let mut server = server_in_with_slow_docs_rs(Some(project.path()), &docs_rs, "1");
+    let cargo_home = TempDir::new().expect("a temporary directory");
+    let cargo_home = cargo_home.path().display().to_string();
+    let mut server = server_in_with_slow_docs_rs(Some(project.path()), &docs_rs, "1", &[(
+        "CARGO_HOME",
+        &cargo_home,
+    )]);
+    // `list_crates` reads no docs.rs.
+    for id in 100..160 {
+        server.send(&call_tool(id, "list_crates", json!({ "target": TARGET })));
+        let listed = server.response(id)["result"].clone();
+        if listed["structuredContent"]["status"] != "building" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
     let arguments = json!({ "query": "hello", "target": TARGET });
     server.send(&call_tool(1, "search_items", arguments.clone()));
     let result = server.response(1)["result"].clone();
     let building = &result["structuredContent"];
     assert_eq!(building["status"], "building", "{result}");
-    assert_eq!(building["building_reason"], "fetching");
-    assert_eq!(building["partial"], true);
-    assert_eq!(building["retry_after_secs"], 10);
+    assert_eq!(building["building_reason"], "fetching", "{result}");
+    assert_eq!(building["partial"], true, "{result}");
+    assert_eq!(building["retry_after_secs"], 10, "{result}");
     // The workspace's member is built here, or not for the target given on another host than
     // Linux (decided in M2's D7): `demo` is what is fetched.
     let demo = |response: &Value| {

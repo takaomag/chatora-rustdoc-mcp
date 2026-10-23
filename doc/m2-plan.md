@@ -1786,6 +1786,13 @@ Claude Code 2.1.304、Linux で測った。
 - 単体 `gc::tests::a_place_with_a_mapped_archive_goes_once_it_can`: 写像中のアーカイブがある置き場は、丸ごと残る (OS が移せないとき、Windows を見込む) か丸ごと消える (Unix では必ず。写像は生きたまま) かで、半端には残らず、写像を放した次の GC で消え、`work/gc` も空になる。Windows で rename が実際に失敗するかは CI で分かる (どちらでも通る形)
 - テストのキャッシュの CLI を走らせる部品 `cache_command` を足した (利用者の設定ファイルを読まない)
 - これで F1 の終わりの印 (`cache` の CLI・GC・サーバーとの同時実行・使用中を飛ばす・Windows の消し残し) はそろった。F1 完了
+- F1c-2 (ff8637c) の CI は Windows の check で `the_cache_commands_break_nothing_while_a_server_reads_the_cache` が落ちた: docs.rs への要求が 1 回だけ。サーバーが写像しているアーカイブの置き場を Windows は rename できず、`cache clear` が丸ごと残した (決定 7 どおり) ので取り直さなかった。Windows で写像中の置き場が実際に移せないことが CI で確かめられた。取り直しの回数の確かめは Unix だけに。手元で全体を 2 本並べたときに 1 度、呼び出しの待ち (20 秒) の間 `building` が続いて落ちた (どの段かは不明、その後は再現せず) ので、`building` の間は呼び直す形にした
+
+**揺れるテストの直し (2026-10-23)**:
+
+- 下調べ (サブエージェント、読むだけ。要点は scratchpad の flaky-research.md)
+- `a_search_that_finds_nothing_while_crates_are_fetched_is_building`: 1 回目の応答への期待が「サーバーの `cargo metadata` が呼び出しの待ち (約 0.67 秒) より先に終わる」ことに頼り、その cargo が利用者の `~/.cargo` のパッケージキャッシュのロックを、並べた他のテストの cargo と取り合っていた。最初の検索の前に `list_crates` (docs.rs を読まない) を `building` でなくなるまで呼んで解決を済ませ、サーバーにはテストごとの `CARGO_HOME` を渡す (`server_in_with_slow_docs_rs` に環境変数の引数を足した)。assert に応答を付けた。手元で 3 本ずつ同時に 12 回と、stdio 全体を 2 本並べて通った
+- Windows の孫のテスト (`dropping_a_child_stops_its_grandchildren`) は未着手
 
 **F3 の下調べと F3a (2026-10-23)**:
 
