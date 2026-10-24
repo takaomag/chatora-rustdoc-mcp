@@ -6801,7 +6801,14 @@ fn a_search_that_finds_nothing_while_crates_are_fetched_is_building() {
     let result = server.response(1)["result"].clone();
     let building = &result["structuredContent"];
     assert_eq!(building["status"], "building", "{result}");
-    assert_eq!(building["building_reason"], "fetching", "{result}");
+    // The first source's: the member's, while it is still indexed, else `demo`'s.
+    assert!(
+        matches!(
+            building["building_reason"].as_str(),
+            Some("fetching" | "indexing" | "building")
+        ),
+        "{result}"
+    );
     assert_eq!(building["partial"], true, "{result}");
     assert_eq!(building["retry_after_secs"], 10, "{result}");
     // The workspace's member is built here, or not for the target given on another host than
@@ -6814,6 +6821,7 @@ fn a_search_that_finds_nothing_while_crates_are_fetched_is_building() {
             .unwrap_or_default()
     };
     assert_eq!(demo(building)["status"], "building", "{result}");
+    assert_eq!(demo(building)["building_reason"], "fetching", "{result}");
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(20))
         .expect("in range");

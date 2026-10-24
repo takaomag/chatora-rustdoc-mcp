@@ -226,6 +226,118 @@ fn every_tool_named_is_one_of_this_build() {
     }
 }
 
+/// The README, which the published crate has too.
+const README: &str = include_str!("../../../README.md");
+
+/// The tools of a build with local features that a build without them does not have (requirement
+/// R-ARCH-4): the README tells of them all.
+const LOCAL_TOOLS: &[&str] = &["build_external_docs", "list_crates"];
+
+/// The name that the README registers the server by, by hand.
+const SERVER: &str = "chatora-rustdoc-mcp";
+
+/// The prefix of the tools' names when the server is registered by hand as [`SERVER`], as the
+/// README's permission rules write it.
+const MANUAL_PREFIX: &str = "mcp__chatora-rustdoc-mcp__";
+
+#[test]
+fn the_local_tools_are_those_of_a_build_with_local_features() {
+    let names = names();
+    for name in LOCAL_TOOLS {
+        assert_eq!(names.contains(*name), cfg!(feature = "local"), "{name}");
+    }
+}
+
+/// The tools that the README names, in backticks or in permission rules, are those of a build
+/// with local features, and its table of tools has each of them (requirement R-QA-5).
+#[test]
+fn the_readme_names_the_tools_there_are() {
+    let names = names();
+    let tools: BTreeSet<String> = names
+        .iter()
+        .filter(|name| *name != TEST_TOOL)
+        .cloned()
+        .chain(LOCAL_TOOLS.iter().map(|&name| name.to_owned()))
+        .collect();
+    for name in planned_tools().difference(&tools) {
+        assert!(
+            !README.contains(&format!("`{name}`")) && !README.contains(&format!("__{name}")),
+            "the README names {name}, which the server does not have"
+        );
+    }
+    let section = README
+        .split("\n## Tools\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("the README has a section of the tools");
+    let table: BTreeSet<String> = section
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `")?.split('`').next())
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(table, tools, "the README's table of tools");
+}
+
+/// The permission rules in the README match tools there are, registered by hand and, with the
+/// prefix of a plugin, as a plugin (requirements R-SEC-2 and R-QA-5).
+#[test]
+fn the_readme_s_permission_rules_match_tools_there_are() {
+    assert!(
+        README.contains(&format!("claude mcp add --scope user {SERVER} -- ")),
+        "the README registers the server as {SERVER}"
+    );
+    assert_eq!(MANUAL_PREFIX, format!("mcp__{SERVER}__"));
+    let blocks: Vec<&str> = README
+        .split("```json\n")
+        .skip(1)
+        .filter_map(|rest| rest.split("```").next())
+        .collect();
+    let [block] = blocks[..] else {
+        panic!("the README has one block of JSON, the permission rules: {blocks:?}");
+    };
+    let rules: Value = serde_json::from_str(block).expect("the rules are JSON");
+    let tools: BTreeSet<String> = names()
+        .into_iter()
+        .chain(LOCAL_TOOLS.iter().map(|&name| name.to_owned()))
+        .collect();
+    let mut matched = 0_usize;
+    for list in ["allow", "ask"] {
+        for rule in rules["permissions"][list]
+            .as_array()
+            .expect("a list of rules")
+        {
+            let rule = rule.as_str().expect("a rule");
+            let tool = rule
+                .strip_prefix(MANUAL_PREFIX)
+                .expect("a rule of this server");
+            assert!(
+                (tool == "*" && list == "allow") || tools.contains(tool),
+                "{rule} in {list}"
+            );
+            assert!(
+                (PLUGIN_PREFIX.to_owned() + tool).len() <= MAX_FULL_NAME_CHARS,
+                "{rule} as a plugin's"
+            );
+            matched = matched.saturating_add(1);
+        }
+    }
+    assert!(matched > 0);
+    assert_eq!(
+        rules["permissions"]["ask"][0],
+        format!("{MANUAL_PREFIX}build_external_docs")
+    );
+    // The README tells how a plugin's names begin, as the plugin's prefix does.
+    let plugin = PLUGIN_PREFIX
+        .split('_')
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("_");
+    assert!(
+        README.contains(&format!("`{plugin}_<plugin>_<server>__`")),
+        "the README tells the plugin's prefix as {plugin}"
+    );
+}
+
 /// Walks a schema, checking each subschema: only the keywords of [`KEYWORDS`], no `null` type,
 /// `$ref` only within the schema, and in an input schema a `minimum` on each integer.
 fn check_schema(whose: &str, schema: &Map<String, Value>, input: bool) {
