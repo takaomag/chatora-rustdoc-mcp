@@ -34,6 +34,7 @@ pub mod format_version;
 pub mod freshness;
 pub mod gc;
 pub mod git_source;
+pub mod hidden;
 mod http;
 pub mod inventory;
 pub mod layout;

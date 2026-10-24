@@ -100,7 +100,9 @@ fn text_json(result: &Value) -> Value {
     serde_json::from_str(text).expect("the text is JSON")
 }
 
-/// The crate in the test cache: `demo` 0.1.0 with `/// Says hello.` `pub fn hello() -> u8`.
+/// The crate in the test cache: `demo` 0.1.0 with `/// Says hello.` `pub fn hello() -> u8`, whose
+/// docs hide a bidirectional control, an ANSI escape and a tag character, which the server removes
+/// (requirement R-SEC-7).
 fn demo_crate() -> Crate {
     let item = |id, name: &str, docs: Option<&str>, inner| Item {
         id: Id(id),
@@ -129,7 +131,7 @@ fn demo_crate() -> Crate {
     let hello = item(
         1,
         "hello",
-        Some("Says hello.\n\nMore."),
+        Some(HELLO_DOCS),
         ItemEnum::Function(Function {
             sig: FunctionSignature {
                 inputs: Vec::new(),
@@ -1059,6 +1061,61 @@ fn get_item_returns_structured_content_and_tool_errors() {
     );
     // Only an unknown tool is a JSON-RPC error.
     assert_eq!(server.response(4)["error"]["code"], -32602);
+    assert!(server.finish().success());
+}
+
+/// The docs of `hello` in [`demo_crate`], with what would hide text.
+const HELLO_DOCS: &str = "Says hello.\u{202E}\u{1B}[31m\u{E0041}\n\nMore.";
+
+/// Whether `response` has a character that would hide text, as the server removes them
+/// (requirement R-SEC-7): JSON escapes a control character.
+fn hides_text(response: &Value) -> bool {
+    let text = response.to_string();
+    text.contains("\\u001b") || text.chars().any(|c| matches!(c, '\u{202E}' | '\u{E0041}'))
+}
+
+/// What would hide text from whom reads it is removed from the answers, the errors and the
+/// JSON-RPC errors, and the log counts it (requirement R-SEC-7, decided in M2f's F7).
+#[test]
+fn answers_carry_no_character_that_hides_text() {
+    let mut server = Server::start();
+    server.send(&call_tool(
+        1,
+        "get_item",
+        json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET }),
+    ));
+    server.send(&call_tool(
+        2,
+        "get_item",
+        json!({ "crate": "demo@0.1.0", "path": "demo::nothing\u{202E}", "target": TARGET }),
+    ));
+    server.send(&call_tool(3, "nope\u{202E}", json!({})));
+    let found = server.response(1);
+    assert!(!hides_text(&found), "{found}");
+    assert_eq!(
+        found["result"]["structuredContent"]["data"]["docs"],
+        "Says hello."
+    );
+    assert_eq!(
+        text_json(&found["result"]),
+        found["result"]["structuredContent"]
+    );
+    let not_found = server.response(2);
+    assert!(!hides_text(&not_found), "{not_found}");
+    assert_eq!(not_found["result"]["isError"], true, "{not_found}");
+    let unknown = server.response(3);
+    assert_eq!(
+        unknown["error"]["message"], "unknown tool: nope",
+        "{unknown}"
+    );
+    // The log tells how many characters were removed from each answer.
+    let log = server.log();
+    let calls: Vec<&Value> = log.iter().filter(|line| line["kind"] == "call").collect();
+    let found = calls
+        .iter()
+        .find(|call| call.get("error").is_none())
+        .unwrap_or_else(|| panic!("the record of the call that succeeded: {log:?}"));
+    assert_eq!(found["hidden_chars"], 7, "{found}");
     assert!(server.finish().success());
 }
 

@@ -401,9 +401,12 @@ fn git_fetch_failure(stderr: &str) -> Option<GitFetchFailure> {
     }
 }
 
-/// The end of cargo's `stderr`, at most [`MAX_STDERR_CHARS`] characters, where its error is.
+/// The end of cargo's `stderr`, at most [`MAX_STDERR_CHARS`] characters, where its error is,
+/// without what would hide text: removed before it is cut, so that a cut leaves no part of an
+/// escape sequence of a build script's colors (requirement R-SEC-7).
 pub(super) fn stderr_tail(output: &Output) -> Box<str> {
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let (stderr, _) = super::hidden::strip(&stderr);
     let stderr = stderr.trim_end();
     let skip = stderr.chars().count().saturating_sub(MAX_STDERR_CHARS);
     stderr.chars().skip(skip).collect()
@@ -549,6 +552,9 @@ mod tests {
         let tail = stderr_tail(&failed(&long));
         assert_eq!(tail.chars().count(), MAX_STDERR_CHARS);
         assert!(tail.ends_with("end"));
+        // Colors that a cut would leave a part of.
+        let colored = format!("{}error", "\u{1B}[31m".repeat(MAX_STDERR_CHARS));
+        assert_eq!(&*stderr_tail(&failed(&colored)), "error");
     }
 }
 

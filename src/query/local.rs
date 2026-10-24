@@ -24,6 +24,7 @@ use crate::data::{
     external::Told,
     flight::{Doing, Flights, Joined, Stage},
     freshness,
+    hidden,
     metadata::PackageId,
     owner::Owner,
     rustdoc_json,
@@ -1078,7 +1079,7 @@ fn failure_body(plan: &Plan, error: &BuildError) -> Value {
             BuildError::Failed { stderr, .. } | BuildError::Fetch { stderr, .. } => {
                 fields.insert(
                     "stderr".to_owned(),
-                    json!(tail_within(stderr, MAX_DIAGNOSTICS_CHARS)),
+                    json!(tail_within(&hidden::strip(stderr).0, MAX_DIAGNOSTICS_CHARS)),
                 );
             },
             BuildError::Run(_)
@@ -1157,7 +1158,8 @@ const MAX_DIAGNOSTIC_CHARS: usize = 3_500;
 const MAX_DIAGNOSTICS_CHARS: usize = 8_000;
 
 /// The first `count` of `errors`, each cut to [`MAX_DIAGNOSTIC_CHARS`] and all to
-/// [`MAX_DIAGNOSTICS_CHARS`], and how many of the rest were left out.
+/// [`MAX_DIAGNOSTICS_CHARS`], and how many of the rest were left out. What would hide text is
+/// removed before it is cut (requirement R-SEC-7), so that a cut leaves no part of an escape.
 fn diagnostics(errors: &[Box<str>], count: usize) -> (Vec<String>, usize) {
     let mut left = MAX_DIAGNOSTICS_CHARS;
     let mut shown = Vec::new();
@@ -1166,7 +1168,7 @@ fn diagnostics(errors: &[Box<str>], count: usize) -> (Vec<String>, usize) {
         if limit == 0 {
             break;
         }
-        let text = head_within(error, limit);
+        let text = head_within(&hidden::strip(error).0, limit);
         left = left.saturating_sub(escaped_len(&text));
         shown.push(text);
     }
@@ -1499,6 +1501,14 @@ mod tests {
             MAX_DIAGNOSTICS_CHARS
         );
         assert_eq!((shown.len(), omitted), (3, 1));
+    }
+
+    #[test]
+    fn a_diagnostic_is_cut_after_what_hides_text_is_removed() {
+        // Colors that would take most of the limit, as escaped, and be cut in the middle.
+        let colored = format!("{}error\u{202E}", "\u{1B}[31m".repeat(1_000));
+        let (shown, omitted) = diagnostics(&[colored.into()], 1);
+        assert_eq!((shown, omitted), (vec!["error".to_owned()], 0));
     }
 
     #[test]

@@ -71,8 +71,9 @@ impl Call {
         self.fetches.clone()
     }
 
-    /// Puts the `request_id` in the error of `result`, if it is one, and logs the call.
-    pub(super) fn finish(self, result: &mut CallToolResult) {
+    /// Puts the `request_id` in the error of `result`, if it is one, and logs the call, with how
+    /// many characters that would hide text were `removed` from it (requirement R-SEC-7).
+    pub(super) fn finish(self, result: &mut CallToolResult, removed: usize) {
         let error = if result.is_error == Some(true) {
             Some(add_request_id(result, &self.request_id))
         } else {
@@ -99,17 +100,24 @@ impl Call {
             .structured_content
             .as_ref()
             .and_then(|structured| structured.get("status")?.as_str());
-        self.log(error.flatten(), status, &response, &sources);
+        self.log(error.flatten(), status, &response, &sources, removed);
     }
 
     /// Logs a call that was rejected with a JSON-RPC error, such as one to an unknown tool.
     pub(super) fn finish_rejected(self, error: &ErrorData) {
         let code = format!("jsonrpc {}", error.code.0);
-        self.log(Some(code), None, "", &[]);
+        self.log(Some(code), None, "", &[], 0);
     }
 
     /// Writes the record of the call to the log file.
-    fn log(self, error: Option<String>, status: Option<&str>, response: &str, sources: &[String]) {
+    fn log(
+        self,
+        error: Option<String>,
+        status: Option<&str>,
+        response: &str,
+        sources: &[String],
+        removed: usize,
+    ) {
         let chars = response.chars().count();
         let fetches = self.fetches.to_vec();
         let mut record = json!({
@@ -144,6 +152,10 @@ impl Call {
             }
             if !fetches.is_empty() {
                 record.insert("fetches".to_owned(), json!(fetches));
+            }
+            // Not told in the answer (decided in M2f's F7).
+            if removed > 0 {
+                record.insert("hidden_chars".to_owned(), removed.into());
             }
         }
         logging::write_record(&record);

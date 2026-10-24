@@ -19,26 +19,7 @@ const SCHEMES: [&str; 4] = ["https", "ssh", "http", "git"];
 /// allow a call, in the provenance and in the log.
 #[must_use]
 pub fn hidden_char(text: &str) -> Option<char> {
-    text.chars().find(|&c| {
-        c.is_control()
-            || matches!(c,
-                '\u{00AD}'
-                | '\u{034F}'
-                | '\u{061C}'
-                | '\u{115F}'..='\u{1160}'
-                | '\u{180B}'..='\u{180F}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{206F}'
-                | '\u{3164}'
-                | '\u{FE00}'..='\u{FE0F}'
-                | '\u{FEFF}'
-                | '\u{FFA0}'
-                | '\u{FFF9}'..='\u{FFFB}'
-                | '\u{1D173}'..='\u{1D17A}'
-                | '\u{E0000}'..='\u{E007F}'
-                | '\u{E0100}'..='\u{E01EF}')
-    })
+    text.chars().find(|&c| super::hidden::is_hidden(c))
 }
 
 /// A git repository's URL, checked (requirement R-SEC-4).

@@ -1928,6 +1928,21 @@ Claude Code 2.1.304、Linux で測った。
 4. 「(in a later version)」を返す 9 か所 (名指しできない path・git の依存など) は文言を残し、どの版かは書かない。要件と m2-plan に「M3 以降で対応を検討」と書く
 5. 揺れるテスト 2 件 (Windows の孫のテスト、stdio のテストを並べたときだけ落ちる building のテスト) は M2f の中で原因を直す
 
+**F7 の下調べと決定 (出力のサニタイズ、R-SEC-7。2026-10-24)**:
+
+- 下調べ (サブエージェント、読むだけ): すべての `tools/call` は `src/mcp/tool/mod.rs` の `call()` を通り、成功もツールのエラーも `call.finish` の前の 1 か所で直せる。ほかの出口は JSON-RPC のエラー (`unknown tool: {name}` はモデルが送った名前を埋める) と進捗の通知 (待っているものの名前、外の workspace の root のパスを含みうる)。instructions と説明文は自前の定数。resources・prompts・logging の通知は無い。成功の結果は `CallToolResult::structured` で、content[0].text は structured の JSON の写し (rmcp 3.5.1)。エラーは JSON を text に持つだけなので、文字単位で直すと `\u001b` のようにエスケープされた ESC が残る (JSON として読んで直す)。応答の上限とカーソルは出口より前に決まり、除くだけなので縮むだけ (カーソルは ASCII)。cargo には `CARGO_TERM_COLOR=never` と `--message-format=json` を渡すので `message.rendered` に ANSI は入らないはずだが、build script などの stderr の末尾には入りうる。ソースの本文を返すツール (`get_source`・examples) はまだ無い (M3)。git の URL と `project` の拒否 (R-SEC-4) の `git_source::hidden_char` は要件の一覧より広い
+- 利用者が決めたこと:
+  1. 除く文字は `hidden_char` と表を 1 つにする: 要件の一覧に、見えない書式の文字 (U+00AD・U+034F・U+115F-1160・U+180B-180F・U+2061-206F・U+3164・U+FEFF・U+FFA0・U+FFF9-FFFB・U+1D173-1D17A) と行・段落の区切り (U+2028-2029) を足す。§7 で要件の一覧もこの表に改める
+  2. ANSI のエスケープは列ごと除く: CSI (`ESC [` から終端の文字まで)・OSC など文字列の列 (`ESC ]`・`ESC P`・`ESC X`・`ESC ^`・`ESC _` から BEL か ST まで、終わりが無ければ行末まで)・2 文字の ESC、8 ビットの U+009B (CSI)・U+009D (OSC) なども同じ。手書きの小さな解析 (依存は足さない)
+  3. 識別子に入りうる ZWJ・ZWNJ・異体字セレクタ (XID_Continue にある) も一律に除き、照合は変えない。そういう名前の item は表示どおりのパスでは引けない (既知の制限。rustc も `uncommon_codepoints` で警告する)
+  4. ソースの本文の見える印 (`<U+202E>` と warnings) は M3 の `get_source` と一緒に作る。形は「ソースを返すツールが出口より前に ASCII の印へ置き換え、出口の一律の処理はその後で何も見つけない」
+  5. 除いたことは応答に書かず、ログの呼び出しの行 (`kind: call`) に除いた文字の数を足す
+- 聞かずに決めたこと (下調べの推奨のとおり): 出口は `call()` の結果 (成功・ツールのエラー・busy・取り消しも同じ関数を通す)、JSON-RPC のエラーの本文、進捗の通知の文の 3 か所。JSON のキーも直す。診断と stderr の末尾は切る前に直し (要件のとおり)、出口でもう一度かける (同じ処理を 2 度かけても変わらない)。ファイル名やローカルの絶対パスも一律に除く (要件のとおり)。ログは範囲の外 (応答の本文を記録せず、JSON Lines は制御文字をエスケープする)。成功の結果は出口で content[0].text を structured から作り直す (`external_git`・`external_build` の building の応答は structured に `hints` を足した後で text を作り直しておらず、text に hints が無かった。これも直る)。表と関数は `data::hidden` に置き、`git_source::hidden_char` もそれを使う
+- 段は 1 つ (F7)
+- 実装: `data::hidden` (`is_hidden`・`strip`・`strip_value`)、`git_source::hidden_char` はその表を使う。出口は `src/mcp/tool/mod.rs` の `respond`・`sanitize` (成功・ツールのエラー・busy・取り消し・panic の `internal_error` がすべて通る)、進捗の通知の文と `unknown tool` の名前。cargo の stderr の末尾 (`cargo::stderr_tail`) と診断 (`query::local::diagnostics`) は切る前に直す。ログの `kind: call` に `hidden_chars` (出口で除いた数)。テスト: `hidden` の単体テスト、出口と診断と stderr の末尾の単体テスト、stdio の `answers_carry_no_character_that_hides_text` (`demo` の docs に双方向の制御・ANSI・タグ文字を埋めたので、docs を確かめる既存のテストも除いた後の文で通る)
+- レビュー (サブエージェント、読むだけ) の対応: (1) stderr は `stderr_tail` が生の末尾を切った後に直していた (色の列の途中で切れて `31m` が残りうる、決定の「切る前に」と違う): `stderr_tail` の中で直してから切る。(2) 終わらない OSC を次のエスケープが打ち切ると、その ESC だけ食べて次の列の残りが見えた: 次の列は残して列ごと除く。(4) 単独の CR・U+0085・U+2028・U+2029 を除くと行がつながる: 改行に置き換える (CRLF の CR は除く。聞かずに決めた)。(5) stdio のテストのタグ文字が応答に載らない第 2 段落にあった: 第 1 段落へ
+- 受け入れたこと (レビューの指摘): 単独の ESC や 8 ビットの導入の文字は後ろの文字を列として取る (端末と同じ解釈。`ESC H` の H、単独の U+009D は行末まで。cp1252 の文字化けで docs に入りうる。テストに書いた)。docs の絵文字は ZWJ と U+FE0F を除くので分かれる (要件の一覧どおり)。ログの `hidden_chars` は出口で除いた数だけで、先に直した診断・stderr・進捗・`unknown tool` の名前の分は数えない。直した後に同じになる JSON のキーは後のほうが勝つ (今の応答のキーは自前の定数と std の auto trait の名前だけ)。進捗の通知の文のテストは無い (応答の前に 3 秒ごとに送るので、待ちを作るテストが要る)
+
 ## 7. M2 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

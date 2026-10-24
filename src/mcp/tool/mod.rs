@@ -76,6 +76,7 @@ use crate::{
         docs_rs::DocsRs,
         fetches::Fetches,
         flight::Flights,
+        hidden,
         sparse_index::SparseIndex,
         target::{self, HostTarget},
         waits::Waits,
@@ -612,9 +613,7 @@ pub(super) async fn call(
 ) -> Result<CallToolResponse, ErrorData> {
     let call = call_log::Call::start(&request.name, request.arguments.as_ref());
     let Some(entered) = state.calls.enter() else {
-        let mut busy = state.calls.busy();
-        call.finish(&mut busy);
-        return Ok(busy.into());
+        return Ok(respond(call, state.calls.busy()));
     };
     let cancelled = context.ct.clone();
     let span = call.span();
@@ -641,9 +640,8 @@ pub(super) async fn call(
             biased;
             called = &mut running => break called,
             () = cancelled.cancelled() => {
-                let mut result = tool_error("cancelled", "the call was cancelled", false, &[]);
-                call.finish(&mut result);
-                return Ok(result.into());
+                let result = tool_error("cancelled", "the call was cancelled", false, &[]);
+                return Ok(respond(call, result));
             },
             _ = ticks.tick(), if progress.is_some() => {
                 if let Some(progress) = &mut progress {
@@ -654,15 +652,57 @@ pub(super) async fn call(
     };
     drop(entered);
     match called {
-        Ok(mut result) => {
-            call.finish(&mut result);
-            Ok(result.into())
-        },
+        Ok(result) => Ok(respond(call, result)),
         Err(error) => {
             call.finish_rejected(&error);
             Err(error)
         },
     }
+}
+
+/// Answers `call` with `result`, without what would hide text from whom reads it, and logs it.
+fn respond(call: call_log::Call, mut result: CallToolResult) -> CallToolResponse {
+    let removed = sanitize(&mut result);
+    call.finish(&mut result, removed);
+    result.into()
+}
+
+/// Removes from `result` what would hide text from whom reads it, and returns how many characters
+/// were removed (requirement R-SEC-7, decided in M2f's F7).
+///
+/// It is the one place that every answer goes through: every string of its structured content is
+/// stripped, the keys too, and its text written again from it, as a tool may have changed the
+/// structured content after it; else, as for an error, its text is stripped as the JSON it is, so
+/// that an escaped control character goes too.
+fn sanitize(result: &mut CallToolResult) -> usize {
+    if let Some(structured) = &mut result.structured_content {
+        let removed = hidden::strip_value(structured);
+        result.content = vec![ContentBlock::text(structured.to_string())];
+        return removed;
+    }
+    result
+        .content
+        .iter_mut()
+        .map(|block| {
+            let Some(text) = block.as_text() else {
+                return 0;
+            };
+            let (text, removed) = serde_json::from_str::<Value>(&text.text).map_or_else(
+                |_| {
+                    let (text, removed) = hidden::strip(&text.text);
+                    (text.into_owned(), removed)
+                },
+                |mut body| {
+                    let removed = hidden::strip_value(&mut body);
+                    (body.to_string(), removed)
+                },
+            );
+            if removed > 0 {
+                *block = ContentBlock::text(text);
+            }
+            removed
+        })
+        .fold(0, usize::saturating_add)
 }
 
 /// How often a call that takes long tells its progress (requirement R-WS-6: from 1 to 30 seconds).
@@ -698,9 +738,12 @@ impl Progress {
     async fn tell(&mut self, waits: &Waits) {
         self.told = self.told.saturating_add(PROGRESS_EVERY.as_secs());
         let progress = self.told;
-        let doing = waits
-            .message()
-            .unwrap_or_else(|| "looking it up".to_owned());
+        // What it waits for may be named after a third party's text, as a path (requirement
+        // R-SEC-7).
+        let doing = waits.message().map_or_else(
+            || "looking it up".to_owned(),
+            |doing| hidden::strip(&doing).0.into_owned(),
+        );
         #[expect(
             clippy::cast_precision_loss,
             reason = "seconds that a call takes are far below 2^52"
@@ -788,7 +831,7 @@ async fn dispatch(
             // Only `sleep` uses the context, which only the tests have.
             drop(context);
             Err(ErrorData::invalid_params(
-                format!("unknown tool: {name}"),
+                format!("unknown tool: {}", hidden::strip(name).0),
                 None,
             ))
         },
@@ -957,6 +1000,53 @@ fn error_result(body: &Value) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_is_sanitized_and_its_text_written_from_its_structured_content() {
+        let mut result = CallToolResult::structured(json!({ "docs": "a" }));
+        // As a tool adds hints after it is made.
+        if let Some(Value::Object(response)) = &mut result.structured_content {
+            response.insert("hints".to_owned(), json!(["b\u{202E}"]));
+        }
+        assert_eq!(sanitize(&mut result), 1);
+        let answer = json!({ "docs": "a", "hints": ["b"] });
+        assert_eq!(result.structured_content, Some(answer.clone()));
+        assert_eq!(
+            result
+                .content
+                .first()
+                .and_then(|block| block.as_text())
+                .map(|text| &*text.text),
+            Some(&*answer.to_string())
+        );
+    }
+
+    #[test]
+    fn an_error_is_sanitized_as_its_json() {
+        let mut result = tool_error("item_not_found", "no \u{1B}[31mx\u{E0041}", false, &[]);
+        assert_eq!(sanitize(&mut result), 6);
+        let text = result
+            .content
+            .first()
+            .and_then(|block| block.as_text())
+            .map(|text| text.text.clone());
+        let body: Value = serde_json::from_str(&text.expect("text")).expect("JSON");
+        assert_eq!(body["message"], "no x");
+        // What is no JSON is stripped as it is.
+        let mut result = CallToolResult::error(vec![ContentBlock::text("plain\u{202E}")]);
+        assert_eq!(sanitize(&mut result), 1);
+        assert_eq!(
+            result
+                .content
+                .first()
+                .and_then(|block| block.as_text())
+                .map(|text| &*text.text),
+            Some("plain")
+        );
+        // Nothing to remove leaves it as it is.
+        let mut result = tool_error("busy", "busy", true, &[]);
+        assert_eq!(sanitize(&mut result), 0);
+    }
 
     #[test]
     fn a_description_keeps_what_is_for_this_build() {
