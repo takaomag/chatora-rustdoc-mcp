@@ -1260,9 +1260,19 @@ mod tests {
         remove_orphan_aliases(&cache, SystemTime::now(), true, &mut outcome);
         assert_eq!(outcome.removed.len(), 2, "{outcome:?}");
         assert_eq!(aliases().len(), 2);
-        let mut outcome = Outcome::default();
-        remove_orphan_aliases(&cache, SystemTime::now(), false, &mut outcome);
-        assert_eq!(outcome.removed.len(), 2, "{outcome:?}");
+        // A child that another test starts meanwhile holds the lock file's descriptor until it
+        // runs its program, and the lock with it: an alias is then in use, and goes the next time.
+        let mut removed = 0_usize;
+        for _ in 0..10 {
+            let mut outcome = Outcome::default();
+            remove_orphan_aliases(&cache, SystemTime::now(), false, &mut outcome);
+            removed = removed.saturating_add(outcome.removed.len());
+            if outcome.in_use.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(removed, 2);
         assert_eq!(aliases(), Vec::<PathBuf>::new());
     }
 

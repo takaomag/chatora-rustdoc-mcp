@@ -1874,6 +1874,7 @@ Claude Code 2.1.304、Linux で測った。
 - 直したこと: くり返したケースの表の名前 (`run.py`)。F4 完了
 - 残したもの: 選ぶ側の 1 回は MCP を読み込んでもソースを読んだ (ソースが手元にあるときは誤りではない)。alwaysLoad (R-MCP-8) は M5 の比較で
 - 49de673 の CI は Windows の testdata だけ落ちた (testdata のキャッシュは初めて復元された): F4a-1 で足した real_data のケース (このリポジトリの member) で、`rustdoc +nightly -vV did not finish in 10 seconds` の `build_failed` が `retryable: false` で返った。toolchain の調べの失敗 (`ChooseError::Failed`) は理由を問わず `retryable: false` だった。利用者が決めたこと: 時間切れは一時的なので `retryable: true` で返し (`ChooseError::is_transient`、`tool::timed_out`。上限 10 秒は変えず、失敗は今どおり 60 秒だけ覚える)、real_data のクライアントは `retryable: true` の `build_failed` も 5 秒おきに 30 回まで呼び直す
+- c08d8c0 の CI は ubuntu の check で `data::gc::tests::an_alias_whose_record_is_gone_goes` が揺れた: 同じ workspace の別名 2 つの 2 つ目が `in_use` になった。推測の原因は、1 つ目の別名でロックを外した直後に同じテストのプロセスの他のテストが子を起動し、子が exec するまでロックファイルの fd の写しを持つ (flock は開いたファイルの記述子に付く) ため。製品では決定 7 のとおり飛ばして次の GC で消えるので変えず、テストで `in_use` が残る間は 10 回まで呼び直す (利用者の決定)
 
 **F5a・F5b (手元の測定。2026-10-23)**:
 
