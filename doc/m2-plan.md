@@ -2010,3 +2010,4 @@ Claude Code 2.1.304、Linux で測った。
   9. 段 4 の編集で見つかった 2 件 (外の workspace の `lockfile_outdated` が古い Cargo.lock にも `cargo generate-lockfile` を勧める、ローカルビルドした member の `source_location.file` が package root でなく workspace のルートからの相対パスらしい (実測していない)) は、既知の残りとして要件に書き、M3 の最初の段で直す (`file` は `path` と一緒に)
 - 編集: requirements.md を 7 段で v0.20 にした (各段をサブエージェントが書き、出典と照らして差分を確かめた。§14 の v0.20 は主題 25 件)。全体のレビュー (サブエージェント、読むだけ) の対応: §6.4 の `target` の既定で `resolve_version` を決定 6 のあるべき姿に、ビルドを待つ上限は呼び出しの期限の 3 分の 2 との短いほう (R-MCP-4・R-WS-6・R-ARCH-6)、outputSchema の `stale_reason` はツールが返しうる値だけ、m2-plan を指す § の参照に「m2-plan.md の」、§12 の M3 に `.crate` の展開、LSP の誘導は「原因の候補」にそろえる、axum 級の待ち、state の段落の主語、target dir の名前は既定の dir の話と限る
 - セキュリティの一覧ページ (Artifact) を v0.18 から v0.20 に合わせた (v0.19 の分も。誤っていた D3 の `GITHUB_TOKEN`・C3 の展開・D2 の building・E2 の公開済みを直し、GitHub の token の扱いは M3 以降の仕様と書いた)
+- M3 の計画 (§7 の 4) は [m3-plan.md](m3-plan.md) に書いた (2026-10-24。下調べはサブエージェント、§5 の P1〜P15 は利用者が 1 件ずつ決めた)。M2 完了
