@@ -867,6 +867,14 @@ fn raw_warnings(because: &CargoError) -> Vec<Box<str>> {
         | Failure::TooOld
         | Failure::Other => {},
     }
+    // Kept while the project's files and settings are the same (decided in M3a).
+    if because.lasts() {
+        warnings.push(
+            "the failure is kept while Cargo.toml, Cargo.lock and cargo's settings are the same: \
+             once its cause is fixed elsewhere, call again with \"refresh\": true"
+                .into(),
+        );
+    }
     warnings
 }
 
@@ -1034,12 +1042,15 @@ mod tests {
             stderr: "".into(),
         };
         let auth = raw_warnings(&failed(Failure::GitFetch(GitFetchFailure::Auth)));
-        assert_eq!(auth.len(), 2, "{auth:?}");
+        assert_eq!(auth.len(), 3, "{auth:?}");
         assert!(auth[0].contains("fetch_failed"), "{auth:?}");
         assert!(auth[1].contains("gh auth setup-git"), "{auth:?}");
+        // Kept until `refresh` (decided in M3a).
+        assert!(auth[2].contains("\"refresh\": true"), "{auth:?}");
         assert_eq!(
             raw_warnings(&failed(Failure::GitFetch(GitFetchFailure::NoRev))).len(),
-            1
+            2
         );
+        assert_eq!(raw_warnings(&failed(Failure::Other)).len(), 1);
     }
 }

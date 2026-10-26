@@ -10,14 +10,19 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::Arc,
     thread,
 };
 
-use chatora_rustdoc_mcp::data::cargo::{Failure, GitFetchFailure, classify};
+use chatora_rustdoc_mcp::data::{
+    cargo::{Failure, GitFetchFailure, classify},
+    metadata::{Resolution, Resolver},
+    project,
+};
 
 use crate::{
     git::{commit_all, git},
-    isolated::{Isolated, output_within},
+    isolated::{Isolated, in_isolated_child, output_within},
 };
 
 /// A bare repository with the package `dep`, a branch `main` and a tag `v1`.
@@ -168,4 +173,64 @@ fn each_failure_to_fetch_a_git_dependency_is_told_apart() {
             String::from_utf8_lossy(&fetched.stderr)
         );
     }
+}
+
+/// A failure of `cargo metadata` to fetch a git dependency that cannot be had is kept while the
+/// workspace's files are the same, a member's manifest among them, until `refresh` (requirement
+/// R-WS-7, decided in M3a). The repository does not exist; Cargo.lock names its commit.
+#[tokio::test]
+async fn a_failure_of_cargo_metadata_to_fetch_a_git_dependency_is_kept() {
+    let Some(dir) = in_isolated_child(
+        "git_failures::a_failure_of_cargo_metadata_to_fetch_a_git_dependency_is_kept",
+    ) else {
+        return;
+    };
+    let root = dir.join("ws");
+    let member = root.join("crates/a");
+    fs::create_dir_all(member.join("src")).expect("made");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"3\"\nmembers = [\"crates/*\"]\n",
+    )
+    .expect("written");
+    let url = file_url(&dir.join("missing.git"));
+    let manifest = format!(
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\ndep = {{ git = \"{url}\" }}\n"
+    );
+    fs::write(member.join("Cargo.toml"), &manifest).expect("written");
+    fs::write(member.join("src/lib.rs"), "").expect("written");
+    fs::write(
+        root.join("Cargo.lock"),
+        format!(
+            "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"dep\",\n]\n\n[[package]]\nname = \"dep\"\nversion = \"0.1.0\"\nsource = \
+             \"git+{url}#0123456789abcdef0123456789abcdef01234567\"\n"
+        ),
+    )
+    .expect("written");
+    let workspace = project::workspace_of(&root).expect("a workspace");
+    let resolver = Resolver::new(false);
+    let first = resolver.resolve(&workspace).await.expect("resolved");
+    let Resolution::CargoLockRaw { because, .. } = &*first else {
+        panic!("cargo metadata cannot fetch the repository: {first:?}");
+    };
+    assert!(because.lasts(), "{because:?}");
+    let again = resolver.resolve(&workspace).await.expect("resolved");
+    assert!(Arc::ptr_eq(&first, &again), "kept");
+    // A member's manifest is an input of the failure too.
+    fs::write(
+        member.join("Cargo.toml"),
+        format!("{manifest}\n# changed\n"),
+    )
+    .expect("written");
+    let changed = resolver.resolve(&workspace).await.expect("resolved");
+    assert!(
+        !Arc::ptr_eq(&first, &changed),
+        "a member's manifest is an input"
+    );
+    // `refresh` forgets it.
+    resolver.forget_failures(&workspace.root).await;
+    let refreshed = resolver.resolve(&workspace).await.expect("resolved");
+    assert!(!Arc::ptr_eq(&changed, &refreshed), "forgotten");
 }

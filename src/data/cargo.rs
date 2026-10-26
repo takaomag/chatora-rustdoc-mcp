@@ -8,7 +8,7 @@ use std::{
     path::Path,
     process::{Output, Stdio},
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::{
@@ -46,10 +46,66 @@ pub enum RunError {
     /// cargo could not be started, as when it is not installed.
     #[error("cargo could not be run")]
     NotStarted(#[source] io::Error),
-    /// cargo ran longer than `build.timeout_secs` (requirement R-WS-6), this long, and was
-    /// stopped.
-    #[error("cargo did not finish in {} seconds", .0.as_secs())]
-    TimedOut(Duration),
+    /// cargo ran longer than `build.timeout_secs` (requirement R-WS-6), `limit`, and was stopped,
+    /// having waited for a lock of another cargo `waiting_for_lock` of it, as its stderr told.
+    #[error("cargo did not finish in {} seconds", .limit.as_secs())]
+    TimedOut {
+        /// How long it ran.
+        limit: Duration,
+        /// How long of it cargo waited for a lock.
+        waiting_for_lock: Duration,
+    },
+}
+
+impl RunError {
+    /// Whether cargo ran too long mostly waiting for the lock of another cargo, as rust-analyzer's
+    /// or the user's: longer than half of its limit (decided in M3's P3). Trying again may then
+    /// work (requirement R-WS-7).
+    #[must_use]
+    pub const fn mostly_waited_for_lock(&self) -> bool {
+        match self {
+            Self::TimedOut {
+                limit,
+                waiting_for_lock,
+            } => waiting_for_lock.saturating_mul(2).as_nanos() > limit.as_nanos(),
+            Self::NotStarted(_) => false,
+        }
+    }
+}
+
+/// How long cargo has waited for a lock, as the lines of its stderr tell: from the line about the
+/// lock to the next line, which it writes once it has the lock.
+#[derive(Debug, Default)]
+struct LockClock {
+    /// Since when cargo waits, if it does.
+    since: Option<Instant>,
+    /// How long it waited before.
+    waited: Duration,
+}
+
+impl LockClock {
+    /// Notes that cargo does `activity` from `now`.
+    fn observe(&mut self, activity: Activity, now: Instant) {
+        match (activity, self.since) {
+            (Activity::WaitingForLock, None) => self.since = Some(now),
+            (Activity::WaitingForLock, Some(_))
+            | (Activity::Fetching | Activity::Running, None) => {},
+            (Activity::Fetching | Activity::Running, Some(since)) => {
+                self.waited = self
+                    .waited
+                    .saturating_add(now.saturating_duration_since(since));
+                self.since = None;
+            },
+        }
+    }
+
+    /// How long cargo has waited by `now`, while it waits too.
+    fn waited(&self, now: Instant) -> Duration {
+        self.since.map_or(self.waited, |since| {
+            self.waited
+                .saturating_add(now.saturating_duration_since(since))
+        })
+    }
 }
 
 /// How a cargo command failed, as far as its messages tell (requirement R-WS-7).
@@ -274,30 +330,55 @@ pub(super) async fn run(command: tokio::process::Command) -> Result<Output, RunE
 /// Returns an error when cargo cannot be started or runs too long.
 pub(super) async fn run_reporting(
     command: tokio::process::Command,
+    on_activity: impl FnMut(Activity) + Send,
+) -> Result<Output, RunError> {
+    run_reporting_within(command, run_time(), on_activity).await
+}
+
+/// [`run_reporting`], stopped after `limit`.
+async fn run_reporting_within(
+    command: tokio::process::Command,
+    limit: Duration,
     mut on_activity: impl FnMut(Activity) + Send,
 ) -> Result<Output, RunError> {
     let child = child::spawn(command).await.map_err(RunError::NotStarted)?;
     let mut activity = Activity::Running;
+    let mut clock = LockClock::default();
     let output = child.output_watching(|line| {
         let now = activity_of(line);
         if now != activity {
             activity = now;
+            clock.observe(now, Instant::now());
             on_activity(now);
         }
     });
-    limited(run_time(), output).await
+    let finished = limited(limit, output).await;
+    ended(finished, limit, &clock)
 }
 
 /// `output` of a cargo command, which is stopped after `limit`: dropped then, as when the call is
-/// cancelled, which stops the whole group.
+/// cancelled, which stops the whole group. `None` when it ran too long.
 async fn limited(
     limit: Duration,
     output: impl Future<Output = io::Result<Output>>,
+) -> Option<io::Result<Output>> {
+    tokio::time::timeout(limit, output).await.ok()
+}
+
+/// What a cargo command that `finished` so, within `limit` or not, ended with: as long as `clock`
+/// tells it waited for a lock, when it ran too long.
+fn ended(
+    finished: Option<io::Result<Output>>,
+    limit: Duration,
+    clock: &LockClock,
 ) -> Result<Output, RunError> {
-    tokio::time::timeout(limit, output)
-        .await
-        .map_err(|_elapsed| RunError::TimedOut(limit))?
-        .map_err(RunError::NotStarted)
+    let Some(finished) = finished else {
+        return Err(RunError::TimedOut {
+            limit,
+            waiting_for_lock: clock.waited(Instant::now()),
+        });
+    };
+    finished.map_err(RunError::NotStarted)
 }
 
 /// [`run_reporting`] for a build in `target_dir`, a target directory in the cache, which the
@@ -317,14 +398,18 @@ pub(super) async fn run_building(
         .await
         .map_err(RunError::NotStarted)?;
     let mut activity = Activity::Running;
+    let mut clock = LockClock::default();
     let output = child.output_streaming(on_message, |line| {
         let now = activity_of(line);
         if now != activity {
             activity = now;
+            clock.observe(now, Instant::now());
             on_activity(now);
         }
     });
-    limited(run_time(), output).await
+    let limit = run_time();
+    let finished = limited(limit, output).await;
+    ended(finished, limit, &clock)
 }
 
 /// What a failed cargo command's `stderr` says about the failure.
@@ -423,15 +508,79 @@ mod tests {
     async fn a_command_that_runs_too_long_is_stopped_with_its_limit() {
         let limit = Duration::from_millis(20);
         let never = std::future::pending::<io::Result<Output>>();
-        let error = limited(limit, never).await.expect_err("timed out");
-        assert!(
-            matches!(error, RunError::TimedOut(at) if at == limit),
-            "{error:?}"
-        );
+        let finished = limited(limit, never).await;
+        let error = ended(finished, limit, &LockClock::default()).expect_err("timed out");
+        let RunError::TimedOut {
+            limit: at,
+            waiting_for_lock,
+        } = error
+        else {
+            panic!("timed out: {error:?}");
+        };
+        assert_eq!((at, waiting_for_lock), (limit, Duration::ZERO));
+        let error = RunError::TimedOut {
+            limit,
+            waiting_for_lock,
+        };
+        assert!(!error.mostly_waited_for_lock());
         assert_eq!(
-            RunError::TimedOut(Duration::from_mins(30)).to_string(),
+            RunError::TimedOut {
+                limit: Duration::from_mins(30),
+                waiting_for_lock: Duration::ZERO
+            }
+            .to_string(),
             "cargo did not finish in 1800 seconds"
         );
+    }
+
+    #[test]
+    fn the_wait_for_a_lock_is_counted_from_its_line_to_the_next() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut clock = LockClock::default();
+        clock.observe(Activity::Fetching, at(1));
+        clock.observe(Activity::WaitingForLock, at(2));
+        assert_eq!(clock.waited(at(5)), Duration::from_secs(3));
+        clock.observe(Activity::Running, at(6));
+        clock.observe(Activity::WaitingForLock, at(10));
+        // Still waiting.
+        assert_eq!(clock.waited(at(12)), Duration::from_secs(6));
+        clock.observe(Activity::Running, at(13));
+        assert_eq!(clock.waited(at(20)), Duration::from_secs(7));
+        // Over half of the limit is mostly waiting (decided in M3's P3).
+        let timed_out = |waited| RunError::TimedOut {
+            limit: Duration::from_secs(10),
+            waiting_for_lock: Duration::from_secs(waited),
+        };
+        assert!(timed_out(6).mostly_waited_for_lock());
+        assert!(!timed_out(5).mostly_waited_for_lock());
+    }
+
+    /// A cargo that waits for a lock until it is stopped ran too long mostly waiting, as its
+    /// stderr tells; one that only runs did not. The line is read long before the limit, also on
+    /// a busy machine; the group is stopped at the limit, as cargo's.
+    #[tokio::test]
+    async fn a_run_too_long_tells_how_long_it_waited_for_a_lock() {
+        let run = |script: &str| {
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            child::prepare(&mut command);
+            run_reporting_within(command, Duration::from_secs(3), |_| {})
+        };
+        let waiting = run(&format!(
+            "echo '    {WAITING_FOR_LOCK} on package cache' >&2; sleep 30"
+        ))
+        .await
+        .expect_err("timed out");
+        assert!(waiting.mostly_waited_for_lock(), "{waiting:?}");
+        let running = run("echo '   Compiling a v0.1.0' >&2; sleep 30")
+            .await
+            .expect_err("timed out");
+        assert!(!running.mostly_waited_for_lock(), "{running:?}");
     }
 
     fn failed(stderr: &str) -> Output {

@@ -1132,7 +1132,8 @@ impl BuildError {
     /// It may when cargo or its children were killed, as by the OOM killer, cargo could not be
     /// started, the JSON could not be published, or what cargo left was not the build's, as
     /// another may have written it; and when fetching failed, but for a git dependency that
-    /// cannot be had, Cargo.lock that does not match, or what is not cached offline. The rest
+    /// cannot be had, Cargo.lock that does not match, or what is not cached offline; and when
+    /// cargo ran too long mostly waiting for another cargo's lock (decided in M3's P3). The rest
     /// lasts while what the build is made from does not change, a build that ran too long too.
     #[must_use]
     pub const fn is_transient(&self) -> bool {
@@ -1147,7 +1148,9 @@ impl BuildError {
             | Self::Fresh(_)
             | Self::Unreadable(_)
             | Self::NotTheCrate { .. } => true,
-            Self::Run(RunError::TimedOut(_)) | Self::NoJson(_) => false,
+            // What waited for another cargo's lock may pass later (decided in M3's P3).
+            Self::Run(timed_out @ RunError::TimedOut { .. }) => timed_out.mostly_waited_for_lock(),
+            Self::NoJson(_) => false,
         }
     }
 }
@@ -2272,11 +2275,22 @@ mod tests {
             )),
             fetch(Failure::LockfileOutdated),
             fetch(Failure::OfflineMiss),
-            BuildError::Run(RunError::TimedOut(Duration::from_mins(30))),
+            BuildError::Run(RunError::TimedOut {
+                limit: Duration::from_mins(30),
+                waiting_for_lock: Duration::from_mins(10),
+            }),
             BuildError::NoJson(PathBuf::from("a.json")),
         ] {
             assert!(!lasting.is_transient(), "{lasting:?}");
         }
+        // Mostly waiting for another cargo's lock, it may pass later (decided in M3's P3).
+        assert!(
+            BuildError::Run(RunError::TimedOut {
+                limit: Duration::from_mins(30),
+                waiting_for_lock: Duration::from_mins(20),
+            })
+            .is_transient()
+        );
     }
 
     #[test]

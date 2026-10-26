@@ -812,6 +812,12 @@ fn metadata_failed(name: &CrateName, because: &CargoError) -> CallToolResult {
     if let (Failure::GitFetch(reason), Some(fields)) = (failure, body.as_object_mut()) {
         fields.insert("reason".to_owned(), json!(reason.as_str()));
     }
+    // Kept while the project's files are the same (decided in M3a).
+    if because.lasts()
+        && let Some(Value::Array(suggestions)) = body.get_mut("suggestions")
+    {
+        suggestions.push(json!(REFRESH_ONCE_FIXED));
+    }
     error_result(&body)
 }
 
@@ -1120,6 +1126,30 @@ mod tests {
         assert!(refresh_acts(scope));
         // Another scope is apart.
         assert!(refresh_acts("crate None another"));
+    }
+
+    /// A failure of `cargo metadata` to fetch a git dependency, which is kept while the project's
+    /// files are the same, tells how to try again once its cause is fixed (decided in M3a).
+    #[test]
+    fn a_lasting_failure_of_cargo_metadata_tells_refresh() {
+        let failed = |failure| {
+            let result = metadata_failed(&"a".parse().expect("a name"), &CargoError::Failed {
+                command: "metadata",
+                failure,
+                stderr: Box::default(),
+            });
+            result
+                .content
+                .first()
+                .and_then(|block| block.as_text())
+                .map(|text| text.text.clone())
+                .unwrap_or_default()
+        };
+        let git = failed(Failure::GitFetch(
+            crate::data::cargo::GitFetchFailure::NoRepository,
+        ));
+        assert!(git.contains("refresh"), "{git}");
+        assert!(!failed(Failure::Other).contains("refresh"));
     }
 
     #[test]

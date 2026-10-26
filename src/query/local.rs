@@ -1031,11 +1031,18 @@ fn failure_body(plan: &Plan, error: &BuildError, rustup: bool) -> Value {
                 "suggestions": suggestions(plan, *failure, "run `cargo fetch` in the project's terminal to see why it fails", rustup),
             }),
         ),
-        BuildError::Run(RunError::TimedOut(_)) => (
+        BuildError::Run(run @ RunError::TimedOut { .. }) => (
             None,
             json!({
                 "code": "build_failed",
-                "message": format!("the build of the documentation of {what} took too long: {error}"),
+                "message": if run.mostly_waited_for_lock() {
+                    format!(
+                        "the build of the documentation of {what} took too long, most of it \
+                         waiting for the lock of another cargo, as rust-analyzer's: {error}"
+                    )
+                } else {
+                    format!("the build of the documentation of {what} took too long: {error}")
+                },
                 "retryable": retryable,
                 "suggestions": [],
                 "reason": "timeout",
@@ -1534,6 +1541,39 @@ mod tests {
     }
 
     #[test]
+    fn a_build_that_ran_too_long_may_pass_later_if_it_mostly_waited_for_a_lock() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let unpinned = plan(dir.path(), None);
+        let failure_body_of = |plan: &Plan, error: &BuildError| failure_body(plan, error, true);
+        let timed_out = failure_body_of(
+            &unpinned,
+            &BuildError::Run(RunError::TimedOut {
+                limit: std::time::Duration::from_mins(30),
+                waiting_for_lock: std::time::Duration::ZERO,
+            }),
+        );
+        assert_eq!(
+            (&timed_out["reason"], &timed_out["retryable"]),
+            (&json!("timeout"), &json!(false))
+        );
+        // Mostly waiting for another cargo's lock, it may pass later (decided in M3's P3).
+        let waited = failure_body_of(
+            &unpinned,
+            &BuildError::Run(RunError::TimedOut {
+                limit: std::time::Duration::from_mins(30),
+                waiting_for_lock: std::time::Duration::from_mins(20),
+            }),
+        );
+        assert_eq!(waited["retryable"], true, "{waited}");
+        assert!(
+            waited["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("the lock of another cargo")),
+            "{waited}"
+        );
+    }
+
+    #[test]
     fn a_failure_tells_its_code_and_whether_trying_again_may_work() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let failed = |failure, errors: Vec<Box<str>>| BuildError::Failed {
@@ -1584,14 +1624,6 @@ mod tests {
         assert_eq!(
             (&body["code"], &body["retryable"], &body["reason"]),
             (&json!("fetch_failed"), &json!(false), &json!("auth"))
-        );
-        let timed_out = failure_body_of(
-            &unpinned,
-            &BuildError::Run(RunError::TimedOut(std::time::Duration::from_mins(30))),
-        );
-        assert_eq!(
-            (&timed_out["reason"], &timed_out["retryable"]),
-            (&json!("timeout"), &json!(false))
         );
         // What updates the toolchain that was too old.
         let too_old = |plan: &Plan| failure_body_of(plan, &failed(Failure::TooOld, Vec::new()));

@@ -273,6 +273,19 @@ pub enum CargoError {
     Unreadable(#[source] io::Error),
 }
 
+impl CargoError {
+    /// Whether trying again does not change the failure while its inputs stay the same: a git
+    /// dependency that cannot be fetched (`fetch_failed`), until `refresh` (requirement R-WS-7,
+    /// decided in M3a).
+    #[must_use]
+    pub const fn lasts(&self) -> bool {
+        matches!(self, Self::Failed {
+            failure: Failure::GitFetch(_),
+            ..
+        })
+    }
+}
+
 /// Why a workspace's packages cannot be resolved at all.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
@@ -408,10 +421,20 @@ struct Kept {
 type PerTarget<T, E> = Mutex<HashMap<TargetTriple, (Instant, Result<Arc<T>, Arc<E>>)>>;
 
 impl Kept {
-    /// Whether the result may be given again: a success while its inputs stay the same, and a
-    /// failure for [`FAILURE_TTL`].
+    /// Whether the result may be given again, while its inputs stay the same: as [`lasts`] tells.
     fn current(&self) -> bool {
-        matches!(&*self.resolution, Resolution::Metadata { .. }) || self.at.elapsed() < FAILURE_TTL
+        lasts(&self.resolution, self.at.elapsed())
+    }
+}
+
+/// Whether a resolution made `age` ago may be given again while its inputs stay the same: a
+/// success, and a failure that trying again does not change (requirement R-WS-7, decided in M3a),
+/// which `refresh` forgets; another failure for [`FAILURE_TTL`]. In this process only, as the
+/// successes (decided in M3's A3-1).
+fn lasts(resolution: &Resolution, age: Duration) -> bool {
+    match resolution {
+        Resolution::Metadata { .. } => true,
+        Resolution::CargoLockRaw { because, .. } => because.lasts() || age < FAILURE_TTL,
     }
 }
 
@@ -928,10 +951,21 @@ impl Inner {
                 let files = self.input_files(&lock_root, Some(&metadata));
                 (Resolution::Metadata { metadata, lock }, files)
             },
-            Err(because) => (
-                Resolution::CargoLockRaw { lock, because },
-                self.input_files(&lock_root, None),
-            ),
+            Err(because) => {
+                // The members' manifests too, which `cargo metadata` would have told: a failure
+                // that lasts goes once one of them changes (decided in M3a).
+                let mut files = self.input_files(&lock_root, None);
+                let root = lock_root.clone();
+                let members = blocking(move || Ok(project::expand_members(&root)))
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                files.extend(members.iter().map(|member| member.join("Cargo.toml")));
+                files.sort();
+                files.dedup();
+                (Resolution::CargoLockRaw { lock, because }, files)
+            },
         };
         let files = with_included(files, &lock_root, self.cargo_home.clone()).await;
         let resolution = Arc::new(resolution);
@@ -1181,6 +1215,26 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    /// A failure of `cargo metadata` to fetch a git dependency is kept while the inputs stay the
+    /// same, until `refresh`; another for the TTL of transient failures (decided in M3a).
+    #[test]
+    fn a_failure_to_fetch_a_git_dependency_lasts() {
+        let failed = |failure| Resolution::CargoLockRaw {
+            lock: CargoLock::parse("version = 4\n").expect("a Cargo.lock"),
+            because: CargoError::Failed {
+                command: "metadata",
+                failure,
+                stderr: Box::default(),
+            },
+        };
+        let long_after = FAILURE_TTL.saturating_mul(10);
+        let git = failed(Failure::GitFetch(cargo::GitFetchFailure::NoRepository));
+        assert!(lasts(&git, long_after));
+        let other = failed(Failure::Other);
+        assert!(lasts(&other, Duration::ZERO));
+        assert!(!lasts(&other, long_after));
+    }
 
     #[test]
     fn the_platforms_that_a_dependency_is_limited_to_are_told() {

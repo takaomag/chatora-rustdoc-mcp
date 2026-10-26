@@ -137,3 +137,16 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - テスト: `search_items` の単体テスト 2 件 (std の検索が `project` を持つ、`required` が構成ごと)、`a_toolchain_too_old_tells_rustup_only_where_it_is`、`failure_body` のテストに rustup なしと `cargo fetch`、stdio の `build_external_docs_tells_how_to_make_the_cargo_lock_of_a_workspace_outside` に古い Cargo.lock、決定 11 の stdio のテスト 2 件に `resolve_version` (直しを外すと落ちることを確かめた)。std の検索の target は、偽の dist が無く std のデータの要る stdio のテストでは確かめられないので、引数の解析の単体テストと、`get_item` の std と同じ `default_target` に任せた
 - レビュー (サブエージェント、読むだけ) の対応: `resolve_version` はプロジェクトの package が今分かるとき (`known_now`) だけリリースを照合し、cargo の解決を待たない (target を決めるだけで、期限を過ぎればどのみちプロジェクトの target で答えるため)。`TooOld` が持つのは rustup の有無ではなく nightly に切り替えるか (`switchable`。rustdoc か rustc をパスで指せば rustup があっても切り替えない)、パスで指すときは `rustup --version` を起動しない短絡に戻した。std の失敗の記憶は、`refresh` で外のプロジェクトを指しても消す (std はプロジェクトに依らない。`get_item` も)。README の `lockfile_outdated` も `cargo fetch` に。テストの条件 (構成ごとの `if`) を外し、stdio の `resolve_version` の確かめに `status` が `building` でないことを足した
 - 残したもの: stdio の決定 11 のテストは、host が x86_64 Linux でないと `resolve_version` の host の場合を確かめない (`get_item` の側と同じ。テスト用の JSON が x86_64 Linux のもののため)
+
+**A3 で利用者が決めたこと**:
+
+5. A3-1 `cargo metadata` の git の取得の決定的な失敗は、入力が同じ間ずっと、プロセスのメモリだけで覚える (`cargo metadata` の成功と同じ。新しいセッションでは 1 回 cargo を走らせ直す)
+
+**A3 の実装 (2026-10-26)**:
+
+- (1) cargo の stderr の行の切り替わりから、ロックを待っていた時間を数える (`LockClock`。ロック待ちの行から次の行まで)。時間切れは `RunError::TimedOut { limit, waiting_for_lock }` で、待ちが上限の半分を超えれば一時的な失敗 (`mostly_waited_for_lock`、P3)。`retryable: true` で、文に「その大半を別の cargo (rust-analyzer など) のロック待ちで過ごした」を足す。`cargo metadata`・`cargo tree` の時間切れも同じ値を持つ (もとから一時的)
+- (2) `cargo metadata` の git の取得の失敗 (`fetch_failed`) は、入力が同じ間ずっとメモリに覚え (`CargoError::lasts`、A3-1)、`refresh` で忘れる (既存の `forget_failures`)。版を Cargo.lock から読んだときの warnings に、`refresh` で呼び直す案内を足した
+- テスト: `LockClock` と `mostly_waited_for_lock` の単体テスト、sh でロック待ちの行を出して時間切れにするテスト (unix)、`is_transient` と `failure_body` の時間切れの場合、`cargo metadata` の失敗を覚える `lasts` の単体テスト、`raw_warnings` の `refresh` の案内
+- 残したもの: `cargo tree` (feature の組と範囲) の git の失敗は 30 秒のまま (`cargo metadata` が通った後の git の失敗は稀なため)。本物の cargo でロックを握る結合テストは入れていない (ビルドの前の `cargo fetch` が先に同じロックで待ち、そちらはもとから一時的な失敗になるため)
+- レビュー (サブエージェント、読むだけ) の対応: member やローカルビルドする依存の照会で `cargo metadata` が git で失敗したときの `metadata_failed` にも `refresh` の案内を足した (足さないと、案内の無いまま記憶が残り続けた)。失敗したときの入力に members の Cargo.toml を足した (前は root の Cargo.toml・Cargo.lock・設定だけで、member の Cargo.toml で git の依存を直しても記憶が残った)。sh のテストは `child::prepare` を呼び (時間切れでグループごと止まり、`sleep` が残らない)、上限を 3 秒にした (遅い CI でもロック待ちの行を読んでから時間切れになる)。`is_transient` の doc を直した。本物の cargo の結合テスト `a_failure_of_cargo_metadata_to_fetch_a_git_dependency_is_kept` (tests/local。無い `file://` のリポジトリを指す git の依存と Cargo.lock を書き、`fetch_failed` が記憶され、member の Cargo.toml の変更と `refresh` で解けることを確かめる。cargo の再試行の待ちで約 34 秒)
+- 残したもの: requirements.md の R-WS-7 (時間切れは `refresh` まで固定、ずれ 2) は M3 の終わりの反映で改める
