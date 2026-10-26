@@ -4703,21 +4703,31 @@ fn the_record_of_a_workspace_whose_directory_is_gone_is_read() {
 }
 
 /// `build_external_docs` does not write the Cargo.lock of a workspace outside the default project
-/// that has none, as it builds with `--locked`: it tells how to make one (requirement R-VR-2,
-/// decided in M2e's E4b).
+/// that has none, or whose Cargo.lock is outdated, as it builds with `--locked`: it tells how to
+/// make one, or to update it with `cargo fetch`, which does not raise every dependency as
+/// `cargo generate-lockfile` does (requirement R-VR-2 and §8, decided in M2e's E4b and M3a).
 #[cfg(all(debug_assertions, feature = "local"))]
 #[test]
 fn build_external_docs_tells_how_to_make_the_cargo_lock_of_a_workspace_outside() {
     let registry = registry::FakeRegistry::start();
     let dir = TempDir::new().expect("a temporary directory");
-    let outside = dir.path().join("ws");
-    std::fs::create_dir_all(outside.join("src")).expect("made");
-    std::fs::write(
-        outside.join("Cargo.toml"),
-        "[package]\nname = \"unlocked\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
-    )
-    .expect("written");
-    std::fs::write(outside.join("src/lib.rs"), "pub fn f() {}\n").expect("written");
+    let workspace = |name: &str| {
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(root.join("src")).expect("made");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"unlocked\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+             [workspace]\n",
+        )
+        .expect("written");
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").expect("written");
+        root
+    };
+    let outside = workspace("ws");
+    // A Cargo.lock of another version of the package, which cargo would update.
+    let outdated = workspace("outdated");
+    let lock = "version = 4\n\n[[package]]\nname = \"unlocked\"\nversion = \"0.0.9\"\n";
+    std::fs::write(outdated.join("Cargo.lock"), lock).expect("written");
     let default = workspace_of("user");
     let mut server = server_in_on(Some(default.path()), &registry, dir.path());
     let result = built_by_external(
@@ -4728,8 +4738,29 @@ fn build_external_docs_tells_how_to_make_the_cargo_lock_of_a_workspace_outside()
     assert_eq!(result["isError"], true, "{result}");
     let error = text_json(&result);
     assert_eq!(error["code"], "lockfile_outdated", "{result}");
-    assert!(error.to_string().contains("generate-lockfile"), "{result}");
+    assert!(
+        error["suggestions"][0]
+            .as_str()
+            .is_some_and(|told| told.contains("generate-lockfile")),
+        "{result}"
+    );
     assert!(!outside.join("Cargo.lock").exists(), "{result}");
+    let result = built_by_external(
+        &mut server,
+        2,
+        &json!({ "project": outdated.display().to_string() }),
+    );
+    assert_eq!(result["isError"], true, "{result}");
+    let error = text_json(&result);
+    assert_eq!(error["code"], "lockfile_outdated", "{result}");
+    let first = error["suggestions"][0].as_str().unwrap_or_default();
+    assert!(first.contains("`cargo fetch`"), "{result}");
+    assert!(!error.to_string().contains("generate-lockfile"), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(outdated.join("Cargo.lock")).expect("read"),
+        lock,
+        "{result}"
+    );
     assert!(server.finish().success());
 }
 
@@ -6122,6 +6153,17 @@ fn the_build_target_of_the_project_is_the_target_of_a_lookup() {
     let found = response["result"]["structuredContent"].clone();
     assert_eq!(found["provenance"]["target"], TARGET, "{response}");
     assert!(warns(&found, "several targets"), "{found}");
+    // `resolve_version` too (decided in M3a).
+    server.send(&call_tool(
+        2,
+        "resolve_version",
+        json!({ "crate": "demo@0.1.0" }),
+    ));
+    let response = server.response(2);
+    let resolved = response["result"]["structuredContent"].clone();
+    assert_ne!(resolved["status"], "building", "{response}");
+    assert_eq!(resolved["provenance"]["target"], TARGET, "{response}");
+    assert!(warns(&resolved, "several targets"), "{resolved}");
     assert!(server.finish().success());
 }
 
@@ -6167,6 +6209,24 @@ fn a_release_that_the_project_does_not_use_is_looked_up_for_the_host() {
     let found = &result["structuredContent"];
     assert_eq!(found["provenance"]["target"], TARGET, "{result}");
     assert!(!warns(found, "wasm32"), "{result}");
+    // `resolve_version` too, as `get_item` (decided in M3a): of the index written here, not of
+    // crates.io.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    write_demo_index(&server, now);
+    server.send(&call_tool(
+        200,
+        "resolve_version",
+        json!({ "crate": "demo@0.1.0" }),
+    ));
+    let response = server.response(200);
+    let resolved = &response["result"]["structuredContent"];
+    assert_ne!(resolved["status"], "building", "{response}");
+    assert_eq!(resolved["provenance"]["target"], TARGET, "{response}");
+    assert_eq!(resolved["data"]["docs_rs_json"], "available", "{response}");
+    assert!(!warns(resolved, "wasm32"), "{response}");
     assert!(server.finish().success());
 }
 

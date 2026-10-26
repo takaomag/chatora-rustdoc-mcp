@@ -175,11 +175,14 @@ async fn record_workspace(
     let root = &workspace.root;
     let what = format!("the workspace at {}", root.display());
     let failed = |why: &str| Box::new(error_result(&failed_so(&what, why, true)));
-    let (metadata, text) = state
-        .resolver
-        .metadata_text(root)
-        .await
-        .map_err(|error| Box::new(error_result(&cargo_error(&what, &error))))?;
+    let (metadata, text) = match state.resolver.metadata_text(root).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return Err(Box::new(error_result(
+                &cargo_error(&what, root, &error).await,
+            )));
+        },
+    };
     // A workspace that builds its own std is not documented here (requirement R-TG-1).
     let targets = targets_built(state, root, &what).await?;
     let files = state.resolver.input_files(root, &metadata).await;
@@ -272,9 +275,14 @@ async fn planned_for(
         .map_err(|why| failed(&why))?;
     progress.set(Doing::Fetching);
     let offline = state.resolver.offline_in(root).await;
-    let trees = features::trees(root, offline, target)
-        .await
-        .map_err(|error| Box::new(error_result(&cargo_error(&what, &error))))?;
+    let trees = match features::trees(root, offline, target).await {
+        Ok(trees) => trees,
+        Err(error) => {
+            return Err(Box::new(error_result(
+                &cargo_error(&what, root, &error).await,
+            )));
+        },
+    };
     let scope = state
         .resolver
         .scope(workspace, target)
@@ -637,7 +645,7 @@ fn outside_response(
 
 /// The body of the error of cargo, `error`, for `what`: with how to make a Cargo.lock that is
 /// missing or out of date, which this server does not write (requirement R-VR-2).
-fn cargo_error(what: &str, error: &CargoError) -> Value {
+async fn cargo_error(what: &str, root: &Path, error: &CargoError) -> Value {
     let failure = match error {
         CargoError::Failed { failure, .. } => Some(*failure),
         CargoError::Run(_) | CargoError::Unreadable(_) => None,
@@ -650,13 +658,21 @@ fn cargo_error(what: &str, error: &CargoError) -> Value {
     if failure == Some(Failure::LockfileOutdated)
         && let Some(Value::Array(suggestions)) = body.get_mut("suggestions")
     {
-        suggestions.insert(
-            0,
-            json!(
-                "make or update the workspace's Cargo.lock in its own terminal, as with `cargo \
-                 generate-lockfile`: this server builds with --locked, and writes no Cargo.lock"
-            ),
-        );
+        // `cargo generate-lockfile` raises every dependency of a Cargo.lock that is there, as
+        // `cargo update` does: `cargo fetch` changes only what it must (§8).
+        let lock = root.join("Cargo.lock");
+        let there = crate::task::spawn_blocking(move || lock.try_exists())
+            .await
+            .map_or(true, |there| there.unwrap_or(true));
+        let suggestion = if there {
+            "update the workspace's Cargo.lock in its own terminal with `cargo fetch`, which \
+             changes only what it must without building (`cargo update` raises every dependency): \
+             this server builds with --locked, and writes no Cargo.lock"
+        } else {
+            "make the workspace's Cargo.lock in its own terminal, as with `cargo \
+             generate-lockfile`: this server builds with --locked, and writes no Cargo.lock"
+        };
+        suggestions.insert(0, json!(suggestion));
     }
     body
 }

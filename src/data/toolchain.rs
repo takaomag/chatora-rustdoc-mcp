@@ -483,6 +483,19 @@ pub async fn check_target(
     }
 }
 
+/// Whether rustup is here (requirement R-TG-1).
+///
+/// A project whose toolchain writes too old a format is built with rustup's nightly, and what the
+/// server tells to do may name rustup's commands only with it. It is asked once in a while, as
+/// other questions about toolchains are.
+pub async fn rustup_here(cache: &Cache) -> bool {
+    tool::output_kept(cache.dir(), tool::Place::Neutral, Path::new("rustup"), &[
+        "--version",
+    ])
+    .await
+    .is_ok()
+}
+
 /// The nightly that a project whose toolchain writes too old a format is built with: `nightly`, or
 /// `nightly-<date>` with `build.nightly_date` (requirement R-WS-8).
 fn nightly(date: Option<&NightlyDate>) -> String {
@@ -700,6 +713,9 @@ pub enum ChooseError {
     TooOld {
         /// The format.
         found: u32,
+        /// Whether the server switches to rustup's nightly for such a project: rustup is here and
+        /// the programs are not set. What to do differs without it (requirement R-TG-1).
+        switchable: bool,
     },
     /// A toolchain's rustdoc did not tell its format.
     #[error("{0}")]
@@ -744,11 +760,7 @@ pub async fn choose(
     // With rustc or rustdoc of a path, `+nightly` would mix toolchains.
     let switchable = rustdoc == Path::new(Kind::Rustdoc.name())
         && rustc == Path::new(Kind::Rustc.name())
-        && tool::output_kept(cache.dir(), tool::Place::Neutral, Path::new("rustup"), &[
-            "--version",
-        ])
-        .await
-        .is_ok();
+        && rustup_here(cache).await;
     let nightly = nightly(NIGHTLY_DATE.get().and_then(Option::as_ref));
     choose_with(
         &rustdoc,
@@ -786,6 +798,7 @@ async fn choose_with(
     let Some(nightly) = nightly else {
         return Err(ChooseError::TooOld {
             found: format.unwrap_or_default(),
+            switchable: false,
         });
     };
     let nightly_format = format_of(rustdoc, Some(nightly), root, cache, work)
@@ -800,6 +813,7 @@ async fn choose_with(
     if nightly_format < *rustdoc_json::SUPPORTED.start() {
         return Err(ChooseError::TooOld {
             found: nightly_format,
+            switchable: true,
         });
     }
     Ok(Chosen::Nightly {
@@ -1084,7 +1098,13 @@ mod tests {
         assert!(timed_out.is_transient());
         let broken = ChooseError::Failed("rustdoc -vV wrote no version".into());
         assert!(!broken.is_transient());
-        assert!(!ChooseError::TooOld { found: 40 }.is_transient());
+        assert!(
+            !ChooseError::TooOld {
+                found: 40,
+                switchable: true
+            }
+            .is_transient()
+        );
     }
 
     /// The rustdoc here writes a format, which is kept by its commit (decided in M2's D1).
@@ -1207,7 +1227,10 @@ mod tests {
         );
         assert_eq!(
             choose_with(&rustdoc, None, dir.path(), &cache, dir.path()).await,
-            Err(ChooseError::TooOld { found: 40 })
+            Err(ChooseError::TooOld {
+                found: 40,
+                switchable: false
+            })
         );
         let dir = tempfile::tempdir().expect("a temporary directory");
         let (cache, rustdoc) = (Cache::at(dir.path()), fake_rustdoc(dir.path(), 40, false));

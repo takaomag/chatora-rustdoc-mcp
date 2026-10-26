@@ -981,7 +981,9 @@ pub(super) fn local_error(what: &str, error: &LocalError) -> CallToolResult {
             },
         )
         | LocalError::Missing(missing_one) => missing_toolchain(what, missing_one, &missing),
-        LocalError::Choose(ChooseError::TooOld { found }) => unsupported(what, *found),
+        LocalError::Choose(ChooseError::TooOld { found, switchable }) => {
+            unsupported(what, *found, Some(*switchable))
+        },
         LocalError::Choose(choose @ ChooseError::Failed(why)) => failed(
             format!("the toolchain that builds {what} could not be told: {why}"),
             // A rustdoc that ran too long, as on a busy machine, may answer later.
@@ -990,7 +992,7 @@ pub(super) fn local_error(what: &str, error: &LocalError) -> CallToolResult {
         ),
         LocalError::Failed { failed, kept } => failed_body(failed, *kept),
         LocalError::Load(LoadError::Parse(ParseError::UnsupportedFormat { found, .. })) => {
-            unsupported(what, *found)
+            unsupported(what, *found, None)
         },
         LocalError::Load(LoadError::Read(error)) => failed(
             format!("the documentation of {what} could not be read: {error}"),
@@ -1031,9 +1033,25 @@ fn missing_toolchain(
     }
 }
 
-/// `unsupported_format` for a toolchain that writes `found` (requirement R-WS-8).
-fn unsupported(what: &str, found: u32) -> Value {
+/// `unsupported_format` for a toolchain that writes `found` (requirement R-WS-8). `switchable`
+/// tells, when the toolchain was chosen, whether the server builds with rustup's nightly when the
+/// project's toolchain is too old: else a nightly is pointed at with the settings of the programs,
+/// and no command of rustup is told (requirement R-TG-1).
+fn unsupported(what: &str, found: u32, switchable: Option<bool>) -> Value {
     let supported = crate::data::rustdoc_json::SUPPORTED;
+    let mut suggestions =
+        vec!["update the server, or the project's toolchain (rust-toolchain.toml)"];
+    match switchable {
+        Some(true) => suggestions.push(
+            "or install a nightly toolchain with rustup, which the server builds with when the \
+             project's is too old",
+        ),
+        Some(false) => suggestions.push(
+            "or set build.rustc_path and build.rustdoc_path to the rustc and rustdoc of a nightly \
+             toolchain",
+        ),
+        None => {},
+    }
     json!({
         "code": "unsupported_format",
         "message": format!(
@@ -1043,11 +1061,7 @@ fn unsupported(what: &str, found: u32) -> Value {
             supported.end()
         ),
         "retryable": false,
-        "suggestions": [
-            "update the server, or the project's toolchain (rust-toolchain.toml)",
-            "or install a nightly toolchain with rustup, which the server builds with when the \
-             project's is too old",
-        ],
+        "suggestions": suggestions,
         "found": found,
         "supported": [supported.start(), supported.end()],
     })
@@ -1106,6 +1120,30 @@ mod tests {
         assert!(refresh_acts(scope));
         // Another scope is apart.
         assert!(refresh_acts("crate None another"));
+    }
+
+    #[test]
+    fn a_toolchain_too_old_tells_rustup_only_where_it_is() {
+        let told = |rustup| {
+            let result = local_error(
+                "a 0.1.0",
+                &LocalError::Choose(ChooseError::TooOld {
+                    found: 40,
+                    switchable: rustup,
+                }),
+            );
+            result
+                .content
+                .first()
+                .and_then(|block| block.as_text())
+                .map(|text| text.text.clone())
+                .unwrap_or_default()
+        };
+        assert!(told(true).contains("unsupported_format"));
+        assert!(told(true).contains("with rustup"));
+        // Without rustup, the settings of the programs (requirement R-TG-1).
+        assert!(!told(false).contains("rustup"), "{}", told(false));
+        assert!(told(false).contains("build.rustdoc_path"));
     }
 
     #[test]

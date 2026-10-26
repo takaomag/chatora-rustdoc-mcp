@@ -378,8 +378,12 @@ async fn build_and_archive(
                 warnings.truncate(planned);
                 built = builder.build(&mut plan, false, &mut warnings).await?;
             },
+            // rustup installed the project's toolchain, whose rustdoc is not set.
             Ok(Chosen::Project { format }) => {
-                return Err(LocalError::Choose(ChooseError::TooOld { found: format }));
+                return Err(LocalError::Choose(ChooseError::TooOld {
+                    found: format,
+                    switchable: true,
+                }));
             },
             Err(error) => return Err(LocalError::Choose(error)),
         }
@@ -533,7 +537,7 @@ impl Builder<'_> {
             fresh.as_ref().map(|fresh| fresh.key.clone()),
             toolchain.as_deref(),
             error.is_transient(),
-            failure_body(plan, &error),
+            failure_body(plan, &error, toolchain::rustup_here(self.cache).await),
         );
         failed.compiler_errors = error.is_compiler_error();
         // Not a build that the server stopped, as it ends (requirement R-WS-7), nor one of sources
@@ -996,8 +1000,9 @@ impl Drop for Following {
 
 /// The error of a build of `plan` that failed so (requirement R-WS-7): its code, and whether trying
 /// again may work, with the first errors of the compiler, as many as `build.max_diagnostics` and
-/// their lengths allow, or else the end of cargo's stderr.
-fn failure_body(plan: &Plan, error: &BuildError) -> Value {
+/// their lengths allow, or else the end of cargo's stderr. `rustup` tells whether rustup is here,
+/// whose commands it may name (requirement R-TG-1).
+fn failure_body(plan: &Plan, error: &BuildError, rustup: bool) -> Value {
     let what = format!("{} {}", plan.crate_name, plan.version);
     let retryable = error.is_transient();
     let (failure, mut body) = match error {
@@ -1014,7 +1019,7 @@ fn failure_body(plan: &Plan, error: &BuildError) -> Value {
                     format!("cargo failed to build the documentation of {what}")
                 },
                 "retryable": retryable,
-                "suggestions": suggestions(plan, *failure, "run `cargo doc` in the project's terminal to see the error there"),
+                "suggestions": suggestions(plan, *failure, "run `cargo doc` in the project's terminal to see the error there", rustup),
             }),
         ),
         BuildError::Fetch { failure, .. } => (
@@ -1023,7 +1028,7 @@ fn failure_body(plan: &Plan, error: &BuildError) -> Value {
                 "code": failure.code(),
                 "message": format!("cargo could not fetch the dependencies of {what}"),
                 "retryable": retryable,
-                "suggestions": suggestions(plan, *failure, "run `cargo fetch` in the project's terminal to see why it fails"),
+                "suggestions": suggestions(plan, *failure, "run `cargo fetch` in the project's terminal to see why it fails", rustup),
             }),
         ),
         BuildError::Run(RunError::TimedOut(_)) => (
@@ -1095,9 +1100,9 @@ fn failure_body(plan: &Plan, error: &BuildError) -> Value {
 
 /// What to do of a failure of the build of `plan`, as its messages tell it, or else `otherwise`
 /// (requirement R-WS-7 and §8).
-fn suggestions(plan: &Plan, failure: Failure, otherwise: &str) -> Vec<String> {
+fn suggestions(plan: &Plan, failure: Failure, otherwise: &str, rustup: bool) -> Vec<String> {
     match failure {
-        Failure::TooOld => too_old(plan),
+        Failure::TooOld => too_old(plan, rustup),
         // GitHub asks for credentials for a repository that does not exist, too.
         Failure::GitFetch(GitFetchFailure::Auth) => vec![
             "check the URL of the git dependency first: GitHub asks for credentials for a \
@@ -1110,9 +1115,10 @@ fn suggestions(plan: &Plan, failure: Failure, otherwise: &str) -> Vec<String> {
         Failure::GitFetch(GitFetchFailure::NoRepository | GitFetchFailure::NoRev) => {
             vec!["check the URL and the branch, tag or rev of the git dependency".to_owned()]
         },
+        // `cargo update` raises every dependency (§8).
         Failure::LockfileOutdated => vec![
-            "update Cargo.lock in the project's terminal, as with `cargo update --workspace`: the \
-             server builds with --locked"
+            "update Cargo.lock in the project's terminal with `cargo fetch`, which changes only \
+             what it must without building: the server builds with --locked"
                 .to_owned(),
         ],
         Failure::OfflineMiss => vec![
@@ -1126,8 +1132,8 @@ fn suggestions(plan: &Plan, failure: Failure, otherwise: &str) -> Vec<String> {
 
 /// What updates the toolchain that built `plan`, too old for it (`toolchain_too_old`, requirement
 /// R-WS-7): the nightly that the server chose, or the project's, as its `rust-toolchain.toml`
-/// names it.
-fn too_old(plan: &Plan) -> Vec<String> {
+/// names it; rustup's commands only where `rustup` is here (requirement R-TG-1).
+fn too_old(plan: &Plan, rustup: bool) -> Vec<String> {
     let pinned = || {
         plan.root.ancestors().any(|dir| {
             dir.join("rust-toolchain.toml").is_file() || dir.join("rust-toolchain").is_file()
@@ -1144,7 +1150,10 @@ fn too_old(plan: &Plan) -> Vec<String> {
         None if pinned() => {
             "update the toolchain that the project's rust-toolchain.toml names".to_owned()
         },
-        None => "update the project's toolchain, as with `rustup update`".to_owned(),
+        None if rustup => "update the project's toolchain, as with `rustup update`".to_owned(),
+        None => {
+            "update the toolchain that cargo uses, the rustc on PATH or build.rustc_path".to_owned()
+        },
     };
     vec![suggestion]
 }
@@ -1534,13 +1543,15 @@ mod tests {
             more_errors: 0,
             stderr: "the end of stderr".into(),
         };
+        // With rustup here.
+        let failure_body_of = |plan: &Plan, error: &BuildError| failure_body(plan, error, true);
         let unpinned = plan(dir.path(), None);
-        let body = failure_body(&unpinned, &failed(Failure::Other, vec!["error: x".into()]));
+        let body = failure_body_of(&unpinned, &failed(Failure::Other, vec!["error: x".into()]));
         assert_eq!(body["code"], "build_failed");
         assert_eq!(body["retryable"], false);
         assert_eq!(body["diagnostics"], json!(["error: x"]));
         assert!(body.get("stderr").is_none());
-        let body = failure_body(&unpinned, &failed(Failure::Killed, Vec::new()));
+        let body = failure_body_of(&unpinned, &failed(Failure::Killed, Vec::new()));
         assert_eq!(body["retryable"], true);
         assert_eq!(body["stderr"], "the end of stderr");
         assert!(
@@ -1550,7 +1561,7 @@ mod tests {
             "{body}"
         );
         // Those that were not kept are counted with those not shown.
-        let body = failure_body(&unpinned, &BuildError::Failed {
+        let body = failure_body_of(&unpinned, &BuildError::Failed {
             failure: Failure::Other,
             in_documented: true,
             errors: vec!["a".into(), "b".into(), "c".into()],
@@ -1558,7 +1569,7 @@ mod tests {
             stderr: Box::default(),
         });
         assert_eq!(body["diagnostics_omitted"], 5);
-        let body = failure_body(&unpinned, &BuildError::Fetch {
+        let body = failure_body_of(&unpinned, &BuildError::Fetch {
             failure: Failure::Other,
             stderr: "error: failed to download".into(),
         });
@@ -1566,7 +1577,7 @@ mod tests {
             (&body["code"], &body["retryable"]),
             (&json!("build_failed"), &json!(true))
         );
-        let body = failure_body(&unpinned, &BuildError::Fetch {
+        let body = failure_body_of(&unpinned, &BuildError::Fetch {
             failure: Failure::GitFetch(GitFetchFailure::Auth),
             stderr: Box::default(),
         });
@@ -1574,7 +1585,7 @@ mod tests {
             (&body["code"], &body["retryable"], &body["reason"]),
             (&json!("fetch_failed"), &json!(false), &json!("auth"))
         );
-        let timed_out = failure_body(
+        let timed_out = failure_body_of(
             &unpinned,
             &BuildError::Run(RunError::TimedOut(std::time::Duration::from_mins(30))),
         );
@@ -1583,7 +1594,7 @@ mod tests {
             (&json!("timeout"), &json!(false))
         );
         // What updates the toolchain that was too old.
-        let too_old = |plan: &Plan| failure_body(plan, &failed(Failure::TooOld, Vec::new()));
+        let too_old = |plan: &Plan| failure_body_of(plan, &failed(Failure::TooOld, Vec::new()));
         let body = too_old(&unpinned);
         assert_eq!(body["code"], "toolchain_too_old");
         assert_eq!(
@@ -1595,6 +1606,21 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.starts_with("set build.nightly_date"))
         );
+        // Without rustup, no command of rustup is told (requirement R-TG-1).
+        let body = failure_body(&unpinned, &failed(Failure::TooOld, Vec::new()), false);
+        assert!(!body.to_string().contains("rustup"), "{body}");
+        // An outdated Cargo.lock is updated with `cargo fetch` (§8).
+        let body = failure_body_of(&unpinned, &BuildError::Fetch {
+            failure: Failure::LockfileOutdated,
+            stderr: Box::default(),
+        });
+        assert!(
+            body["suggestions"][0]
+                .as_str()
+                .is_some_and(|told| told.contains("`cargo fetch`")),
+            "{body}"
+        );
+        assert!(!body.to_string().contains("cargo update"), "{body}");
         fs::write(dir.path().join("rust-toolchain.toml"), "").expect("written");
         assert_eq!(
             too_old(&unpinned)["suggestions"],

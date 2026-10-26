@@ -109,7 +109,16 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 
 ## 6. 結果
 
-(段ごとに、下調べ・決定・実装・レビュー・コミットを書く)
+### 6.1 M3a
+
+**下調べ (2026-10-26。サブエージェント、読むだけ。LSP は使わず grep と Read)**: A1〜A5 の直す場所と大きさ、テスト、判断の候補 10 件。新しく見つかった同じ種類のずれ: std の nightly を選ぶ所 (`project_toolchain`) も既定のプロジェクトだけを見る、照会のツールの `lockfile_outdated` が `cargo update --workspace` を勧める (§8 は `cargo fetch`)、`unsupported_format` の案内が rustup の無い環境でも rustup と書く。形式の版の定数が 5 か所に散り、版を直に書く所が 2 つある (inventory の今の版の判定と GC の `NOT_COLLECTED`)。コミットの順の案: A1+A2 → A3 → A5 → A4 (4a 版を集めて口を足す、4b 結合テスト)
+
+**A1+A2 で利用者が決めたこと**:
+
+1. A1-1 std の nightly を選ぶ所も、引数 `project` のプロジェクトの toolchain を基準にする (target と一緒に直す)
+2. A1-2 照会のツールの `lockfile_outdated` の案内を `cargo fetch` に直す (§8 に合わせる)
+3. A1-3 `unsupported_format` の案内も、rustup の有無で分ける (無ければ `build.*_path` で nightly を指す案内)
+4. A2-1 `resolve_version` の「使わない crate」は、`get_item` と同じリリース単位で判じ、同じ関数を共有する
 
 ## 7. M3 の終わり方
 
@@ -117,3 +126,14 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 2. requirements.md を次の版 (v0.21) にし、§14 に経緯を書く。セキュリティの仕様が変われば一覧ページも直して公開する
 3. README を合わせる (M3h の H3)。`cargo publish --dry-run --locked` を確かめる。crates.io への公開は利用者が M3 の後にまとめて行う (m2-plan.md の §5 の P9)
 4. M4 の計画を立てる
+
+**A1+A2 の実装 (2026-10-26)**:
+
+- A1(a) と A1-1: `search_items` の std の検索が引数 `project` を持ち、target (`default_target`) と nightly を選ぶ toolchain (`get_item::project_toolchain`) と `refresh` をその project で決める。`project_toolchain` は `project` を受け、既定のプロジェクトの中の workspace のときだけ `rustc -vV` を走らせる (外では何も起動しない。R-MCP-3)。`get_item` の std も同じ
+- A1(b): ローカル機能の無い構成では、`search_items` の `required` を `["crate", "query"]` にし、`crate` の無い呼び出しを引数の解析で `invalid_argument` にする (`SearchArguments::Dependencies` はローカル機能のある構成だけ)
+- A1(c): 外の workspace の `lockfile_outdated` は、Cargo.lock が無ければ `cargo generate-lockfile`、あれば `cargo fetch` を案内する (blocking のスレッドで有無を見る)
+- A1(d)・A1-2・A1-3: `toolchain::rustup_here` を出し、ビルドの失敗の本文 (`failure_body`) と `ChooseError::TooOld` (`rustup` を持たせた) に rustup の有無を渡す。rustup が無ければ `toolchain_too_old` は「cargo が使う toolchain (PATH の rustc か build.rustc_path) を更新する」、`unsupported_format` は「build.rustc_path と build.rustdoc_path で nightly を指す」と案内し、rustup の名前を出さない。JSON を読んで分かった形式違いには nightly の文を付けない。照会のツールの `lockfile_outdated` は `cargo fetch` を案内する
+- A2: `get_item` の M2e の決定 11 の 2 つの部分を `project::unused_target` (target が頼まれず、プロジェクトの target が host と違えば host を候補に) と `project::for_host` (プロジェクトの package が今分かるときだけ host にし、プロジェクトの target の warning を捨てる) に出し、`resolve_version` も使う。`resolve_version` は、プロジェクトが版を決めなかったリリースを `get_item::same_release`・`the_release_in_build` でリリース単位に判じる。説明文の target の既定は `TARGET_DEFAULT` に (`PROJECT_TARGET_DEFAULT` は `list_crates` だけ)
+- テスト: `search_items` の単体テスト 2 件 (std の検索が `project` を持つ、`required` が構成ごと)、`a_toolchain_too_old_tells_rustup_only_where_it_is`、`failure_body` のテストに rustup なしと `cargo fetch`、stdio の `build_external_docs_tells_how_to_make_the_cargo_lock_of_a_workspace_outside` に古い Cargo.lock、決定 11 の stdio のテスト 2 件に `resolve_version` (直しを外すと落ちることを確かめた)。std の検索の target は、偽の dist が無く std のデータの要る stdio のテストでは確かめられないので、引数の解析の単体テストと、`get_item` の std と同じ `default_target` に任せた
+- レビュー (サブエージェント、読むだけ) の対応: `resolve_version` はプロジェクトの package が今分かるとき (`known_now`) だけリリースを照合し、cargo の解決を待たない (target を決めるだけで、期限を過ぎればどのみちプロジェクトの target で答えるため)。`TooOld` が持つのは rustup の有無ではなく nightly に切り替えるか (`switchable`。rustdoc か rustc をパスで指せば rustup があっても切り替えない)、パスで指すときは `rustup --version` を起動しない短絡に戻した。std の失敗の記憶は、`refresh` で外のプロジェクトを指しても消す (std はプロジェクトに依らない。`get_item` も)。README の `lockfile_outdated` も `cargo fetch` に。テストの条件 (構成ごとの `if`) を外し、stdio の `resolve_version` の確かめに `status` が `building` でないことを足した
+- 残したもの: stdio の決定 11 のテストは、host が x86_64 Linux でないと `resolve_version` の host の場合を確かめない (`get_item` の側と同じ。テスト用の JSON が x86_64 Linux のもののため)

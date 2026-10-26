@@ -37,13 +37,17 @@ pub(super) enum SearchArguments {
     One(Arguments),
     /// std with alloc and core.
     Std {
+        /// The project whose target and toolchain the nightly is chosen for (requirement R-STD-1).
+        project: Option<PathBuf>,
         target: Option<TargetTriple>,
         detail: Detail,
         searching: Searching,
         /// Whether what failed is to be tried again (§6.4).
         refresh: bool,
     },
-    /// The workspace's members and the project's direct dependencies (requirement R-SR-2).
+    /// The workspace's members and the project's direct dependencies (requirement R-SR-2), which
+    /// only a build that reads projects searches (requirement R-ARCH-4).
+    #[cfg(feature = "local")]
     Dependencies {
         project: Option<PathBuf>,
         target: Option<TargetTriple>,
@@ -60,6 +64,14 @@ const QUERY_EXAMPLE: &[&str] = &[r#"pass words or a path, for example {"query": 
 /// How to pass `fields`, for `invalid_argument`.
 const FIELDS_EXAMPLE: &[&str] =
     &[r#"pass some of name, alias, docs and path, for example {"fields": ["name", "alias"]}"#];
+
+/// The arguments that a call must give: `crate` too without local features, which read no
+/// project to search across (requirement R-ARCH-4).
+const REQUIRED: &[&str] = if cfg!(feature = "local") {
+    &["query"]
+} else {
+    &["crate", "query"]
+};
 
 /// Definition of the tool for `tools/list`.
 pub(super) fn definition() -> Tool {
@@ -125,7 +137,7 @@ pub(super) fn definition() -> Tool {
                 "description": "The next_cursor of the previous page.",
             },
         },
-        "required": ["query"],
+        "required": REQUIRED,
     }));
     Tool::new(NAME, super::for_this_build(DESCRIPTION), input_schema)
         .with_title("Search a Rust crate")
@@ -231,6 +243,15 @@ pub(super) fn parse_arguments(
             ]));
         },
     };
+    #[cfg(not(feature = "local"))]
+    if argument("crate").is_none() {
+        return Err(InvalidArgument::new(
+            "this server is built without local features, so it has no project to search the \
+             dependencies of; `crate` is required",
+            &[r#"pass the crate to search, for example {"crate": "tokio"}"#],
+        ));
+    }
+    #[cfg(feature = "local")]
     if argument("crate").is_none() {
         let (project, target) = get_item::parse_project_and_target(arguments)?;
         // A crate of a git repository is named.
@@ -253,6 +274,7 @@ pub(super) fn parse_arguments(
     let release = get_item::parse_release(arguments)?;
     if release.name.as_str() == "std" && release.version.is_none() {
         return Ok(SearchArguments::Std {
+            project: release.project,
             target: release.target,
             detail,
             searching,
@@ -359,6 +381,7 @@ pub(super) async fn execute(arguments: SearchArguments, state: Arc<ToolState>) -
     match arguments {
         SearchArguments::One(arguments) => get_item::execute(arguments, state).await,
         SearchArguments::Std {
+            project,
             target,
             detail,
             searching,
@@ -368,25 +391,34 @@ pub(super) async fn execute(arguments: SearchArguments, state: Arc<ToolState>) -
             #[cfg(feature = "local")]
             let scope = "std";
             #[cfg(feature = "local")]
-            if refresh
-                && super::local::refresh_acts(scope)
-                && super::local::refresh_project(&state, None).await
-            {
+            // What failed of std is forgotten whatever the project, which only builds in the
+            // default project.
+            if refresh && super::local::refresh_acts(scope) {
+                super::local::refresh_project(&state, project.as_deref()).await;
                 crate::data::forget_failures(state.cache.dir().join("std"), true).await;
             }
             #[cfg(not(feature = "local"))]
             let _ = refresh;
-            // The default project's target (requirement R-TG-1); its warnings go with the
-            // search's own.
+            // The target of the project that `project` names, or else of the default project
+            // (requirement R-TG-1); its warnings go with the search's own.
             let (target, warnings) = match target {
                 Some(target) => (target, Vec::new()),
-                None => super::project::default_target(&state, None).await,
+                None => super::project::default_target(&state, project.as_deref()).await,
             };
-            let result = search_across::std(state, target, detail, searching, warnings).await;
+            let result = search_across::std(
+                state,
+                target,
+                project.as_deref(),
+                detail,
+                searching,
+                warnings,
+            )
+            .await;
             #[cfg(feature = "local")]
             super::local::refresh_told(scope, &result);
             result
         },
+        #[cfg(feature = "local")]
         SearchArguments::Dependencies {
             project,
             target,
@@ -396,58 +428,19 @@ pub(super) async fn execute(arguments: SearchArguments, state: Arc<ToolState>) -
         } => {
             // Of the workspace only, not of each crate searched, and once until a call for it ends
             // (decided in M2's D5).
-            #[cfg(feature = "local")]
             let scope = format!("project {project:?}");
-            #[cfg(feature = "local")]
             if refresh && super::local::refresh_acts(&scope) {
                 super::local::refresh_project(&state, project.as_deref()).await;
             }
-            #[cfg(not(feature = "local"))]
-            let _ = refresh;
             let (target, warnings) =
                 super::project::lookup_target(&state, target.as_ref(), project.as_deref()).await;
-            let result = dependencies(state, project, target, detail, searching, warnings).await;
-            #[cfg(feature = "local")]
+            let result =
+                search_across::dependencies(state, project, target, detail, searching, warnings)
+                    .await;
             super::local::refresh_told(&scope, &result);
             result
         },
     }
-}
-
-/// Searches the workspace's members and the project's direct dependencies.
-#[cfg(feature = "local")]
-async fn dependencies(
-    state: Arc<ToolState>,
-    project: Option<PathBuf>,
-    target: super::project::LookupTarget,
-    detail: Detail,
-    searching: Searching,
-    warnings: Vec<Box<str>>,
-) -> CallToolResult {
-    search_across::dependencies(state, project, target, detail, searching, warnings).await
-}
-
-/// Without local features, there is no project to search the dependencies of.
-#[cfg(not(feature = "local"))]
-#[expect(
-    clippy::unused_async,
-    reason = "the same signature as with local features, where it reads the project"
-)]
-async fn dependencies(
-    _state: Arc<ToolState>,
-    _project: Option<PathBuf>,
-    _target: super::project::LookupTarget,
-    _detail: Detail,
-    _searching: Searching,
-    _warnings: Vec<Box<str>>,
-) -> CallToolResult {
-    super::tool_error(
-        "invalid_argument",
-        "this server is built without local features, so it has no project to search the \
-         dependencies of; `crate` is required",
-        false,
-        &[r#"pass the crate to search, for example {"crate": "tokio"}"#],
-    )
 }
 
 #[cfg(test)]
@@ -459,6 +452,34 @@ mod tests {
             panic!("the arguments are an object");
         };
         parse_arguments(Some(&arguments))
+    }
+
+    /// A search of std keeps `project`, whose target and toolchain the nightly is chosen for, as
+    /// `get_item` does (requirement R-STD-1, decided in M3a).
+    #[test]
+    fn a_search_of_std_keeps_the_project() {
+        let searched = arguments(json!({ "crate": "std", "query": "x", "project": "app" }));
+        let Ok(SearchArguments::Std { project, .. }) = searched else {
+            panic!("std is searched: {searched:?}");
+        };
+        assert_eq!(project.as_deref(), Some(std::path::Path::new("app")));
+    }
+
+    #[test]
+    fn a_crate_is_required_only_without_local_features() {
+        let tool = definition();
+        let required = &tool.input_schema["required"];
+        let expected = if cfg!(feature = "local") {
+            json!(["query"])
+        } else {
+            json!(["crate", "query"])
+        };
+        assert_eq!(*required, expected);
+        // As the arguments are checked.
+        assert_eq!(
+            arguments(json!({ "query": "x" })).is_ok(),
+            cfg!(feature = "local")
+        );
     }
 
     #[test]

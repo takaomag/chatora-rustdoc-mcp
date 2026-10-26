@@ -552,12 +552,10 @@ const TARGET_DEFAULT: &str = " Defaults to the project's build.target for the cr
 #[cfg(not(feature = "local"))]
 const TARGET_DEFAULT: &str = " Defaults to the host's.";
 
-/// [`TARGET_DEFAULT`] for the tools that tell of the project's build (`list_crates`) or of a
-/// release for it (`resolve_version`): the project's target, whatever the crate.
+/// [`TARGET_DEFAULT`] for the tool that tells of the project's build (`list_crates`): the project's
+/// target, whatever the crate.
 #[cfg(feature = "local")]
 const PROJECT_TARGET_DEFAULT: &str = " Defaults to the project's build.target, or else the host's.";
-#[cfg(not(feature = "local"))]
-const PROJECT_TARGET_DEFAULT: &str = TARGET_DEFAULT;
 
 /// The end of every tool's description of `project` (doc/m2-plan.md §5, P5): the server sees only
 /// the directory that Claude Code was opened in, not the worktree of a subagent, so one that works

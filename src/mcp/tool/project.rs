@@ -630,6 +630,45 @@ pub(super) fn project_path(default: Option<&DefaultProject>, project: &Path) -> 
     }
 }
 
+/// The host's target for a lookup that asks for no target, of a release that the project may not
+/// use, when the project's target is another, with how many of the warnings so far were told of
+/// the project's (requirement R-WS-5, decided in M2e, 11): what [`for_host`] answers for.
+#[cfg(feature = "local")]
+pub(super) async fn unused_target(
+    state: &ToolState,
+    asked: Option<&TargetTriple>,
+    lookup: &LookupTarget,
+    told: usize,
+) -> Option<(TargetTriple, usize)> {
+    if asked.is_some() {
+        return None;
+    }
+    let host = state.host().await.triple.clone();
+    (lookup.triple != host || lookup.docs_rs_default).then_some((host, told))
+}
+
+/// Whether a release that the project does not use (`unused`) is looked up for the host, as
+/// [`unused_target`] gave it (`host`): only when the project's packages tell it now, so that the
+/// answer does not change once cargo has resolved them (decided in M2e, 11). What the project's
+/// target warned of is then dropped from `warnings`, as it is not of the host's.
+#[cfg(feature = "local")]
+pub(super) async fn for_host(
+    state: &ToolState,
+    project: Option<&Path>,
+    unused: bool,
+    host: Option<&(TargetTriple, usize)>,
+    warnings: &mut Vec<Box<str>>,
+) -> bool {
+    let Some((_, told)) = host.filter(|_| unused) else {
+        return false;
+    };
+    if !known_now(state, project).await {
+        return false;
+    }
+    warnings.drain(..(*told).min(warnings.len()));
+    true
+}
+
 /// Whether the packages of the project that `project` names, or else of the default project, are
 /// known now, as `cargo metadata` resolved them, without waiting: a release that a lookup did not
 /// find among them is then not the project's (decided in M2e, 11). Without a project, none uses

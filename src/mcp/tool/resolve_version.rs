@@ -1,11 +1,15 @@
 //! The `resolve_version` tool: which version of a crate is meant, and what docs.rs has of it
 //! (§5.3 and §6.3).
 
+#[cfg(feature = "local")]
+use std::path::Path;
 use std::sync::Arc;
 
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use semver::Version;
 use serde_json::{Value, json};
+#[cfg(feature = "local")]
+use tokio::time::Instant;
 
 #[cfg(feature = "local")]
 use super::project::Found;
@@ -59,7 +63,7 @@ pub(super) fn definition() -> Tool {
                 "type": "string",
                 "description": const_format::concatcp!(
                     "The target triple whose rustdoc JSON is looked for.",
-                    super::PROJECT_TARGET_DEFAULT
+                    super::TARGET_DEFAULT
                 ),
             },
             "project": {
@@ -204,6 +208,16 @@ pub(super) async fn execute(arguments: ReleaseArguments, state: Arc<ToolState>) 
     resolve(arguments, state).await
 }
 
+/// `invalid_argument` for `name`, a crate of std, which has no versions on crates.io.
+fn no_versions(name: &CrateName) -> CallToolResult {
+    super::tool_error(
+        "invalid_argument",
+        &format!("{name} comes with the Rust toolchain and has no versions on crates.io"),
+        false,
+        &["call get_item for its items, which come from a nightly toolchain's documentation"],
+    )
+}
+
 /// [`execute`], forgetting what failed first when it asks for `refresh`.
 async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallToolResult {
     // In the records of `build_external_docs`, which `refresh` is not of (decided in M2e's E3b).
@@ -213,15 +227,7 @@ async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallTool
     }
     let until = state.until();
     if get_item::std_crate(&arguments.name).is_some() {
-        return super::tool_error(
-            "invalid_argument",
-            &format!(
-                "{} comes with the Rust toolchain and has no versions on crates.io",
-                arguments.name
-            ),
-            false,
-            &["call get_item for its items, which come from a nightly toolchain's documentation"],
-        );
+        return no_versions(&arguments.name);
     }
     // What failed is forgotten before it is read again (§6.4, decided in M2's D5).
     #[cfg(feature = "local")]
@@ -238,6 +244,11 @@ async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallTool
     .await;
     #[cfg(feature = "local")]
     let target = lookup.triple.clone();
+    // A release that the project does not use is for the host when no target is asked for, as
+    // `get_item` looks it up (decided in M2e, 11, and in M3a).
+    #[cfg(feature = "local")]
+    let unused =
+        project::unused_target(&state, arguments.target.as_ref(), &lookup, warnings.len()).await;
     let ReleaseArguments {
         name,
         version,
@@ -298,7 +309,33 @@ async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallTool
             },
         },
     };
-    answered(&state, name, decided, &lookup, warnings).await
+    answered(
+        &state,
+        name,
+        decided,
+        &lookup,
+        warnings,
+        #[cfg(feature = "local")]
+        Unused {
+            project: project.as_deref(),
+            until,
+            host: unused.as_ref(),
+        },
+    )
+    .await
+}
+
+/// Of a release that the project may not use: the project, and the host's target for it (decided in
+/// M2e, 11).
+#[cfg(feature = "local")]
+struct Unused<'a> {
+    /// The project that the call names, if any.
+    project: Option<&'a Path>,
+    /// When the call answers by.
+    until: Instant,
+    /// The host's target, with how many warnings were told of the project's, when no target was
+    /// asked for and the project's is another.
+    host: Option<&'a (TargetTriple, usize)>,
 }
 
 /// What the project's package that `decided` found, or else crates.io, tells of the version that
@@ -313,6 +350,7 @@ async fn answered(
         expect(unused_mut, reason = "only a project's package warns more")
     )]
     mut warnings: Vec<Box<str>>,
+    #[cfg(feature = "local")] unused: Unused<'_>,
 ) -> CallToolResult {
     #[cfg(feature = "local")]
     if let Some(found) = decided.found.clone() {
@@ -320,14 +358,23 @@ async fn answered(
         // A package of the project that is not from crates.io is not looked for there: a crate
         // of the same name on crates.io is another (requirement R-VR-2).
         let result = if found.package.source == Source::CratesIo {
-            from_crates_io(state, name, decided, lookup, warnings).await
+            from_crates_io(state, name, decided, lookup, warnings, unused).await
         } else {
             explicitly_the_projects(&found, &mut warnings);
             not_from_crates_io(&found, target, &warnings)
         };
         return of_changed_record(state, &found.workspace, target, result).await;
     }
-    from_crates_io(state, name, decided, lookup, warnings).await
+    from_crates_io(
+        state,
+        name,
+        decided,
+        lookup,
+        warnings,
+        #[cfg(feature = "local")]
+        unused,
+    )
+    .await
 }
 
 /// `result`, of the project `workspace` for `target`, marked stale when it is of the record of a
@@ -417,15 +464,17 @@ async fn from_crates_io(
     decided: Decided,
     lookup: &project::LookupTarget,
     mut warnings: Vec<Box<str>>,
+    #[cfg(feature = "local")] unused: Unused<'_>,
 ) -> CallToolResult {
-    let target = &lookup.triple;
     // By the package's name, read again past the cache when the index does not list its version
     // (decided in M2's D7).
     #[cfg(feature = "local")]
     let name = match decided.found.as_deref() {
-        Some(found) => match copy_in_project(state, found, name, target, &mut warnings).await {
-            Ok(name) => name,
-            Err(response) => return *response,
+        Some(found) => {
+            match copy_in_project(state, found, name, &lookup.triple, &mut warnings).await {
+                Ok(name) => name,
+                Err(response) => return *response,
+            }
         },
         None => name,
     };
@@ -444,6 +493,16 @@ async fn from_crates_io(
     warnings.extend(resolved.warnings.into_iter().map(Into::into));
     let found = resolved.version;
     let published: CrateName = entry.name.parse().unwrap_or(name);
+    #[cfg(feature = "local")]
+    let host_lookup = if decided.found.is_none() {
+        let release = (&published, &found.version, &entry);
+        for_the_host(state, release, spec, &unused, &mut warnings).await
+    } else {
+        None
+    };
+    #[cfg(feature = "local")]
+    let lookup = host_lookup.as_ref().unwrap_or(lookup);
+    let target = &lookup.triple;
     let latest = VersionSpec::Latest
         .resolve(&entry.versions)
         .ok()
@@ -494,6 +553,35 @@ async fn from_crates_io(
         Value::Object(data),
         &warnings,
     )
+}
+
+/// The host's target for `release` (its name, version and index entry), which the project did not
+/// decide, when the project does not have it from crates.io and no target was asked for: as
+/// `get_item` looks it up (decided in M2e, 11).
+#[cfg(feature = "local")]
+async fn for_the_host(
+    state: &ToolState,
+    (name, version, entry): (&CrateName, &Version, &IndexEntry),
+    spec: &VersionSpec,
+    unused: &Unused<'_>,
+    warnings: &mut Vec<Box<str>>,
+) -> Option<project::LookupTarget> {
+    let (host, _) = unused.host?;
+    // Without waiting for cargo: only the target is decided here, and past the deadline the
+    // project's would be answered with anyway, so that the answer does not change once cargo has
+    // resolved the project.
+    if !project::known_now(state, unused.project).await {
+        return None;
+    }
+    let same = get_item::same_release(state, name, unused.project, spec, unused.until)
+        .await
+        .and_then(|same| get_item::the_release_in_build(same, version, entry, &mut Vec::new()));
+    project::for_host(state, unused.project, same.is_none(), unused.host, warnings)
+        .await
+        .then(|| project::LookupTarget {
+            triple: host.clone(),
+            docs_rs_default: false,
+        })
 }
 
 /// How the project decided the version, where the project came from, and whether docs.rs has

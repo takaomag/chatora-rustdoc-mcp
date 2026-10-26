@@ -78,7 +78,7 @@ The tools answer within 30 seconds (`limits.request_timeout_secs`); work that ta
 | `toolchain_missing` | The toolchain, or the standard library of the target, that the build needs is not installed: install it |
 | `toolchain_too_old` | The code needs a newer toolchain than the one it is built with, as its `rust-version` or an unstable feature says: update it, or set `build.nightly_date` when the server chose the nightly |
 | `unsupported_format` | The toolchain writes a rustdoc JSON format that this server does not read: update the server or the toolchain, or install rustup's `nightly`, which the server builds with when the project's toolchain is too old |
-| `lockfile_outdated` | `Cargo.lock` does not match `Cargo.toml`: builds run with `--locked`, so update it yourself, as with `cargo update --workspace` |
+| `lockfile_outdated` | `Cargo.lock` does not match `Cargo.toml`: builds run with `--locked`, so update it yourself with `cargo fetch`, which changes only what it must (`cargo update` raises every dependency) |
 | `fetch_failed`, `offline_miss` | cargo could not fetch a git dependency, as `reason` tells, or the server is offline and the cache lacks what the build needs |
 | `docs_unavailable` | No documentation of it can be had here: `reason` says why, such as `build_unsupported` (`build_external_docs` builds it, or will in a later version) or `target_unsupported` (a target of the project's own, which the server does not build) |
 

@@ -4,7 +4,12 @@
 
 #[cfg(feature = "local")]
 use std::borrow::Cow;
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use semver::Version;
@@ -906,7 +911,7 @@ pub(super) fn parse_git(
 /// it, and without `project`, as it is no package of a workspace here.
 pub(super) fn apart_from_git(
     version: Option<&VersionSpec>,
-    project: Option<&std::path::Path>,
+    project: Option<&Path>,
 ) -> Result<(), InvalidArgument> {
     if version.is_some() {
         return Err(InvalidArgument::new(
@@ -1107,11 +1112,7 @@ pub(super) fn parse_arguments(
 #[cfg(feature = "local")]
 async fn member_in_project(
     state: &ToolState,
-    (found, spec, project): (
-        Option<&project::Found>,
-        &VersionSpec,
-        Option<&std::path::Path>,
-    ),
+    (found, spec, project): (Option<&project::Found>, &VersionSpec, Option<&Path>),
     name: &CrateName,
     (path, target, shape): (&str, &TargetTriple, &Shape),
     until: Instant,
@@ -1527,7 +1528,7 @@ async fn entry_or_copy(
 #[cfg(feature = "local")]
 async fn explicit_in_project(
     state: &ToolState,
-    project: Option<&std::path::Path>,
+    project: Option<&Path>,
     name: &CrateName,
     (version, path, target, shape): (&Version, &str, &TargetTriple, &Shape),
     until: Instant,
@@ -1671,7 +1672,7 @@ async fn explicit_found_member(
 #[cfg(feature = "local")]
 async fn explicit_workspace(
     state: &ToolState,
-    project: Option<&std::path::Path>,
+    project: Option<&Path>,
     warnings: &mut Vec<Box<str>>,
 ) -> Option<(Workspace, data::project::ProjectFrom)> {
     match project::place_for_lookup(state, project).await {
@@ -1708,7 +1709,7 @@ async fn explicit_workspace(
 #[cfg(feature = "local")]
 pub(super) async fn explicit_found(
     state: &ToolState,
-    project: Option<&std::path::Path>,
+    project: Option<&Path>,
     name: &CrateName,
     (version, target): (&Version, &TargetTriple),
     until: Instant,
@@ -1829,7 +1830,7 @@ fn explicit_package<'a>(
 #[cfg(feature = "local")]
 async fn explicit_member(
     state: &ToolState,
-    project: Option<&std::path::Path>,
+    project: Option<&Path>,
     name: &CrateName,
     (version, path, target, shape): (&Version, &str, &TargetTriple, &Shape),
     until: Instant,
@@ -2594,10 +2595,10 @@ fn cached_request(
 /// project), when one may be the release that `spec` asks for: the crates.io index then tells
 /// whether it is ([`the_release_in_build`]).
 #[cfg(feature = "local")]
-async fn same_release(
+pub(super) async fn same_release(
     state: &ToolState,
     name: &CrateName,
-    project: Option<&std::path::Path>,
+    project: Option<&Path>,
     spec: &VersionSpec,
     until: Instant,
 ) -> Option<project::FromCratesIo> {
@@ -2616,7 +2617,7 @@ async fn same_release(
 /// release on crates.io (its checksum is the index's): its build then tells `enabled_in_project`
 /// (requirements R-VR-1 and R-FT-2). A copy that differs is warned about.
 #[cfg(feature = "local")]
-fn the_release_in_build(
+pub(super) fn the_release_in_build(
     same: project::FromCratesIo,
     version: &Version,
     entry: &IndexEntry,
@@ -3083,12 +3084,16 @@ async fn look_up(
     #[cfg(feature = "local")] refresh: bool,
 ) -> CallToolResult {
     let until = state.until();
-    // What failed is forgotten before it is read again (§6.4, decided in M2's D5).
+    // What failed is forgotten before it is read again (§6.4, decided in M2's D5); of std,
+    // whatever the project, which only builds in the default project.
     #[cfg(feature = "local")]
-    let refresh = refresh && local::refresh_project(&state, arguments.project.as_deref()).await;
+    let (refresh, of_std) = (
+        refresh && local::refresh_project(&state, arguments.project.as_deref()).await,
+        refresh,
+    );
     if let Some(krate) = std_crate(&arguments.name) {
         #[cfg(feature = "local")]
-        if refresh {
+        if of_std {
             data::forget_failures(state.cache.dir().join("std"), true).await;
         }
         return execute_std(arguments, krate, state, Vec::new(), until).await;
@@ -3106,12 +3111,8 @@ async fn look_up(
     // A release that the project does not use is looked up for the host when no target is asked
     // for: the project's target is not its (requirement R-WS-5, decided in M2e, 11).
     #[cfg(feature = "local")]
-    let unused = if arguments.target.is_none() {
-        let host = state.host().await.triple.clone();
-        (target.triple != host || target.docs_rs_default).then_some((host, warnings.len()))
-    } else {
-        None
-    };
+    let unused =
+        project::unused_target(&state, arguments.target.as_ref(), &target, warnings.len()).await;
     #[cfg(feature = "local")]
     let project = arguments.project.clone();
     #[cfg(not(feature = "local"))]
@@ -3140,21 +3141,18 @@ async fn look_up(
         Ok(resolved) => resolved,
         Err(error) => return *error,
     };
-    // Only when the project's packages tell it, so that the answer does not change once cargo
-    // has resolved them.
     #[cfg(feature = "local")]
-    let for_host = arguments.here.unused
-        && unused.is_some()
-        && project::known_now(&state, project.as_deref()).await;
+    let for_host = project::for_host(
+        &state,
+        project.as_deref(),
+        arguments.here.unused,
+        unused.as_ref(),
+        &mut warnings,
+    )
+    .await;
     #[cfg(feature = "local")]
     if arguments.here.unused && unused.is_some() && !for_host {
         arguments.target = target.triple.clone();
-    }
-    #[cfg(not(feature = "local"))]
-    let for_host = false;
-    // What the project's target warned of is not of the host's.
-    if let (true, Some((_, told))) = (for_host, unused) {
-        warnings.drain(..told.min(warnings.len()));
     }
     // Of a lookup on docs.rs, not of a crate built here (decided in M2's D7).
     #[cfg(feature = "local")]
@@ -4789,7 +4787,7 @@ async fn execute_std(
                 .into(),
         );
     }
-    let at_least = project_toolchain(&state).await;
+    let at_least = project_toolchain(&state, arguments.project.as_deref()).await;
     let chosen = match shared_std(&state, &target, &host.triple, at_least.as_ref(), until).await {
         Ok(chosen) => chosen,
         Err(StdUnready::Failed(error)) => return dist_error(krate, &error),
@@ -4877,13 +4875,18 @@ async fn execute_std(
     }
 }
 
-/// The release of the project's toolchain, which a nightly installed here must not be older than
-/// to be used for std (requirement R-STD-1). `None` without a single default workspace, or when
-/// its toolchain cannot be run without installing it.
+/// The release of the toolchain of the project that `project` names, or else of the default
+/// project, which a nightly installed here must not be older than to be used for std (requirement
+/// R-STD-1). `None` without such a workspace in the default project (outside it, nothing is run,
+/// requirement R-MCP-3), with several default workspaces, or when its toolchain cannot be run
+/// without installing it.
 #[cfg(feature = "local")]
-pub(super) async fn project_toolchain(state: &ToolState) -> Option<Version> {
-    let project = state.project.as_ref()?;
-    let [workspace] = &*project.workspaces else {
+pub(super) async fn project_toolchain(
+    state: &ToolState,
+    project: Option<&Path>,
+) -> Option<Version> {
+    let Ok(project::Place::Here(workspace, _)) = project::place(state.project.as_ref(), project)
+    else {
         return None;
     };
     let rustc = data::toolchain::Programs::this()
@@ -4902,7 +4905,10 @@ pub(super) async fn project_toolchain(state: &ToolState) -> Option<Version> {
     clippy::unused_async,
     reason = "the same signature as with local features, where it runs rustc"
 )]
-pub(super) async fn project_toolchain(_state: &ToolState) -> Option<Version> {
+pub(super) async fn project_toolchain(
+    _state: &ToolState,
+    _project: Option<&Path>,
+) -> Option<Version> {
     None
 }
 

@@ -8,7 +8,7 @@
 
 #[cfg(feature = "local")]
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use rmcp::model::CallToolResult;
 use semver::Version;
@@ -291,12 +291,13 @@ pub(super) async fn dependencies(
 pub(super) async fn std(
     state: Arc<ToolState>,
     target: TargetTriple,
+    project: Option<&Path>,
     detail: Detail,
     searching: Searching,
     mut warnings: Vec<Box<str>>,
 ) -> CallToolResult {
     let until = state.until();
-    let at_least = get_item::project_toolchain(&state).await;
+    let at_least = get_item::project_toolchain(&state, project).await;
     let host = &state.host().await.triple;
     let chosen = match get_item::shared_std(&state, &target, host, at_least.as_ref(), until).await {
         Ok(chosen) => chosen,
