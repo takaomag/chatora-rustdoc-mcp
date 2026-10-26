@@ -1476,6 +1476,7 @@ mod tests {
             target_dir: build::TargetDir::of(Path::new("/c"), root),
             package: PackageId("path+file:///ws/app#0.1.0".into()),
             manifest: root.join("app/Cargo.toml"),
+            package_root: root.join("app"),
             documented: Documented::Lib { proc_macro: false },
             crate_name: "app".into(),
             version: semver::Version::new(0, 1, 0),

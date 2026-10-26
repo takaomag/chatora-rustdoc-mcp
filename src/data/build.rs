@@ -580,6 +580,9 @@ pub struct Plan {
     /// settings apply, and with feature resolver 1, `--features` would be of the package there
     /// (decided in M2's D3).
     pub manifest: PathBuf,
+    /// The root of the package documented, which the files of its definitions are told relative
+    /// to (requirement R-OUT-8, decided in M3a).
+    pub package_root: PathBuf,
     /// Its crate.
     pub documented: Documented,
     /// The name of the crate, with `_` for `-`: the name of its JSON.
@@ -1039,6 +1042,14 @@ pub struct BuildRecord {
     /// ([`Plan::document_private`]). The records before M2's D7, of members only, did.
     #[serde(default = "documented_private")]
     pub private: bool,
+    /// The workspace's root, where cargo ran, which the spans of the JSON relative to it are of
+    /// (decided in M3a). `None` in a record from before.
+    #[serde(default)]
+    pub workspace_root: Option<PathBuf>,
+    /// The root of the package documented, which the files of its definitions are told relative
+    /// to (requirement R-OUT-8, decided in M3a). `None` in a record from before.
+    #[serde(default)]
+    pub package_root: Option<PathBuf>,
 }
 
 /// What a build was planned with, of what the tries change (decided in M2's D3 and D4).
@@ -1307,6 +1318,8 @@ pub async fn build(
         dep_info: false,
         planned: None,
         private: plan.document_private,
+        workspace_root: Some(plan.root.clone()),
+        package_root: Some(plan.package_root.clone()),
     };
     let dir = plan.published_dir(cache.dir(), target.as_ref());
     let path = dir.join(format!("{}.json", header.format_version));
@@ -2064,6 +2077,7 @@ mod tests {
             target_dir: TargetDir(PathBuf::from("/c/t/0123456789ab")),
             package: PackageId("path+file:///ws/app#0.1.0".into()),
             manifest: PathBuf::from("/ws/app/Cargo.toml"),
+            package_root: PathBuf::from("/ws/app"),
             documented: Documented::Lib { proc_macro },
             crate_name: "app".into(),
             version: Version::new(0, 1, 0),
@@ -2444,6 +2458,7 @@ mod tests {
             target_dir: TargetDir(PathBuf::from("/c/t/0123456789ab")),
             package: PackageId("path+file:///ws/app#0.1.0".into()),
             manifest: PathBuf::from("/ws/app/Cargo.toml"),
+            package_root: PathBuf::from("/ws/app"),
             documented: Documented::Bin {
                 name: "my-app".into(),
             },
@@ -2527,6 +2542,7 @@ mod tests {
             target_dir: TargetDir(PathBuf::from("/c/t/0123456789ab")),
             package: PackageId("path+file:///ws/macros#0.1.0".into()),
             manifest: PathBuf::from("/ws/macros/Cargo.toml"),
+            package_root: PathBuf::from("/ws/macros"),
             documented: Documented::Lib { proc_macro: true },
             crate_name: "macros".into(),
             version: Version::new(0, 1, 0),

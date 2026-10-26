@@ -3423,6 +3423,10 @@ async fn look_up_member(
             features_requested: record.features_requested.as_deref(),
             features_effective: record.features_effective.as_deref(),
             recorded_by: built.recorded_by,
+            roots: record
+                .workspace_root
+                .as_deref()
+                .zip(record.package_root.as_deref()),
         };
         let mut looked_up = look_up_in(&built.archived.mapped, &arguments, origin);
         if let (Some(built_at), Ok(response)) = (&built_before, &mut looked_up) {
@@ -5832,9 +5836,10 @@ mod tests {
                     path: "x".into(),
                 }),
                 source_location: Some(SourceLocation {
-                    file: "x",
+                    file: "x".into(),
                     lines: "1".into(),
                     url: some(),
+                    warning: None,
                 }),
                 sections: Box::from([Section {
                     heading: "x".into(),

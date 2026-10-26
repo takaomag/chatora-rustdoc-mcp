@@ -10,7 +10,7 @@ use std::{
     borrow::Cow,
     collections::BTreeSet,
     fmt,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 use rustdoc_types::{
@@ -143,6 +143,10 @@ pub enum Origin<'a> {
         /// The tool that recorded it, `build_external_docs`, for a build that the external tool
         /// made (decided in M2e's E1b).
         recorded_by: Option<&'static str>,
+        /// The workspace's root, where cargo ran, and the package's, which the files of the
+        /// definitions are told relative to (requirement R-OUT-8, decided in M3a). `None` for a
+        /// record from before.
+        roots: Option<(&'a Path, &'a Path)>,
     },
     /// The std of a nightly toolchain (requirement R-STD-1).
     Std {
@@ -566,14 +570,18 @@ pub struct ReexportOf {
 /// Where an item is defined.
 #[derive(Debug, Serialize)]
 pub struct SourceLocation<'a> {
-    /// The file as the span gives it: relative to the package root when the file is in the
-    /// package.
-    pub file: &'a str,
+    /// The file: relative to the package root, with `/`, when the file is in the package; else as
+    /// the span gives it.
+    pub file: Cow<'a, str>,
     /// The first and last lines (`434-466`), or the one line (`301`).
     pub lines: Box<str>,
     /// The file on docs.rs, when it is in the package.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<Box<str>>,
+    /// The warning that the file is outside the package, which the query told, to take back
+    /// with the location from a response that leaves it out.
+    #[serde(skip)]
+    pub warning: Option<Box<str>>,
 }
 
 /// Why an item could not be returned. The caller has the path it asked for.
@@ -1495,17 +1503,47 @@ impl<'a> Query<'a> {
                 format!("https://github.com/rust-lang/rust/blob/{commit}/{path}#{anchor}").into()
             });
             return Some(SourceLocation {
-                file,
+                file: Cow::Borrowed(file),
                 lines: lines.into(),
                 url,
+                warning: None,
             });
         }
         let on_docs_rs = matches!(self.request.origin, Origin::DocsRs { .. });
-        // A local build has no URL anywhere: the file is the user's.
-        if !in_package && on_docs_rs {
-            self.warnings.push(Cow::Owned(format!(
+        // A local build's spans are relative to the workspace's root where cargo ran, or absolute
+        // outside it, as a dependency's that a derive generated code of (decided in M3a).
+        let (file, in_package) = match self.request.origin {
+            Origin::Local {
+                roots: Some((workspace, package)),
+                ..
+            } => {
+                let full = lexically(&workspace.join(&span.filename));
+                match full.strip_prefix(package) {
+                    Ok(inside) => (Cow::Owned(slash_separated(inside)), true),
+                    // As the span gives it, with `/` (decided in M3a).
+                    Err(_) if std::path::MAIN_SEPARATOR == '/' => (Cow::Borrowed(file), false),
+                    Err(_) => (
+                        Cow::Owned(file.replace(std::path::MAIN_SEPARATOR, "/")),
+                        false,
+                    ),
+                }
+            },
+            Origin::DocsRs { .. } | Origin::Local { .. } | Origin::Std { .. } => {
+                (Cow::Borrowed(file), in_package)
+            },
+        };
+        // A local build's record from before has no roots to tell the package's files by.
+        let warning = match self.request.origin {
+            Origin::DocsRs { .. } if !in_package => Some(format!(
                 "{file} is outside the package, so the definition has no docs.rs URL"
-            )));
+            )),
+            Origin::Local { roots: Some(_), .. } if !in_package => {
+                Some(format!("{file} is outside the package"))
+            },
+            Origin::DocsRs { .. } | Origin::Local { .. } | Origin::Std { .. } => None,
+        };
+        if let Some(warning) = &warning {
+            self.warnings.push(Cow::Owned(warning.clone()));
         }
         let url = (in_package && on_docs_rs).then(|| {
             let version: &dyn fmt::Display = match self.view.crate_version() {
@@ -1523,7 +1561,21 @@ impl<'a> Query<'a> {
             file,
             lines: lines.into(),
             url,
+            warning: warning.map(String::into_boxed_str),
         })
+    }
+
+    /// Takes the source location out of `data`, for a response that leaves it out, with the
+    /// warning it told.
+    pub(super) fn drop_source_location(&mut self, data: &mut ItemData<'a>) {
+        if let Some(warning) = data
+            .source_location
+            .take()
+            .and_then(|location| location.warning)
+            && let Some(at) = self.warnings.iter().rposition(|told| **told == *warning)
+        {
+            self.warnings.remove(at);
+        }
     }
 
     /// The crate and definition path of the item that `reexport` re-exports, to look it up
@@ -1861,6 +1913,23 @@ fn docs_rs_release(url: &str) -> Option<(CrateName, Version)> {
     Some((name, version))
 }
 
+/// `path` with `.` and `..` resolved by its text alone, as cargo writes the spans.
+fn lexically(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {},
+            Component::ParentDir => {
+                resolved.pop();
+            },
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                resolved.push(component);
+            },
+        }
+    }
+    resolved
+}
+
 /// `path` with `/` between its components, whatever the platform.
 fn slash_separated(path: &Path) -> String {
     let mut joined = String::with_capacity(path.as_os_str().len());
@@ -1896,7 +1965,7 @@ pub(super) fn first_paragraph(docs: &str) -> (&str, bool) {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::collections::HashMap;
 
     use rustdoc_types::{
         Crate,
@@ -2307,6 +2376,87 @@ pub(super) mod tests {
                 "{generated} is outside the package, so the definition has no docs.rs URL"
             )])
         );
+    }
+
+    /// The file of a definition in a crate built here is relative to its package's root, as the
+    /// spans relative to the workspace's root where cargo ran, or absolute outside it, tell; one
+    /// outside the package, as of code that a derive of another crate generated, is as the span
+    /// gives it, with a warning (requirement R-OUT-8, decided in M3a).
+    #[test]
+    fn a_definition_built_here_is_told_relative_to_its_package() {
+        let told = |filename: &str, roots: Option<(&str, &str)>| {
+            let mut parsed = parsed();
+            if let Some(span) = parsed
+                .krate
+                .index
+                .get_mut(&Id(3))
+                .and_then(|item| item.span.as_mut())
+            {
+                span.filename = PathBuf::from(filename);
+            }
+            let bytes = archive(parsed.krate);
+            let view = CrateView::new(archived(&bytes));
+            let name: CrateName = "my-crate".parse().expect("a crate name");
+            let version = Version::parse("1.2.3").expect("a version");
+            let response = get_item(&view, ItemRequest {
+                name: &name,
+                version: &version,
+                path: "my_crate::sync::Mutex",
+                origin: Origin::Local {
+                    private: true,
+                    package_source: None,
+                    resolved_from: ResolvedFrom::Explicit,
+                    project_from: None,
+                    toolchain: None,
+                    built_at: "2026-10-26T00:00:00Z",
+                    features_requested: None,
+                    features_effective: None,
+                    recorded_by: None,
+                    roots: roots
+                        .map(|(workspace, package)| (Path::new(workspace), Path::new(package))),
+                },
+                detail: Detail::Normal,
+                project_features: None,
+                follow: false,
+                target: None,
+            })
+            .expect("found");
+            serde_json::to_value(response).expect("serializes")
+        };
+        // A member of a virtual workspace, the root package, a path dependency outside the
+        // workspace, whose spans are absolute, and spans that go through `.` and `..`.
+        for (filename, roots) in [
+            ("one/src/lib.rs", ("/ws", "/ws/one")),
+            ("src/lib.rs", ("/ws", "/ws")),
+            ("/deps/watcher/src/lib.rs", ("/ws", "/deps/watcher")),
+            ("./one/../one/src/lib.rs", ("/ws", "/ws/one")),
+            ("../watcher/src/lib.rs", ("/ws", "/watcher")),
+        ] {
+            let response = told(filename, Some(roots));
+            assert_eq!(
+                response["data"]["source_location"],
+                json!({ "file": "src/lib.rs", "lines": "10-12" }),
+                "{filename}"
+            );
+            assert!(response.get("warnings").is_none(), "{response}");
+        }
+        let generated = "/home/u/.cargo/registry/src/index/dep-1.0.0/src/lib.rs";
+        let response = told(generated, Some(("/ws", "/ws/one")));
+        assert_eq!(
+            response["data"]["source_location"],
+            json!({ "file": generated, "lines": "10-12" })
+        );
+        assert_eq!(
+            response["warnings"],
+            json!([format!("{generated} is outside the package")])
+        );
+        // A record from before has no roots: the span as it is, without a warning.
+        let response = told(generated, None);
+        assert_eq!(
+            response["data"]["source_location"],
+            json!({ "file": generated, "lines": "10-12" })
+        );
+        assert!(response.get("warnings").is_none(), "{response}");
     }
 
     #[test]

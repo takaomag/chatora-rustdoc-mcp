@@ -262,6 +262,10 @@ pub fn plan(
         target_dir: target_dir(cache),
         package: found.id.clone(),
         manifest: dir.join("Cargo.toml"),
+        package_root: found
+            .manifest_path
+            .parent()
+            .map_or_else(|| dir.to_path_buf(), Path::to_path_buf),
         crate_name,
         documented,
         version: found.version.clone(),

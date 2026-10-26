@@ -1273,7 +1273,7 @@ fn result<'a>(
         data.variants = Box::default();
         data.sections = Box::default();
         data.also_reexported_at = Box::default();
-        data.source_location = None;
+        query.drop_source_location(&mut data);
     }
     Some(data)
 }
@@ -1518,6 +1518,7 @@ mod tests {
             features_requested: None,
             features_effective: None,
             recorded_by: None,
+            roots: None,
         };
         let (paths, _) = found_in(member, "lock", change);
         assert_eq!(

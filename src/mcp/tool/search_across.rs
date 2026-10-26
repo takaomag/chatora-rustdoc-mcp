@@ -859,6 +859,10 @@ fn request_of<'a>(
                     features_requested: record.features_requested.as_deref(),
                     features_effective: record.features_effective.as_deref(),
                     recorded_by: built.recorded_by,
+                    roots: record
+                        .workspace_root
+                        .as_deref()
+                        .zip(record.package_root.as_deref()),
                 }
             },
             (Some(std), Some(toolchain)) => Origin::Std {

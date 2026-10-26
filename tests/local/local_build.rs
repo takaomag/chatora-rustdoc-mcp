@@ -57,6 +57,17 @@ fn items(built: &Built) -> BTreeSet<String> {
     items_at(&built.json)
 }
 
+/// The file of the span of the item `name` in the JSON of `built`.
+fn file_of(built: &Built, name: &str) -> Option<String> {
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&built.json).expect("published")).expect("JSON");
+    json["index"]
+        .as_object()?
+        .values()
+        .find(|item| item["name"] == name)
+        .and_then(|item| item["span"]["filename"].as_str().map(str::to_owned))
+}
+
 /// The names of the items of the JSON at `path`.
 fn items_at(path: &Path) -> BTreeSet<String> {
     let json: serde_json::Value =
@@ -86,6 +97,11 @@ fn plan(
         target_dir: TargetDir::of(cache.dir(), root),
         package: package.id.clone(),
         manifest: package.manifest_path.clone(),
+        package_root: package
+            .manifest_path
+            .parent()
+            .expect("a directory")
+            .to_path_buf(),
         documented,
         crate_name: name.into(),
         version: package.version.clone(),
@@ -130,6 +146,17 @@ async fn the_members_are_built_and_published() {
         items(&one)
     );
     assert_eq!(one.record.crate_name.as_ref(), "one");
+    // A member's spans are relative to the workspace's root, where cargo ran: the record keeps it
+    // and the package's root, which `get_item` tells the file relative to (decided in M3a).
+    assert_eq!(file_of(&one, "answer").as_deref(), Some("one/src/lib.rs"));
+    assert_eq!(
+        one.record.workspace_root.as_deref(),
+        Some(workspace.root.as_path())
+    );
+    assert_eq!(
+        one.record.package_root.as_deref(),
+        Some(workspace.root.join("one").as_path())
+    );
     assert_eq!(one.record.crate_version.as_ref(), "0.1.0");
     assert_eq!(one.record.target.as_deref(), Some(host.as_str()));
     assert_eq!(
@@ -1225,6 +1252,11 @@ async fn a_git_dependency_of_a_members_name_is_built_with_its_public_items() {
         target_dir: TargetDir::of(&dir.join("cache"), &root),
         package: found.id.clone(),
         manifest: root.join("Cargo.toml"),
+        package_root: found
+            .manifest_path
+            .parent()
+            .expect("a directory")
+            .to_path_buf(),
         crate_name,
         documented,
         version: found.version.clone(),

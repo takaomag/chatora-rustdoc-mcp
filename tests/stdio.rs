@@ -1828,7 +1828,7 @@ fn a_member_is_found_by_the_name_that_code_writes() {
 
 /// A member is built with its features in the build of the whole workspace, which another member
 /// may enable, as rust-analyzer checks it and `enabled_in_project` tells (requirement R-FT-3,
-/// decided in M2's D3).
+/// decided in M2's D3). Its file is relative to its own root (decided in M3a).
 #[cfg(feature = "local")]
 #[test]
 fn a_member_is_built_with_the_features_of_the_workspace() {
@@ -1890,6 +1890,13 @@ fn a_member_is_built_with_the_features_of_the_workspace() {
         "{found}"
     );
     assert_eq!(found["data"]["enabled_in_project"], true, "{found}");
+    // A member of a virtual workspace, told its file relative to its own root, not the
+    // workspace's (decided in M3a).
+    assert_eq!(
+        found["data"]["source_location"]["file"], "src/lib.rs",
+        "{found}"
+    );
+    assert!(in_its_package(found), "{found}");
     assert!(server.finish().success());
 }
 
@@ -2269,6 +2276,8 @@ fn a_members_items_tell_their_visibility_and_their_path_in_the_crate() {
         json!(["pub open: u8", "count: u8", "pub(crate) shared: u8"]),
         "{normal}"
     );
+    // The root package of the workspace, told its file relative to its root (decided in M3a).
+    assert!(in_its_package(&normal["structuredContent"]), "{normal}");
     server.send(&call_tool(
         6_000,
         "list_impls",
@@ -2760,6 +2769,8 @@ fn a_path_dependency_is_built_here_with_its_public_items() {
     let shown = &shown["structuredContent"];
     assert_eq!(shown["provenance"]["source"], "local", "{shown}");
     assert_eq!(shown["provenance"]["package_source"], "path", "{shown}");
+    // A path dependency outside the workspace, whose spans are absolute.
+    assert!(in_its_package(shown), "{shown}");
     assert!(
         shown["data"].get("visibility").is_none(),
         "public only: {shown}"
@@ -5400,6 +5411,7 @@ fn a_git_dependency_of_a_members_name_is_built_here() {
         assert_eq!(found["provenance"]["package_source"], "git", "{found}");
         assert!(found["data"].get("visibility").is_none(), "{found}");
         assert!(found.to_string().contains("From git."), "{found}");
+        assert!(in_its_package(&found), "{found}");
     }
     assert!(server.finish().success());
 }
@@ -6108,6 +6120,17 @@ fn set_cargo_settings(project: &Path, settings: &str) {
     std::fs::write(project.join(".cargo/config.toml"), settings).expect("written");
 }
 
+/// Whether the file of the definition that `found` tells is relative to its package's root, as
+/// `src/…`, without a warning that it is outside: the spans of a build here are relative to the
+/// workspace's root or absolute (decided in M3a).
+#[cfg(feature = "local")]
+fn in_its_package(found: &Value) -> bool {
+    found["data"]["source_location"]["file"]
+        .as_str()
+        .is_some_and(|file| file.starts_with("src/"))
+        && !warns(found, "outside the package")
+}
+
 /// Whether `response` warns about something that contains `part`.
 #[cfg(feature = "local")]
 fn warns(response: &Value, part: &str) -> bool {
@@ -6575,6 +6598,7 @@ fn a_copy_of_a_crates_io_release_that_differs_is_built_here() {
             "{found}"
         );
         assert_eq!(found["provenance"]["source"], "local", "{found}");
+        assert!(in_its_package(found), "{found}");
         assert_eq!(
             found["provenance"]["package_source"], "crates.io",
             "{found}"

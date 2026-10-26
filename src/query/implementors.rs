@@ -172,7 +172,10 @@ pub fn list_implementors<'a>(
     let path = query.path_of(trait_id);
     let signature = query
         .item_data(trait_id, None)
-        .and_then(|data| data.signature)
+        .and_then(|mut data| {
+            query.drop_source_location(&mut data);
+            data.signature
+        })
         .unwrap_or_default();
     query.hint(format!(
         "implementors in other crates are not listed; list_impls on a type tells whether it \

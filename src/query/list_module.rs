@@ -456,7 +456,7 @@ fn entry_data<'a>(
                 data.variants = Box::default();
                 data.sections = Box::default();
                 data.also_reexported_at = Box::default();
-                data.source_location = None;
+                query.drop_source_location(&mut data);
             }
             if *data.path != *path {
                 data.canonical = Some(std::mem::replace(&mut data.path, path.into()));
@@ -468,6 +468,8 @@ fn entry_data<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use rustdoc_types::Crate;
     use semver::Version;
     use serde_json::json;
@@ -680,5 +682,53 @@ mod tests {
             listed("my_crate::Nothing", options()),
             Listed::Err(GetItemError::NotFound)
         ));
+    }
+
+    /// A list that leaves the source locations out does not warn that a file is outside the
+    /// package; one that shows them does.
+    #[test]
+    fn only_a_list_that_shows_the_files_warns_of_one_outside_the_package() {
+        let mut krate: Crate = parsed().krate;
+        let generated = "/build/out/generated.rs";
+        if let Some(span) = krate
+            .index
+            .get_mut(&Id(3))
+            .and_then(|item| item.span.as_mut())
+        {
+            span.filename = PathBuf::from(generated);
+        }
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes));
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::new(1, 2, 3);
+        let warnings = |detail| {
+            let response = list_module(
+                &view,
+                ItemRequest {
+                    name: &name,
+                    version: &version,
+                    path: "my_crate::sync",
+                    origin: Origin::DocsRs {
+                        resolved_from: ResolvedFrom::Explicit,
+                        project_from: None,
+                        build: None,
+                    },
+                    detail,
+                    project_features: None,
+                    follow: false,
+                    target: None,
+                },
+                options(),
+            )
+            .expect("listed");
+            serde_json::to_value(response).expect("serializes")["warnings"].clone()
+        };
+        assert_eq!(warnings(Detail::Normal), serde_json::Value::Null);
+        assert_eq!(
+            warnings(Detail::Full),
+            json!([format!(
+                "{generated} is outside the package, so the definition has no docs.rs URL"
+            )])
+        );
     }
 }

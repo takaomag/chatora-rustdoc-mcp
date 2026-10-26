@@ -4,7 +4,7 @@
 
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::Duration,
 };
@@ -294,6 +294,7 @@ pub(super) async fn member_for(
         target_dir: target_dir(state, root, (target, built)),
         package: package.id.clone(),
         manifest: package.manifest_path.clone(),
+        package_root: root_of(&package.manifest_path),
         crate_name: build::documented_name(package, &documented).into(),
         documented,
         version: package.version.clone(),
@@ -471,6 +472,7 @@ pub(super) async fn dependency_for(
         // The workspace's, as cargo would take the dependency's for a root of its own and write
         // another Cargo.lock (requirement R-WS-5).
         manifest: root.join("Cargo.toml"),
+        package_root: root_of(&found.manifest_path),
         crate_name,
         documented,
         version: found.version.clone(),
@@ -941,6 +943,13 @@ pub(super) fn refresh_told(scope: &str, result: &CallToolResult) {
     if !again {
         REFRESHING.lock().remove(scope);
     }
+}
+
+/// The root of the package whose manifest is at `manifest`.
+fn root_of(manifest: &Path) -> PathBuf {
+    manifest
+        .parent()
+        .map_or_else(|| manifest.to_path_buf(), Path::to_path_buf)
 }
 
 /// The tool error of a member's build that failed (requirement R-WS-7, decided in M2's D2).

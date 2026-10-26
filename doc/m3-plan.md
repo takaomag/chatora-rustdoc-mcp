@@ -140,7 +140,7 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 
 **A3 で利用者が決めたこと**:
 
-5. A3-1 `cargo metadata` の git の取得の決定的な失敗は、入力が同じ間ずっと、プロセスのメモリだけで覚える (`cargo metadata` の成功と同じ。新しいセッションでは 1 回 cargo を走らせ直す)
+- 決定 5 (A3-1) `cargo metadata` の git の取得の決定的な失敗は、入力が同じ間ずっと、プロセスのメモリだけで覚える (`cargo metadata` の成功と同じ。新しいセッションでは 1 回 cargo を走らせ直す)
 
 **A3 の実装 (2026-10-26)**:
 
@@ -150,3 +150,17 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 残したもの: `cargo tree` (feature の組と範囲) の git の失敗は 30 秒のまま (`cargo metadata` が通った後の git の失敗は稀なため)。本物の cargo でロックを握る結合テストは入れていない (ビルドの前の `cargo fetch` が先に同じロックで待ち、そちらはもとから一時的な失敗になるため)
 - レビュー (サブエージェント、読むだけ) の対応: member やローカルビルドする依存の照会で `cargo metadata` が git で失敗したときの `metadata_failed` にも `refresh` の案内を足した (足さないと、案内の無いまま記憶が残り続けた)。失敗したときの入力に members の Cargo.toml を足した (前は root の Cargo.toml・Cargo.lock・設定だけで、member の Cargo.toml で git の依存を直しても記憶が残った)。sh のテストは `child::prepare` を呼び (時間切れでグループごと止まり、`sleep` が残らない)、上限を 3 秒にした (遅い CI でもロック待ちの行を読んでから時間切れになる)。`is_transient` の doc を直した。本物の cargo の結合テスト `a_failure_of_cargo_metadata_to_fetch_a_git_dependency_is_kept` (tests/local。無い `file://` のリポジトリを指す git の依存と Cargo.lock を書き、`fetch_failed` が記憶され、member の Cargo.toml の変更と `refresh` で解けることを確かめる。cargo の再試行の待ちで約 34 秒)
 - 残したもの: requirements.md の R-WS-7 (時間切れは `refresh` まで固定、ずれ 2) は M3 の終わりの反映で改める
+
+**A5 で利用者が決めたこと**:
+
+- 決定 6 (A5-1) ローカルビルドした crate でも、パッケージの外を指す span の `source_location` には `url` を付けず warning を出す (P5・R-OUT-8 のとおり。B5 で `path` を付けるときに文を見直す)
+- 決定 7 (A5-2) `source_location.file` の区切りは、Windows のローカルビルドでも `/` にそろえる (R-OUT-8 の「取得元とキャッシュの状態によらず同じ形」)
+
+**A5 の実装 (2026-10-26)**:
+
+- `Plan.package_root` (文書化する package のルート) と、ビルドの記録の `workspace_root`・`package_root` (`#[serde(default)]`、形式の版は上げない) を足し、`Origin::Local` に `roots` として渡す。`source_location` は、span が相対なら workspace のルートにつなぎ、`.` と `..` を文字の上で解き、パッケージのルートの下ならそこからの相対を `/` 区切りで `file` にする。下でなければ span のまま (区切りは `/`) で `url` を付けず「パッケージの外」の warning (A5-1・A5-2)。ルートの無い前の記録は、今までどおり span の形 (相対で `..` を含まない) で判じ、warning も出さない
+- 取得元ごとの span の形の実測: 仮想 workspace の member は workspace のルートからの相対 (`one/src/lib.rs`。tests/local の `the_members_are_built_and_published` で、記録の 2 つのルートも確かめる)。root の package・workspace の外の path 依存 (span は絶対)・ローカルビルドした crates.io の写し・git の依存は、どれも stdio のテストで `file` が `src/…` になる (`in_its_package`)
+- テスト: `a_definition_built_here_is_told_relative_to_its_package` (相対・root・絶対・`.` と `..` を通る中、外、ルートの無い前の記録)、`only_a_list_that_shows_the_files_warns_of_one_outside_the_package` (list_module)、stdio の 5 件 (仮想 workspace の member を足した。`in_its_package` は「パッケージの外」の warning が無いことも見る)、tests/local の 1 件
+- 134fa5d の CI は config-lint だけ落ちた: m3-plan の決定のリストを 5 から始めた (MD029。一番上の階層の番号付きリストは 1 から)。決定の番号は `- 決定 5 (A3-1)` の箇条書きにした
+- レビュー (サブエージェント、読むだけ) の対応: 「パッケージの外」の warning は `item_data` が出すので、位置を捨てる `search_items`・`list_module` (`normal`)・`list_implementors` の応答にも漏れていた (docs.rs の `OUT_DIR` の場合は前から)。warning を `SourceLocation` に持たせ (直列化しない)、位置を捨てる所で `Query::drop_source_location` が warning も取り消す。ローカルビルドの warning の文は「パッケージの外」だけにした (derive とは限らない)。warning はルートのある記録だけで出す。誤った注釈 (ローカルビルドに URL は無い) を消した。stdio の root package の確かめは同じ get_item の重複を除き、既存の応答で見る
+- 残したもの: 前の記録にはルートが無く、照会のツールのビルドは鮮度の鍵が変わるまで作り直さないので、手元の前の記録では `file` が workspace のルートからの相対のまま (公開前の版では起きない)。形式の版を上げないので、前の版のサーバーが同じキャッシュでビルドし直すと記録は 2 つのルートの無いものになる (A4 の版の違うサーバーの結合テストで扱う)
