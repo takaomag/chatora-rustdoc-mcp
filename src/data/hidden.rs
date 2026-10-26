@@ -182,6 +182,56 @@ pub fn strip_value(value: &mut Value) -> usize {
     }
 }
 
+/// `text` with each character that [`is_hidden`] finds, but a newline, a tab and the carriage
+/// return of a CRLF, written as a visible mark such as `<U+202E>`; and how many were marked.
+///
+/// It is for source text (requirement R-SEC-7, decided in M3b, B4-1), where what would hide code
+/// from a person, as a bidirectional control does, is shown rather than removed. Nothing is removed
+/// nor added between the lines: a carriage return alone, U+0085, U+2028 and U+2029 are marked, not
+/// made newlines, so that the lines are numbered as the file's are. What is left for [`strip`] is
+/// the carriage return of a CRLF.
+#[must_use]
+pub fn mark(text: &str) -> (Cow<'_, str>, usize) {
+    let mut chars = text.chars().peekable();
+    let shown = |c: char, next: Option<&char>| {
+        matches!(c, '\n' | '\t') || (c == '\r' && next == Some(&'\n')) || !is_hidden(c)
+    };
+    let mut all_shown = true;
+    while let Some(c) = chars.next() {
+        if !shown(c, chars.peek()) {
+            all_shown = false;
+            break;
+        }
+    }
+    if all_shown {
+        return (Cow::Borrowed(text), 0);
+    }
+    let mut marked = String::with_capacity(text.len().saturating_add(16));
+    let mut count = 0_usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if shown(c, chars.peek()) {
+            marked.push(c);
+        } else {
+            let code = format!("{:04X}", u32::from(c));
+            marked.push_str("<U+");
+            marked.push_str(&code);
+            marked.push('>');
+            count = count.saturating_add(1);
+        }
+    }
+    (Cow::Owned(marked), count)
+}
+
+/// The warning of source text in which [`mark`] marked `count` characters.
+#[must_use]
+pub fn marked_warning(count: usize) -> String {
+    format!(
+        "{count} invisible or control characters in the source, as bidirectional controls, are \
+         shown as marks such as <U+202E>"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -288,6 +338,35 @@ mod tests {
                 "attrs": ["#[doc(alias = \"ab\")]", 1, null, true],
                 "auto_traits": {"Send": {"note": "bold"}},
             })
+        );
+    }
+
+    /// In source text, what would hide code is marked, not removed, and the lines stay as the
+    /// file numbers them: a CRLF is kept, a carriage return alone or U+2028 is marked.
+    #[test]
+    fn hidden_characters_of_source_text_are_marked() {
+        assert_eq!(
+            mark("fn main() {\n\tok();\r\n}"),
+            (Cow::Borrowed("fn main() {\n\tok();\r\n}"), 0)
+        );
+        let source = "let a = \"x\u{202E}y\";\rlet b = 1;\u{2028}// \u{1B}[31m\u{E0041}\r\n";
+        let (marked, count) = mark(source);
+        assert_eq!(
+            marked,
+            "let a = \"x<U+202E>y\";<U+000D>let b = 1;<U+2028>// <U+001B>[31m<U+E0041>\r\n"
+        );
+        assert_eq!(count, 5);
+        // Marked again, or through the exit's stripping, nothing changes but the CR of the CRLF,
+        // and no line is added.
+        assert_eq!(mark(&marked).0, marked);
+        let (stripped, removed) = strip(&marked);
+        assert_eq!(removed, 1);
+        assert_eq!(stripped.lines().count(), source.split('\n').count() - 1);
+        assert!(marked_warning(count).contains("5 invisible"));
+        // U+0085, U+2029 and a byte order mark are marked; of `\r\r\n`, the first CR.
+        assert_eq!(
+            mark("\u{FEFF}a\u{85}b\u{2029}c\r\r\n").0,
+            "<U+FEFF>a<U+0085>b<U+2029>c<U+000D>\r\n"
         );
     }
 }

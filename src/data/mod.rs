@@ -19,6 +19,7 @@ pub mod child;
 pub mod clear;
 pub mod crate_file;
 pub mod crate_name;
+pub mod crate_source;
 pub mod dist;
 pub mod docs_rs;
 #[cfg(feature = "local")]

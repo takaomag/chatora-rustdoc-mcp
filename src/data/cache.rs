@@ -718,10 +718,11 @@ pub(super) fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     result
 }
 
-/// Removes the temporary files in `dir` that writes which did not finish left behind: those older
-/// than [`STALE_TEMPORARY_AGE`] (requirement R-CA-4, decided in M1). The places that are never
-/// written again are left to the GC (requirement R-CA-5).
-fn remove_stale_temporaries(dir: &Path) {
+/// Removes the temporary files in `dir` that writes which did not finish left behind, and the
+/// temporary directories of unpackings (decided in M3b, B1-3): those older than
+/// [`STALE_TEMPORARY_AGE`] (requirement R-CA-4, decided in M1). The places that are never written
+/// again are left to the GC (requirement R-CA-5).
+pub(super) fn remove_stale_temporaries(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -734,15 +735,24 @@ fn remove_stale_temporaries(dir: &Path) {
         }
         // Not followed if it is a symlink.
         let stale = entry.metadata().is_ok_and(|metadata| {
-            metadata.is_file()
+            (metadata.is_file() || metadata.is_dir())
                 && metadata
                     .modified()
                     .ok()
                     .and_then(|modified| now.duration_since(modified).ok())
                     .is_some_and(|age| age > STALE_TEMPORARY_AGE)
         });
-        if stale && let Err(error) = fs::remove_file(entry.path()) {
-            tracing::warn!(path = %entry.path().display(), %error, "failed to remove a stale temporary file");
+        if !stale {
+            continue;
+        }
+        // `metadata` followed no symlink, so a directory here is one.
+        let removed = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            fs::remove_dir_all(entry.path())
+        } else {
+            fs::remove_file(entry.path())
+        };
+        if let Err(error) = removed {
+            tracing::warn!(path = %entry.path().display(), %error, "failed to remove a stale temporary file or directory");
         }
     }
 }
@@ -960,8 +970,20 @@ mod tests {
             .open(&stale)
             .and_then(|file| file.set_modified(two_hours_ago))
             .expect("made old");
+        // And a temporary directory of an unpacking that did not finish (decided in M3b, B1-3).
+        let unpacking = place.join(".src.v1.1.0.tmp");
+        fs::create_dir_all(unpacking.join("src")).expect("made");
+        fs::write(unpacking.join("src/lib.rs"), b"part").expect("written");
+        let old_dir = cfg!(unix)
+            && File::open(&unpacking)
+                .and_then(|file| file.set_modified(two_hours_ago))
+                .is_ok();
         write_atomically(&place.join("61.json"), b"json").expect("writes");
-        assert_eq!(file_names(&place), [".61.json.2.0.tmp", "61.json"]);
+        let mut left = vec![".61.json.2.0.tmp", "61.json"];
+        if !old_dir {
+            left.insert(1, ".src.v1.1.0.tmp");
+        }
+        assert_eq!(file_names(&place), left);
     }
 
     #[cfg(unix)]

@@ -120,13 +120,6 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 3. A1-3 `unsupported_format` の案内も、rustup の有無で分ける (無ければ `build.*_path` で nightly を指す案内)
 4. A2-1 `resolve_version` の「使わない crate」は、`get_item` と同じリリース単位で判じ、同じ関数を共有する
 
-## 7. M3 の終わり方
-
-1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める
-2. requirements.md を次の版 (v0.21) にし、§14 に経緯を書く。セキュリティの仕様が変われば一覧ページも直して公開する
-3. README を合わせる (M3h の H3)。`cargo publish --dry-run --locked` を確かめる。crates.io への公開は利用者が M3 の後にまとめて行う (m2-plan.md の §5 の P9)
-4. M4 の計画を立てる
-
 **A1+A2 の実装 (2026-10-26)**:
 
 - A1(a) と A1-1: `search_items` の std の検索が引数 `project` を持ち、target (`default_target`) と nightly を選ぶ toolchain (`get_item::project_toolchain`) と `refresh` をその project で決める。`project_toolchain` は `project` を受け、既定のプロジェクトの中の workspace のときだけ `rustc -vV` を走らせる (外では何も起動しない。R-MCP-3)。`get_item` の std も同じ
@@ -179,3 +172,33 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - レビュー (サブエージェント、読むだけ) の対応: 「1 時間以内に使った他の版の置き場は消さない」は容量の上限を超えたときだけ効くので、テストは `cache.target_max_size` を 1 バイトにして `cache gc` を走らせる形にした (`KEPT_FOR` を 0 にすると落ちることを確かめた)。テストのサーバーと CLI は、走らせるシェルに口の変数があっても普通の版で動くよう消してから渡す。アーカイブのスキーマはテストに直書きせず `formats::archive_schema()` から取る。`testing` の関数に `#[must_use]`。`alias`・`git_commits` の名前は在庫と GC で別々に持っていたので `layout::EXTERNAL_INDEXES` にまとめた。doc の直し (external の `local/v1`、release で切れるリンク、`cargo install --debug` の説明)。口の変数を立てて単体テストを走らせると、`v1` を直書きした単体テストは落ちる (口は統合テストのためのもので、そう走らせることはない)
 - 確かめていないもの: `build_external_docs` の `ext/v<n>` (使う所は同じ関数から版を取るので、在庫と GC の判定だけを確かめた)、子プロセスの記録の他の版の掃除 (owner の単体テストが `v0` で確かめている)
 - 839691a (A5) の CI は Windows の check で落ちた: tests/local の `the_members_are_built_and_published` が JSON の生の span を `one/src/lib.rs` と比べていた (Windows では `one\src\lib.rs`)。製品のコードは `/` にそろえている (stdio のテストは Windows でも通った)。テストを OS の区切りで比べる形に直した
+
+### 6.2 M3b
+
+**下調べ (2026-10-26。サブエージェント、読むだけ。LSP は使わず grep と Read。ネットワークなし)**: B1〜B5 の直す場所と大きさ、判断の候補。手元で測ったこと: registry の 1,625 crate の展開後のファイル数は中央値 22・p99 565・最大 8,868 (aws-sdk-ec2)、大きさは p99 17MB・最大 122.7MB (windows 0.58)・1 ファイルの最大 13.2MB。`.crate` 3,440 個の tar のエントリはすべて通常のファイルで、GNU の長い名前はあり PAX は 0 件、Windows で書けない名前・symlink は 0 件、registry/src のディレクトリの中身は `.crate` の目録と完全に一致した (R1・R2)。手元の nightly の rust-src は 80MB・3,802 ファイルで、キャッシュにある dist の std の commit とは 1 つも一致しない。core の JSON の span の 38,222 件が `library/core/src/../../stdarch/…` の形。docs.rs の span で rustwide の絶対パスは tokio 352 件、axum 1,015 件。コミットの順の案: B4 → B1a (展開の部品) → B1b (口・GC) → B2 → B5 → B3
+
+**M3b で利用者が決めたこと**:
+
+- 決定 11 (B4-1) ソースの本文の見える印は、`hidden::is_hidden` の対象のうち改行・タブ・CRLF の CR 以外をすべて `<U+XXXX>` にする。単独の CR・U+0085・U+2028/2029 も印にする (出口で改行に替えると行番号がずれるため)
+- 決定 12 (B1-4) `.crate` の罠のエントリ (`..`・絶対・symlink・hardlink・デバイス・先頭の要素の違い・重複) は `.crate` ごと拒否して理由付きの `docs_unavailable`。その OS で書けない名前 (Windows の予約名・末尾の `.`・大文字小文字だけ違う名前) も `.crate` ごと拒否するが、判定はその OS でだけ行う
+- 決定 13 (B1-5) 展開の上限は、合計を既存の `limits.extract_max_size` (既定 4GiB)、ファイル数を 10 万 (設定にしない) とし、1 ファイルの上限は設けない (読むときに `get_source` の上限で切る)
+- 決定 14 (B2-2) ローカルビルドの記録に、rustdoc 自身の dep-info のファイルだけを別に持つ (`#[serde(default)]`、形式の版は上げない)。前の記録では作り直すまで dep-info 由来のファイルは読めない
+- 決定 15 (B2-3) `$CARGO_HOME/registry/src` を読むときに `.crate` がどこにも無く、オフラインで目録を作れなければ `offline_miss` を返す (ディレクトリの中身では代えない)
+- 決定 16 (B5-1) `source_location.path` はローカルビルドのデータにだけ付ける。docs.rs と std には付けない (展開の有無で結果が変わり R-ARCH-5 に反し、`get_item` が展開を待つことになるため)
+- 決定 17 (B5-2) ローカルビルドの span が依存のソースを指すときの `path` は、`get_source` と同じ判定 (registry なら `.crate` の目録) を通ったものにだけ付ける。目録が無く今作れないときは付けない
+
+**聞かずに決めたこと (下調べの推す案のまま。実装の細部)**: 展開先は `static.crates.io/<鍵>/<版>/src.v<n>/` に先頭の `<name>-<version>/` を剥がして置き、版は `formats` に足す (B1-1)。展開先は `.crate` と同じ置き場に含め、GC の使用中の判定は展開先のロックも見る (B1-2)。一時ディレクトリは置き場の隣に作って rename し、古い一時ディレクトリも片付ける (B1-3)。ファイルごとに `sync_all` してから完了印、rename (B1-6。R-CA-4)。registry/src は `.cargo-ok` が `v >= 1` のものだけ読み、読めるファイルは `.crate` の目録で決める (B1-7。R-SC-4)。判定は新しい `data::source_root` に 1 つ置く (B2-1)。symlink は実パスで比べる (B2-4)、`#[path]` は特別扱いしない (B2-5)。`path` は実パス (B5-3)。B3 (rust-src) の判断 (照合・置き場・既定で取るか・取れないときのエラー) は、ネットワークでの実測の許可と一緒に B3 に入るときに聞く
+
+**B4 と B1a の実装 (2026-10-26)**:
+
+- B4: `hidden::mark` (決定 11) と警告の文 `marked_warning`。印を付けた本文に出口の `strip` をかけても、消えるのは CRLF の CR だけで行は増えない。使う所は M3c の `get_source` から
+- B1a: 新しい `data::crate_source::unpack`。1 回目は raw のエントリで、拡張の見出し (GNU の長い名前・PAX) の大きさ (64KiB まで)・エントリの数・合計の大きさを、メモリに読む前と書く前に確かめる。2 回目は、パスを検証しながら置き場の隣の一時ディレクトリに書き、ファイルごとに `sync_all` してから置き場と入れ替える (前のものは一時の名前に退かしてから消す)。伸ばした量にも天井を付ける。キャッシュの古い一時の片付けは、ディレクトリも消す
+- レビュー (サブエージェント、読むだけ) の対応: PAX の `size` は raw の 1 回目と 2 回目でエントリの並びを変え、上限とメモリの検査をすり抜けられたので、`size` か `GNU.sparse` を持つ PAX の拡張は `.crate` ごと拒否し、2 回目でも大きさとファイル数を数える。同じ名前の一時ディレクトリが残っていれば空にしてから使う (同じ pid で再起動したとき)。書いている途中の一時ディレクトリを片付けが消さないよう、256 ファイルごとに中に印を作って消し (時刻が新しくなる)、終わりに一時ディレクトリがあることを確かめる。ファイルの後の同じ名前のディレクトリ・ファイルを通るパス・NUL を拒否の理由で返す (キャッシュの失敗にしない)。大文字小文字を区別しない OS (Windows・macOS) では、大文字小文字だけ違うパスをディレクトリでも拒否する。Windows の予約名に `COM0`・`LPT0`・上付き数字・`CONIN$`・`CONOUT$` を足した。エラーの文に入るエントリのパスは見える印にする (ログと CLI のため)。テスト: PAX の size と path、GNU の長い名前の `..`、ファイルを通るパス、残った一時ディレクトリ、`mark` の U+0085・U+2029・BOM・`\r\r\n`
+- 残したもの: macOS の Unicode の正規化 (NFC と NFD) だけが違う名前の衝突は判じない (依存が要る。ファイルなら `create_new` が捕まえる)。gzip の CRC は読まない (tar は終わりの印で止まる。呼ぶ側が index の sha256 を展開の前に確かめる)
+
+## 7. M3 の終わり方
+
+1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める
+2. requirements.md を次の版 (v0.21) にし、§14 に経緯を書く。セキュリティの仕様が変われば一覧ページも直して公開する
+3. README を合わせる (M3h の H3)。`cargo publish --dry-run --locked` を確かめる。crates.io への公開は利用者が M3 の後にまとめて行う (m2-plan.md の §5 の P9)
+4. M4 の計画を立てる
