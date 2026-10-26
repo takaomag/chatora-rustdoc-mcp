@@ -1,7 +1,7 @@
 //! The records of `build_external_docs` (requirement R-WS-10, decided in M2e).
 //!
 //! A record is an index in `ext/v<format>`, by what the query tools look up, of a build published
-//! in `local/v1` as the builds of the default project are.
+//! in `local/v<format>` as the builds of the default project are.
 //!
 //! The query tools read the records, and start nothing for them (requirement R-MCP-3). While the
 //! external tool makes the record of a key, it holds the lock of the key, which the query tools
@@ -30,9 +30,6 @@ use super::{
 
 /// The directory of the records in the cache.
 pub const EXT_DIR: &str = super::layout::EXTERNAL;
-
-/// The format of the records, which their path has: a server of another format finds none.
-const INDEX_FORMAT: u32 = 1;
 
 /// The index of a record in its directory.
 const INDEX: &str = "record.json";
@@ -143,7 +140,7 @@ impl Key {
     #[must_use]
     pub fn dir(&self, root: &Path) -> PathBuf {
         root.join(EXT_DIR)
-            .join(format!("v{INDEX_FORMAT}"))
+            .join(super::formats::external_dir())
             .join(self.kind())
             .join(self.digest())
     }
@@ -158,7 +155,7 @@ impl Key {
 /// The directory of the records of this format in the cache at `root`: `ext/v<format>`.
 #[must_use]
 pub fn records_dir(root: &Path) -> PathBuf {
-    root.join(EXT_DIR).join(format!("v{INDEX_FORMAT}"))
+    root.join(EXT_DIR).join(super::formats::external_dir())
 }
 
 /// The first 32 hex digits of the SHA-256 of the JSON of `value`.
@@ -661,7 +658,7 @@ fn commits_dir(root: &Path, key: &Key) -> Option<PathBuf> {
     };
     Some(
         root.join(EXT_DIR)
-            .join(format!("v{INDEX_FORMAT}"))
+            .join(super::formats::external_dir())
             .join("git_commits")
             .join(digest_of(&of)),
     )

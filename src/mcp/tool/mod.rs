@@ -288,23 +288,16 @@ impl std::fmt::Display for ErrorChain<'_> {
     }
 }
 
-/// The environment variable that adds the tool for testing (`sleep`) to a debug build. The
-/// integration tests set it to `1`; a debug build installed for use (`cargo install --debug`)
-/// does not list the tool. It is not a setting (requirement R-DIST-3), so it is not under the
-/// settings' prefix.
-#[cfg(debug_assertions)]
-const TEST_TOOLS_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_TOOLS";
-
-/// Whether the tool for testing is served: a debug build with [`TEST_TOOLS_ENV_VAR`] set to `1`.
+/// Whether the tool for testing (`sleep`) is served: a debug build with the hooks for the tests
+/// on ([`crate::testing::on`]).
 #[cfg(debug_assertions)]
 fn test_tools() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(TEST_TOOLS_ENV_VAR).is_some_and(|value| value == "1"))
+    crate::testing::on()
 }
 
 /// The environment variable that points the docs.rs client of a debug build with the tool for
 /// testing at a server of the tests, for the tests of work that takes long (`tests/stdio.rs`). Like
-/// [`TEST_TOOLS_ENV_VAR`], it is not a setting.
+/// the hooks' own, it is not a setting.
 #[cfg(debug_assertions)]
 const TEST_DOCS_RS_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_DOCS_RS_URL";
 

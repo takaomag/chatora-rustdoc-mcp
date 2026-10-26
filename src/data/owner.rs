@@ -28,9 +28,6 @@ pub const WORK_DIR: &str = super::layout::WORK;
 /// format are in a directory `v<format>` of their own (decided in C1).
 pub const RECORDS_DIR: &str = super::layout::RECORDS;
 
-/// The format of the records that this version writes.
-pub const RECORDS_FORMAT: u32 = 1;
-
 /// How long the records of other versions are kept after they were last written, once their
 /// owner has stopped: their children have ended long before (decided in C4).
 const OTHER_RECORDS_KEPT: Duration = Duration::from_hours(7 * 24);
@@ -224,7 +221,7 @@ impl Owner {
     fn records(&self) -> PathBuf {
         self.root
             .join(RECORDS_DIR)
-            .join(format!("v{RECORDS_FORMAT}"))
+            .join(super::formats::records_dir())
     }
 
     /// The record of the child `number` that is about to start, with its lock, which this server
@@ -420,7 +417,7 @@ pub fn sweep(me: &Owner, until: Instant) -> Swept {
         }
         remove_lock_file(root, &id, held);
     }
-    let current = format!("v{RECORDS_FORMAT}");
+    let current = super::formats::records_dir();
     for version in subdirectories(&root.join(RECORDS_DIR)) {
         if version.file_name().is_some_and(|name| *name == *current) {
             continue;
@@ -569,7 +566,7 @@ fn settle(root: &Path, record: &Path, until: Instant) -> Settled {
 #[cfg(unix)]
 #[must_use]
 pub fn recorded_target_dirs(root: &Path) -> std::collections::HashSet<String> {
-    let records = root.join(RECORDS_DIR).join(format!("v{RECORDS_FORMAT}"));
+    let records = root.join(RECORDS_DIR).join(super::formats::records_dir());
     owned(&records)
         .into_iter()
         .filter_map(|(_, path)| {
@@ -782,7 +779,7 @@ mod tests {
         let old = record("v0", &stopped, 8);
         let recent = record("v0", &new_id(), 1);
         let alive = record("v0", running.id(), 8);
-        let this_version = record(&format!("v{RECORDS_FORMAT}"), &stopped, 8);
+        let this_version = record(&crate::data::formats::records_dir(), &stopped, 8);
         let swept = sweep(&me, later());
         assert_eq!(swept.records, 1);
         assert!(!old.exists());

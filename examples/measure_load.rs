@@ -29,12 +29,10 @@ use chatora_rustdoc_mcp::{
     data::{
         archive::{self, Header, Mapped},
         cache::{self, Cache},
+        formats,
         rustdoc_json,
     },
-    query::{
-        across::{self, Indexed},
-        path_index::PathIndex,
-    },
+    query::{across::Indexed, path_index::PathIndex},
     task,
 };
 use sha2::{Digest as _, Sha256};
@@ -133,7 +131,7 @@ fn measure_archive(path: &str) -> Result<String, String> {
     let json = fs::read(path).map_err(|e| error(&e))?;
     let parsed = rustdoc_json::parse(&json).map_err(|e| error(&e))?;
     let header = Header {
-        schema: across::ARCHIVE_SCHEMA,
+        schema: formats::archive_schema(),
         format_version: parsed.krate.format_version,
         types_version: rustdoc_types::FORMAT_VERSION,
         source_sha256: cache::sha256_hex(&json).into(),

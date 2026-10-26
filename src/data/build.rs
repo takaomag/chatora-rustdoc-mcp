@@ -712,7 +712,7 @@ impl Plan {
         };
         cache
             .join(LOCAL_DIR)
-            .join(format!("v{RECORD_FORMAT}"))
+            .join(super::formats::local_dir())
             .join(workspace_hash(&self.root))
             .join(package)
             .join(target)
@@ -801,10 +801,6 @@ static ENVIRONMENT: LazyLock<String> = LazyLock::new(|| {
 
 /// The directory of the published builds, in the cache (decided in M2's D2).
 pub const LOCAL_DIR: &str = super::layout::LOCAL;
-
-/// The format of the records of the published builds, which their path has (decided in C1 and
-/// M2's D4).
-const RECORD_FORMAT: u32 = 1;
 
 /// The key and the inputs of a build, taken before it (requirement R-WS-4, decided in M2's D4).
 #[derive(Debug, Clone)]

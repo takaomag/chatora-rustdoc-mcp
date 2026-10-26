@@ -148,7 +148,10 @@ async fn the_members_are_built_and_published() {
     assert_eq!(one.record.crate_name.as_ref(), "one");
     // A member's spans are relative to the workspace's root, where cargo ran: the record keeps it
     // and the package's root, which `get_item` tells the file relative to (decided in M3a).
-    assert_eq!(file_of(&one, "answer").as_deref(), Some("one/src/lib.rs"));
+    assert_eq!(
+        file_of(&one, "answer").map(PathBuf::from),
+        Some(Path::new("one").join("src").join("lib.rs"))
+    );
     assert_eq!(
         one.record.workspace_root.as_deref(),
         Some(workspace.root.as_path())

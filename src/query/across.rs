@@ -16,13 +16,8 @@ use crate::data::{archive::Mapped, rustdoc_json::ParsedCrate};
 /// Most crates that one lookup goes through. `std::vec::Vec` goes through two.
 const MAX_CRATES: usize = 4;
 
-/// The version of the schema of [`Indexed`] in an archive (requirement R-CA-2).
-///
-/// Change it with the types that it holds, other than those of rustdoc-types, whose
-/// `FORMAT_VERSION` is in the header and the name of the archive too.
-pub const ARCHIVE_SCHEMA: u32 = 8;
-
 /// A parsed crate with its path index, which is archived as one (requirements R-PF-1 and R-PF-2).
+/// The version of its schema is in [`crate::data::formats`], to change with what it holds.
 #[derive(Debug, rkyv::Archive, rkyv::Serialize)]
 pub struct Indexed {
     /// The crate.

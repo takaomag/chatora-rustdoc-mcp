@@ -30,6 +30,7 @@ pub mod features;
 pub mod fetches;
 pub mod flight;
 pub mod format_version;
+pub mod formats;
 #[cfg(feature = "local")]
 pub mod freshness;
 pub mod gc;

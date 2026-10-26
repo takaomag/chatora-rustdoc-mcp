@@ -16,6 +16,7 @@ use std::{
 };
 
 use super::{
+    formats,
     layout::{self, Class},
     used,
 };
@@ -176,8 +177,10 @@ impl Taking<'_> {
             layout::INDEX => self.index(),
             layout::TOOLCHAINS => self.place(Path::new(name), Kind::Toolchains, class),
             layout::TARGETS => self.levels(name, (Kind::TargetDir, 1), Kind::TargetDir),
-            layout::LOCAL => self.versioned(name, Kind::Local, 4),
-            layout::EXTERNAL => self.versioned(name, Kind::External, 2),
+            layout::LOCAL => self.versioned((name, &formats::local_dir()), Kind::Local, 4),
+            layout::EXTERNAL => {
+                self.versioned((name, &formats::external_dir()), Kind::External, 2);
+            },
             _ if class == Some(Class::Kept) => self.place(Path::new(name), Kind::Kept, class),
             _ => self.place(Path::new(name), Kind::Unknown, None),
         }
@@ -197,24 +200,24 @@ impl Taking<'_> {
         );
     }
 
-    /// Takes in the places of `name`, whose directory `v1` is of this version's format, `depth`
-    /// levels under it; the other formats are places of their own.
-    fn versioned(&mut self, name: &str, kind: Kind, depth: usize) {
+    /// Takes in the places of `name`, whose directory `current` (`v<n>`) is of this version's
+    /// format, `depth` levels under it; the other formats are places of their own.
+    fn versioned(&mut self, (name, current): (&str, &str), kind: Kind, depth: usize) {
         let class = layout::class_of(name);
         for child in self.children(Path::new(name)) {
             let path = Path::new(name).join(&child);
             // A link, which may lead out of the cache, is not followed.
             let is_dir =
                 fs::symlink_metadata(self.root.join(&path)).is_ok_and(|metadata| metadata.is_dir());
-            if child == "v1" && !is_dir {
+            if child == current && !is_dir {
                 self.place(&path, Kind::Unknown, None);
-            } else if child == "v1" {
+            } else if child == current {
                 for grandchild in self.children(&path) {
                     let path = path.join(&grandchild);
                     // The aliases of the workspaces and the commits of the repositories, which the
                     // records are found by.
                     if name == layout::EXTERNAL
-                        && matches!(grandchild.as_str(), "alias" | "git_commits")
+                        && layout::EXTERNAL_INDEXES.contains(&grandchild.as_str())
                     {
                         self.place(&path, kind, class);
                         continue;

@@ -63,8 +63,14 @@ pub const AFTER_BUILDS_EVERY: Duration = Duration::from_hours(1);
 /// The key of the lock that one collection at a time holds, across processes.
 const GC_KEY: &str = "gc";
 
-/// The places that the records of `build_external_docs` are found by, which are small and kept.
-const NOT_COLLECTED: [&str; 2] = ["ext/v1/alias", "ext/v1/git_commits"];
+/// Whether `path` is one of the places that the records of `build_external_docs` of this format
+/// are found by ([`layout::EXTERNAL_INDEXES`]), which are kept.
+fn not_collected(path: &Path) -> bool {
+    let records = Path::new(layout::EXTERNAL).join(super::formats::external_dir());
+    layout::EXTERNAL_INDEXES
+        .iter()
+        .any(|kept| path == records.join(kept))
+}
 
 /// Why a place is removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,9 +401,7 @@ pub fn plan<S: BuildHasher, T: BuildHasher>(
                 && entry.kind != Kind::Toolchains
                 && !bodies.contains(&entry.path)
                 && !in_use.contains(&entry.path)
-                && !NOT_COLLECTED
-                    .iter()
-                    .any(|kept| entry.path == Path::new(kept))
+                && !not_collected(&entry.path)
                 // A place whose use is not told is old.
                 && age_of(entry).is_none_or(|age| age >= KEPT_FOR)
         })

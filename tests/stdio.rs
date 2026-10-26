@@ -225,8 +225,8 @@ const LOG_DIR: &str = "logs";
 /// A running server, talking JSON-RPC over its stdin and stdout.
 struct Server {
     child: Child,
-    /// The server's cache directory, removed when the server is dropped.
-    cache: TempDir,
+    /// The server's cache directory.
+    cache: CacheDir,
     /// The server's config file and logs, out of its cache, which is then this server's alone
     /// (decided in M2f's F1a).
     state: TempDir,
@@ -240,6 +240,25 @@ struct Server {
     calls: HashMap<u64, String>,
     /// How many `tools/call` requests were sent, each of which the log records.
     sent_calls: usize,
+}
+
+/// The cache directory of a server of the tests.
+enum CacheDir {
+    /// Its own, removed when the server is dropped.
+    Own(TempDir),
+    /// Another server's, which it shares.
+    #[cfg(all(debug_assertions, feature = "local"))]
+    Shared(PathBuf),
+}
+
+impl CacheDir {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Own(dir) => dir.path(),
+            #[cfg(all(debug_assertions, feature = "local"))]
+            Self::Shared(path) => path,
+        }
+    }
 }
 
 impl Server {
@@ -260,6 +279,17 @@ impl Server {
 
     /// [`Self::start_with`], with the cache `cache`, which [`test_cache`] made.
     fn start_with_cache(cache: TempDir, project: Option<&Path>, env: &[(&str, &str)]) -> Self {
+        Self::start_on(CacheDir::Own(cache), project, env)
+    }
+
+    /// [`Self::start_with`], with the cache of another server, at `cache`.
+    #[cfg(all(debug_assertions, feature = "local"))]
+    fn start_sharing(cache: &Path, project: Option<&Path>, env: &[(&str, &str)]) -> Self {
+        Self::start_on(CacheDir::Shared(cache.to_owned()), project, env)
+    }
+
+    /// [`Self::start_with`], with the cache `cache`.
+    fn start_on(cache: CacheDir, project: Option<&Path>, env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_chatora-rustdoc-mcp"));
         let state = TempDir::new().expect("a temporary directory");
         // Not the config file of the user who runs the tests (requirement R-DIST-3).
@@ -268,6 +298,8 @@ impl Server {
         command.env("CHATORA_RUSTDOC_MCP_CONFIG", config);
         // The tool for testing (`sleep`) in a debug build.
         command.env("CHATORA_RUSTDOC_TEST_TOOLS", "1");
+        // Of the formats of this release, unless the test says otherwise.
+        command.env_remove("CHATORA_RUSTDOC_TEST_FORMAT_BUMP");
         command.envs(env.iter().copied());
         match project {
             Some(project) => command.env("CLAUDE_PROJECT_DIR", project),
@@ -436,6 +468,17 @@ impl Server {
             messages.push(message);
         }
         messages
+    }
+
+    /// Its own cache, taken out, for another server: an empty one is left.
+    #[cfg(feature = "local")]
+    fn take_cache(&mut self) -> TempDir {
+        let empty = CacheDir::Own(TempDir::new().expect("a temporary directory"));
+        match std::mem::replace(&mut self.cache, empty) {
+            CacheDir::Own(cache) => cache,
+            #[cfg(debug_assertions)]
+            CacheDir::Shared(_) => panic!("the cache is another server's"),
+        }
     }
 
     /// Closes stdin, checks the rest of stdout, and returns how the server exited.
@@ -792,6 +835,11 @@ fn cache_clear_removes_what_it_is_asked_to() {
 
 /// Runs `chatora-rustdoc-mcp` with `args` for the cache at `cache`, without the user's config file.
 fn cache_command(cache: &Path, args: &[&str]) -> std::process::Output {
+    cache_command_with(cache, args, &[])
+}
+
+/// [`cache_command`], with more environment variables.
+fn cache_command_with(cache: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let config = TempDir::new().expect("a temporary directory");
     let file = config.path().join("config.toml");
     std::fs::write(&file, "").expect("written");
@@ -799,6 +847,8 @@ fn cache_command(cache: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .env("CHATORA_RUSTDOC_MCP_CONFIG", &file)
         .env("CHATORA_RUSTDOC_MCP_CACHE__DIR", cache)
+        .env_remove("CHATORA_RUSTDOC_TEST_FORMAT_BUMP")
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .output()
         .expect("the binary runs")
@@ -6093,10 +6143,7 @@ fn the_next_server_stops_what_a_killed_server_left() {
     let [_, rustc, grandchild] = hang(&mut server, pids.path());
     server.child.kill().expect("killed");
     server.child.wait().expect("waited");
-    let cache = std::mem::replace(
-        &mut server.cache,
-        TempDir::new().expect("a temporary directory"),
-    );
+    let cache = server.take_cache();
     assert!(alive(&grandchild), "the grandchild outlived the server");
     let next = Server::start_with_cache(cache, None, &[]);
     let stopped = eventually(Duration::from_secs(10), || {
@@ -6950,10 +6997,7 @@ fn a_server_removes_what_stopped_servers_left_and_leaves_nothing() {
         thread::sleep(Duration::from_millis(50));
     }
     // Kept past `finish`, which drops the server's own.
-    let cache = std::mem::replace(
-        &mut server.cache,
-        TempDir::new().expect("a temporary directory"),
-    );
+    let cache = server.take_cache();
     assert!(server.finish().success());
     let collecting = chatora_rustdoc_mcp::data::process_lock::lock_path(cache.path(), "gc");
     let left_locks: Vec<_> = std::fs::read_dir(cache.path().join("locks"))
@@ -6963,4 +7007,149 @@ fn a_server_removes_what_stopped_servers_left_and_leaves_nothing() {
         .map(|entry| entry.file_name())
         .collect();
     assert!(left_locks.is_empty(), "{left_locks:?}");
+}
+
+/// The environment of a server, or of its cache commands, of a later release: every format of the
+/// cache is one version newer (decided in M3a, A4-1 and A4-2).
+#[cfg(all(debug_assertions, feature = "local"))]
+const NEWER_FORMATS: [(&str, &str); 2] = [
+    ("CHATORA_RUSTDOC_TEST_TOOLS", "1"),
+    ("CHATORA_RUSTDOC_TEST_FORMAT_BUMP", "1"),
+];
+
+/// The files under `dir`, at any depth, whose names end with `suffix`.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn files_ending(dir: &Path, suffix: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut dirs = vec![dir.to_owned()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.to_string_lossy().ends_with(suffix) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Servers of two releases, whose formats of the cache differ, share one cache: each builds a
+/// member and keeps its record in its own format, without building again for the other's; each
+/// archives the JSON of docs.rs in its own schema next to the other's; the cache commands of each
+/// tell the other's places of another format and leave them while they are used, and remove them
+/// once unused for long (requirements R-CA-4 and R-CA-5, decided in M3a, A4).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn servers_of_different_formats_share_a_cache() {
+    let project = workspace_of("vbump");
+    std::fs::write(
+        project.path().join("src/lib.rs"),
+        "/// Hi.\npub fn hi() {}\n",
+    )
+    .expect("written");
+    // The test's, which outlives both.
+    let shared = test_cache();
+    let cache = shared.path();
+    let mut older = Server::start_sharing(cache, Some(project.path()), &[]);
+    let mut newer = Server::start_sharing(cache, Some(project.path()), &NEWER_FORMATS);
+    // A member, built by both at once.
+    let member = json!({ "crate": "vbump", "path": "hi" });
+    older.send(&call_tool(1, "get_item", member.clone()));
+    newer.send(&call_tool(1, "get_item", member.clone()));
+    for server in [&mut older, &mut newer] {
+        assert_eq!(server.response(1)["result"]["isError"], false);
+        let found = called_until_done(server, 2, "get_item", &member);
+        assert_eq!(found["isError"], false, "{found}");
+        assert_eq!(
+            found["structuredContent"]["data"]["path"], "vbump::hi",
+            "{found}"
+        );
+    }
+    let records = |format: &str| files_ending(&cache.join("local").join(format), "record.json");
+    let [old_record] = records("v1").try_into().expect("one record of v1");
+    let [new_record] = records("v2").try_into().expect("one record of v2");
+    let written = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .expect("a time")
+    };
+    let (old_written, new_written) = (written(&old_record), written(&new_record));
+    // Asked again, neither builds again for the other's record.
+    for (server, id) in [(&mut older, 100), (&mut newer, 100)] {
+        let found = called_until_done(server, id, "get_item", &member);
+        assert_eq!(found["isError"], false, "{found}");
+    }
+    assert_eq!(written(&old_record), old_written);
+    assert_eq!(written(&new_record), new_written);
+    // A crate of docs.rs, whose JSON in the cache each archives in its own schema.
+    let docs_rs = json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET });
+    for server in [&mut older, &mut newer] {
+        let found = called_until_done(server, 200, "get_item", &docs_rs);
+        assert_eq!(found["isError"], false, "{found}");
+    }
+    let archives = files_ending(&cache.join("docs.rs/demo"), ".rkyv");
+    let schema = |schema: u32| {
+        let part = format!(".v{schema}t{}.rkyv", rustdoc_types::FORMAT_VERSION);
+        archives
+            .iter()
+            .filter(|path| path.to_string_lossy().ends_with(&part))
+            .count()
+    };
+    let older_schema = chatora_rustdoc_mcp::data::formats::archive_schema();
+    assert_eq!(
+        (schema(older_schema), schema(older_schema + 1)),
+        (1, 1),
+        "{archives:?}"
+    );
+    assert!(older.finish().success());
+    assert!(newer.finish().success());
+    for format in ["v1", "v2"] {
+        assert!(cache.join("toolchains").join(format).is_dir(), "{format}");
+    }
+    // The other's places are of another format, and kept while they were used within the hour.
+    let text = |output: &std::process::Output| String::from_utf8_lossy(&output.stdout).into_owned();
+    let other_format = |listed: &str, path: &str| {
+        listed
+            .lines()
+            .any(|line| line.contains("other format") && line.contains(path))
+    };
+    let listed = text(&cache_command(cache, &["cache", "ls"]));
+    assert!(other_format(&listed, "local/v2"), "{listed}");
+    let listed = text(&cache_command_with(cache, &["cache", "ls"], &NEWER_FORMATS));
+    assert!(other_format(&listed, "local/v1"), "{listed}");
+    // Even over the limits, which only what was used within the hour is spared from.
+    let over = ("CHATORA_RUSTDOC_MCP_CACHE__TARGET_MAX_SIZE", "1B");
+    for env in [&[over][..], &[NEWER_FORMATS[0], NEWER_FORMATS[1], over][..]] {
+        let collected = cache_command_with(cache, &["cache", "gc"], env);
+        assert!(
+            matches!(collected.status.code(), Some(0 | 1)),
+            "{collected:?}"
+        );
+    }
+    for kept in ["local/v1", "local/v2", "toolchains/v1", "toolchains/v2"] {
+        assert!(cache.join(kept).exists(), "{kept}");
+    }
+    // Unused for longer than the target directories are kept, each goes by the other's: the newer
+    // by the older's first, while the older's is used.
+    let long_ago = std::time::SystemTime::now()
+        .checked_sub(Duration::from_hours(31 * 24))
+        .expect("a time");
+    for (old, env) in [("local/v2", &[][..]), ("local/v1", &NEWER_FORMATS[..])] {
+        set_time(&cache.join(old), long_ago);
+        let collected = cache_command_with(cache, &["cache", "gc"], env);
+        assert!(collected.status.success(), "{collected:?}");
+        let told = text(&collected);
+        assert!(
+            told.lines()
+                .any(|line| line.contains(old) && line.contains("other format, unused")),
+            "{told}"
+        );
+        assert!(!cache.join(old).exists(), "{old}");
+        if old == "local/v2" {
+            assert!(cache.join("local/v1").exists());
+        }
+    }
 }

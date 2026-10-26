@@ -5,7 +5,7 @@
 //!
 //! The code is split into three layers. Each layer depends only on the layers below it:
 //! [`mcp`] → [`query`] → [`data`]. [`config`], [`logging`] and [`task`] are shared by all of
-//! them.
+//! them, and so are the hooks of a debug build for the tests, `testing`.
 
 pub mod cli;
 pub mod config;
@@ -16,6 +16,8 @@ pub mod query;
 pub mod task;
 #[cfg(test)]
 mod test_process;
+#[cfg(debug_assertions)]
+pub mod testing;
 
 // Dev-dependencies that only the tests and examples use; the library's test build sees them too.
 #[cfg(test)]

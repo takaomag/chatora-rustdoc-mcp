@@ -55,6 +55,12 @@ pub const LOCAL: &str = "local";
 /// The records of `build_external_docs`.
 pub const EXTERNAL: &str = "ext";
 
+/// What the records of `build_external_docs` are found by, in their format's directory.
+///
+/// They are under [`EXTERNAL`]: the aliases of the workspaces and the commits of the repositories, which are
+/// small and kept whole.
+pub const EXTERNAL_INDEXES: [&str; 2] = ["alias", "git_commits"];
+
 /// The file in a target directory that tells what it is the target directory of, for `cache ls`
 /// (decided in M2f's F1a).
 pub const TARGET_ABOUT: &str = "about.json";

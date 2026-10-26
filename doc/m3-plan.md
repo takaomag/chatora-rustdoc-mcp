@@ -164,3 +164,18 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 134fa5d の CI は config-lint だけ落ちた: m3-plan の決定のリストを 5 から始めた (MD029。一番上の階層の番号付きリストは 1 から)。決定の番号は `- 決定 5 (A3-1)` の箇条書きにした
 - レビュー (サブエージェント、読むだけ) の対応: 「パッケージの外」の warning は `item_data` が出すので、位置を捨てる `search_items`・`list_module` (`normal`)・`list_implementors` の応答にも漏れていた (docs.rs の `OUT_DIR` の場合は前から)。warning を `SourceLocation` に持たせ (直列化しない)、位置を捨てる所で `Query::drop_source_location` が warning も取り消す。ローカルビルドの warning の文は「パッケージの外」だけにした (derive とは限らない)。warning はルートのある記録だけで出す。誤った注釈 (ローカルビルドに URL は無い) を消した。stdio の root package の確かめは同じ get_item の重複を除き、既存の応答で見る
 - 残したもの: 前の記録にはルートが無く、照会のツールのビルドは鮮度の鍵が変わるまで作り直さないので、手元の前の記録では `file` が workspace のルートからの相対のまま (公開前の版では起きない)。形式の版を上げないので、前の版のサーバーが同じキャッシュでビルドし直すと記録は 2 つのルートの無いものになる (A4 の版の違うサーバーの結合テストで扱う)
+
+**A4 で利用者が決めたこと**:
+
+- 決定 8 (A4-1) テスト用の口 `CHATORA_RUSTDOC_TEST_FORMAT_BUMP` (debug ビルドで `CHATORA_RUSTDOC_TEST_TOOLS=1` のときだけ効く) は、すべての形式の版を一度に 1 つ上げる。どれか 1 つだけ上がる場合の食い違いは、A4a で版を 1 か所に集めて直書きを無くすことで防ぐ
+- 決定 9 (A4-2) docs.rs と std のアーカイブのスキーマ (`v8t61` の 8) も上げる対象に入れる。JSON の取得が 1 回で済み、2 つの版のアーカイブが並んで互いを壊さないことをテストで確かめる
+- 決定 10 (A4-3) 容量の上限を超えたときに、他の版のサーバーが使っている置き場が消えうること (ロックでは守られず、1 時間以内に使ったものは消さないことだけで守られる) は今のまま。テストでは 1 時間以内は消さないことと、30 日使われなければ消すことを確かめる
+- A5 の残りの、同じ形式の版の前のサーバーが記録をルートの無いものに書き直す件は、版を上げる口のテストでは起きない (同じ版どうし)。起きても前の振る舞い (`file` は span の形、warning なし) に戻るだけで、鮮度の鍵が変わって今のサーバーがビルドし直せば直るので、テストは足さない
+
+**A4 の実装 (2026-10-26)**:
+
+- A4a: 形式の版を `data::formats` に集めた (`local`・`ext`・`procs`・`toolchains` の置き場の `v<n>` と、アーカイブのスキーマ)。使う所 (build・external・owner・toolchain・load・在庫・GC) はそこから取る。在庫の今の版の判定 (`"v1"` の直書き) は置き場ごとの今の版に、GC の `NOT_COLLECTED` は今の版の `ext/v<n>` の下の名前にした。テスト用の口の判定 (`CHATORA_RUSTDOC_TEST_TOOLS`) は mcp の層から crate の `testing` (debug ビルドだけ) に移し、data の層と CLI も読めるようにした。`CHATORA_RUSTDOC_TEST_FORMAT_BUMP=1` で、すべての版が 1 つ上がる (A4-1・A4-2)。release ビルドでは常に 0
+- A4b: stdio のテスト `servers_of_different_formats_share_a_cache`。テストの持つキャッシュを、普通のサーバーと版を上げたサーバーが借りる (`Server::start_sharing`)。同じ member を同時にビルドして `local/v1` と `local/v2` に記録が 1 つずつでき、もう一度引いても互いの記録のために作り直さない (記録の mtime が変わらない)。docs.rs の JSON は 1 つで、アーカイブは `v8t61` と `v9t61` が並ぶ。`toolchains/v1` と `v2` ができる。`cache ls` は互いの置き場を other format と示し、`cache gc` は 1 時間以内に使った互いの置き場を消さない。31 日前に使ったことにすると、相手の `cache gc` が other format, unused の理由で消す (A4-3)。在庫の判定を `"v1"` の直書きに戻すと落ちることを確かめた
+- レビュー (サブエージェント、読むだけ) の対応: 「1 時間以内に使った他の版の置き場は消さない」は容量の上限を超えたときだけ効くので、テストは `cache.target_max_size` を 1 バイトにして `cache gc` を走らせる形にした (`KEPT_FOR` を 0 にすると落ちることを確かめた)。テストのサーバーと CLI は、走らせるシェルに口の変数があっても普通の版で動くよう消してから渡す。アーカイブのスキーマはテストに直書きせず `formats::archive_schema()` から取る。`testing` の関数に `#[must_use]`。`alias`・`git_commits` の名前は在庫と GC で別々に持っていたので `layout::EXTERNAL_INDEXES` にまとめた。doc の直し (external の `local/v1`、release で切れるリンク、`cargo install --debug` の説明)。口の変数を立てて単体テストを走らせると、`v1` を直書きした単体テストは落ちる (口は統合テストのためのもので、そう走らせることはない)
+- 確かめていないもの: `build_external_docs` の `ext/v<n>` (使う所は同じ関数から版を取るので、在庫と GC の判定だけを確かめた)、子プロセスの記録の他の版の掃除 (owner の単体テストが `v0` で確かめている)
+- 839691a (A5) の CI は Windows の check で落ちた: tests/local の `the_members_are_built_and_published` が JSON の生の span を `one/src/lib.rs` と比べていた (Windows では `one\src\lib.rs`)。製品のコードは `/` にそろえている (stdio のテストは Windows でも通った)。テストを OS の区切りで比べる形に直した

@@ -12,7 +12,7 @@ use parking_lot::{Condvar, Mutex};
 use semver::Version;
 use tokio::time::Instant;
 
-use super::across::{ARCHIVE_SCHEMA, Indexed};
+use super::across::Indexed;
 use crate::data::{
     self,
     archive::{self, Header, Mapped},
@@ -21,6 +21,7 @@ use crate::data::{
     dist::{Dist, DistError, StdCrate},
     docs_rs::DocsRs,
     flight::{Doing, Flights, Joined, Stage},
+    formats,
     rustdoc_json::{self, ParseError},
     std_json::{self, Chosen},
     target::TargetTriple,
@@ -480,9 +481,9 @@ fn archive_path(dir: &Path, format: u32, sha256: &str) -> PathBuf {
 }
 
 /// The header of the archive of the JSON in `format` with `sha256`.
-const fn header(format: u32, sha256: Box<str>) -> Header {
+fn header(format: u32, sha256: Box<str>) -> Header {
     Header {
-        schema: ARCHIVE_SCHEMA,
+        schema: formats::archive_schema(),
         format_version: format,
         types_version: rustdoc_types::FORMAT_VERSION,
         source_sha256: sha256,
@@ -494,7 +495,11 @@ const fn header(format: u32, sha256: Box<str>) -> Header {
 /// is left alone (the GC removes it), not replaced in place, which Windows does not allow while
 /// another process maps it.
 fn archive_version() -> String {
-    format!("v{ARCHIVE_SCHEMA}t{}", rustdoc_types::FORMAT_VERSION)
+    format!(
+        "v{}t{}",
+        formats::archive_schema(),
+        rustdoc_types::FORMAT_VERSION
+    )
 }
 
 /// The archive of the rustdoc JSON in the cache directory `dir`, if it is there and checks out.

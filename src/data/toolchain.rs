@@ -504,7 +504,9 @@ fn nightly(date: Option<&NightlyDate>) -> String {
 
 /// The directory of what the probes of toolchains found, in the cache, for the format of its
 /// records (decided in M2's C1).
-pub const PROBES_DIR: &str = const_format::concatcp!(super::layout::TOOLCHAINS, "/v1");
+fn probes_dir() -> PathBuf {
+    Path::new(super::layout::TOOLCHAINS).join(super::formats::toolchains_dir())
+}
 
 /// What the probe of a toolchain found, kept in the cache by the commit of its rustdoc.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -571,7 +573,7 @@ pub async fn format_of(
         let digest = cache::sha256_hex(key.as_bytes());
         cache
             .dir()
-            .join(PROBES_DIR)
+            .join(probes_dir())
             .join(format!("{}.json", digest.get(..32).unwrap_or(&digest)))
     });
     // Files of the cache, read and written off the async threads, as below.
@@ -1126,7 +1128,7 @@ mod tests {
         }
         .expect("probed");
         assert!(format >= *rustdoc_json::SUPPORTED.start(), "{format}");
-        let kept: Vec<_> = std::fs::read_dir(dir.path().join(PROBES_DIR))
+        let kept: Vec<_> = std::fs::read_dir(dir.path().join(probes_dir()))
             .expect("kept")
             .collect();
         assert_eq!(kept.len(), 1);
