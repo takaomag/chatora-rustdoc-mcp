@@ -32,6 +32,7 @@ use super::{
 #[cfg(feature = "local")]
 use crate::data::{
     features::FeatureSets,
+    local_std::NoSourceHere,
     metadata::{self, PackageId},
     packages::{DocsRsCheck, Lookup as PackageLookup, PackageGraph, ProjectPackage, Source},
     project::Workspace,
@@ -5027,6 +5028,12 @@ pub(super) fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
         },
         // With the dist turned off, the nightly here is the only source (requirement R-STD-4).
         DistError::Disabled { .. } => ("toolchain_missing", None, false),
+        #[cfg(feature = "local")]
+        DistError::NoLocalSource { why } => (
+            "toolchain_missing",
+            None,
+            matches!(why, NoSourceHere::NotRun { timed_out: true }),
+        ),
         // The install command below goes with it too (requirement R-STD-4).
         DistError::Offline => ("offline_miss", None, false),
     };

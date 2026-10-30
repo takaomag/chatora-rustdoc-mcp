@@ -247,6 +247,12 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - レビュー (サブエージェント、読むだけ) の対応: 前の版のサーバーが書いた日付の要約 (`rust-src` を読んでいない) が残っていると、取り直しの失敗 (オフラインなど) が `NoSource` に化けたので、要約に `rust-src` を読んだかの印 (`src_read`) を持たせ、印の無い要約しか無ければ失敗をそのまま返す。印があれば `rust-src` の無い日付でも manifest を取り直さない。`get_item` の対応表で、commit の違いと展開の拒否は再試行不可、展開のディスクの失敗は `internal_error` に分けた (M3c の `get_source` でも同じ分け方を使う)。`git-commit-hash` の無いアーカイブは壊れたアーカイブとして返す。doc の直し。テスト: 前の版の要約とオフライン、印のある要約で取らずに `NoSource`、xz の GNU の長い名前、キャッシュにあれば取得を止めた設定でも返ること
 - 残したもの: 展開の途中でプロセスが落ちると `std/<commit>/.src.v1.<pid>.<n>.tmp` (最大 74MB ほど) が残り、同じ commit をもう一度展開するときの古い一時の片付けか GC の容量の上限まで消えない (`.crate` の展開と同じ設計)。同時の 2 回の呼び出しで取得と展開が 1 回になることは、ロックに頼り、テストでは数えていない
 
+**B3b の実装 (2026-10-30)**:
+
+- 決定 20: `local_std::rust_src(neutral_dir, commit)` は、手元の nightly の `rustc -vV` の commit-hash が JSON の完全な commit と同じとき、その sysroot の `lib/rustlib/src/rust` を返す。rust-src そのものの commit も確かめる: rustup が rust-src を入れた印 (`lib/rustlib/manifest-rust-src`) があり、rustup の channel の manifest (`multirust-channel-manifest.toml`) の `[pkg.rust-src]` の版の短い commit が JSON の commit の先頭と合うこと (manifest は 1MB ほどなので、TOML として解かずその節の行だけを読む)。`rustc -vV` と `--print sysroot` は `local_std` と同じコマンドで、同じディレクトリ (キャッシュのもの) なら 1 分は出力が覚えられているので起動は増えない。`std_json::rust_src(cache, dist, neutral_dir, json)` は選ばれた std の JSON から決める: dist の JSON なら、手元に合うものがあればそれ、無ければ `dist::rust_src`。手元の JSON なら、JSON の置き場 (`<sysroot>/share/doc/rust/json`) から sysroot を求め、プロセスを走らせずに同じ確かめ方をする (決定 20 の前半は「その sysroot を使う」だが、`rustup update` などで JSON の後に toolchain が変わりうるので、commit で照合し直す)。使えなければ `NoLocalSource` (理由は `NotRun`・`OtherCommit`・`NoComponent`。`toolchain_missing` で、走らせられず時間切れのときだけ再試行可。dist の日付が分からないので取らない)。`RustSrc.in_cache` で、手元のものは symlink を辿る側 (`Root::RustSrc` の `in_cache: false`) にする
+- レビュー (サブエージェント、読むだけ) の対応: 使えない理由を 1 つにまとめていたのを分けた。手元の JSON では sysroot を JSON の置き場から求め、プロセスを走らせない。rust-src そのものの commit を rustup の manifest で確かめる。起動が増えない条件 (1 分以内、同じディレクトリ) を doc に書いた。テスト: commit の照合 (完全な commit だけ)、rust-src を入れた印と manifest の commit、手元の JSON の sysroot (何も走らせない)、手元のソースでは symlink を辿り、キャッシュでは拒むこと、このマシンの nightly で無い commit には何も返さないこと、手元に合うものが無ければ dist の JSON は dist の rust-src に落ちること
+- 残したもの: M3c の `get_source` は、`neutral_dir` にキャッシュのディレクトリを渡し (起動を増やさないため)、`NoLocalSource` には `rustup component add rust-src --toolchain nightly` を案内する。dist の JSON で手元に合うものを使う経路は、このマシンの nightly の commit が JSON と合わないので通しでは確かめていない
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

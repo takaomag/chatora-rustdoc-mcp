@@ -19,6 +19,9 @@ use super::{dist::StdCrate, docs_rs::MAX_BYTES, target::TargetTriple, tool};
 /// The toolchain that is looked for.
 const TOOLCHAIN: &str = "nightly";
 
+/// Largest manifest of the channel read: rustup's is about 1 MB.
+const MAX_CHANNEL_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+
 /// The JSON of std of the nightly toolchain installed here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalStd {
@@ -115,6 +118,113 @@ pub async fn local_std(
         dir,
         rustc: rustc_version,
     })
+}
+
+/// Why the sources of std of the nightly toolchain here are not used (decided in M3b, decision
+/// 20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NoSourceHere {
+    /// rustup or rustc could not be run, or ran too long, which trying again may undo.
+    #[error("the nightly toolchain here could not be run")]
+    NotRun {
+        /// Whether it ran too long.
+        timed_out: bool,
+    },
+    /// The nightly toolchain is of another commit than the JSON of std.
+    #[error("the nightly toolchain here is of another commit than the JSON of std")]
+    OtherCommit,
+    /// It has no `rust-src`, or one of another commit, as rustup's manifests tell.
+    #[error("the nightly toolchain here has no rust-src of the JSON's commit")]
+    NoComponent,
+}
+
+/// The sources of std of the nightly toolchain installed with rustup, if they are of `commit`
+/// (decided in M3b, decision 20).
+///
+/// `commit` is the full commit of the JSON of std. The sources are its `rust-src`, under
+/// `<sysroot>/lib/rustlib/src/rust`, whose `library/` the JSON's spans are in.
+///
+/// It runs the same `rustc -vV` and `rustc --print sysroot` as [`local_std`], in `neutral_dir`,
+/// whose outputs are kept for a minute: no more processes within it, with the same directory (the
+/// cache's, as the JSON of std is chosen in).
+///
+/// # Errors
+///
+/// Returns why they are not used.
+pub async fn rust_src(neutral_dir: &Path, commit: &str) -> Result<PathBuf, NoSourceHere> {
+    let rustc = async |args: &'static [&'static str]| {
+        let mut all = vec!["run", TOOLCHAIN, "rustc"];
+        all.extend_from_slice(args);
+        tool::output_kept(neutral_dir, tool::Place::Neutral, Path::new("rustup"), &all)
+            .await
+            .map_err(|why| NoSourceHere::NotRun {
+                timed_out: tool::timed_out(&why),
+            })
+    };
+    let version = rustc(&["-vV"]).await?;
+    if !of_commit(&version, commit) {
+        return Err(NoSourceHere::OtherCommit);
+    }
+    let sysroot = rustc(&["--print", "sysroot"]).await?;
+    rust_src_in(Path::new(sysroot.trim()), commit)
+}
+
+/// The sources of std of the nightly toolchain whose JSON of std `local` is, without running it:
+/// its sysroot is where the JSON is (`<sysroot>/share/doc/rust/json`).
+///
+/// # Errors
+///
+/// Returns why they are not used.
+pub fn rust_src_of(local: &LocalStd) -> Result<PathBuf, NoSourceHere> {
+    let sysroot = local
+        .dir
+        .ancestors()
+        .nth(4)
+        .ok_or(NoSourceHere::NoComponent)?;
+    rust_src_in(sysroot, &local.rustc.commit_hash)
+}
+
+/// Whether `rustc -vV` printed `version` of the full `commit`.
+fn of_commit(version: &str, commit: &str) -> bool {
+    parse_rustc_version(version).is_some_and(|version| *version.commit_hash == *commit)
+}
+
+/// The sources of std in `sysroot`, if rustup installed its `rust-src` (`manifest-rust-src`) of
+/// `commit`, as rustup's manifest of the channel tells: its version names the commit, shortened.
+fn rust_src_in(sysroot: &Path, commit: &str) -> Result<PathBuf, NoSourceHere> {
+    let rustlib = sysroot.join("lib/rustlib");
+    let root = rustlib.join("src/rust");
+    let installed = rustlib.join("manifest-rust-src").is_file() && root.join("library").is_dir();
+    let of_commit = channel_source_commit(&rustlib.join("multirust-channel-manifest.toml"))
+        .is_some_and(|short| short.len() >= 7 && commit.starts_with(&*short));
+    if installed && of_commit {
+        Ok(root)
+    } else {
+        Err(NoSourceHere::NoComponent)
+    }
+}
+
+/// The short commit of `rust-src` in rustup's manifest of the channel at `path`: the `version` of
+/// its `[pkg.rust-src]`, as `1.101.0-nightly (41089d07a 2026-10-27)`. Its lines are read alone,
+/// as the manifest is large.
+fn channel_source_commit(path: &Path) -> Option<String> {
+    let mut text = String::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_CHANNEL_MANIFEST_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    let mut lines = text
+        .lines()
+        .skip_while(|line| line.trim() != "[pkg.rust-src]");
+    lines.next()?;
+    let version = lines
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .find_map(|line| line.trim().strip_prefix("version = \""))?;
+    let hash = version.split_once('(')?.1.split(' ').next()?;
+    hash.bytes()
+        .all(|byte| byte.is_ascii_hexdigit())
+        .then(|| hash.to_owned())
 }
 
 /// The release of the toolchain that `rustc` is in `dir`, where the project's
@@ -231,6 +341,64 @@ LLVM version: 23.1.4
         );
     }
 
+    /// A sysroot with the `rust-src` of the commit that rustup's manifest of the channel gives
+    /// as `short`, if `installed`.
+    fn sysroot(dir: &Path, short: &str, installed: bool) -> PathBuf {
+        let rustlib = dir.join("lib/rustlib");
+        std::fs::create_dir_all(rustlib.join("src/rust/library")).expect("made");
+        std::fs::write(
+            rustlib.join("multirust-channel-manifest.toml"),
+            format!(
+                "[pkg.rustc]\nversion = \"1.101.0-nightly (000000000 2026-10-17)\"\n\n\
+                 [pkg.rust-src]\nversion = \"1.101.0-nightly ({short} 2026-10-17)\"\n\n\
+                 [pkg.rust-src.target.\"*\"]\navailable = true\n"
+            ),
+        )
+        .expect("written");
+        if installed {
+            std::fs::write(rustlib.join("manifest-rust-src"), "").expect("written");
+        }
+        rustlib.join("src/rust")
+    }
+
+    /// The sources of std of the nightly here are used only for its own commit, in full, and only
+    /// where rustup installed its `rust-src` of that commit (decided in M3b, decision 20).
+    #[test]
+    fn the_sources_here_are_of_the_nightlys_commit() {
+        const COMMIT: &str = "8006091eb71ae7d9e9bccb66c6122c9d68af4466";
+        assert!(of_commit(NIGHTLY, COMMIT));
+        assert!(!of_commit(NIGHTLY, "8006091eb"));
+        assert!(!of_commit(
+            NIGHTLY,
+            "0123456789012345678901234567890123456789"
+        ));
+        assert!(!of_commit("not rustc -vV", COMMIT));
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = sysroot(dir.path(), "8006091eb", true);
+        assert_eq!(rust_src_in(dir.path(), COMMIT), Ok(root));
+        let other = tempfile::tempdir().expect("a temporary directory");
+        sysroot(other.path(), "41089d07a", true);
+        assert_eq!(
+            rust_src_in(other.path(), COMMIT),
+            Err(NoSourceHere::NoComponent)
+        );
+        let missing = tempfile::tempdir().expect("a temporary directory");
+        sysroot(missing.path(), "8006091eb", false);
+        assert_eq!(
+            rust_src_in(missing.path(), COMMIT),
+            Err(NoSourceHere::NoComponent)
+        );
+        // Of the JSON here, by its sysroot, without running anything.
+        let local = LocalStd {
+            dir: dir.path().join("share/doc/rust/json"),
+            rustc: parse_rustc_version(NIGHTLY).expect("parsed"),
+        };
+        assert_eq!(
+            rust_src_of(&local),
+            Ok(dir.path().join("lib/rustlib/src/rust"))
+        );
+    }
+
     #[tokio::test]
     async fn the_nightly_here_is_looked_for_without_installing_it() {
         // Whatever this machine has, the answer is one of these, and nothing is installed.
@@ -240,5 +408,9 @@ LLVM version: 23.1.4
             Err(NotUsed::NoNightly(_) | NotUsed::NoComponent) => {},
             Err(error @ NotUsed::TooOld { .. }) => panic!("{error}"),
         }
+        // Its sources, whatever this machine has: none of a commit that no nightly has.
+        rust_src(dir.path(), "0000000000000000000000000000000000000000")
+            .await
+            .expect_err("no nightly has it");
     }
 }

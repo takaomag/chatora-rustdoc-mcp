@@ -884,6 +884,24 @@ mod tests {
         ] {
             assert_eq!(resolve(rust_src, Path::new(asked)), Err(refusal), "{asked}");
         }
+        // A toolchain's here, through a symlink, under its root: followed, unlike in the cache
+        // (decided in M3b, decision 20).
+        #[cfg(unix)]
+        {
+            let linked = root.join("library/core/src/linked.rs");
+            std::os::unix::fs::symlink(root.join("library/core/src/lib.rs"), &linked)
+                .expect("linked");
+            let asked = Path::new("library/core/src/linked.rs");
+            assert_eq!(resolve(rust_src, asked), Err(Refusal::SymlinkInCache));
+            let here = Root::RustSrc {
+                root: &root,
+                in_cache: false,
+            };
+            assert_eq!(
+                resolve(here, asked).map(|resolved| resolved.path),
+                Ok(real(&root.join("library/core/src/lib.rs")).expect("there"))
+            );
+        }
     }
 
     #[test]

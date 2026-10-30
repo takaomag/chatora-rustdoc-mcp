@@ -212,6 +212,16 @@ pub enum DistError {
     /// The archive of `rust-src` could not be unpacked, or is refused.
     #[error("the archive of rust-src could not be unpacked")]
     Unpack(#[source] super::crate_source::UnpackError),
+    /// The JSON of std is the nightly toolchain's here, whose `rust-src` is not used, as `why`
+    /// tells (decided in M3b, decision 20): it is not fetched for a JSON that did not come from
+    /// the distribution server. Install it with `rustup component add rust-src --toolchain
+    /// nightly`.
+    #[cfg(feature = "local")]
+    #[error("the sources of std of the JSON of the nightly toolchain here cannot be had: {why}")]
+    NoLocalSource {
+        /// Why.
+        why: super::local_std::NoSourceHere,
+    },
     /// The archive of `rust-src` is of another commit than the JSON of std.
     #[error("the rust-src of the nightly is of commit {found}, not of the JSON's")]
     CommitMismatch {
@@ -517,6 +527,9 @@ pub struct RustSrc {
     /// The directory of the sources, whose `library/` the spans of the JSON of std are in, as
     /// `/rustc/<commit>/library/…`.
     pub root: PathBuf,
+    /// Whether they are in the cache, where no symlink is followed, or else a toolchain's here
+    /// (decided in M3b, decision 20).
+    pub in_cache: bool,
     /// What the response warns about, such as a manifest that could not be fetched again.
     pub warnings: Vec<Box<str>>,
 }
@@ -560,7 +573,11 @@ pub async fn rust_src(cache: &Cache, dist: &Dist, nightly: &Nightly) -> Result<R
     {
         drop(held);
         super::std_json::note_use(cache, dir);
-        return Ok(RustSrc { root, warnings });
+        return Ok(RustSrc {
+            root,
+            in_cache: true,
+            warnings,
+        });
     }
     if !dist.fetches() {
         return Err(DistError::Disabled {
@@ -598,7 +615,11 @@ pub async fn rust_src(cache: &Cache, dist: &Dist, nightly: &Nightly) -> Result<R
     };
     unpacked?;
     super::std_json::note_use(cache, dir);
-    Ok(RustSrc { root, warnings })
+    Ok(RustSrc {
+        root,
+        in_cache: true,
+        warnings,
+    })
 }
 
 /// Unpacks the `rust-src` archive `body` into `dir`, checks that it is of the commit of

@@ -201,6 +201,56 @@ pub async fn choose(
     })
 }
 
+/// The sources of std of `json`, the JSON of std that was chosen (decisions 20 to 22).
+///
+/// They are the nightly toolchain's here if they are of the JSON's commit, or else, for a JSON of
+/// the distribution server, its `rust-src` from there ([`dist::rust_src`]). The toolchain runs in
+/// `neutral_dir`, the cache's directory, as when the JSON of std was chosen, whose outputs are
+/// kept for a minute; for its own JSON, it does not run.
+///
+/// # Errors
+///
+/// As [`dist::rust_src`], and [`DistError::NoLocalSource`] for the JSON of the nightly toolchain
+/// here when it has no `rust-src`.
+pub async fn rust_src(
+    cache: &Cache,
+    dist: &Dist,
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(
+            unused_variables,
+            reason = "no toolchain here is run without the local builds"
+        )
+    )]
+    neutral_dir: &Path,
+    json: &StdJson,
+) -> Result<dist::RustSrc, DistError> {
+    match json {
+        StdJson::Dist(docs) => {
+            #[cfg(feature = "local")]
+            if let Ok(root) = local_std::rust_src(neutral_dir, &docs.nightly.commit_hash).await {
+                return Ok(here(root));
+            }
+            dist::rust_src(cache, dist, &docs.nightly).await
+        },
+        // Its own sysroot's, without running it.
+        #[cfg(feature = "local")]
+        StdJson::Local(local) => local_std::rust_src_of(local)
+            .map(here)
+            .map_err(|why| DistError::NoLocalSource { why }),
+    }
+}
+
+/// The sources of std of a toolchain here, at `root`, where symlinks are followed.
+#[cfg(feature = "local")]
+const fn here(root: PathBuf) -> dist::RustSrc {
+    dist::RustSrc {
+        root,
+        in_cache: false,
+        warnings: Vec::new(),
+    }
+}
+
 /// The JSON of the nightly toolchain installed here, or why it is not used. One older than
 /// `at_least` is not used if `refuse_older`, and is used with a warning otherwise.
 #[cfg(feature = "local")]
@@ -654,6 +704,75 @@ mod tests {
         assert!(recent.exists() && in_use.exists() && not_ours.exists());
         assert!(held.join(dist::COMPLETE_FILE).exists(), "left whole");
         drop(holding);
+    }
+
+    /// Without sources here of the JSON's commit, those of a JSON of the distribution server are
+    /// its `rust-src` from there, which offline and not in the cache are not had (decisions 20 and
+    /// 23).
+    #[tokio::test]
+    async fn the_sources_of_a_json_of_the_dist_are_its_rust_src() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let json = StdJson::Dist(StdDocs {
+            dir: dir.path().join("std/0000000000/x86_64-unknown-linux-gnu"),
+            nightly: dist::Nightly {
+                date: "2026-10-19".into(),
+                version: "1.101.0-nightly (000000000 2026-10-18)".into(),
+                commit_hash: "0000000000000000000000000000000000000000".into(),
+                triple: "x86_64-unknown-linux-gnu".parse().expect("a triple"),
+            },
+            warnings: Vec::new(),
+        });
+        let offline = Dist::for_local_test("http://127.0.0.1:9").offline();
+        assert!(matches!(
+            rust_src(&cache, &offline, dir.path(), &json).await,
+            Err(DistError::Offline)
+        ));
+    }
+
+    /// The sources of the JSON of the nightly toolchain here are its own sysroot's, without running
+    /// it, if rustup installed its `rust-src` of the JSON's commit; else why not is told (decision
+    /// 20).
+    #[cfg(feature = "local")]
+    #[tokio::test]
+    async fn the_sources_of_the_json_here_are_its_sysroots() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let sysroot = dir.path().join("sysroot");
+        let rustlib = sysroot.join("lib/rustlib");
+        fs::create_dir_all(rustlib.join("src/rust/library")).expect("made");
+        fs::write(
+            rustlib.join("multirust-channel-manifest.toml"),
+            "[pkg.rust-src]\nversion = \"1.101.0-nightly (8006091eb 2026-10-17)\"\n",
+        )
+        .expect("written");
+        let json = StdJson::Local(LocalStd {
+            dir: sysroot.join("share/doc/rust/json"),
+            rustc: local_std::RustcVersion {
+                release: "1.101.0-nightly".into(),
+                commit_hash: "8006091eb71ae7d9e9bccb66c6122c9d68af4466".into(),
+                commit_date: "2026-10-17".into(),
+                host: linux(),
+            },
+        });
+        let cache = Cache::at(&dir.path().join("cache"));
+        // Offline, which a fetch would need: none is tried.
+        let offline = Dist::for_local_test("http://127.0.0.1:9").offline();
+        let neutral = dir.path().join("neutral");
+        assert!(matches!(
+            rust_src(&cache, &offline, &neutral, &json).await,
+            Err(DistError::NoLocalSource {
+                why: local_std::NoSourceHere::NoComponent
+            })
+        ));
+        fs::write(rustlib.join("manifest-rust-src"), "").expect("written");
+        let found = rust_src(&cache, &offline, &neutral, &json)
+            .await
+            .expect("its own");
+        assert_eq!(
+            (found.root, found.in_cache),
+            (rustlib.join("src/rust"), false)
+        );
+        assert!(!neutral.exists(), "nothing ran");
     }
 
     #[test]
