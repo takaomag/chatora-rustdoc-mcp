@@ -204,6 +204,11 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 残したもの: `sources` は `checksum` が無いと取得せず `NotCached` を返す (オフラインの `offline_miss` は `checksum` を渡したときだけ。M3c の呼ぶ側は index の checksum を渡す)。返したルートのファイルを読む間に GC が置き場を消しうる (読む側 (M3c) が `NotFound` を扱う)。同時の 2 回の呼び出しが 1 回だけ展開することは、ロックの仕組みに頼り、テストでは数えていない
 - Windows で不安定だった stdio のテスト `servers_of_different_formats_share_a_cache` (b77409b の CI): 答えの後に別のタスクで dep-info を取るビルドが記録を書き直すのが Windows では遅く、テストが mtime を控えた後に来ていた。両方の記録に `dep_info: true` が付いてから控える形にした (ef852b6、製品のコードは変えていない)
 
+**B2a の実装 (2026-10-30)**: B2 は B2a (土台と crates.io のリリースの規則) と B2b (local の `Package`・`Git` と、記録に rustdoc 自身の dep-info を持つ決定 14) に分けた。std の規則は B3 で足す。
+
+- 新しい `data::source_root`: `resolve(root, asked)` が、読んでよいファイルの実パスか拒否の理由 (`Refusal`: `Outside`・`Dotfile`・`NotInPackage`・`SymlinkOutside`・`SymlinkInCache`・`Missing`・`NotAFile`) を返す。字面で `.` と `..` を解いてルートの下 (ルートの下の絶対パスも受ける) → どの段もドットで始まらない → パッケージのファイル (`Root::Release` は `.crate` の目録) → 実パス (キャッシュの中は symlink を 1 つでも拒否、cargo の展開は辿った先がルートの実パスの下で、同じ規則を通るもの) → 通常のファイル。`lexically` と `slash_separated` は query から移した (動きは同じ)
+- レビュー (サブエージェント、読むだけ) の対応: 実パスは feature によらず `fs::canonicalize` で両側を作る (`dunce` は長いパスに `\\?\` を残し、短いルートと比べられなくなるため。clippy の禁止には理由付きの `#[expect]`)。ルートは `std::path::absolute` と字面の解決をしてから比べる (`$CARGO_HOME` が相対や `..` を含むと何も読めなかった)。cargo の展開で symlink を辿った先にも、ドットファイルと目録の判定を同じに掛ける。UTF-8 でない名前は目録に無いものとする (判定は lossy、開くのは元の名前、という食い違いを防ぐ)。`Missing` の文を「無いか見られない」に直した。テスト: Windows の `\` の区切り・UNC・verbatim・ドライブの根、大文字小文字だけ違う名前、`//` と末尾の `/`、`..` を含むルート、UTF-8 でない名前、キャッシュの中のディレクトリの symlink、symlink の先が目録に無い・ドットファイル
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

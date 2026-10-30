@@ -10,7 +10,7 @@ use std::{
     borrow::Cow,
     collections::BTreeSet,
     fmt,
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
 };
 
 use rustdoc_types::{
@@ -36,7 +36,7 @@ use super::{
     render::{Renderer, in_crate},
     view::CrateView,
 };
-use crate::data::{crate_file::DocsRsBuild, crate_name::CrateName};
+use crate::data::{crate_file::DocsRsBuild, crate_name::CrateName, source_root};
 
 /// What to look up.
 #[derive(Debug, Clone, Copy)]
@@ -1517,9 +1517,9 @@ impl<'a> Query<'a> {
                 roots: Some((workspace, package)),
                 ..
             } => {
-                let full = lexically(&workspace.join(&span.filename));
+                let full = source_root::lexically(&workspace.join(&span.filename));
                 match full.strip_prefix(package) {
-                    Ok(inside) => (Cow::Owned(slash_separated(inside)), true),
+                    Ok(inside) => (Cow::Owned(source_root::slash_separated(inside)), true),
                     // As the span gives it, with `/` (decided in M3a).
                     Err(_) if std::path::MAIN_SEPARATOR == '/' => (Cow::Borrowed(file), false),
                     Err(_) => (
@@ -1553,7 +1553,7 @@ impl<'a> Query<'a> {
             format!(
                 "https://docs.rs/crate/{}/{version}/source/{}#{lines}",
                 self.request.name,
-                slash_separated(&span.filename)
+                source_root::slash_separated(&span.filename)
             )
             .into()
         });
@@ -1913,35 +1913,6 @@ fn docs_rs_release(url: &str) -> Option<(CrateName, Version)> {
     Some((name, version))
 }
 
-/// `path` with `.` and `..` resolved by its text alone, as cargo writes the spans.
-fn lexically(path: &Path) -> PathBuf {
-    let mut resolved = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {},
-            Component::ParentDir => {
-                resolved.pop();
-            },
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
-                resolved.push(component);
-            },
-        }
-    }
-    resolved
-}
-
-/// `path` with `/` between its components, whatever the platform.
-fn slash_separated(path: &Path) -> String {
-    let mut joined = String::with_capacity(path.as_os_str().len());
-    for (position, component) in path.components().enumerate() {
-        if position > 0 {
-            joined.push('/');
-        }
-        joined.push_str(&component.as_os_str().to_string_lossy());
-    }
-    joined
-}
-
 /// The first paragraph of `docs`, and whether anything follows it. A blank line inside a code
 /// block does not end the paragraph.
 pub(super) fn first_paragraph(docs: &str) -> (&str, bool) {
@@ -1965,7 +1936,7 @@ pub(super) fn first_paragraph(docs: &str) -> (&str, bool) {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, path::PathBuf};
 
     use rustdoc_types::{
         Crate,
