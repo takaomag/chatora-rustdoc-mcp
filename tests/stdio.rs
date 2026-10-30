@@ -7036,6 +7036,35 @@ fn files_ending(dir: &Path, suffix: &str) -> Vec<PathBuf> {
     found
 }
 
+/// When the build records `records` were written, once each tells that it has its build's
+/// dep-info: that is had after the build's answer, in a task of its own, which writes the record
+/// once more, as late as Windows has it, after the answer to the next call.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn written_with_dep_info<const N: usize>(records: [&Path; N]) -> [std::time::SystemTime; N] {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .expect("in range");
+    for record in records {
+        while !std::fs::read(record)
+            .ok()
+            .and_then(|json| serde_json::from_slice::<Value>(&json).ok())
+            .is_some_and(|record| record["dep_info"] == true)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "no dep-info in {}",
+                record.display()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    records.map(|record| {
+        std::fs::metadata(record)
+            .and_then(|metadata| metadata.modified())
+            .expect("a time")
+    })
+}
+
 /// Servers of two releases, whose formats of the cache differ, share one cache: each builds a
 /// member and keeps its record in its own format, without building again for the other's; each
 /// archives the JSON of docs.rs in its own schema next to the other's; the cache commands of each
@@ -7071,19 +7100,14 @@ fn servers_of_different_formats_share_a_cache() {
     let records = |format: &str| files_ending(&cache.join("local").join(format), "record.json");
     let [old_record] = records("v1").try_into().expect("one record of v1");
     let [new_record] = records("v2").try_into().expect("one record of v2");
-    let written = |path: &Path| {
-        std::fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .expect("a time")
-    };
-    let (old_written, new_written) = (written(&old_record), written(&new_record));
+    let records = [old_record.as_path(), new_record.as_path()];
+    let written = written_with_dep_info(records);
     // Asked again, neither builds again for the other's record.
     for (server, id) in [(&mut older, 100), (&mut newer, 100)] {
         let found = called_until_done(server, id, "get_item", &member);
         assert_eq!(found["isError"], false, "{found}");
     }
-    assert_eq!(written(&old_record), old_written);
-    assert_eq!(written(&new_record), new_written);
+    assert_eq!(written_with_dep_info(records), written);
     // A crate of docs.rs, whose JSON in the cache each archives in its own schema.
     let docs_rs = json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET });
     for server in [&mut older, &mut newer] {
