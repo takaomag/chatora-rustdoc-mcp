@@ -3914,6 +3914,15 @@ async fn conclude(
                     get_source::Source::DocsRs
                 },
                 until: arguments.until,
+                #[cfg(feature = "local")]
+                built: match &arguments.here.local {
+                    Some(LocalSource::Built(built) | LocalSource::Recorded { built, .. }) => {
+                        Some(Arc::clone(built))
+                    },
+                    Some(LocalSource::Wanted(_)) | None => None,
+                },
+                #[cfg(feature = "local")]
+                workspace: arguments.in_build.workspace.as_ref(),
             };
             get_source::read(state, found, ask, item, &warnings).await
         },
@@ -3936,6 +3945,10 @@ async fn finish_std(
                 checksum: None,
                 docs: get_source::Source::Std,
                 until: request.until,
+                #[cfg(feature = "local")]
+                built: None,
+                #[cfg(feature = "local")]
+                workspace: None,
             };
             get_source::read(state, found, ask, item, warnings).await
         },

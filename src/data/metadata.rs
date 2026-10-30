@@ -124,6 +124,10 @@ pub struct Package {
     /// The names of the features it declares, with those of its optional dependencies.
     #[serde(default, deserialize_with = "feature_names")]
     pub features: BTreeSet<Box<str>>,
+    /// Its readme, as its manifest names it, relative to its directory, inherited from its
+    /// workspace too; `None` without one (requirement R-SC-4).
+    #[serde(default)]
+    pub readme: Option<PathBuf>,
 }
 
 /// The names of the features of a package: the keys of its `features`.
@@ -140,8 +144,12 @@ fn feature_names<'de, D: serde::Deserializer<'de>>(
 pub struct Target {
     /// The name: a lib's with `_` for `-`, as its crate's; a bin's as written, with any `-`.
     pub name: Box<str>,
-    /// The kinds, as `lib`, `proc-macro`, `bin` or `custom-build`.
+    /// The kinds, as `lib`, `proc-macro`, `bin`, `example` or `custom-build`.
     pub kind: Box<[Box<str>]>,
+    /// Its root source file, absolute (requirement R-SC-4). Empty in a record of `cargo metadata`
+    /// that did not keep it.
+    #[serde(default)]
+    pub src_path: PathBuf,
 }
 
 /// The dependency graph.

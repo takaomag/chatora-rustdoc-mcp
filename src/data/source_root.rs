@@ -50,15 +50,17 @@ pub enum Root<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Package {
     /// The known source root that its paths are judged under: the root of its workspace, where its
-    /// inherited readme and the files that rustdoc read may be, a path or git dependency's own
-    /// workspace's too; or the package's own directory, if it is in none.
+    /// inherited readme and the files that rustdoc read may be; or, for a package outside the
+    /// workspace that is built, as a path dependency, its own directory, above which nothing is
+    /// read, as a readme that it inherits from a workspace of its own.
     pub root: PathBuf,
     /// The directory of its `Cargo.toml`.
     pub dir: PathBuf,
     /// Its targets' files, as cargo tells them (`src_path`), its build script's among them: the
-    /// `.rs` files under a target's directory are its, but for one directly in the package's
-    /// directory, as `build.rs`, that file only, so that nothing else under the package's
-    /// directory is taken by it, as its target directory or other packages (decided in M3b).
+    /// `.rs` files under a target's directory are its, below the package's directory; for one
+    /// directly in it, as `build.rs`, or outside it, as a build script shared from the workspace's
+    /// root, that file only, so that nothing else is taken by it, as a target directory or other
+    /// packages (decided in M3b, decision 18, and M3c).
     pub targets: Vec<PathBuf>,
     /// The files that rustdoc read, as the build's record tells (decided in M3b, B2-2).
     pub source_files: Vec<PathBuf>,
@@ -186,13 +188,14 @@ impl Package {
     fn holds_as(&self, full: &Path, form: impl Fn(&Path) -> Option<PathBuf>) -> bool {
         let is = |path: &Path| form(path).is_some_and(|path| path == full);
         let dir = form(&self.dir);
-        let of_target = |target: &PathBuf| match target.parent().and_then(&form) {
-            Some(parent) if Some(&parent) == dir.as_ref() => is(target),
-            Some(parent) => {
+        // The `.rs` files under a target's directory only below the package's: else, as for a
+        // build script shared from the workspace's root, the target's file only.
+        let of_target = |target: &PathBuf| match (target.parent().and_then(&form), &dir) {
+            (Some(parent), Some(dir)) if parent.starts_with(dir) && parent != *dir => {
                 full.extension().is_some_and(|extension| extension == "rs")
                     && full.starts_with(parent)
             },
-            None => false,
+            (Some(_) | None, _) => is(target),
         };
         is(&self.dir.join("Cargo.toml"))
             || self.targets.iter().any(of_target)
@@ -708,6 +711,18 @@ mod tests {
         }
         for asked in ["one/src/lib.rs", "two/src/lib.rs", "target/debug/x.rs"] {
             assert_eq!(read(&root, asked), Err(Refusal::NotInPackage), "{asked}");
+        }
+        // A member with a build script shared from the workspace's root: that file only, not the
+        // workspace's other files (decided in M3c).
+        let shared = Package {
+            root: workspace.clone(),
+            dir: one.clone(),
+            targets: vec![workspace.join("build.rs"), one.join("src/lib.rs")],
+            ..Package::default()
+        };
+        assert_eq!(read(&shared, "build.rs"), Ok("build.rs".to_owned()));
+        for asked in ["two/src/lib.rs", "target/debug/x.rs"] {
+            assert_eq!(read(&shared, asked), Err(Refusal::NotInPackage), "{asked}");
         }
     }
 

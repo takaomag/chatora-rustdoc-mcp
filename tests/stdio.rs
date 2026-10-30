@@ -2026,30 +2026,7 @@ fn a_member_is_found_by_the_name_that_code_writes() {
 #[test]
 fn a_member_is_built_with_the_features_of_the_workspace() {
     let dir = TempDir::new().expect("a temporary directory");
-    let write = |path: &str, text: &str| {
-        let path = dir.path().join(path);
-        std::fs::create_dir_all(path.parent().expect("a directory")).expect("made");
-        std::fs::write(path, text).expect("written");
-    };
-    write(
-        "Cargo.toml",
-        "[workspace]\nmembers = [\"front\", \"back\"]\nresolver = \"3\"\n",
-    );
-    write(
-        "front/Cargo.toml",
-        "[package]\nname = \"front\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
-         [features]\nextra = []\n",
-    );
-    write(
-        "front/src/lib.rs",
-        "/// Only with `extra`.\n#[cfg(feature = \"extra\")]\npub fn extra() {}\n",
-    );
-    write(
-        "back/Cargo.toml",
-        "[package]\nname = \"back\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
-         [dependencies]\nfront = { path = \"../front\", features = [\"extra\"] }\n",
-    );
-    write("back/src/lib.rs", "");
+    write_front_and_back(dir.path());
     let status = Command::new("cargo")
         .args(["generate-lockfile", "--offline"])
         .current_dir(dir.path())
@@ -2122,7 +2099,110 @@ fn a_member_is_built_with_the_features_of_the_workspace() {
         std::fs::read(&path).expect("opened"),
         std::fs::read(dir.path().join("front/src/lib.rs")).expect("read")
     );
+    reads_the_source_of_front(&mut server);
     assert!(server.finish().success());
+}
+
+/// Writes the workspace of [`a_member_is_built_with_the_features_of_the_workspace`] in `dir`.
+#[cfg(feature = "local")]
+fn write_front_and_back(dir: &Path) {
+    let write = |path: &str, text: &str| {
+        let path = dir.join(path);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("made");
+        std::fs::write(path, text).expect("written");
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"front\", \"back\"]\nresolver = \"3\"\n\n\
+         [workspace.package]\nreadme = \"README.md\"\n",
+    );
+    write(
+        "front/Cargo.toml",
+        "[package]\nname = \"front\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         readme.workspace = true\n\n[features]\nextra = []\n",
+    );
+    write(
+        "front/src/lib.rs",
+        "/// Only with `extra`.\n#[cfg(feature = \"extra\")]\npub fn extra() {}\n\
+         #[path = \"../../shared/imp.rs\"]\npub mod imp;\n",
+    );
+    // Of the package, but outside its directory; its readme, inherited; an example; a dotfile.
+    for (path, text) in [
+        ("shared/imp.rs", "/// Shared.\npub fn shared() {}\n"),
+        ("README.md", "# The workspace\n"),
+        ("front/examples/demo.rs", "fn main() {}\n"),
+        ("front/.env", "SECRET=1\n"),
+    ] {
+        write(path, text);
+    }
+    write(
+        "back/Cargo.toml",
+        "[package]\nname = \"back\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nfront = { path = \"../front\", features = [\"extra\"] }\n",
+    );
+    write("back/src/lib.rs", "");
+}
+
+/// `get_source` reads the source of `front::extra`, a member of the workspace of
+/// [`a_member_is_built_with_the_features_of_the_workspace`], from its target, and its
+/// `Cargo.toml`; not the workspace's, which is not the package's (decided in M3c, C1b).
+#[cfg(feature = "local")]
+fn reads_the_source_of_front(server: &mut Server) {
+    let mut read = |id, arguments: Value| called_until_done(server, id, "get_source", &arguments);
+    let source = read(
+        300,
+        json!({ "crate": "front", "path": "extra", "context": 2 }),
+    );
+    let data = &source["structuredContent"]["data"];
+    assert_eq!(
+        source["structuredContent"]["provenance"]["source"], "local",
+        "{source}"
+    );
+    assert_eq!(
+        (&data["file"], &data["lines"]),
+        (&json!("src/lib.rs"), &json!("3")),
+        "{source}"
+    );
+    assert_eq!(
+        data["source"],
+        "/// Only with `extra`.\n#[cfg(feature = \"extra\")]\npub fn extra() {}\n#[path = \
+         \"../../shared/imp.rs\"]\npub mod imp;\n",
+        "{source}"
+    );
+    let manifest = read(400, json!({ "crate": "front", "file": "Cargo.toml" }));
+    assert!(
+        manifest["structuredContent"]["data"]["source"]
+            .as_str()
+            .is_some_and(|text| text.contains("name = \"front\"")),
+        "{manifest}"
+    );
+    for (id, file) in [(500, "../Cargo.toml"), (600, ".env")] {
+        let refused = read(id, json!({ "crate": "front", "file": file }));
+        assert_eq!(
+            text_json(&refused)["reason"],
+            "outside_package",
+            "{refused}"
+        );
+    }
+    // A module outside the package's directory, which rustdoc read; the inherited readme and an
+    // example, told relative to the package's root.
+    let shared = read(700, json!({ "crate": "front", "path": "imp::shared" }));
+    assert_eq!(
+        shared["structuredContent"]["data"]["source"], "pub fn shared() {}\n",
+        "{shared}"
+    );
+    for (id, file, text) in [
+        (800, "../README.md", "# The workspace\n"),
+        (900, "examples/demo.rs", "fn main() {}\n"),
+    ] {
+        let read = read(id, json!({ "crate": "front", "file": file }));
+        let data = &read["structuredContent"]["data"];
+        assert_eq!(
+            (&data["file"], &data["source"]),
+            (&json!(file), &json!(text)),
+            "{read}"
+        );
+    }
 }
 
 /// With feature resolver 1 and a package at the root, `--features` is of the package that cargo

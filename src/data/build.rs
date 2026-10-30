@@ -1944,6 +1944,7 @@ mod tests {
         package.targets = vec![Target {
             name: long.into(),
             kind: vec!["lib".into()].into(),
+            src_path: PathBuf::new(),
         }]
         .into();
         assert_eq!(Bootstrap::of(&metadata), Bootstrap::All);

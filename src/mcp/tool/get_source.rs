@@ -30,6 +30,10 @@ use crate::data::{
     hidden,
     source_root::{self, Refusal, Root},
 };
+#[cfg(feature = "local")]
+use crate::data::{metadata::Resolution, project::Workspace};
+#[cfg(feature = "local")]
+use crate::query::local::LocalBuilt;
 
 /// The name of the tool.
 pub(super) const NAME: &str = "get_source";
@@ -272,6 +276,37 @@ pub(super) struct Found<'a> {
     pub(super) docs: Source,
     /// Until when the call waits for the sources (requirement R-ARCH-6): the lookup's deadline.
     pub(super) until: Instant,
+    /// The build here, for [`Source::Local`].
+    #[cfg(feature = "local")]
+    pub(super) built: Option<Arc<LocalBuilt>>,
+    /// The workspace whose `cargo metadata` tells the build's package, when the project decided
+    /// the version.
+    #[cfg(feature = "local")]
+    pub(super) workspace: Option<&'a Workspace>,
+}
+
+/// The sources whose files may be read (requirement R-SC-4).
+enum Readable {
+    /// Of a crates.io release.
+    Release(Sources),
+    /// Of a package built here, under the directory of its `Cargo.toml`, `dir`, in the workspace
+    /// at `workspace_root`, which its spans outside it are relative to.
+    #[cfg(feature = "local")]
+    Package {
+        package: source_root::Package,
+        dir: PathBuf,
+        workspace_root: PathBuf,
+    },
+}
+
+/// A file read.
+struct ReadFile {
+    /// What `source_root` judged of it: its real path.
+    resolved: source_root::Resolved,
+    /// Its contents.
+    contents: Vec<u8>,
+    /// Its path relative to its package's root, with `/`.
+    file: String,
 }
 
 /// Where the documentation that the item was found in came from.
@@ -304,16 +339,27 @@ pub(super) async fn read(
         Ok(asked) => asked,
         Err(answer) => return *answer,
     };
-    let sources = match found.docs {
+    let readable = match found.docs {
         Source::DocsRs => {
             match release_sources(state, &found, provenance.clone(), warnings).await {
-                Ok(sources) => sources,
+                Ok(sources) => Readable::Release(sources),
                 Err(answer) => return *answer,
             }
         },
-        Source::Local | Source::Std => return not_read_yet(found.docs),
+        #[cfg(feature = "local")]
+        Source::Local => match local_package(state, &found, provenance.clone(), warnings).await {
+            Ok(readable) => readable,
+            Err(answer) => return *answer,
+        },
+        #[cfg(not(feature = "local"))]
+        Source::Local => return not_read_yet(found.docs),
+        Source::Std => return not_read_yet(found.docs),
     };
-    let (resolved, contents) = match read_file(sources, &asked.file).await {
+    let ReadFile {
+        resolved,
+        contents,
+        file,
+    } = match read_file(readable, &asked.file, ask.file.is_none()).await {
         Ok(read) => read,
         Err(answer) => return *answer,
     };
@@ -321,20 +367,14 @@ pub(super) async fn read(
     let excerpt = match excerpt(&contents, lines, ask.context) {
         Ok(excerpt) => excerpt,
         Err(in_file) if ask.file.is_some() => {
-            return InvalidArgument::new(
-                format!("{} has {in_file} lines", resolved.relative),
-                LINES_EXAMPLE,
-            )
-            .into_result();
+            return InvalidArgument::new(format!("{file} has {in_file} lines"), LINES_EXAMPLE)
+                .into_result();
         },
         Err(in_file) => {
             return super::error_result(&json!({
                 "code": "docs_unavailable",
                 "reason": "source_missing",
-                "message": format!(
-                    "{} has {in_file} lines, fewer than the item's span tells",
-                    resolved.relative
-                ),
+                "message": format!("{file} has {in_file} lines, fewer than the item's span tells"),
                 "retryable": false,
                 "suggestions": ["the file may have changed since the documentation was built"],
             }));
@@ -346,12 +386,12 @@ pub(super) async fn read(
     });
     let mut answer = answer(
         (provenance, &item, &data),
-        (lines, &resolved),
+        (&file, lines, &resolved),
         &excerpt,
         ask,
     );
     if let Some(answer) = answer.as_object_mut() {
-        rest_to_read(answer, call, (&resolved.relative, lines), &excerpt, ask);
+        rest_to_read(answer, call, (&file, lines), &excerpt, ask);
     }
     get_item::add_warnings(&mut answer, warnings);
     CallToolResult::structured(answer)
@@ -409,6 +449,105 @@ fn push(answer: &mut Map<String, Value>, key: &str, text: &str) {
     }
 }
 
+/// The package of the build here of `found`, a member or a path dependency, and what of it may be
+/// read (requirement R-SC-4, decided in M3b, B2b): its targets, readme and examples, as the
+/// workspace's `cargo metadata` tells them, and the files that rustdoc read, as the build's record
+/// tells, under the root of its workspace, or its own directory outside it. Without `cargo
+/// metadata`, the files that rustdoc read only. Else the error.
+#[cfg(feature = "local")]
+async fn local_package(
+    state: &Arc<ToolState>,
+    found: &Found<'_>,
+    provenance: Map<String, Value>,
+    warnings: &[Box<str>],
+) -> Result<Readable, Box<CallToolResult>> {
+    let Some(built) = &found.built else {
+        return Err(Box::new(not_read_yet(Source::Local)));
+    };
+    let record = &built.record;
+    // A git or registry dependency's are judged otherwise.
+    if super::local::package_source(&record.package) != "path" {
+        return Err(Box::new(not_read_yet(Source::Local)));
+    }
+    let (Some(workspace_root), Some(dir)) = (&record.workspace_root, &record.package_root) else {
+        return Err(Box::new(super::error_result(&json!({
+            "code": "docs_unavailable",
+            "reason": "no_source",
+            "message": "the record of the build is from an older version of the server, which did \
+                        not keep where its package is",
+            "retryable": false,
+            "suggestions": [
+                "remove the build from the cache with `chatora-rustdoc-mcp cache clear` for the \
+                 crate, so that the next lookup builds it again",
+            ],
+        }))));
+    };
+    let mut package = source_root::Package {
+        root: if dir.starts_with(workspace_root) {
+            workspace_root
+        } else {
+            dir
+        }
+        .clone(),
+        dir: dir.clone(),
+        source_files: record.source_files.clone(),
+        ..source_root::Package::default()
+    };
+    let resolution = match found.workspace {
+        // Outside the default project, what build_external_docs recorded: no cargo runs there
+        // (decided in M2e's E4b-3).
+        Some(workspace) if super::recorded_workspace::is_outside(state, workspace) => {
+            super::recorded_workspace::read(state, workspace)
+                .await
+                .ok()
+                .map(|recorded| Arc::clone(&recorded.resolution))
+        },
+        Some(workspace) => match state.resolver.resolve_until(workspace, found.until).await {
+            Joined::Done(resolved) => resolved.ok(),
+            Joined::Going(doing) => {
+                return Err(Box::new(get_item::building_response(
+                    provenance,
+                    doing,
+                    "cargo reads the packages of the workspace",
+                    warnings,
+                )));
+            },
+            Joined::Ended => None,
+        },
+        None => None,
+    };
+    let dir_text = source_root::lexically(dir);
+    if let Some(resolution) = &resolution
+        && let Resolution::Metadata { metadata, .. } = &**resolution
+        && let Some(listed) = metadata.packages.iter().find(|listed| {
+            listed
+                .manifest_path
+                .parent()
+                .is_some_and(|parent| source_root::lexically(parent) == dir_text)
+        })
+    {
+        let files = |example: bool| {
+            listed
+                .targets
+                .iter()
+                .filter(|target| {
+                    !target.src_path.as_os_str().is_empty()
+                        && target.kind.iter().any(|kind| &**kind == "example") == example
+                })
+                .map(|target| target.src_path.clone())
+                .collect()
+        };
+        package.targets = files(false);
+        package.examples = files(true);
+        package.readme = listed.readme.as_ref().map(|readme| dir.join(readme));
+    }
+    Ok(Readable::Package {
+        package,
+        dir: dir.clone(),
+        workspace_root: workspace_root.clone(),
+    })
+}
+
 /// The tool error for the sources of a local build or of std, which are not read yet.
 fn not_read_yet(docs: Source) -> CallToolResult {
     let (of, suggestion) = match docs {
@@ -453,29 +592,66 @@ fn where_to_read(ask: &SourceAsk, data: &Value) -> Result<AskedFile, Box<CallToo
     }
 }
 
-/// The file at `file` of `sources`, as `source_root` judges it, and its contents, read on a
+/// The file at `file` of `readable`, as `source_root` judges it, and its contents, read on a
 /// blocking thread; else the error. A file that is not there is told so, before that it is not
-/// of the package.
+/// of the package. `file` is relative to the package's root, or absolute under it, as a span of a
+/// local build outside its workspace is; or, `of_span`, as a span outside the package gives it,
+/// relative to the workspace's root.
 async fn read_file(
-    sources: Sources,
+    readable: Readable,
     file: &str,
-) -> Result<(source_root::Resolved, Vec<u8>), Box<CallToolResult>> {
-    let asked = PathBuf::from(file);
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(
+            unused_variables,
+            reason = "only a package built here has spans outside it"
+        )
+    )]
+    of_span: bool,
+) -> Result<ReadFile, Box<CallToolResult>> {
+    let file_text = file.to_owned();
     let reading = crate::task::spawn_blocking(move || {
-        let resolved =
-            source_root::resolve(Root::Release(&sources), &asked).map_err(|refusal| {
-                let there = std::fs::symlink_metadata(sources.root.join(&asked)).is_ok();
-                if refusal == Refusal::NotInPackage && !there {
-                    Refusal::Missing
+        let (root, asked, dir) = match &readable {
+            Readable::Release(sources) => (
+                Root::Release(sources),
+                PathBuf::from(&file_text),
+                sources.root.as_path(),
+            ),
+            #[cfg(feature = "local")]
+            Readable::Package {
+                package,
+                dir,
+                workspace_root,
+            } => {
+                let in_package = dir.join(&file_text);
+                // A span outside the package is relative to the workspace's root.
+                let asked = if of_span && std::fs::symlink_metadata(&in_package).is_err() {
+                    workspace_root.join(&file_text)
                 } else {
-                    refusal
-                }
-            })?;
+                    in_package
+                };
+                (Root::Package(package), asked, dir.as_path())
+            },
+        };
+        let resolved = source_root::resolve(root, &asked).map_err(|refusal| {
+            let there = std::fs::symlink_metadata(root.dir().join(&asked)).is_ok();
+            if refusal == Refusal::NotInPackage && !there {
+                Refusal::Missing
+            } else {
+                refusal
+            }
+        })?;
         let contents = std::fs::read(&resolved.path).map_err(|error| {
             tracing::debug!(path = %resolved.path.display(), %error, "a source file could not be read");
             Refusal::Missing
         })?;
-        Ok::<_, Refusal>((resolved, contents))
+        // Relative to the package's root, which the root judged under may hold.
+        let file = relative_to(&root.dir().join(&asked), dir);
+        Ok::<_, Refusal>(ReadFile {
+            resolved,
+            contents,
+            file,
+        })
     })
     .await;
     match reading {
@@ -494,15 +670,33 @@ async fn read_file(
     }
 }
 
+/// `path` relative to `dir`, by their text, with `/`, and `..` for what of `dir` it is not under,
+/// as `../README.md` for a readme that a member inherits from its workspace.
+fn relative_to(path: &Path, dir: &Path) -> String {
+    let (path, dir) = (source_root::lexically(path), source_root::lexically(dir));
+    let common = path
+        .components()
+        .zip(dir.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in dir.components().skip(common) {
+        relative.push("..");
+    }
+    for component in path.components().skip(common) {
+        relative.push(component);
+    }
+    source_root::slash_separated(&relative)
+}
+
 /// The answer: `provenance` and the warnings of `item`, the response of `get_item`, whose `data`
-/// tells the item; and of the file `resolved`, the asked `lines`, `excerpt`.
+/// tells the item; and of `file`, judged as `resolved`, the asked `lines`, `excerpt`.
 fn answer(
     (provenance, item, data): (Map<String, Value>, &Value, &Value),
-    (lines, resolved): ((usize, usize), &source_root::Resolved),
+    (file, lines, resolved): (&str, (usize, usize), &source_root::Resolved),
     excerpt: &Excerpt,
     ask: &SourceAsk,
 ) -> Value {
-    let file = &resolved.relative;
     let mut answer = Map::new();
     answer.insert("provenance".to_owned(), Value::Object(provenance));
     let mut told: Vec<Value> = item
