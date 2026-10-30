@@ -293,6 +293,13 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - C1c のレビュー (サブエージェント、読むだけ) の対応: git の依存を `Dependencies` で判じると、`file` に `../` や絶対パスを渡して `$CARGO_HOME` の下の別の checkout や registry の展開まで読め、無いパスの有無も探れた (R-SC-4 の「その crate 自身のソースルートとだけ」に反する) ので、パッケージのディレクトリからその checkout のルート (`$CARGO_HOME/git/checkouts/<リポジトリ>/<rev>`、`.cargo-ok` あり) を取り出し、`Root::Checkout` で判じる。checkout の外の git の依存 (vendor) は読まない。crates.io の依存のローカルビルドは、パッケージのディレクトリが cargo の `registry/src/index.crates.io-*` の下にあるときだけ `.crate` で読み、crates.io を置き換えたソース・ミラー・vendor (cargo metadata は crates.io の id のまま出す) は決定 31 のとおり読まない (中身が crates.io のものと違いうる)。説明文に git の checkout と、他の registry・vendor を読まないことを書いた。テスト: git の crate の `../`・`.cargo-ok`・`$CARGO_HOME` の下の別の場所を拒む (stdio)、偽の registry (crates.io の置き換え) のリリースを読まない (stdio。crates.io から展開したものを読む経路はこれで通しでは確かめられなくなり、判定の関数を単体で確かめる)
 - 残したもの: パッケージの外を指す span (derive が依存のソースを指すもの) は、`get_item` は `source_location.path` を付ける (B5b) が、`get_source` はその crate のルートの外として読まない (読むなら、その依存の crate を名指して `file` で)
 
+**C2 の実装 (2026-10-30)**: docs.rs の JSON で、依存から写した item (blanket impl など) の span は rustwide の絶対パス (`/opt/rustwide/cargo-home/registry/src/index.crates.io-<hash>/<名前>-<版>/<パス>`) なので、そこから依存のリリース (`crate_source::package_name` で名前と版を分ける) とパスを取り出し、そのリリースの `.crate` のソースから読む (checksum は index から。`release_sources` の Flights と `building` を共有する)。応答の `file_crate` にそのリリースを書き、続きの案内もそのリリースで出す。`index.crates.io-*` 以外 (git index・git の checkout・`/opt/rustwide/target` の生成物) は読まない。オフラインで `.crate` も checksum も手元に無いときは `offline_miss` (決定 15。`no_source` にしない)。テスト: rustwide のパスの分け方 (単体)、オフラインで依存の `.crate` から読み `file_crate` を付ける、その `.crate` が無ければ `offline_miss` (stdio)
+
+- 残したもの: `.crate` の取得と展開の途中の `status: building` は、通しのテストでは確かめていない (`crate_sources` の Flights の期限で返る。他のツールの building と同じ仕組み)
+- C2 のレビュー (サブエージェント、読むだけ) の対応: checksum を index から得るとき、オンラインで index が読めなければ `network_error` (再試行可) にし、index にその版が無ければ (その後に公開されたもの) 一度引き直す (`no_source` で再試行不可にしない)。依存のファイルの応答には、そのリリースの docs.rs の source の `url` を付け、get_item の「パッケージの外で URL が無い」の warning を除く。続きの案内は依存のリリースで、target を付けず、そのリリースの docs.rs の JSON を引く旨を添える。読めないときのエラーにリリースを書く (`src/lib.rs of fixture-dep@1.0.0`)。説明文の「crate 自身のファイルだけ」と依存のファイルの食い違いを直した。テスト: `+build` を含む版のディレクトリ、`..` を含むパス (判定で拒まれる)、依存のファイルの `url` と warning
+- 残したもの: 第三者のデータである docs.rs の JSON の span で、crates.io の任意のリリースの取得と展開を起こせる (index の checksum の照合・`extract_max_size`・目録とドットファイルと symlink の規則・1 回に 1 件で抑えている。JSON の `external_crates` との照合はしない)
+- df28b45 (C1c) の CI は Windows の check だけ落ちた: stdio のテストが git の crate の実パスを `/git/checkouts/` の文字列で分けて `$CARGO_HOME` を求めていた (Windows の区切りは `\`)。パスの要素で辿る形に直した (製品のコードは変えていない)
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

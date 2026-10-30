@@ -227,22 +227,39 @@ const DEMO_LIB: &str = "//! Demo.\n/// Says hello.\npub fn hello() -> u8 {\n    
 /// A cache directory with [`demo_crate`], whose `hello` has its span in `src/lib.rs`, and the
 /// `.crate` of `demo` 0.1.0 with that file and a dotfile, for `get_source`.
 fn demo_source_cache() -> TempDir {
+    source_cache(("src/lib.rs", (3, 5)), &[("demo", &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", DEMO_LIB),
+        (".env", "SECRET=1\n"),
+    ])])
+}
+
+/// A cache directory with [`demo_crate`], whose `hello` has its span in the file and the lines of
+/// `span`, and the `.crate` files of `crates` (each name at version 0.1.0 for `demo`, else 1.0.0),
+/// with their files.
+fn source_cache(
+    (file, (first, last)): (&str, (usize, usize)),
+    crates: &[(&str, &[(&str, &str)])],
+) -> TempDir {
     let dir = TempDir::new().expect("a temporary directory");
     let mut krate = demo_crate();
     if let Some(hello) = krate.index.get_mut(&Id(1)) {
         hello.span = Some(Span {
-            filename: PathBuf::from("src/lib.rs"),
-            begin: (3, 1),
-            end: (5, 2),
+            filename: PathBuf::from(file),
+            begin: (first, 1),
+            end: (last, 2),
         });
     }
     let json = serde_json::to_vec(&krate).expect("serializes");
-    let name: CrateName = "demo".parse().expect("a crate name");
+    let demo: CrateName = "demo".parse().expect("a crate name");
     let cache = Cache::at(dir.path());
     cache
         .write_docs_rs_json(
             &cache.docs_rs_dir(
-                &name,
+                &demo,
                 &Version::new(0, 1, 0),
                 Some(&TARGET.parse().expect("a target")),
             ),
@@ -250,32 +267,92 @@ fn demo_source_cache() -> TempDir {
             &json,
         )
         .expect("the cache is writable");
-    let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
-    for (path, contents) in [
-        (
-            "demo-0.1.0/Cargo.toml",
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
-        ),
-        ("demo-0.1.0/src/lib.rs", DEMO_LIB),
-        ("demo-0.1.0/.env", "SECRET=1\n"),
-    ] {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(contents.len().try_into().expect("small"));
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, path, contents.as_bytes())
-            .expect("appended");
+    for (name, files) in crates {
+        let version = if *name == "demo" {
+            Version::new(0, 1, 0)
+        } else {
+            Version::new(1, 0, 0)
+        };
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        for (path, contents) in *files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len().try_into().expect("small"));
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(
+                    &mut header,
+                    format!("{name}-{version}/{path}"),
+                    contents.as_bytes(),
+                )
+                .expect("appended");
+        }
+        let contents = builder
+            .into_inner()
+            .and_then(GzEncoder::finish)
+            .expect("finished");
+        let name: CrateName = name.parse().expect("a crate name");
+        let path = cache.crate_file_path(&name, &version);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+        std::fs::write(&path, &contents).expect("written");
+        std::fs::write(path.with_extension("crate.sha256"), sha256_hex(&contents))
+            .expect("written");
     }
-    let contents = builder
-        .into_inner()
-        .and_then(GzEncoder::finish)
-        .expect("finished");
-    let path = cache.crate_file_path(&name, &Version::new(0, 1, 0));
-    std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
-    std::fs::write(&path, &contents).expect("written");
-    std::fs::write(path.with_extension("crate.sha256"), sha256_hex(&contents)).expect("written");
     dir
+}
+
+/// The span of `demo::hello` in [`rustwide_cache`]: a file of `fixture-dep` 1.0.0, a dependency,
+/// as docs.rs's build read it.
+const RUSTWIDE_SPAN: &str = "/opt/rustwide/cargo-home/registry/src/\
+                             index.crates.io-1949cf8c6b5b557f/fixture-dep-1.0.0/src/lib.rs";
+
+/// `get_source` reads an item that docs.rs copied from a dependency, whose span is of docs.rs's
+/// build, from that release's `.crate`, which it names; offline, without that `.crate`, it is not
+/// had (decided in M3c, C2, and decision 15).
+#[test]
+fn get_source_reads_a_dependencys_file_that_docs_rs_names() {
+    let cargo_home = TempDir::new().expect("a temporary directory");
+    let home = cargo_home.path().display().to_string();
+    let env = [
+        ("CARGO_HOME", home.as_str()),
+        ("CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE", "true"),
+    ];
+    let lookup = json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET });
+    let with_dependency = source_cache((RUSTWIDE_SPAN, (1, 1)), &[("fixture-dep", &[(
+        "src/lib.rs",
+        "pub fn dep() {}\n",
+    )])]);
+    let mut server = Server::start_with_cache(with_dependency, None, &env);
+    server.send(&call_tool(1, "get_source", lookup.clone()));
+    let found = server.response(1)["result"].clone();
+    let data = &found["structuredContent"]["data"];
+    assert_eq!(
+        (&data["file"], &data["file_crate"], &data["source"]),
+        (
+            &json!("src/lib.rs"),
+            &json!("fixture-dep@1.0.0"),
+            &json!("pub fn dep() {}\n")
+        ),
+        "{found}"
+    );
+    // Its URL is that release's on docs.rs, and no warning tells that it has none.
+    assert_eq!(
+        data["url"], "https://docs.rs/crate/fixture-dep/1.0.0/source/src/lib.rs#1",
+        "{found}"
+    );
+    assert!(
+        !found["structuredContent"]["warnings"]
+            .to_string()
+            .contains("outside the package"),
+        "{found}"
+    );
+    assert!(server.finish().success());
+    let without = source_cache((RUSTWIDE_SPAN, (1, 1)), &[]);
+    let mut server = Server::start_with_cache(without, None, &env);
+    server.send(&call_tool(2, "get_source", lookup));
+    let missed = server.response(2)["result"].clone();
+    assert_eq!(text_json(&missed)["code"], "offline_miss", "{missed}");
+    assert!(server.finish().success());
 }
 
 /// `get_source` reads an item's lines, with lines of context, from its release's sources,
@@ -4179,6 +4256,24 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
             "{tool}: {result}"
         );
     }
+    reads_the_source_of_the_git_crate(&mut server, &with(json!({})));
+    looked_up_by_hash_and_when_stale(&mut server, &commit);
+    looked_up_while_rebuilding(&mut server, &commit);
+    assert!(server.finish().success());
+}
+
+/// `get_source` reads the source of the crate of [`git_repository`] that `server` has the record
+/// of, asked for with the arguments of `crate_arguments`, in the checkout where cargo checked it
+/// out, and nothing outside it nor its dotfiles (decided in M3c, C1c).
+#[cfg(all(debug_assertions, feature = "local"))]
+fn reads_the_source_of_the_git_crate(server: &mut Server, crate_arguments: &Value) {
+    let with = |more: Value| {
+        let mut arguments = crate_arguments.clone();
+        for (name, value) in more.as_object().expect("an object") {
+            arguments[name] = value.clone();
+        }
+        arguments
+    };
     // Its source, in the checkout where cargo checked it out (decided in M3c, C1c).
     server.send(&call_tool(
         200,
@@ -4202,11 +4297,28 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
     );
     // Not what is outside its checkout, nor its dotfiles: of its own root only (requirement
     // R-SC-4).
+    // `$CARGO_HOME/registry/src/elsewhere.rs`, by the components of the path, as on Windows too.
     let elsewhere = data["path"]
         .as_str()
-        .and_then(|path| path.split_once("/git/checkouts/"))
-        .map(|(home, _)| format!("{home}/registry/src/elsewhere.rs"))
-        .unwrap_or_default();
+        .map(Path::new)
+        .and_then(|path| {
+            path.ancestors().find(|dir| {
+                dir.file_name().is_some_and(|name| name == "checkouts")
+                    && dir
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|name| name == "git")
+            })
+        })
+        .and_then(|checkouts| checkouts.parent()?.parent())
+        .map(|home| {
+            home.join("registry")
+                .join("src")
+                .join("elsewhere.rs")
+                .display()
+                .to_string()
+        })
+        .expect("in a checkout of the cargo home");
     for (id, file) in [
         (201, "../../other/rev/src/lib.rs".to_owned()),
         (202, ".cargo-ok".to_owned()),
@@ -4220,9 +4332,6 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
             "{refused}"
         );
     }
-    looked_up_by_hash_and_when_stale(&mut server, &commit);
-    looked_up_while_rebuilding(&mut server, &commit);
-    assert!(server.finish().success());
 }
 
 /// Asks `server`, which has the record of the branch `main` of [`git_repository`] at `commit`,

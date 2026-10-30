@@ -398,7 +398,8 @@ struct Kept {
 
 /// The name and the version of a package from its directory's name, `<name>-<version>`, as cargo
 /// names it: where the name is valid and the rest is a version.
-fn package_name(package: &str) -> Option<(CrateName, Version)> {
+#[must_use]
+pub fn package_name(package: &str) -> Option<(CrateName, Version)> {
     package.match_indices('-').find_map(|(at, _)| {
         let name = package.get(..at)?.parse().ok()?;
         let version = Version::parse(package.get(at.saturating_add(1)..)?).ok()?;

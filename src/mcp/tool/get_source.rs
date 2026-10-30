@@ -151,6 +151,7 @@ fn output_schema() -> JsonObject {
                     "defined_at": get_item::defined_at_schema(),
                     "kind": { "type": "string" },
                     "file": { "type": "string" },
+                    "file_crate": { "type": "string" },
                     "lines": { "type": "string" },
                     "shown": { "type": "string" },
                     "source": { "type": "string" },
@@ -343,14 +344,23 @@ pub(super) async fn read(
         .cloned()
         .unwrap_or_default();
     let data = item.get("data").cloned().unwrap_or(Value::Null);
-    let asked = match where_to_read(ask, &data) {
+    let mut asked = match where_to_read(ask, &data) {
         Ok(asked) => asked,
         Err(answer) => return *answer,
     };
+    let mut release = format!("{}@{}", found.name, found.version);
+    // The release that the file is of, when it is not the crate's.
+    let mut file_crate = None;
     let readable = match found.docs {
         Source::DocsRs => {
-            match release_sources(state, &found, provenance.clone(), warnings).await {
-                Ok(sources) => Readable::Release(sources),
+            match docs_rs_sources(state, &found, ask, &mut asked, (&provenance, warnings)).await {
+                Ok((sources, of)) => {
+                    if let Some(of) = of {
+                        release.clone_from(&of);
+                        file_crate = Some(of);
+                    }
+                    Readable::Release(sources)
+                },
                 Err(answer) => return *answer,
             }
         },
@@ -367,7 +377,14 @@ pub(super) async fn read(
         resolved,
         contents,
         file,
-    } = match read_file(readable, &asked.file, ask.file.is_none()).await {
+    } = match read_file(
+        readable,
+        &asked.file,
+        ask.file.is_none(),
+        file_crate.as_deref(),
+    )
+    .await
+    {
         Ok(read) => read,
         Err(answer) => return *answer,
     };
@@ -389,12 +406,13 @@ pub(super) async fn read(
         },
     };
     let call = json!({
-        "crate": format!("{}@{}", found.name, found.version),
-        "target": provenance.get("target"),
+        "crate": release,
+        // A dependency's on docs.rs, of its own target.
+        "target": if file_crate.is_none() { provenance.get("target") } else { None },
     });
     let mut answer = answer(
         (provenance, &item, &data),
-        (&file, lines, &resolved),
+        (&file, file_crate.as_deref(), lines, &resolved),
         &excerpt,
         ask,
     );
@@ -437,11 +455,22 @@ fn rest_to_read(
         call.insert("file".to_owned(), json!(file));
         call.insert("lines".to_owned(), json!(range(rest, last)));
     }
+    // A dependency's file is read through its release's documentation on docs.rs, of its own
+    // target.
+    let through = if ask.file.is_none()
+        && answer
+            .get("data")
+            .is_some_and(|data| data.get("file_crate").is_some())
+    {
+        ", which reads that release's documentation on docs.rs first"
+    } else {
+        ""
+    };
     push(
         answer,
         "hints",
         &format!(
-            "the source was cut after line {}: for the rest, call get_source with {call}",
+            "the source was cut after line {}: for the rest, call get_source with {call}{through}",
             excerpt.shown.1
         ),
     );
@@ -643,6 +672,42 @@ fn other_registry(found: &Found<'_>) -> CallToolResult {
     }))
 }
 
+/// The sources of the release of `found`, documented on docs.rs, to read `asked` from; or, for an
+/// item whose span is a file of a dependency that docs.rs's build read, as of a blanket impl
+/// copied from it, that release's, with `asked` made the path in it, and that release as
+/// `name@version` (decided in M3c, C2). Else the answer to give.
+async fn docs_rs_sources(
+    state: &Arc<ToolState>,
+    found: &Found<'_>,
+    ask: &SourceAsk,
+    asked: &mut AskedFile,
+    (provenance, warnings): (&Map<String, Value>, &[Box<str>]),
+) -> Result<(Sources, Option<String>), Box<CallToolResult>> {
+    let dependency = if ask.file.is_none() {
+        rustwide(&asked.file)
+    } else {
+        None
+    };
+    let Some((name, version, path)) = &dependency else {
+        let sources = release_sources(state, found, provenance.clone(), warnings).await?;
+        return Ok((sources, None));
+    };
+    let of = Found {
+        name,
+        version,
+        checksum: None,
+        docs: Source::DocsRs,
+        until: found.until,
+        #[cfg(feature = "local")]
+        built: None,
+        #[cfg(feature = "local")]
+        workspace: None,
+    };
+    asked.file = path.as_str().into();
+    let sources = release_sources(state, &of, provenance.clone(), warnings).await?;
+    Ok((sources, Some(format!("{name}@{version}"))))
+}
+
 /// The tool error for the sources of a local build or of std, which are not read yet.
 fn not_read_yet(docs: Source) -> CallToolResult {
     let (of, suggestion) = match docs {
@@ -703,6 +768,7 @@ async fn read_file(
         )
     )]
     of_span: bool,
+    of_release: Option<&str>,
 ) -> Result<ReadFile, Box<CallToolResult>> {
     let file_text = file.to_owned();
     let reading = crate::task::spawn_blocking(move || {
@@ -769,7 +835,10 @@ async fn read_file(
     .await;
     match reading {
         Ok(Ok(read)) => Ok(read),
-        Ok(Err(refusal)) => Err(Box::new(refused(file, refusal))),
+        Ok(Err(refusal)) => Err(Box::new(refused(
+            &of_release.map_or_else(|| file.to_owned(), |release| format!("{file} of {release}")),
+            refusal,
+        ))),
         Err(error) => {
             let error = crate::task::resume_if_panic(error);
             tracing::error!(%error, "the reading of a source file did not finish");
@@ -806,7 +875,12 @@ fn relative_to(path: &Path, dir: &Path) -> String {
 /// tells the item; and of `file`, judged as `resolved`, the asked `lines`, `excerpt`.
 fn answer(
     (provenance, item, data): (Map<String, Value>, &Value, &Value),
-    (file, lines, resolved): (&str, (usize, usize), &source_root::Resolved),
+    (file, file_crate, lines, resolved): (
+        &str,
+        Option<&str>,
+        (usize, usize),
+        &source_root::Resolved,
+    ),
     excerpt: &Excerpt,
     ask: &SourceAsk,
 ) -> Value {
@@ -817,6 +891,18 @@ fn answer(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // That a dependency's file has no URL, which it has as that release's.
+    if file_crate.is_some()
+        && let Some(span) = data
+            .pointer("/source_location/file")
+            .and_then(Value::as_str)
+    {
+        told.retain(|warning| {
+            warning.as_str().is_none_or(|warning| {
+                !warning.starts_with(&format!("{span} is outside the package"))
+            })
+        });
+    }
     if ask.file.is_none() && lines.1 > excerpt.lines_in_file {
         told.push(json!(format!(
             "{file} has {} lines, fewer than the item's span tells: it may have changed since the \
@@ -848,6 +934,19 @@ fn answer(
         }
     }
     shown.insert("file".to_owned(), json!(file));
+    if let Some(file_crate) = file_crate {
+        shown.insert("file_crate".to_owned(), json!(file_crate));
+        // On docs.rs, among that release's sources.
+        if let Some((name, version)) = file_crate.split_once('@') {
+            shown.insert(
+                "url".to_owned(),
+                json!(format!(
+                    "https://docs.rs/crate/{name}/{version}/source/{file}#{}",
+                    range(lines.0, lines.1.min(excerpt.lines_in_file))
+                )),
+            );
+        }
+    }
     let shown_range = |first: usize, last: usize| {
         if excerpt.lines_in_file == 0 {
             String::new()
@@ -865,6 +964,7 @@ fn answer(
         shown.insert("path".to_owned(), json!(path));
     }
     if ask.file.is_none()
+        && file_crate.is_none()
         && let Some(url) = data.pointer("/source_location/url")
     {
         shown.insert("url".to_owned(), url.clone());
@@ -942,17 +1042,7 @@ async fn release_sources(
     let checksum = match found.checksum {
         Some(checksum) => Some(Box::<str>::from(checksum)),
         // As the version was decided without the index: from it, as for docs.rs's build.
-        None => match state.index.entry(found.name).await {
-            Ok(entry) => entry
-                .versions
-                .iter()
-                .find(|listed| listed.version == *found.version)
-                .map(|listed| listed.checksum.clone()),
-            Err(error) => {
-                tracing::debug!(error = %super::ErrorChain(&error), "the index was not read for the sources");
-                None
-            },
-        },
+        None => index_checksum(state, found.name, found.version).await?,
     };
     let max_bytes = state.dist.extract_max_size();
     let what = format!("{name} {version}");
@@ -975,7 +1065,11 @@ async fn release_sources(
     match joined {
         Joined::Done(sources) => match &*sources {
             Ok(sources) => Ok(sources.clone()),
-            Err(error) => Err(Box::new(sources_error(&release, error))),
+            Err(error) => Err(Box::new(sources_error(
+                &release,
+                error,
+                state.index.is_offline(),
+            ))),
         },
         Joined::Going(doing) => Err(Box::new(get_item::building_response(
             provenance,
@@ -984,6 +1078,59 @@ async fn release_sources(
             warnings,
         ))),
         Joined::Ended => Err(Box::new(get_item::shutting_down())),
+    }
+}
+
+/// The release and the path in it of a file that a span of docs.rs names outside the crate, as
+/// `/opt/rustwide/cargo-home/registry/src/index.crates.io-<hash>/<name>-<version>/<path>`: a
+/// dependency's from crates.io, which docs.rs's build read (decided in M3c, C2). `None` for any
+/// other, as a git dependency's or one generated in the target directory.
+fn rustwide(file: &str) -> Option<(CrateName, Version, String)> {
+    let rest = file.strip_prefix("/opt/rustwide/cargo-home/registry/src/")?;
+    let (index, rest) = rest.split_once('/')?;
+    if !index.starts_with("index.crates.io-") {
+        return None;
+    }
+    let (package, path) = rest.split_once('/')?;
+    let (name, version) = crate_source::package_name(package)?;
+    Some((name, version, path.to_owned()))
+}
+
+/// The checksum of `name` at `version` in the crates.io index, read again if the index as kept
+/// does not list that version yet, as one published since. `None` when the index has none, or
+/// offline cannot be read, which the sources then tell; else the error when the index cannot be
+/// read online, which may pass.
+async fn index_checksum(
+    state: &Arc<ToolState>,
+    name: &CrateName,
+    version: &Version,
+) -> Result<Option<Box<str>>, Box<CallToolResult>> {
+    let listed = |entry: &crate::data::sparse_index::IndexEntry| {
+        entry
+            .versions
+            .iter()
+            .find(|listed| listed.version == *version)
+            .map(|listed| listed.checksum.clone())
+    };
+    match state.index.entry(name).await {
+        Ok(entry) if let Some(checksum) = listed(&entry) => Ok(Some(checksum)),
+        Ok(_) => Ok(state
+            .index
+            .entry_fresh(name)
+            .await
+            .ok()
+            .as_ref()
+            .and_then(listed)),
+        Err(_) if state.index.is_offline() => Ok(None),
+        Err(error) => Err(Box::new(super::tool_error(
+            "network_error",
+            &format!(
+                "the crates.io index could not be read for {name}@{version}: {}",
+                super::ErrorChain(&error)
+            ),
+            true,
+            &["try again in a while"],
+        ))),
     }
 }
 
@@ -1032,13 +1179,15 @@ fn refused(file: &str, refusal: Refusal) -> CallToolResult {
 
 /// The tool error for the sources of `release` (`name@version`) that could not be had (§8,
 /// decisions 12, 13 and 15).
-fn sources_error(release: &str, error: &SourcesError) -> CallToolResult {
+fn sources_error(release: &str, error: &SourcesError, offline: bool) -> CallToolResult {
     let message = format!(
         "the sources of {release} could not be had: {}",
         super::ErrorChain(error)
     );
     let (code, reason, retryable): (&str, Option<&str>, bool) = match error {
+        // Offline, without the `.crate` at hand nor the checksum to fetch it with.
         SourcesError::Crate(CrateError::Offline) => ("offline_miss", None, false),
+        SourcesError::NotCached if offline => ("offline_miss", None, false),
         SourcesError::Crate(
             CrateError::Network(_)
             | CrateError::Transient { .. }
@@ -1430,6 +1579,59 @@ mod tests {
         );
     }
 
+    /// A span of docs.rs in a dependency from crates.io names that release and the path in it;
+    /// none of another source (decided in M3c, C2).
+    #[test]
+    fn a_span_of_docs_rs_in_a_dependency_names_its_release() {
+        let named = |file: &str| {
+            rustwide(file)
+                .map(|(name, version, path)| (name.to_string(), version.to_string(), path))
+        };
+        let index = "/opt/rustwide/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f";
+        assert_eq!(
+            named(&format!("{index}/tracing-0.1.44/src/instrument.rs")),
+            Some((
+                "tracing".to_owned(),
+                "0.1.44".to_owned(),
+                "src/instrument.rs".to_owned()
+            ))
+        );
+        assert_eq!(
+            named(&format!("{index}/aws-sdk-ec2-1.0.0-beta.1/src/lib.rs")),
+            Some((
+                "aws-sdk-ec2".to_owned(),
+                "1.0.0-beta.1".to_owned(),
+                "src/lib.rs".to_owned()
+            ))
+        );
+        assert_eq!(
+            named(&format!("{index}/windows-sys-0.59.0+build.1/src/lib.rs")),
+            Some((
+                "windows-sys".to_owned(),
+                "0.59.0+build.1".to_owned(),
+                "src/lib.rs".to_owned()
+            ))
+        );
+        // A path that leaves the release, which the judging of the sources refuses.
+        assert_eq!(
+            named(&format!("{index}/serde-1.0.0/../../x-1.0.0/src/lib.rs")),
+            Some((
+                "serde".to_owned(),
+                "1.0.0".to_owned(),
+                "../../x-1.0.0/src/lib.rs".to_owned()
+            ))
+        );
+        for file in [
+            "/opt/rustwide/cargo-home/registry/src/github.com-1ecc6299db9ec823/a-1.0.0/src/lib.rs",
+            "/opt/rustwide/cargo-home/git/checkouts/a-0123/abcdef0/src/lib.rs",
+            "/opt/rustwide/target/debug/build/a-0123/out/gen.rs",
+            "src/lib.rs",
+            &format!("{index}/not-a-version/src/lib.rs"),
+        ] {
+            assert_eq!(named(file), None, "{file}");
+        }
+    }
+
     /// An item without a span, and each failure to have the sources, are told by their codes
     /// and reasons (decisions 28 and 29).
     #[test]
@@ -1490,7 +1692,7 @@ mod tests {
                 false,
             ),
         ] {
-            let told = body(sources_error("a@1.0.0", &error));
+            let told = body(sources_error("a@1.0.0", &error, false));
             assert_eq!(
                 (
                     told["code"].as_str(),
@@ -1501,6 +1703,9 @@ mod tests {
                 "{error:?}"
             );
         }
+        // Offline, without the `.crate` nor the checksum to fetch it with (decision 15).
+        let told = body(sources_error("a@1.0.0", &SourcesError::NotCached, true));
+        assert_eq!(told["code"], "offline_miss");
         for (refusal, reason) in [
             (Refusal::Missing, "source_missing"),
             (Refusal::Dotfile, "outside_package"),
