@@ -265,6 +265,7 @@ pub(super) async fn dependencies(
         project_from: Some(project_from.as_str()),
         resolved_from,
         sets,
+        dependencies: local::dependencies(&state),
         std: None,
         detail,
         searching,
@@ -361,6 +362,8 @@ pub(super) async fn std(
         resolved_from: ResolvedFrom::Latest,
         #[cfg(feature = "local")]
         sets: None,
+        #[cfg(feature = "local")]
+        dependencies: None,
         std: Some(StdContext {
             chosen,
             project_release: at_least,
@@ -391,6 +394,9 @@ struct Context {
     /// The project's builds, for `enabled_in_project`.
     #[cfg(feature = "local")]
     sets: Option<Arc<FeatureSets>>,
+    /// Where cargo has the sources of the dependencies (decided in M3b, B5b).
+    #[cfg(feature = "local")]
+    dependencies: Option<crate::data::source_root::Dependencies>,
     std: Option<StdContext>,
     detail: Detail,
     searching: Searching,
@@ -864,6 +870,7 @@ fn request_of<'a>(
                         .as_deref()
                         .zip(record.package_root.as_deref()),
                     source_files: &record.source_files,
+                    dependencies: context.dependencies.as_ref(),
                 }
             },
             (Some(std), Some(toolchain)) => Origin::Std {

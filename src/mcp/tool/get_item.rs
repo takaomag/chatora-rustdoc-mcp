@@ -3411,6 +3411,7 @@ async fn look_up_member(
     arguments.in_build.sets = feature_sets(state, &arguments, &mut warnings).await;
     // Kept for the lookup again when a re-export is not followed.
     arguments.here.local = Some(LocalSource::Built(Arc::clone(&built)));
+    let dependencies = local::dependencies(state);
     let task = crate::task::spawn_blocking(move || {
         let record = &built.record;
         let origin = Origin::Local {
@@ -3429,6 +3430,7 @@ async fn look_up_member(
                 .as_deref()
                 .zip(record.package_root.as_deref()),
             source_files: &record.source_files,
+            dependencies: dependencies.as_ref(),
         };
         let mut looked_up = look_up_in(&built.archived.mapped, &arguments, origin);
         if let (Some(built_at), Ok(response)) = (&built_before, &mut looked_up) {

@@ -127,6 +127,8 @@ pub fn list_implementors<'a>(
     let digest = view.source_digest();
     let data_digest = digest.get(..16).unwrap_or(digest);
     let mut query = Query::new(view, request);
+    // Of the trait's location, which is left out.
+    query.leave_out_paths();
     let provenance = query.provenance();
     let with_root = with_root_name(view, request.name, request.path);
     let path = with_root.as_deref().unwrap_or(request.path);

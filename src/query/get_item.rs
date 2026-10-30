@@ -151,6 +151,10 @@ pub enum Origin<'a> {
         /// told their real paths (decided in M3b, B2-2 and B5). Empty until the build's dep-info
         /// is had.
         source_files: &'a [PathBuf],
+        /// Where cargo has the sources of the dependencies, by which the files of the definitions
+        /// outside the package are told their real paths (decided in M3b, B5b).
+        #[cfg(feature = "local")]
+        dependencies: Option<&'a source_root::Dependencies>,
     },
     /// The std of a nightly toolchain (requirement R-STD-1).
     Std {
@@ -843,6 +847,9 @@ pub(super) struct Query<'a> {
     /// The package of a local build, made once for the real paths of its files.
     #[cfg(feature = "local")]
     package: Option<source_root::Package>,
+    /// Whether the real paths of the files are told: not for a list that leaves the locations out,
+    /// which would judge them for nothing.
+    paths: bool,
     /// The real paths of the files judged so far, or `None` for those that may not be read.
     #[cfg(feature = "local")]
     judged: std::collections::BTreeMap<PathBuf, Option<Box<str>>>,
@@ -863,9 +870,16 @@ impl<'a> Query<'a> {
             hints: Vec::new(),
             #[cfg(feature = "local")]
             package: None,
+            paths: true,
             #[cfg(feature = "local")]
             judged: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Leaves out the real paths of the files of the definitions, for a list that leaves their
+    /// locations out ([`Self::drop_source_location`]).
+    pub(super) const fn leave_out_paths(&mut self) {
+        self.paths = false;
     }
 
     /// Adds a hint of what to call next.
@@ -1539,17 +1553,20 @@ impl<'a> Query<'a> {
                 ..
             } => {
                 let full = source_root::lexically(&workspace.join(&span.filename));
-                match full.strip_prefix(package) {
-                    Ok(inside) => {
-                        path = self.readable(&full);
-                        (Cow::Owned(source_root::slash_separated(inside)), true)
-                    },
+                if let Ok(inside) = full.strip_prefix(package) {
+                    path = self.readable(&full);
+                    (Cow::Owned(source_root::slash_separated(inside)), true)
+                } else {
+                    path = self.dependency_path(&full);
                     // As the span gives it, with `/` (decided in M3a).
-                    Err(_) if std::path::MAIN_SEPARATOR == '/' => (Cow::Borrowed(file), false),
-                    Err(_) => (
-                        Cow::Owned(file.replace(std::path::MAIN_SEPARATOR, "/")),
-                        false,
-                    ),
+                    if std::path::MAIN_SEPARATOR == '/' {
+                        (Cow::Borrowed(file), false)
+                    } else {
+                        (
+                            Cow::Owned(file.replace(std::path::MAIN_SEPARATOR, "/")),
+                            false,
+                        )
+                    }
                 }
             },
             Origin::DocsRs { .. } | Origin::Local { .. } | Origin::Std { .. } => {
@@ -1611,6 +1628,9 @@ impl<'a> Query<'a> {
         else {
             return None;
         };
+        if !self.paths {
+            return None;
+        }
         if let Some(judged) = self.judged.get(full) {
             return judged.clone();
         }
@@ -1631,6 +1651,45 @@ impl<'a> Query<'a> {
             .and_then(|resolved| dunce::simplified(&resolved.path).to_str().map(Into::into));
         self.judged.insert(full.to_path_buf(), judged.clone());
         judged
+    }
+
+    /// The real path of the file at `full`, absolute, outside a local build's package, if it is a
+    /// dependency's that may be read, where cargo has it ([`source_root::Dependencies`], decided
+    /// in M3b, B5b). Each file is judged once in a query.
+    ///
+    /// It looks at the file system and may make the listing of a `.crate`, as the queries do on
+    /// their blocking threads.
+    #[cfg(feature = "local")]
+    fn dependency_path(&mut self, full: &Path) -> Option<Box<str>> {
+        let Origin::Local {
+            dependencies: Some(dependencies),
+            ..
+        } = self.request.origin
+        else {
+            return None;
+        };
+        if !self.paths {
+            return None;
+        }
+        if let Some(judged) = self.judged.get(full) {
+            return judged.clone();
+        }
+        let judged = dependencies
+            .resolve(full)
+            .and_then(|resolved| dunce::simplified(&resolved.path).to_str().map(Into::into));
+        self.judged.insert(full.to_path_buf(), judged.clone());
+        judged
+    }
+
+    /// No real path of a dependency's file without the local builds.
+    #[cfg(not(feature = "local"))]
+    #[expect(
+        clippy::unused_self,
+        clippy::missing_const_for_fn,
+        reason = "the same as the local builds' own"
+    )]
+    fn dependency_path(&self, _full: &Path) -> Option<Box<str>> {
+        None
     }
 
     /// No real path without the local builds.
@@ -2437,6 +2496,25 @@ pub(super) mod tests {
         roots: Option<(&Path, &Path)>,
         source_files: &[PathBuf],
     ) -> serde_json::Value {
+        defined_in(filename, Origin::Local {
+            private: package_source.is_none(),
+            package_source,
+            resolved_from: ResolvedFrom::Explicit,
+            project_from: None,
+            toolchain: None,
+            built_at: "2026-10-26T00:00:00Z",
+            features_requested: None,
+            features_effective: None,
+            recorded_by: None,
+            roots,
+            source_files,
+            #[cfg(feature = "local")]
+            dependencies: None,
+        })
+    }
+
+    /// The response for `my_crate::sync::Mutex` of `origin`, defined in `filename`.
+    fn defined_in(filename: &str, origin: Origin<'_>) -> serde_json::Value {
         let mut parsed = parsed();
         if let Some(span) = parsed
             .krate
@@ -2454,19 +2532,7 @@ pub(super) mod tests {
             name: &name,
             version: &version,
             path: "my_crate::sync::Mutex",
-            origin: Origin::Local {
-                private: package_source.is_none(),
-                package_source,
-                resolved_from: ResolvedFrom::Explicit,
-                project_from: None,
-                toolchain: None,
-                built_at: "2026-10-26T00:00:00Z",
-                features_requested: None,
-                features_effective: None,
-                recorded_by: None,
-                roots,
-                source_files,
-            },
+            origin,
             detail: Detail::Normal,
             project_features: None,
             follow: false,
@@ -2474,6 +2540,59 @@ pub(super) mod tests {
         })
         .expect("found");
         serde_json::to_value(response).expect("serializes")
+    }
+
+    /// A file outside the package that a dependency's sources have where cargo has them, as of
+    /// code that a derive generated, is told its real path, with the warning that it is outside
+    /// the package (decided in M3b, B5b).
+    #[cfg(feature = "local")]
+    #[test]
+    fn a_dependencys_file_is_told_its_real_path() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let home = dir.path().join("cargo-home");
+        let checkout = home.join("git/checkouts/derive-0123/abcdef0");
+        let file = checkout.join("src/lib.rs");
+        std::fs::create_dir_all(file.parent().expect("a parent")).expect("made");
+        std::fs::write(&file, "x").expect("written");
+        std::fs::write(checkout.join(".cargo-ok"), "").expect("written");
+        let workspace = dir.path().join("ws");
+        let package = workspace.join("one");
+        let dependencies = source_root::Dependencies::new(
+            crate::data::cache::Cache::at(&dir.path().join("cache")),
+            &home,
+            1024,
+        );
+        let filename = file.to_str().expect("UTF-8");
+        let response = defined_in(filename, Origin::Local {
+            private: true,
+            package_source: None,
+            resolved_from: ResolvedFrom::Explicit,
+            project_from: None,
+            toolchain: None,
+            built_at: "2026-10-26T00:00:00Z",
+            features_requested: None,
+            features_effective: None,
+            recorded_by: None,
+            roots: Some((&workspace, &package)),
+            source_files: &[],
+            dependencies: Some(&dependencies),
+        });
+        let opened = dunce::canonicalize(&file).expect("there");
+        assert_eq!(
+            response["data"]["source_location"]["path"],
+            json!(opened.to_str().expect("UTF-8")),
+            "{response}"
+        );
+        assert_eq!(
+            response["warnings"],
+            json!([format!("{} is outside the package", slashed(filename))])
+        );
+    }
+
+    /// `path` with `/` for the separators of the OS, as a file outside the package is told.
+    #[cfg(feature = "local")]
+    fn slashed(path: &str) -> String {
+        path.replace(std::path::MAIN_SEPARATOR, "/")
     }
 
     /// A file of the package that rustdoc read, as the build's dep-info tells, is told its real

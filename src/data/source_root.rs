@@ -14,6 +14,8 @@ use std::{
 };
 
 use super::crate_source::{Origin, Sources};
+#[cfg(feature = "local")]
+use super::{cache::Cache, crate_source};
 
 /// A root of sources, and which files under it are the package's.
 #[derive(Debug, Clone, Copy)]
@@ -177,6 +179,76 @@ impl Package {
                 .readme
                 .as_deref()
                 .is_some_and(|readme| is(readme) && is_document(readme))
+    }
+}
+
+/// The sources of the dependencies of local builds where cargo has them (decided in M3b, B5b).
+///
+/// They are for the files that the spans of a build tell outside its package, as of code that a
+/// derive generated (decisions 17 and 19): a crates.io release that cargo unpacked, by the listing
+/// of its `.crate`, made from one at hand if need be but never fetched; and a git checkout.
+#[cfg(feature = "local")]
+#[derive(Debug)]
+pub struct Dependencies {
+    cache: Cache,
+    cargo_home: PathBuf,
+    max_bytes: u64,
+    /// The sources of the releases looked at, by the directory that cargo unpacked each into.
+    known: parking_lot::Mutex<std::collections::HashMap<PathBuf, Option<std::sync::Arc<Sources>>>>,
+}
+
+#[cfg(feature = "local")]
+impl Dependencies {
+    /// The sources of the dependencies in `cargo_home`, whose listings are kept in `cache`, of at
+    /// most `max_bytes` each (`limits.extract_max_size`).
+    #[must_use]
+    pub fn new(cache: Cache, cargo_home: &Path, max_bytes: u64) -> Self {
+        Self {
+            cache,
+            // As the spans tell it: absolute, with its text resolved.
+            cargo_home: lexically(
+                &std::path::absolute(cargo_home).unwrap_or_else(|_| cargo_home.to_path_buf()),
+            ),
+            max_bytes,
+            known: parking_lot::Mutex::default(),
+        }
+    }
+
+    /// The file at `full`, absolute with its text resolved, if it is a dependency's that may be
+    /// read: under `$CARGO_HOME/registry/src/index.crates.io-…/<name>-<version>/`, or under
+    /// `$CARGO_HOME/git/checkouts/<repository>/<revision>/` that cargo finished.
+    ///
+    /// It reads and writes files, so it is for a blocking thread. A release whose sources another
+    /// holds the lock of is not waited for: it has no path then.
+    #[must_use]
+    pub fn resolve(&self, full: &Path) -> Option<Resolved> {
+        let inside = full.strip_prefix(&self.cargo_home).ok()?;
+        let mut parts = inside.components().map(Component::as_os_str);
+        let (Some(kind), Some(of), Some(first), Some(second)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let root = self.cargo_home.join(kind).join(of).join(first).join(second);
+        if kind == "registry" && of == "src" {
+            let known = self.known.lock().get(&root).cloned();
+            let sources = known.unwrap_or_else(|| {
+                // Made without the lock, which is for a moment only.
+                let made =
+                    crate_source::unpacked_at(&self.cache, &self.cargo_home, &root, self.max_bytes)
+                        .map(std::sync::Arc::new);
+                self.known.lock().insert(root.clone(), made.clone());
+                made
+            })?;
+            resolve(Root::Release(&sources), full).ok()
+        } else if kind == "git"
+            && of == "checkouts"
+            && fs::symlink_metadata(root.join(".cargo-ok")).is_ok_and(|ok| ok.is_file())
+        {
+            resolve(Root::Checkout(&root), full).ok()
+        } else {
+            None
+        }
     }
 }
 
@@ -692,6 +764,52 @@ mod tests {
         }
         assert_eq!(read(checkout, ".env"), Err(Refusal::Dotfile));
         assert_eq!(read(checkout, "src/out.rs"), Err(Refusal::SymlinkOutside));
+    }
+
+    /// A dependency's file where cargo has it is read: of a crates.io release that cargo
+    /// unpacked, by its `.crate`'s listing, made from the `.crate` at hand; of a git checkout that
+    /// cargo finished, but its dotfiles; nothing elsewhere (decided in M3b, B5b).
+    #[cfg(feature = "local")]
+    #[test]
+    fn a_dependencys_file_is_read_where_cargo_has_it() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let home = dir.path().join("cargo-home");
+        let unpacked = home.join("registry/src/index.crates.io-1949cf8c6b5b557f/demo-0.1.0");
+        write_all(&unpacked, &["Cargo.toml", "src/lib.rs", "written.rs"]);
+        fs::write(unpacked.join(".cargo-ok"), r#"{"v":1}"#).expect("written");
+        let cached = home.join("registry/cache/index.crates.io-1949cf8c6b5b557f");
+        fs::create_dir_all(&cached).expect("made");
+        fs::write(
+            cached.join("demo-0.1.0.crate"),
+            crate::data::crate_file::tests::crate_file("demo", "0.1.0", "[package]\n"),
+        )
+        .expect("written");
+        let checkout = home.join("git/checkouts/repo-0123/abcdef0");
+        write_all(&checkout, &["Cargo.toml", "src/lib.rs", ".env"]);
+        fs::write(checkout.join(".cargo-ok"), "").expect("written");
+        let unfinished = home.join("git/checkouts/repo-0123/1234567");
+        write_all(&unfinished, &["src/lib.rs"]);
+        write_all(&home, &["config.toml"]);
+        let dependencies =
+            Dependencies::new(Cache::at(&dir.path().join("cache")), &home, 1024 * 1024);
+        let read = |path: &Path| dependencies.resolve(path).map(|resolved| resolved.relative);
+        assert_eq!(
+            read(&unpacked.join("src/lib.rs")),
+            Some("src/lib.rs".to_owned())
+        );
+        assert_eq!(
+            read(&checkout.join("src/lib.rs")),
+            Some("src/lib.rs".to_owned())
+        );
+        for path in [
+            unpacked.join("written.rs"),
+            checkout.join(".env"),
+            unfinished.join("src/lib.rs"),
+            home.join("config.toml"),
+            dir.path().join("elsewhere.rs"),
+        ] {
+            assert_eq!(read(&path), None, "{}", path.display());
+        }
     }
 
     #[test]

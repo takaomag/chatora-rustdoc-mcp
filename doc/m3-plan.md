@@ -223,6 +223,13 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - レビュー (サブエージェント、読むだけ) の対応: workspace の外の path 依存は、判定のルートが workspace のルートで `Outside` になり `path` が付かなかったので、パッケージ自身のディレクトリにした。同じファイルの判定を照会の中で覚える (一覧の item ごとに実パスを取り直さない)。doc の直し。テスト: workspace の外の path 依存、git の依存には付かないこと、stdio の結合テストで付いた `path` を開いて中身を比べる (Windows の dep-info の遅さに合わせて待ちは 120 秒)
 - 受け入れたこと: `path` は、ビルドの直後の答え (dep-info の前) には付かず、後の答えには付く。ファイルが消えたり symlink が変わったりしても変わる。同じデータの同じ問いでも答えが変わりうる (R-ARCH-5 の例外。`stale` と同じく手元の状態による)。`source_files` を持たない前の記録 (cc7a5e5 より前) には、作り直すまで付かない (決定 14 の範囲)。一覧の応答で `source_location` を捨てるもの (`search`・`list_module` の `normal`・`implementors`) でも判定は走る (ファイルごとに 1 度)
 
+**B5b の実装 (2026-10-30)**:
+
+- 決定 19 (B5b、利用者が決めた): 依存を指す span の `path` の照合に要る `.crate` の目録は、キャッシュに無ければ手元の `.crate` (このキャッシュのものか cargo の `registry/cache` のもの) から照会の中で作ってキャッシュに置く。取得はしない (決定 16 の「照会が取得を待たない」に合わせる)。cargo の `.crate` は checksum なしで信じる (cargo が取得のときに確かめ、同じ cargo が展開したものと同じ信頼のため)
+- `crate_source::unpacked_at`: cargo が展開し終えた `$CARGO_HOME/registry/src/index.crates.io-…/<名前>-<版>/` の目録 (`src.v1.json`) を、無ければ手元の `.crate` から作る。名前と版はディレクトリ名から (名前として正しく、残りが版になる最初の `-` で分ける)。`source_root::Dependencies`: span の実パスが `$CARGO_HOME/registry/src/…` なら `Root::Release`、`$CARGO_HOME/git/checkouts/<リポジトリ>/<rev>/` で `.cargo-ok` があれば `Root::Checkout` で判定する。照会ごとに 1 つ作り、`Origin::Local` に渡す (`get_item` と `search_across`)。作った目録は照会の中で覚える (mutex は覚えた表を見る間だけ)
+- レビュー (サブエージェント、読むだけ) の対応: 目録を作るときのロックは、同じプロセスの中では上限なしに待ち、`get_source` の取得の間も待ちうるので、先に `.crate` が手元にあるかを確かめ、ロックは待たずに試し取りする (取れなければその回は `path` を付けない)。checksum を確かめていない cargo の `.crate` から作った目録は、共有のキャッシュに印 (`unchecked`) を付けて置き、checksum を持つ `sources` はそれを使わずに作り直す (B1 の「目録は確かめた `.crate` から」を `get_source` の側で弱めない)。位置を捨てる一覧 (`search`・`list_module` の `normal`・`implementors`) では実パスの判定そのものを走らせない。cargo の `.crate` は symlink を辿らず上限付きで読む。目録を使ったら置き場に `used` を付ける。`$CARGO_HOME` は起動時に決めたもの (ほかのツールと同じ)。テスト: 印の付いた目録を `sources` が作り直すこと、ロックを他が持てば待たないこと、cargo の `.crate` の symlink
+- 残したもの: vendor (`cargo metadata` の `manifest_path` が要る) と、crates.io 以外の registry の依存には付けない。`$CARGO_HOME` は、このサーバーが見るものと cargo が span に書いたものが同じであることに頼る (Windows で綴りの大文字小文字が違えば付かない。安全側)。`index.crates.io-*` が cargo の版で 2 つ並ぶと、`sources` は先に見つけたほうを、`path` は span が指すほうを使う (M3c の `get_source` が `path` を受けるときに合わせる)。目録を作れなかったこと (大きすぎるなど) は照会の中でしか覚えない
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

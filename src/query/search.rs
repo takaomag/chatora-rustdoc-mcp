@@ -697,13 +697,16 @@ pub fn search_across<'a>(
     let mut queries: Vec<Query<'a>> = searched
         .iter()
         .map(|source| {
-            Query::new(source.view, ItemRequest {
+            let mut query = Query::new(source.view, ItemRequest {
                 detail: match source.request.detail {
                     Detail::Brief => Detail::Brief,
                     Detail::Normal | Detail::Full => Detail::Normal,
                 },
                 ..source.request
-            })
+            });
+            // A search leaves the locations out.
+            query.leave_out_paths();
+            query
         })
         .collect();
     let provenances = queries.iter_mut().map(Query::provenance).collect();
@@ -1520,6 +1523,8 @@ mod tests {
             recorded_by: None,
             roots: None,
             source_files: &[],
+            #[cfg(feature = "local")]
+            dependencies: None,
         };
         let (paths, _) = found_in(member, "lock", change);
         assert_eq!(

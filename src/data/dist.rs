@@ -326,6 +326,13 @@ impl Dist {
         self.settings.fetch
     }
 
+    /// The most bytes unpacked from one archive (`limits.extract_max_size`), the `.crate` files'
+    /// too.
+    #[must_use]
+    pub const fn extract_max_size(&self) -> u64 {
+        self.settings.extract_max_size
+    }
+
     /// A client for a server at `base_url` that serves the same paths, such as a mirror or a test
     /// server. `base_url` has no trailing `/`.
     ///

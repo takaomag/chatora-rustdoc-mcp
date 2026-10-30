@@ -149,6 +149,10 @@ pub fn list_module<'a>(
         detail: item_detail,
         ..request
     });
+    // A list at `normal` leaves the locations out.
+    if request.detail == Detail::Normal {
+        query.leave_out_paths();
+    }
     let provenance = query.provenance();
     let with_root = with_root_name(view, request.name, request.path);
     let path = with_root.as_deref().unwrap_or(request.path);

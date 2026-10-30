@@ -22,7 +22,7 @@ use semver::Version;
 
 use super::{
     cache::{self, Cache, Verified},
-    crate_file::{CrateError, StaticCrates},
+    crate_file::{self, CrateError, StaticCrates},
     crate_name::CrateName,
     formats,
     used,
@@ -166,8 +166,10 @@ pub async fn sources(
         async move {
             super::blocking(move || {
                 let by_cargo = unpacked_by_cargo(home.as_deref(), &wanted.0, &wanted.1);
-                Ok(found(&reading, &dir, by_cargo.clone(), max_bytes)
-                    .map(|found| (found, by_cargo)))
+                Ok(
+                    found(&reading, &dir, by_cargo.clone(), max_bytes, Trust::Checked)
+                        .map(|found| (found, by_cargo)),
+                )
             })
             .await
             .map_err(SourcesError::Cache)?
@@ -195,7 +197,15 @@ pub async fn sources(
     let (writing, prefix) = (cache.clone(), format!("{name}-{version}"));
     // With the lock, which goes when the work is done, even when this call is dropped.
     let made = super::blocking(move || {
-        let made = make(&writing, &contents, &prefix, &dir, by_cargo, max_bytes);
+        let made = make(
+            &writing,
+            &contents,
+            &prefix,
+            &dir,
+            by_cargo,
+            max_bytes,
+            Trust::Checked,
+        );
         drop(held);
         Ok(made)
     })
@@ -220,40 +230,177 @@ fn unpacked_by_cargo(
     name: &CrateName,
     version: &Version,
 ) -> Option<PathBuf> {
-    #[derive(serde::Deserialize)]
-    struct CargoOk {
-        v: u64,
-    }
     let registries = fs::read_dir(cargo_home?.join("registry/src")).ok()?;
     let package = format!("{name}-{version}");
     registries
         .filter_map(Result::ok)
-        .filter(|registry| {
-            registry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("index.crates.io-")
-        })
+        .filter(|registry| is_sparse_index(&registry.file_name().to_string_lossy()))
         .map(|registry| registry.path().join(&package))
-        .find(|dir| {
-            let mut ok = Vec::new();
-            fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir())
-                && cache::open_without_following(&dir.join(".cargo-ok"))
-                    .and_then(|file| {
-                        if file.metadata()?.is_file() {
-                            file.take(MAX_CARGO_OK_BYTES).read_to_end(&mut ok)
-                        } else {
-                            Err(io::ErrorKind::InvalidData.into())
-                        }
-                    })
-                    .is_ok()
-                && serde_json::from_slice::<CargoOk>(&ok).is_ok_and(|ok| ok.v >= 1)
+        .find(|dir| finished_by_cargo(dir))
+}
+
+/// Whether `registry`, a directory of `$CARGO_HOME/registry`, is of the sparse index of crates.io.
+fn is_sparse_index(registry: &str) -> bool {
+    registry.starts_with("index.crates.io-")
+}
+
+/// Whether cargo finished unpacking a package into `dir`: its `.cargo-ok`, a regular file, tells
+/// a version of at least 1.
+fn finished_by_cargo(dir: &Path) -> bool {
+    #[derive(serde::Deserialize)]
+    struct CargoOk {
+        v: u64,
+    }
+    let mut ok = Vec::new();
+    fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir())
+        && cache::open_without_following(&dir.join(".cargo-ok"))
+            .and_then(|file| {
+                if file.metadata()?.is_file() {
+                    file.take(MAX_CARGO_OK_BYTES).read_to_end(&mut ok)
+                } else {
+                    Err(io::ErrorKind::InvalidData.into())
+                }
+            })
+            .is_ok()
+        && serde_json::from_slice::<CargoOk>(&ok).is_ok_and(|ok| ok.v >= 1)
+}
+
+/// The sources of the crates.io release that cargo unpacked into `unpacked`, without fetching
+/// anything (decided in M3b, B5b).
+///
+/// `unpacked` is `$CARGO_HOME/registry/src/index.crates.io-…/<name>-<version>` in `cargo_home`,
+/// which cargo finished. The listing of the `.crate` is the cache's, or else made now from a
+/// `.crate` at hand, of the cache or of cargo's `registry/cache`. `None` when it cannot be had so.
+///
+/// Cargo's `.crate` is taken without a checksum, as what cargo unpacked from it is: both are
+/// cargo's, which checked them when it fetched them. Its listing is kept noted so, which
+/// [`sources`], that can check it, makes again. The lock of the sources is not waited for: `None`
+/// while another holds it.
+///
+/// It reads and writes files, so it is for a blocking thread.
+#[must_use]
+pub fn unpacked_at(
+    cache: &Cache,
+    cargo_home: &Path,
+    unpacked: &Path,
+    max_bytes: u64,
+) -> Option<Sources> {
+    let registry = unpacked.parent()?;
+    let index = registry.file_name()?.to_str()?;
+    if !is_sparse_index(index)
+        || registry.parent()? != cargo_home.join("registry").join("src")
+        || !finished_by_cargo(unpacked)
+    {
+        return None;
+    }
+    let package = unpacked.file_name()?.to_str()?;
+    let (name, version) = package_name(package)?;
+    let place = cache.crate_place(&name, &version);
+    let dir = place.join(formats::sources_dir());
+    let found = |reading: &Cache| {
+        found(
+            reading,
+            &dir,
+            Some(unpacked.to_path_buf()),
+            max_bytes,
+            Trust::Unchecked,
+        )
+        .ok()
+        .flatten()
+    };
+    if let Some(found) = found(cache) {
+        used::note(&place);
+        return Some(found);
+    }
+    // At hand, before the lock: the cache's, checked when it was fetched, or else cargo's.
+    let (contents, trust) = match cache.read_verified(&cache.crate_file_path(&name, &version)) {
+        Ok(Verified::Found(contents)) => (contents, Trust::Checked),
+        Ok(Verified::Mismatch | Verified::None) | Err(_) => {
+            let path = cargo_home
+                .join("registry")
+                .join("cache")
+                .join(index)
+                .join(format!("{package}.crate"));
+            (read_cargos_crate(&path)?, Trust::Unchecked)
+        },
+    };
+    // Not waited for: what holds it may be fetching, which a query does not wait for (decided in
+    // M3b, decision 16).
+    let held = cache.try_lock(&dir)?;
+    if let Some(found) = found(cache) {
+        drop(held);
+        used::note(&place);
+        return Some(found);
+    }
+    let made = make(
+        cache,
+        &contents,
+        package,
+        &dir,
+        Some(unpacked.to_path_buf()),
+        max_bytes,
+        trust,
+    );
+    drop(held);
+    let made = made
+        .inspect_err(|error| {
+            tracing::debug!(path = %unpacked.display(), %error, "the listing of a .crate could not be made");
         })
+        .ok()?;
+    used::note(&place);
+    Some(made)
+}
+
+/// Cargo's `.crate` at `path`, a regular file of at most [`crate_file::MAX_CRATE_BYTES`], read
+/// without following a symlink.
+fn read_cargos_crate(path: &Path) -> Option<Box<[u8]>> {
+    let file = cache::open_without_following(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > crate_file::MAX_CRATE_BYTES {
+        return None;
+    }
+    let mut contents = Vec::new();
+    file.take(crate_file::MAX_CRATE_BYTES.saturating_add(1))
+        .read_to_end(&mut contents)
+        .ok()?;
+    (u64::try_from(contents.len()).ok()? <= crate_file::MAX_CRATE_BYTES)
+        .then(|| contents.into_boxed_slice())
+}
+
+/// Whether the checksum of the `.crate` that a listing is made from was checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trust {
+    /// Against the crates.io index's, as the cache's `.crate` was when it was fetched.
+    Checked,
+    /// Not: cargo's, which cargo checked when it fetched it (decided in M3b, decision 19).
+    Unchecked,
+}
+
+/// A listing as the cache keeps it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Kept {
+    #[serde(flatten)]
+    listing: Listing,
+    /// Whether it was made from a `.crate` whose checksum was not checked, which only what cargo
+    /// unpacked is read by: `sources`, which can check it, makes it again (decided in M3b, B5b).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unchecked: bool,
+}
+
+/// The name and the version of a package from its directory's name, `<name>-<version>`, as cargo
+/// names it: where the name is valid and the rest is a version.
+fn package_name(package: &str) -> Option<(CrateName, Version)> {
+    package.match_indices('-').find_map(|(at, _)| {
+        let name = package.get(..at)?.parse().ok()?;
+        let version = Version::parse(package.get(at.saturating_add(1)..)?).ok()?;
+        Some((name, version))
+    })
 }
 
 /// The sources that are there already, with the listing in the cache beside `dir`: where cargo
 /// unpacked them (`by_cargo`), or else in `dir`, which is there only whole. Ones of more than
-/// `max_bytes`, as a listing made under a larger limit tells, are refused.
+/// `max_bytes`, as a listing made under a larger limit tells, are refused; and a listing made from
+/// a `.crate` whose checksum was not checked, unless `trust` takes it.
 ///
 /// It reads the file system, so it is for a blocking thread.
 fn found(
@@ -261,17 +408,21 @@ fn found(
     dir: &Path,
     by_cargo: Option<PathBuf>,
     max_bytes: u64,
+    trust: Trust,
 ) -> Result<Option<Sources>, SourcesError> {
-    let listing = match cache
+    let kept = match cache
         .read_verified(&listing_path(dir))
         .map_err(SourcesError::Cache)?
     {
-        Verified::Found(json) => serde_json::from_slice::<Listing>(&json).ok(),
+        Verified::Found(json) => serde_json::from_slice::<Kept>(&json).ok(),
         Verified::Mismatch | Verified::None => None,
     };
-    let Some(listing) = listing else {
+    let Some(Kept { listing, unchecked }) = kept else {
         return Ok(None);
     };
+    if unchecked && trust == Trust::Checked {
+        return Ok(None);
+    }
     if listing.bytes > max_bytes {
         return Err(UnpackError::TooLarge { limit: max_bytes }.into());
     }
@@ -295,8 +446,9 @@ fn is_unpacked(dir: &Path) -> bool {
 
 /// Lists the `.crate` `contents` for where cargo unpacked it (`by_cargo`), or for `dir` if it is
 /// unpacked there, as when the listing was not written after it, or else unpacks it into `dir`;
-/// and keeps its listing beside `dir`. What is unpacked is not unpacked again, which Windows may
-/// not let replace while a file in it is open.
+/// and keeps its listing beside `dir`, noting if `trust` tells that the checksum of `contents` was
+/// not checked. What is unpacked is not unpacked again, which Windows may not let replace while a
+/// file in it is open.
 ///
 /// It reads and writes files, so it is for a blocking thread, with the lock of `dir` held.
 fn make(
@@ -306,6 +458,7 @@ fn make(
     dir: &Path,
     by_cargo: Option<PathBuf>,
     max_bytes: u64,
+    trust: Trust,
 ) -> Result<Sources, SourcesError> {
     let (listing, root, origin) = match by_cargo {
         Some(root) => (list(contents, prefix, max_bytes)?, root, Origin::Cargo),
@@ -320,7 +473,12 @@ fn make(
             Origin::Cache,
         ),
     };
-    let json = serde_json::to_vec(&listing).map_err(|error| SourcesError::Cache(error.into()))?;
+    let kept = Kept {
+        listing,
+        unchecked: trust == Trust::Unchecked,
+    };
+    let json = serde_json::to_vec(&kept).map_err(|error| SourcesError::Cache(error.into()))?;
+    let Kept { listing, .. } = kept;
     cache
         .write_verified(&listing_path(dir), &json)
         .map_err(SourcesError::Cache)?;
@@ -1144,7 +1302,7 @@ mod tests {
 
     /// The `.crate` of the release of the tests: `Cargo.toml` and `src/lib.rs`.
     fn demo_crate() -> Vec<u8> {
-        super::super::crate_file::tests::crate_file("demo", "0.1.0", "[package]\n")
+        crate_file::tests::crate_file("demo", "0.1.0", "[package]\n")
     }
 
     /// The sources of the release of the tests, as `sources` has them.
@@ -1299,6 +1457,134 @@ mod tests {
         make_below(&temp, Path::new("src/bin")).expect("made");
         make_below(&temp, Path::new("src")).expect("there already");
         assert!(temp.join("src/bin").is_dir());
+    }
+
+    /// Cargo's home with the release of the tests unpacked in it, finished, and its `.crate` in
+    /// cargo's cache if `cached`; and the directory of what cargo unpacked.
+    fn cargo_home_with(root: &Path, cached: bool) -> (PathBuf, PathBuf) {
+        let home = root.join("cargo-home");
+        let unpacked = home.join("registry/src/index.crates.io-1949cf8c6b5b557f/demo-0.1.0");
+        fs::create_dir_all(unpacked.join("src")).expect("made");
+        fs::write(unpacked.join("Cargo.toml"), "[package]\n").expect("written");
+        fs::write(unpacked.join("src/lib.rs"), "").expect("written");
+        fs::write(unpacked.join(".cargo-ok"), r#"{"v":1}"#).expect("written");
+        if cached {
+            let cache = home.join("registry/cache/index.crates.io-1949cf8c6b5b557f");
+            fs::create_dir_all(&cache).expect("made");
+            fs::write(cache.join("demo-0.1.0.crate"), demo_crate()).expect("written");
+        }
+        (home, unpacked)
+    }
+
+    /// What cargo unpacked is had with the listing of the `.crate` at hand, cargo's or the
+    /// cache's, which is kept; without one at hand, or unfinished, or of another registry, nothing
+    /// is had, and nothing is fetched (decided in M3b, B5b and decision 19).
+    #[test]
+    fn what_cargo_unpacked_is_had_without_fetching() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        let (home, unpacked) = cargo_home_with(dir.path(), true);
+        let cache = Cache::at(&dir.path().join("cache"));
+        let found = unpacked_at(&cache, &home, &unpacked, 1024 * 1024).expect("listed");
+        assert_eq!(
+            (found.root.as_path(), found.origin),
+            (unpacked.as_path(), Origin::Cargo)
+        );
+        assert_eq!(found.listing.files, ["Cargo.toml", "src/lib.rs"]);
+        let listing = dir
+            .path()
+            .join("cache/static.crates.io/demo/0.1.0/src.v1.json");
+        assert!(listing.is_file());
+        // Kept: had again without cargo's `.crate`.
+        fs::remove_dir_all(home.join("registry/cache")).expect("removed");
+        assert_eq!(
+            unpacked_at(&cache, &home, &unpacked, 1024 * 1024),
+            Some(found)
+        );
+        // Without a `.crate` at hand; with the cache's.
+        let (home, unpacked) = cargo_home_with(&dir.path().join("other"), false);
+        let other = Cache::at(&dir.path().join("other-cache"));
+        assert_eq!(unpacked_at(&other, &home, &unpacked, 1024 * 1024), None);
+        let other = cache_with(&dir.path().join("other-cache"), &demo_crate());
+        assert!(unpacked_at(&other, &home, &unpacked, 1024 * 1024).is_some());
+        // Unfinished, or of another registry.
+        fs::write(unpacked.join(".cargo-ok"), "ok").expect("written");
+        let third = Cache::at(&dir.path().join("third"));
+        assert_eq!(unpacked_at(&third, &home, &unpacked, 1024 * 1024), None);
+        let git = home.join("registry/src/github.com-1ecc6299db9ec823/demo-0.1.0");
+        fs::create_dir_all(&git).expect("made");
+        fs::write(git.join(".cargo-ok"), r#"{"v":1}"#).expect("written");
+        assert_eq!(unpacked_at(&third, &home, &git, 1024 * 1024), None);
+    }
+
+    /// A listing made from cargo's `.crate`, whose checksum was not checked, is kept noted so,
+    /// and `sources`, that checks it, makes it again; one whose lock another holds is not waited
+    /// for (decided in M3b, B5b).
+    #[tokio::test]
+    async fn a_listing_of_cargos_crate_is_made_again_when_checked() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        let (home, unpacked) = cargo_home_with(dir.path(), true);
+        let cache = Cache::at(&dir.path().join("cache"));
+        let place = dir.path().join("cache/static.crates.io/demo/0.1.0");
+        let held = cache.try_lock(&place.join("src.v1")).expect("free");
+        assert_eq!(unpacked_at(&cache, &home, &unpacked, 1024 * 1024), None);
+        drop(held);
+        let had = unpacked_at(&cache, &home, &unpacked, 1024 * 1024).expect("listed");
+        let kept = || fs::read_to_string(place.join("src.v1.json")).expect("kept");
+        assert!(kept().contains("\"unchecked\":true"), "{}", kept());
+        let checksum = cache::sha256_hex(&demo_crate());
+        let (name, version) = demo();
+        let found = sources(
+            &offline(Some(home)),
+            &cache,
+            &name,
+            &version,
+            Some(&checksum),
+            1024 * 1024,
+        )
+        .await
+        .expect("checked");
+        assert_eq!(found, had);
+        assert!(!kept().contains("unchecked"), "{}", kept());
+    }
+
+    /// Cargo's `.crate` that is a symlink is not read.
+    #[cfg(unix)]
+    #[test]
+    fn cargos_crate_is_not_read_through_a_symlink() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        let real = dir.path().join("real.crate");
+        fs::write(&real, demo_crate()).expect("written");
+        let linked = dir.path().join("demo-0.1.0.crate");
+        std::os::unix::fs::symlink(&real, &linked).expect("linked");
+        assert_eq!(read_cargos_crate(&linked), None);
+        assert_eq!(read_cargos_crate(&real).as_deref(), Some(&*demo_crate()));
+    }
+
+    /// The name and the version of a package from its directory's name, as cargo names it.
+    #[test]
+    fn a_package_is_named_by_its_directory() {
+        let named = |package: &str| {
+            package_name(package).map(|(name, version)| (name.to_string(), version.to_string()))
+        };
+        for (package, name, version) in [
+            ("demo-0.1.0", "demo", "0.1.0"),
+            ("serde-json-1.0.0", "serde-json", "1.0.0"),
+            ("a-b-1.0.0-beta.1", "a-b", "1.0.0-beta.1"),
+            (
+                "windows-sys-0.59.0+build.1",
+                "windows-sys",
+                "0.59.0+build.1",
+            ),
+        ] {
+            assert_eq!(
+                named(package),
+                Some((name.to_owned(), version.to_owned())),
+                "{package}"
+            );
+        }
+        for package in ["demo", "demo-", "0.1.0", "demo-x.y"] {
+            assert_eq!(named(package), None, "{package}");
+        }
     }
 
     /// Without the `.crate` at hand nothing is had, offline or without its checksum; a `.crate`

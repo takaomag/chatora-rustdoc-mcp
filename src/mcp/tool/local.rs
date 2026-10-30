@@ -862,6 +862,19 @@ pub(super) async fn built(
     }
 }
 
+/// Where cargo has the sources of the dependencies of the local builds, for the real paths of the
+/// files of definitions outside their packages (decided in M3b, B5b): in `$CARGO_HOME`, as the
+/// server found it when it started; `None` where it found none.
+pub(super) fn dependencies(state: &ToolState) -> Option<crate::data::source_root::Dependencies> {
+    state.resolver.cargo_home().map(|home| {
+        crate::data::source_root::Dependencies::new(
+            state.cache.clone(),
+            home,
+            state.dist.extract_max_size(),
+        )
+    })
+}
+
 /// Where the package of `id`, a package id of either format, came from: `path`, `git`,
 /// `registry` or `crates.io` (decided in M2's D7).
 pub(super) fn package_source(id: &str) -> &'static str {

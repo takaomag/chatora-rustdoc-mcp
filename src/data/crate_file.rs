@@ -26,7 +26,7 @@ pub const DEFAULT_BASE_URL: &str = "https://static.crates.io";
 
 /// Largest `.crate` held in memory (requirement R-NW-3, initial value). crates.io takes crates
 /// of up to 10 MB unless it allows a crate more.
-const MAX_CRATE_BYTES: u64 = 128 * 1024 * 1024;
+pub(super) const MAX_CRATE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Most bytes decompressed while looking for `Cargo.toml`, against a `.crate` that inflates
 /// without end. Cargo writes `Cargo.toml` among the first entries.
