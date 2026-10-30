@@ -1947,6 +1947,38 @@ fn a_member_is_built_with_the_features_of_the_workspace() {
         "{found}"
     );
     assert!(in_its_package(found), "{found}");
+    // Once the build's dep-info is had, after the answer, the file is told its real path to open
+    // (decided in M3b, B5): as late as Windows has it.
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(120))
+        .expect("in range");
+    let mut id = 100;
+    let path = loop {
+        let found = called_until_done(
+            &mut server,
+            id,
+            "get_item",
+            &json!({
+                "crate": "front",
+                "path": "extra"
+            }),
+        );
+        if let Some(path) = found["structuredContent"]["data"]["source_location"]["path"].as_str() {
+            break PathBuf::from(path);
+        }
+        assert!(Instant::now() < deadline, "no path: {found}");
+        thread::sleep(Duration::from_millis(200));
+        id += 100;
+    };
+    assert!(
+        path.is_absolute() && path.ends_with("front/src/lib.rs"),
+        "{}",
+        path.display()
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("opened"),
+        std::fs::read(dir.path().join("front/src/lib.rs")).expect("read")
+    );
     assert!(server.finish().success());
 }
 

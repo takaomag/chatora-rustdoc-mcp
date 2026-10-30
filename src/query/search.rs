@@ -1519,6 +1519,7 @@ mod tests {
             features_effective: None,
             recorded_by: None,
             roots: None,
+            source_files: &[],
         };
         let (paths, _) = found_in(member, "lock", change);
         assert_eq!(

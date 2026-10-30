@@ -809,6 +809,7 @@ pub(super) fn data_schema() -> Value {
                     "file": { "type": "string" },
                     "lines": { "type": "string" },
                     "url": { "type": "string" },
+                    "path": { "type": "string" },
                 },
                 "required": ["file", "lines"],
             },
@@ -3427,6 +3428,7 @@ async fn look_up_member(
                 .workspace_root
                 .as_deref()
                 .zip(record.package_root.as_deref()),
+            source_files: &record.source_files,
         };
         let mut looked_up = look_up_in(&built.archived.mapped, &arguments, origin);
         if let (Some(built_at), Ok(response)) = (&built_before, &mut looked_up) {
@@ -5839,6 +5841,7 @@ mod tests {
                     file: "x".into(),
                     lines: "1".into(),
                     url: some(),
+                    path: some(),
                     warning: None,
                 }),
                 sections: Box::from([Section {

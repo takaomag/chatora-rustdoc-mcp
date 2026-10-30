@@ -217,6 +217,12 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - レビュー (サブエージェント、読むだけ) の対応: dep-info の `..` を含むパスは `freshness` が実パスにして記録するので、workspace が symlink の下にあると (macOS の `/var` など) 字面の照合で外れた。字面で合わなければ、両側の実パスでも比べる。doc の直し (`Package.root` は path・git の依存でもその workspace のルート、`Checkout` はドットファイルを除く)。テスト: workspace のルートのパッケージ (他の member と `target/` を読まない)、symlink の下の workspace、build script が見張らせたファイルが `source_files` に入らないこと (結合テスト)
 - 残したもの: 作り直したビルドの記録は、`deps` を前の記録から引き継ぐが `source_files` は空から始まり、dep-info が取れるまで dep-info 由来のファイルは読めない (取れなかったときは次に作り直すまで)。形式の版を上げないので、`source_files` を知らない前の版のサーバーが記録を書き直すと (`refresh`)、`source_files` は落ちて作り直すまで戻らない (決定 14 の範囲)
 
+**B5a の実装 (2026-10-30)**: B5 は B5a (パッケージの中の span) と B5b (依存を指す span、決定 17) に分けた。B5b は `.crate` の目録の得方 (照会の中で取得や展開を待つか) を、入るときに利用者に聞く。
+
+- `source_location` に `path` (開ける実パス) を足した (outputSchema も)。付けるのは、ローカルビルドの member と path 依存の、パッケージの中のファイルで、`source_root::Package` の判定を通ったものだけ (決定 16)。判定のルートは、パッケージが workspace の下にあればそのルート、外にあればパッケージ自身のディレクトリ。読めるのは記録の `source_files` (rustdoc が読んだファイル) で、`get_source` が読むものの中でいちばん狭い。Windows では `\\?\` を外して返す (`dunce::simplified`)。`Package` と各ファイルの判定の結果は照会の中で 1 度だけ作る。crates.io・git などの依存のローカルビルドには付けない (B5b で、それぞれの目録や checkout の規則で付ける)
+- レビュー (サブエージェント、読むだけ) の対応: workspace の外の path 依存は、判定のルートが workspace のルートで `Outside` になり `path` が付かなかったので、パッケージ自身のディレクトリにした。同じファイルの判定を照会の中で覚える (一覧の item ごとに実パスを取り直さない)。doc の直し。テスト: workspace の外の path 依存、git の依存には付かないこと、stdio の結合テストで付いた `path` を開いて中身を比べる (Windows の dep-info の遅さに合わせて待ちは 120 秒)
+- 受け入れたこと: `path` は、ビルドの直後の答え (dep-info の前) には付かず、後の答えには付く。ファイルが消えたり symlink が変わったりしても変わる。同じデータの同じ問いでも答えが変わりうる (R-ARCH-5 の例外。`stale` と同じく手元の状態による)。`source_files` を持たない前の記録 (cc7a5e5 より前) には、作り直すまで付かない (決定 14 の範囲)。一覧の応答で `source_location` を捨てるもの (`search`・`list_module` の `normal`・`implementors`) でも判定は走る (ファイルごとに 1 度)
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

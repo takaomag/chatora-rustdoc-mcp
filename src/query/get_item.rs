@@ -10,7 +10,7 @@ use std::{
     borrow::Cow,
     collections::BTreeSet,
     fmt,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 use rustdoc_types::{
@@ -147,6 +147,10 @@ pub enum Origin<'a> {
         /// definitions are told relative to (requirement R-OUT-8, decided in M3a). `None` for a
         /// record from before.
         roots: Option<(&'a Path, &'a Path)>,
+        /// The files that rustdoc read, by which the files of the definitions in the package are
+        /// told their real paths (decided in M3b, B2-2 and B5). Empty until the build's dep-info
+        /// is had.
+        source_files: &'a [PathBuf],
     },
     /// The std of a nightly toolchain (requirement R-STD-1).
     Std {
@@ -578,6 +582,10 @@ pub struct SourceLocation<'a> {
     /// The file on docs.rs, when it is in the package.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<Box<str>>,
+    /// The file's real path here, to open: of a local build's file of the package that may be
+    /// read, as `get_source` judges it (requirements R-OUT-8 and R-SC-4, decided in M3b, B5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<Box<str>>,
     /// The warning that the file is outside the package, which the query told, to take back
     /// with the location from a response that leaves it out.
     #[serde(skip)]
@@ -832,6 +840,12 @@ pub(super) struct Query<'a> {
     renderer: Renderer<'a>,
     warnings: Vec<Cow<'static, str>>,
     hints: Vec<Box<str>>,
+    /// The package of a local build, made once for the real paths of its files.
+    #[cfg(feature = "local")]
+    package: Option<source_root::Package>,
+    /// The real paths of the files judged so far, or `None` for those that may not be read.
+    #[cfg(feature = "local")]
+    judged: std::collections::BTreeMap<PathBuf, Option<Box<str>>>,
 }
 
 impl<'a> Query<'a> {
@@ -847,6 +861,10 @@ impl<'a> Query<'a> {
             })),
             warnings: Vec::new(),
             hints: Vec::new(),
+            #[cfg(feature = "local")]
+            package: None,
+            #[cfg(feature = "local")]
+            judged: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1477,9 +1495,9 @@ impl<'a> Query<'a> {
             .collect()
     }
 
-    /// Where `item` is defined, with a docs.rs URL when the file is in the package. A file outside
-    /// it (generated in `OUT_DIR`, or a path on the build host) gets no URL and a warning
-    /// (requirement R-OUT-8).
+    /// Where `item` is defined, with a docs.rs URL when the file is in the package, or a local
+    /// build's real path to open ([`Self::readable`]). A file outside it (generated in `OUT_DIR`,
+    /// or a path on the build host) gets no URL and a warning (requirement R-OUT-8).
     fn source_location(&mut self, item: &'a Item) -> Option<SourceLocation<'a>> {
         let span = item.span.as_ref()?;
         let file = span.filename.to_str()?;
@@ -1506,12 +1524,15 @@ impl<'a> Query<'a> {
                 file: Cow::Borrowed(file),
                 lines: lines.into(),
                 url,
+                path: None,
                 warning: None,
             });
         }
         let on_docs_rs = matches!(self.request.origin, Origin::DocsRs { .. });
         // A local build's spans are relative to the workspace's root where cargo ran, or absolute
         // outside it, as a dependency's that a derive generated code of (decided in M3a).
+        // Its real path only for a local build's, and in the package (decided in M3b, B5-1).
+        let mut path = None;
         let (file, in_package) = match self.request.origin {
             Origin::Local {
                 roots: Some((workspace, package)),
@@ -1519,7 +1540,10 @@ impl<'a> Query<'a> {
             } => {
                 let full = source_root::lexically(&workspace.join(&span.filename));
                 match full.strip_prefix(package) {
-                    Ok(inside) => (Cow::Owned(source_root::slash_separated(inside)), true),
+                    Ok(inside) => {
+                        path = self.readable(&full);
+                        (Cow::Owned(source_root::slash_separated(inside)), true)
+                    },
                     // As the span gives it, with `/` (decided in M3a).
                     Err(_) if std::path::MAIN_SEPARATOR == '/' => (Cow::Borrowed(file), false),
                     Err(_) => (
@@ -1561,8 +1585,63 @@ impl<'a> Query<'a> {
             file,
             lines: lines.into(),
             url,
+            path,
             warning: warning.map(String::into_boxed_str),
         })
+    }
+
+    /// The real path of the file at `full`, absolute, of a local build's member or path
+    /// dependency, if it may be read (requirement R-SC-4), as one that rustdoc read (decided in
+    /// M3b, B5): the narrowest of what `get_source` reads of the package, under the root of its
+    /// workspace, or under its own directory outside the workspace. `None` for a package of
+    /// another source, whose files are judged otherwise; before the build's dep-info is had; for
+    /// a file that rustdoc did not read, that is not there, that is a dotfile, or that a symlink
+    /// leads to outside the root; and for a path that is not UTF-8. Each file is judged once in a
+    /// query.
+    ///
+    /// It looks at the file system, as the queries do on their blocking threads.
+    #[cfg(feature = "local")]
+    fn readable(&mut self, full: &Path) -> Option<Box<str>> {
+        let Origin::Local {
+            roots: Some((workspace, dir)),
+            source_files,
+            package_source: None | Some("path"),
+            ..
+        } = self.request.origin
+        else {
+            return None;
+        };
+        if let Some(judged) = self.judged.get(full) {
+            return judged.clone();
+        }
+        let package = self.package.get_or_insert_with(|| source_root::Package {
+            root: if dir.starts_with(workspace) {
+                workspace
+            } else {
+                dir
+            }
+            .to_path_buf(),
+            dir: dir.to_path_buf(),
+            source_files: source_files.to_vec(),
+            ..source_root::Package::default()
+        });
+        let judged = source_root::resolve(source_root::Root::Package(package), full)
+            .ok()
+            // Without the `\\?\` that Windows puts before a real path, where it can go.
+            .and_then(|resolved| dunce::simplified(&resolved.path).to_str().map(Into::into));
+        self.judged.insert(full.to_path_buf(), judged.clone());
+        judged
+    }
+
+    /// No real path without the local builds.
+    #[cfg(not(feature = "local"))]
+    #[expect(
+        clippy::unused_self,
+        clippy::missing_const_for_fn,
+        reason = "the same as the local builds' own"
+    )]
+    fn readable(&self, _full: &Path) -> Option<Box<str>> {
+        None
     }
 
     /// Takes the source location out of `data`, for a response that leaves it out, with the
@@ -1936,7 +2015,7 @@ pub(super) fn first_paragraph(docs: &str) -> (&str, bool) {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::collections::HashMap;
 
     use rustdoc_types::{
         Crate,
@@ -2349,6 +2428,114 @@ pub(super) mod tests {
         );
     }
 
+    /// The response for `my_crate::sync::Mutex` built here, of a package from `package_source`
+    /// (`None` for a member), defined in `filename`, with the build's `roots` and the files that
+    /// rustdoc read.
+    fn built_here(
+        package_source: Option<&'static str>,
+        filename: &str,
+        roots: Option<(&Path, &Path)>,
+        source_files: &[PathBuf],
+    ) -> serde_json::Value {
+        let mut parsed = parsed();
+        if let Some(span) = parsed
+            .krate
+            .index
+            .get_mut(&Id(3))
+            .and_then(|item| item.span.as_mut())
+        {
+            span.filename = PathBuf::from(filename);
+        }
+        let bytes = archive(parsed.krate);
+        let view = CrateView::new(archived(&bytes));
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::parse("1.2.3").expect("a version");
+        let response = get_item(&view, ItemRequest {
+            name: &name,
+            version: &version,
+            path: "my_crate::sync::Mutex",
+            origin: Origin::Local {
+                private: package_source.is_none(),
+                package_source,
+                resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
+                toolchain: None,
+                built_at: "2026-10-26T00:00:00Z",
+                features_requested: None,
+                features_effective: None,
+                recorded_by: None,
+                roots,
+                source_files,
+            },
+            detail: Detail::Normal,
+            project_features: None,
+            follow: false,
+            target: None,
+        })
+        .expect("found");
+        serde_json::to_value(response).expect("serializes")
+    }
+
+    /// A file of the package that rustdoc read, as the build's dep-info tells, is told its real
+    /// path to open, of a member or of a path dependency outside the workspace; one that it did not
+    /// read, or before the dep-info is had, or outside the package, or of a git dependency, is not
+    /// (requirements R-OUT-8 and R-SC-4, decided in M3b, B5).
+    #[cfg(feature = "local")]
+    #[test]
+    fn a_file_of_the_package_built_here_is_told_its_real_path() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let workspace = dir.path().join("ws");
+        for file in ["one/src/lib.rs", "one/src/other.rs", "notes.md"] {
+            let path = workspace.join(file);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+            std::fs::write(path, "x").expect("written");
+        }
+        let package = workspace.join("one");
+        let roots = Some((workspace.as_path(), package.as_path()));
+        let read = [package.join("src/lib.rs"), workspace.join("notes.md")];
+        let opened = dunce::canonicalize(package.join("src/lib.rs")).expect("there");
+        let location = |filename: &str, source_files: &[PathBuf]| {
+            built_here(None, filename, roots, source_files)["data"]["source_location"].clone()
+        };
+        assert_eq!(
+            location("one/src/lib.rs", &read),
+            json!({
+                "file": "src/lib.rs",
+                "lines": "10-12",
+                "path": opened.to_str().expect("UTF-8"),
+            })
+        );
+        for (filename, source_files) in [
+            ("one/src/lib.rs", &[][..]),
+            ("one/src/other.rs", &read[..]),
+            ("notes.md", &read[..]),
+        ] {
+            assert!(
+                location(filename, source_files).get("path").is_none(),
+                "{filename}"
+            );
+        }
+        // A path dependency outside the workspace, whose spans are absolute, under its own
+        // directory; not a git dependency's, whose files are judged by its checkout.
+        let watcher = dir.path().join("deps/watcher");
+        let lib = watcher.join("src/lib.rs");
+        std::fs::create_dir_all(lib.parent().expect("a parent")).expect("made");
+        std::fs::write(&lib, "x").expect("written");
+        let outside = Some((workspace.as_path(), watcher.as_path()));
+        let path_of = |package_source| {
+            built_here(
+                Some(package_source),
+                lib.to_str().expect("UTF-8"),
+                outside,
+                std::slice::from_ref(&lib),
+            )["data"]["source_location"]["path"]
+                .clone()
+        };
+        let opened = dunce::canonicalize(&lib).expect("there");
+        assert_eq!(path_of("path"), json!(opened.to_str().expect("UTF-8")));
+        assert_eq!(path_of("git"), serde_json::Value::Null);
+    }
+
     /// The file of a definition in a crate built here is relative to its package's root, as the
     /// spans relative to the workspace's root where cargo ran, or absolute outside it, tell; one
     /// outside the package, as of code that a derive of another crate generated, is as the span
@@ -2356,43 +2543,12 @@ pub(super) mod tests {
     #[test]
     fn a_definition_built_here_is_told_relative_to_its_package() {
         let told = |filename: &str, roots: Option<(&str, &str)>| {
-            let mut parsed = parsed();
-            if let Some(span) = parsed
-                .krate
-                .index
-                .get_mut(&Id(3))
-                .and_then(|item| item.span.as_mut())
-            {
-                span.filename = PathBuf::from(filename);
-            }
-            let bytes = archive(parsed.krate);
-            let view = CrateView::new(archived(&bytes));
-            let name: CrateName = "my-crate".parse().expect("a crate name");
-            let version = Version::parse("1.2.3").expect("a version");
-            let response = get_item(&view, ItemRequest {
-                name: &name,
-                version: &version,
-                path: "my_crate::sync::Mutex",
-                origin: Origin::Local {
-                    private: true,
-                    package_source: None,
-                    resolved_from: ResolvedFrom::Explicit,
-                    project_from: None,
-                    toolchain: None,
-                    built_at: "2026-10-26T00:00:00Z",
-                    features_requested: None,
-                    features_effective: None,
-                    recorded_by: None,
-                    roots: roots
-                        .map(|(workspace, package)| (Path::new(workspace), Path::new(package))),
-                },
-                detail: Detail::Normal,
-                project_features: None,
-                follow: false,
-                target: None,
-            })
-            .expect("found");
-            serde_json::to_value(response).expect("serializes")
+            built_here(
+                None,
+                filename,
+                roots.map(|(workspace, package)| (Path::new(workspace), Path::new(package))),
+                &[],
+            )
         };
         // A member of a virtual workspace, the root package, a path dependency outside the
         // workspace, whose spans are absolute, and spans that go through `.` and `..`.

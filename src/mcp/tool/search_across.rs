@@ -863,6 +863,7 @@ fn request_of<'a>(
                         .workspace_root
                         .as_deref()
                         .zip(record.package_root.as_deref()),
+                    source_files: &record.source_files,
                 }
             },
             (Some(std), Some(toolchain)) => Origin::Std {
