@@ -9,7 +9,7 @@
 //! goes by its own rule, a week unused, which the reads of std apply too.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     hash::BuildHasher,
     io,
@@ -558,9 +558,10 @@ enum Held {
 }
 
 /// The locks of `removal` that its writers and users take, if no one holds any: the place and the
-/// archives and `.crate` files directly in it, which are locked by their own paths; a target directory's builds
-/// and their documentation; a record of `build_external_docs`, and its builds. `None` when one is
-/// held, or the OS cannot lock it.
+/// archives and `.crate` files directly in it, which are locked by their own paths; the sources
+/// unpacked from a `.crate`, of any format, and this format's even before they are there; a target
+/// directory's builds and their documentation; a record of `build_external_docs`, and its builds.
+/// `None` when one is held, or the OS cannot lock it.
 fn held(cache: &Cache, removal: &Removal) -> Option<Vec<Held>> {
     let root = cache.dir();
     let name = removal
@@ -600,6 +601,7 @@ fn held(cache: &Cache, removal: &Removal) -> Option<Vec<Held>> {
             _guard: cache.try_lock_held(&absolute)?,
         });
         if fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_dir()) {
+            let mut sources = BTreeSet::new();
             for entry in fs::read_dir(&absolute).into_iter().flatten().flatten() {
                 let archive = entry
                     .path()
@@ -610,10 +612,40 @@ fn held(cache: &Cache, removal: &Removal) -> Option<Vec<Held>> {
                         _guard: cache.try_lock_held(&entry.path())?,
                     });
                 }
+                if removal.entry.kind == Kind::Crate {
+                    sources.extend(
+                        sources_dir(&entry.file_name().to_string_lossy()).map(str::to_owned),
+                    );
+                }
+            }
+            // This format's, which a call may hold before anything of it is there.
+            if removal.entry.kind == Kind::Crate {
+                sources.insert(super::formats::sources_dir());
+            }
+            for dir in sources {
+                held.push(Held::Path {
+                    _guard: cache.try_lock_held(&absolute.join(dir))?,
+                });
             }
         }
     }
     Some(held)
+}
+
+/// The directory of sources unpacked from a `.crate`, `src.v<n>` of any format, that `name` in its
+/// place is or is of: the directory itself, its listing (`src.v<n>.json` and its digest) or its
+/// temporary directory (`.src.v<n>.<process>.<count>.tmp`). Its lock is held while it is made
+/// (decided in M3b, B1-2).
+fn sources_dir(name: &str) -> Option<&str> {
+    let name = name
+        .strip_prefix('.')
+        .and_then(|temporary| temporary.strip_suffix(".tmp"))
+        .unwrap_or(name);
+    let version = name.strip_prefix("src.v")?;
+    let digits = version
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(version.len());
+    (digits > 0).then(|| name.get(..digits.saturating_add("src.v".len())))?
 }
 
 /// Removes the place `place` of the cache at `root`, of `kind`, not following links. A directory is
@@ -1116,6 +1148,63 @@ mod tests {
             "static.crates.io/serde/1.0.0"
         )]);
         drop(reading);
+    }
+
+    /// Sources being unpacked from a `.crate`, of any format, under the lock of their directory,
+    /// are in use, and so is their place, though only their temporary directory is there yet, or
+    /// nothing of them for this format's (decided in M3b, B1-2).
+    #[test]
+    fn sources_being_unpacked_are_skipped() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        write(root, "static.crates.io/serde/1.0.0/serde-1.0.0.crate");
+        write(
+            root,
+            "static.crates.io/serde/1.0.0/.src.v2.7.0.tmp/src/lib.rs",
+        );
+        let cache = Cache::at(root);
+        let removal = || Removal {
+            entry: found(root, Kind::Crate, "static.crates.io/serde/1.0.0"),
+            reason: Reason::OverLimit,
+            bodies: Vec::new(),
+            bytes: 1,
+        };
+        let unpacking = cache
+            .try_lock_held(&root.join("static.crates.io/serde/1.0.0/src.v2"))
+            .expect("free");
+        let outcome = run(&cache, vec![removal()], false);
+        assert_eq!(outcome.in_use, [PathBuf::from(
+            "static.crates.io/serde/1.0.0"
+        )]);
+        drop(unpacking);
+        // This format's, held before anything of it is there.
+        let starting = cache
+            .try_lock_held(&root.join("static.crates.io/serde/1.0.0/src.v1"))
+            .expect("free");
+        let outcome = run(&cache, vec![removal()], false);
+        assert_eq!(outcome.in_use.len(), 1, "{outcome:?}");
+        drop(starting);
+        let outcome = run(&cache, vec![removal()], false);
+        assert_eq!(outcome.removed.len(), 1, "{outcome:?}");
+        assert!(!root.join("static.crates.io/serde").exists());
+    }
+
+    /// The directory of sources that a name in a crate's place is or is of.
+    #[test]
+    fn the_sources_are_found_by_their_names() {
+        for (name, dir) in [
+            ("src.v1", Some("src.v1")),
+            ("src.v12.json", Some("src.v12")),
+            ("src.v1.json.sha256", Some("src.v1")),
+            (".src.v3.123.0.tmp", Some("src.v3")),
+            ("src.v", None),
+            ("src.vx", None),
+            ("serde-1.0.0.crate", None),
+            ("used", None),
+            (".serde-1.0.0.crate.1.tmp", None),
+        ] {
+            assert_eq!(sources_dir(name), dir, "{name}");
+        }
     }
 
     /// A place with an archive that a process maps is left whole where the OS does not move it, as

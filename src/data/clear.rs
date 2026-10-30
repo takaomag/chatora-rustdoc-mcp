@@ -366,6 +366,11 @@ mod tests {
             "static.crates.io/serde-json/1.0.0/serde_json-1.0.0.crate",
             "",
         );
+        write(
+            root,
+            "static.crates.io/serde-json/1.0.0/src.v1/src/lib.rs",
+            "",
+        );
         write(root, "index.crates.io/se/rd/serde_json", "");
         write(root, "index.crates.io/se/rd/serde_json.meta.json", "{}");
         write(root, "index.crates.io/se/rd/serde_json.miss.json", "{}");
@@ -404,6 +409,7 @@ mod tests {
         );
         let root = dir.path();
         assert!(!root.join("docs.rs/serde-json").exists());
+        assert!(!root.join("static.crates.io/serde-json/1.0.0").exists());
         assert!(
             !root
                 .join("index.crates.io/se/rd/serde_json.meta.json")

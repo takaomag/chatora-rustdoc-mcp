@@ -6,6 +6,8 @@
 //! whole into memory, and refuses a PAX extension that would make the second pass read the
 //! entries otherwise than the first; then each entry is checked and written into a temporary
 //! directory next to the place, which is renamed into it once every file is on the disk.
+//!
+//! [`sources`] is where they are had: where cargo unpacked them, or else unpacked here.
 
 use std::{
     collections::HashMap,
@@ -16,6 +18,15 @@ use std::{
 };
 
 use flate2::read::GzDecoder;
+use semver::Version;
+
+use super::{
+    cache::{self, Cache, Verified},
+    crate_file::{CrateError, StaticCrates},
+    crate_name::CrateName,
+    formats,
+    used,
+};
 
 /// Most files unpacked from one `.crate` (requirement R-SC-2, initial value; not a setting).
 pub const MAX_FILES: usize = 100_000;
@@ -32,6 +43,9 @@ const IN_USE: &str = ".chatora-rustdoc-mcp.in-use";
 /// How many files are written between two notes in the temporary directory that it is in use, so
 /// that the removal of stale temporaries, which looks at its time, leaves it.
 const FILES_PER_NOTE: usize = 256;
+
+/// Largest `.cargo-ok` read: cargo writes `{"v":1}`.
+const MAX_CARGO_OK_BYTES: u64 = 1024;
 
 /// Counts the unpackings of this process, so that no two temporary directories share a name.
 static UNPACK_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -69,24 +83,270 @@ pub enum UnpackError {
     Cache(#[source] io::Error),
 }
 
-/// What was unpacked: the files, relative to the package's root with `/`, sorted, and their bytes.
+/// The files of a `.crate`, relative to the package's root with `/`, sorted, and their bytes: what
+/// is unpacked from it, and what of a directory that cargo unpacked is read (decided in M3b, B1-7).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Unpacked {
+pub struct Listing {
     /// The files.
     pub files: Vec<String>,
     /// Their bytes in all.
     pub bytes: u64,
 }
 
+/// Where the sources of a release were found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// In `$CARGO_HOME/registry/src`, where cargo unpacked them (decided in M3b, B1-7).
+    Cargo,
+    /// In the cache, where this server unpacked them.
+    Cache,
+}
+
+/// The sources of a crates.io release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sources {
+    /// The package's root: the directory of its `Cargo.toml`.
+    pub root: PathBuf,
+    /// The files of its `.crate`, which alone are read under `root` (requirement R-SC-4).
+    pub listing: Listing,
+    /// Where they were found.
+    pub origin: Origin,
+}
+
+/// Why the sources of a release could not be had.
+#[derive(Debug, thiserror::Error)]
+pub enum SourcesError {
+    /// Its `.crate` could not be had: offline, [`CrateError::Offline`] when no `.crate` is at hand
+    /// (decided in M3b, B2-3).
+    #[error(transparent)]
+    Crate(#[from] CrateError),
+    /// Its `.crate` is not at hand, and without its checksum it is not fetched.
+    #[error("the .crate is not at hand")]
+    NotCached,
+    /// Its `.crate` could not be unpacked or listed.
+    #[error(transparent)]
+    Unpack(#[from] UnpackError),
+    /// The cache could not be used.
+    #[error("the cache could not be used")]
+    Cache(#[source] io::Error),
+}
+
+/// The sources of `name` at `version` from crates.io (requirements R-SC-2 and R-SC-4, decided in
+/// M3b, B1): where cargo unpacked them, or else unpacked in the cache.
+///
+/// Cargo's are in `$CARGO_HOME/registry/src`, if it finished them. Else the `.crate` is unpacked:
+/// that of [`StaticCrates::crate_file`], from the cache or cargo's, or else fetched and checked
+/// against `checksum`. `name` is spelled as crates.io spells it, as the archive's directory and
+/// cargo's are.
+///
+/// Either way, the files that may be read are those of the `.crate`'s listing, kept in the cache
+/// beside the unpacked sources: a build script may have written more where cargo unpacked them.
+/// The place in the cache is noted as used.
+///
+/// # Errors
+///
+/// Returns an error when the `.crate` cannot be had (offline, [`CrateError::Offline`]), is not at
+/// hand without `checksum`, is refused or too large, or the cache cannot be used.
+pub async fn sources(
+    crates: &StaticCrates,
+    cache: &Cache,
+    name: &CrateName,
+    version: &Version,
+    checksum: Option<&str>,
+    max_bytes: u64,
+) -> Result<Sources, SourcesError> {
+    let place = cache.crate_place(name, version);
+    let dir = place.join(formats::sources_dir());
+    let look = || {
+        let (reading, dir) = (cache.clone(), dir.clone());
+        let (home, wanted) = (
+            crates.cargo_home().map(Path::to_path_buf),
+            (name.clone(), version.clone()),
+        );
+        async move {
+            super::blocking(move || {
+                let by_cargo = unpacked_by_cargo(home.as_deref(), &wanted.0, &wanted.1);
+                Ok(found(&reading, &dir, by_cargo.clone(), max_bytes)
+                    .map(|found| (found, by_cargo)))
+            })
+            .await
+            .map_err(SourcesError::Cache)?
+        }
+    };
+    if let (Some(found), _) = look().await? {
+        used::note_later(&place);
+        return Ok(found);
+    }
+    // Another call that wants the same goes first (requirement R-NW-2), and the GC leaves it. What
+    // cargo has may have changed while it waited.
+    let held = cache.lock(&dir).await;
+    let by_cargo = match look().await? {
+        (Some(found), _) => {
+            drop(held);
+            used::note_later(&place);
+            return Ok(found);
+        },
+        (None, by_cargo) => by_cargo,
+    };
+    let contents = crates
+        .crate_file(cache, name, version, checksum)
+        .await?
+        .ok_or(SourcesError::NotCached)?;
+    let (writing, prefix) = (cache.clone(), format!("{name}-{version}"));
+    // With the lock, which goes when the work is done, even when this call is dropped.
+    let made = super::blocking(move || {
+        let made = make(&writing, &contents, &prefix, &dir, by_cargo, max_bytes);
+        drop(held);
+        Ok(made)
+    })
+    .await
+    .map_err(SourcesError::Cache)??;
+    used::note_later(&place);
+    Ok(made)
+}
+
+/// The directory where cargo unpacked `name` at `version` from crates.io, if it finished: its
+/// `.cargo-ok` tells a version of at least 1, which cargo writes last (decided in M3b, B1-7).
+/// One that is older, empty or cut short is unpacked again by cargo, and is not read here.
+///
+/// Only the sparse index of crates.io is taken, `index.crates.io-…`, whose name tells its host:
+/// that of a git index, `github.com-…`, tells only that it is on GitHub, as another registry may
+/// be, and nothing checks what cargo unpacked against the `.crate`. A symlink or a FIFO for
+/// `.cargo-ok` is not read.
+///
+/// It reads the file system, so it is for a blocking thread.
+fn unpacked_by_cargo(
+    cargo_home: Option<&Path>,
+    name: &CrateName,
+    version: &Version,
+) -> Option<PathBuf> {
+    #[derive(serde::Deserialize)]
+    struct CargoOk {
+        v: u64,
+    }
+    let registries = fs::read_dir(cargo_home?.join("registry/src")).ok()?;
+    let package = format!("{name}-{version}");
+    registries
+        .filter_map(Result::ok)
+        .filter(|registry| {
+            registry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("index.crates.io-")
+        })
+        .map(|registry| registry.path().join(&package))
+        .find(|dir| {
+            let mut ok = Vec::new();
+            fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir())
+                && cache::open_without_following(&dir.join(".cargo-ok"))
+                    .and_then(|file| {
+                        if file.metadata()?.is_file() {
+                            file.take(MAX_CARGO_OK_BYTES).read_to_end(&mut ok)
+                        } else {
+                            Err(io::ErrorKind::InvalidData.into())
+                        }
+                    })
+                    .is_ok()
+                && serde_json::from_slice::<CargoOk>(&ok).is_ok_and(|ok| ok.v >= 1)
+        })
+}
+
+/// The sources that are there already, with the listing in the cache beside `dir`: where cargo
+/// unpacked them (`by_cargo`), or else in `dir`, which is there only whole. Ones of more than
+/// `max_bytes`, as a listing made under a larger limit tells, are refused.
+///
+/// It reads the file system, so it is for a blocking thread.
+fn found(
+    cache: &Cache,
+    dir: &Path,
+    by_cargo: Option<PathBuf>,
+    max_bytes: u64,
+) -> Result<Option<Sources>, SourcesError> {
+    let listing = match cache
+        .read_verified(&listing_path(dir))
+        .map_err(SourcesError::Cache)?
+    {
+        Verified::Found(json) => serde_json::from_slice::<Listing>(&json).ok(),
+        Verified::Mismatch | Verified::None => None,
+    };
+    let Some(listing) = listing else {
+        return Ok(None);
+    };
+    if listing.bytes > max_bytes {
+        return Err(UnpackError::TooLarge { limit: max_bytes }.into());
+    }
+    let (root, origin) = match by_cargo {
+        Some(root) => (root, Origin::Cargo),
+        None if is_unpacked(dir) => (dir.to_path_buf(), Origin::Cache),
+        None => return Ok(None),
+    };
+    Ok(Some(Sources {
+        root,
+        listing,
+        origin,
+    }))
+}
+
+/// Whether the sources are unpacked in `dir`: a directory, which is there only whole, and not a
+/// symlink, which this server does not make.
+fn is_unpacked(dir: &Path) -> bool {
+    fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// Lists the `.crate` `contents` for where cargo unpacked it (`by_cargo`), or for `dir` if it is
+/// unpacked there, as when the listing was not written after it, or else unpacks it into `dir`;
+/// and keeps its listing beside `dir`. What is unpacked is not unpacked again, which Windows may
+/// not let replace while a file in it is open.
+///
+/// It reads and writes files, so it is for a blocking thread, with the lock of `dir` held.
+fn make(
+    cache: &Cache,
+    contents: &[u8],
+    prefix: &str,
+    dir: &Path,
+    by_cargo: Option<PathBuf>,
+    max_bytes: u64,
+) -> Result<Sources, SourcesError> {
+    let (listing, root, origin) = match by_cargo {
+        Some(root) => (list(contents, prefix, max_bytes)?, root, Origin::Cargo),
+        None if is_unpacked(dir) => (
+            list(contents, prefix, max_bytes)?,
+            dir.to_path_buf(),
+            Origin::Cache,
+        ),
+        None => (
+            unpack(contents, prefix, dir, max_bytes)?,
+            dir.to_path_buf(),
+            Origin::Cache,
+        ),
+    };
+    let json = serde_json::to_vec(&listing).map_err(|error| SourcesError::Cache(error.into()))?;
+    cache
+        .write_verified(&listing_path(dir), &json)
+        .map_err(SourcesError::Cache)?;
+    Ok(Sources {
+        root,
+        listing,
+        origin,
+    })
+}
+
+/// Where the listing of the `.crate` is kept, beside the directory `dir` of its sources:
+/// `src.v<n>.json`.
+fn listing_path(dir: &Path) -> PathBuf {
+    cache::with_suffix(dir, ".json")
+}
+
 /// Unpacks the gzipped tar `contents` into the directory `into`, which is replaced.
 ///
 /// Its entries are all under `prefix/` (`<name>-<version>`), which is left out, so that `into` is
 /// the package's root. More than `max_bytes` in all, or more than [`MAX_FILES`] files, is an
-/// error, before anything is written. The caller has checked `contents` against its checksum, and
-/// removes its own mark that `into` is complete before this, as `into` may be left part removed
-/// when it cannot be replaced.
+/// error, before anything is written. The caller has checked `contents` against its checksum.
 ///
-/// It reads and writes files, so it is for a blocking thread, with the lock of the place held.
+/// `into` is there only whole: the files are written into a temporary directory beside it, which
+/// is renamed to it once each is synced, so that its being there tells that it is complete.
+///
+/// It reads and writes files, so it is for a blocking thread, with the lock of `into` held.
 ///
 /// # Errors
 ///
@@ -97,20 +357,33 @@ pub fn unpack(
     prefix: &str,
     into: &Path,
     max_bytes: u64,
-) -> Result<Unpacked, UnpackError> {
+) -> Result<Listing, UnpackError> {
     check_sizes(contents, max_bytes)?;
     let parent = into.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(UnpackError::Cache)?;
     let temp = temporary(into);
-    let unpacked = unpack_into(contents, prefix, &temp, max_bytes)
+    let unpacked = walk(contents, prefix, Some(&temp), max_bytes)
         .and_then(|unpacked| replace(into, &temp).map(|()| unpacked));
     if unpacked.is_err() {
         remove_quietly(&temp);
     }
     if unpacked.is_ok() {
-        super::cache::remove_stale_temporaries(parent);
+        cache::remove_stale_temporaries(parent);
     }
     unpacked
+}
+
+/// The files of the gzipped tar `contents` under `prefix/`, checked as [`unpack`] checks them,
+/// without writing anything.
+///
+/// It reads the whole archive, so it is for a blocking thread.
+///
+/// # Errors
+///
+/// Returns an error when an entry is refused, a limit is passed, or the archive cannot be read.
+pub fn list(contents: &[u8], prefix: &str, max_bytes: u64) -> Result<Listing, UnpackError> {
+    check_sizes(contents, max_bytes)?;
+    walk(contents, prefix, None, max_bytes)
 }
 
 /// A new name next to `into` for a temporary directory: `.<name>.<process>.<count>.tmp`, which the
@@ -214,18 +487,21 @@ fn check_sizes(contents: &[u8], max_bytes: u64) -> Result<(), UnpackError> {
 }
 
 /// Writes the entries of `contents` under `prefix/` into the new directory `temp`, each file
-/// synced to the disk (requirement R-CA-4). The limits are checked again as it goes.
+/// synced to the disk (requirement R-CA-4), or, without `temp`, only checks them. The limits are
+/// checked again as it goes.
 #[expect(
     clippy::create_dir,
     reason = "the temporary directory is made alone, so that one left there is found"
 )]
-fn unpack_into(
+fn walk(
     contents: &[u8],
     prefix: &str,
-    temp: &Path,
+    temp: Option<&Path>,
     max_bytes: u64,
-) -> Result<Unpacked, UnpackError> {
-    if let Err(error) = fs::create_dir(temp) {
+) -> Result<Listing, UnpackError> {
+    if let Some(temp) = temp
+        && let Err(error) = fs::create_dir(temp)
+    {
         // Left by a process of the same id that stopped: its name is this unpacking's now.
         if error.kind() != io::ErrorKind::AlreadyExists {
             return Err(UnpackError::Cache(error));
@@ -266,18 +542,26 @@ fn unpack_into(
             continue;
         };
         written.claim(&relative, is_file).map_err(refused)?;
+        let size = entry.size();
+        if is_file {
+            written.count(size, max_bytes)?;
+        }
+        let Some(temp) = temp else {
+            if is_file {
+                written.files.push(slashed(&relative));
+            }
+            continue;
+        };
         let path = temp.join(&relative);
         if !is_file {
-            fs::create_dir_all(&path).map_err(UnpackError::Cache)?;
+            make_below(temp, &relative).map_err(UnpackError::Cache)?;
             continue;
         }
-        let size = entry.size();
-        written.count(size, max_bytes)?;
         if written.files.len() % FILES_PER_NOTE == 0 {
             note_in_use(temp)?;
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(UnpackError::Cache)?;
+        if let Some(parent) = relative.parent() {
+            make_below(temp, parent).map_err(UnpackError::Cache)?;
         }
         // A second entry of the same path finds the first there.
         let mut file = match File::create_new(&path) {
@@ -291,14 +575,37 @@ fn unpack_into(
         file.sync_all().map_err(UnpackError::Cache)?;
         written.files.push(slashed(&relative));
     }
-    // Gone, if the removal of stale temporaries took it meanwhile: what is in it is not whole.
-    note_in_use(temp)?;
+    // Gone, if the removal of stale temporaries or the GC took it meanwhile: what is in it is not
+    // whole.
+    if let Some(temp) = temp {
+        note_in_use(temp)?;
+    }
     let mut files = written.files;
     files.sort_unstable();
-    Ok(Unpacked {
+    Ok(Listing {
         files,
         bytes: written.bytes,
     })
+}
+
+/// Makes the directory `relative` under `temp`, and those that it is in, but not `temp`: one that
+/// was taken away, as by the GC with its place, is not made again, so that what was written in it
+/// is not taken for whole.
+#[expect(
+    clippy::create_dir,
+    reason = "each directory is made under one that must be there"
+)]
+fn make_below(temp: &Path, relative: &Path) -> io::Result<()> {
+    let mut dir = temp.to_path_buf();
+    for component in relative.components() {
+        dir.push(component);
+        match fs::create_dir(&dir) {
+            Ok(()) => {},
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// What an unpacking has written so far.
@@ -518,7 +825,7 @@ mod tests {
     fn unpacked(
         entries: &[Entry<'_>],
         max_bytes: u64,
-    ) -> (tempfile::TempDir, Result<Unpacked, UnpackError>) {
+    ) -> (tempfile::TempDir, Result<Listing, UnpackError>) {
         let dir = tempfile::TempDir::new().expect("a temporary directory");
         let into = dir.path().join("demo/0.1.0/src.v1");
         let result = unpack(&archive(entries), "demo-0.1.0", &into, max_bytes);
@@ -809,6 +1116,218 @@ mod tests {
         );
     }
 
+    /// A client that sends no request, with `cargo_home`.
+    fn offline(cargo_home: Option<PathBuf>) -> StaticCrates {
+        let network = super::super::http::Network {
+            offline: true,
+            ..Default::default()
+        };
+        StaticCrates::with_base_url("http://127.0.0.1:9", &network)
+            .expect("a client")
+            .with_cargo_home(cargo_home)
+    }
+
+    /// The release of the tests.
+    fn demo() -> (CrateName, Version) {
+        ("demo".parse().expect("a name"), Version::new(0, 1, 0))
+    }
+
+    /// The cache at `root`, with `contents` as the `.crate` of the release of the tests.
+    fn cache_with(root: &Path, contents: &[u8]) -> Cache {
+        let cache = Cache::at(root);
+        let (name, version) = demo();
+        cache
+            .write_verified(&cache.crate_file_path(&name, &version), contents)
+            .expect("written");
+        cache
+    }
+
+    /// The `.crate` of the release of the tests: `Cargo.toml` and `src/lib.rs`.
+    fn demo_crate() -> Vec<u8> {
+        super::super::crate_file::tests::crate_file("demo", "0.1.0", "[package]\n")
+    }
+
+    /// The sources of the release of the tests, as `sources` has them.
+    async fn sources_of(crates: &StaticCrates, cache: &Cache) -> Result<Sources, SourcesError> {
+        let (name, version) = demo();
+        sources(crates, cache, &name, &version, None, 1024 * 1024).await
+    }
+
+    /// Without cargo's, the `.crate` is unpacked into the cache once, with its listing beside it;
+    /// then they are read without the `.crate` (decided in M3b, B1-1).
+    #[tokio::test]
+    async fn the_sources_are_unpacked_into_the_cache_once() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        let cache = cache_with(dir.path(), &demo_crate());
+        let crates = offline(None);
+        let found = sources_of(&crates, &cache).await.expect("unpacked");
+        let place = dir.path().join("static.crates.io/demo/0.1.0");
+        assert_eq!(found, Sources {
+            root: place.join("src.v1"),
+            listing: Listing {
+                files: vec!["Cargo.toml".to_owned(), "src/lib.rs".to_owned()],
+                bytes: 10,
+            },
+            origin: Origin::Cache,
+        });
+        assert!(place.join("src.v1/src/lib.rs").is_file());
+        assert!(place.join("src.v1.json").is_file());
+        fs::remove_file(place.join("demo-0.1.0.crate")).expect("removed");
+        assert_eq!(sources_of(&crates, &cache).await.expect("found"), found);
+    }
+
+    /// Two calls at once unpack it once, and both have it.
+    #[tokio::test]
+    async fn two_calls_at_once_have_the_same_sources() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        let cache = cache_with(dir.path(), &demo_crate());
+        let crates = offline(None);
+        let (one, two) = tokio::join!(sources_of(&crates, &cache), sources_of(&crates, &cache));
+        assert_eq!(one.expect("unpacked"), two.expect("unpacked"));
+        // The note of its use is written later, on its own.
+        let mut names = names_in(&dir.path().join("static.crates.io"));
+        names.retain(|name| name != used::USED);
+        assert_eq!(names, [
+            "demo-0.1.0.crate",
+            "demo-0.1.0.crate.sha256",
+            "src.v1",
+            "src.v1.json",
+            "src.v1.json.sha256",
+        ]);
+    }
+
+    /// What cargo finished unpacking from the sparse index of crates.io is read where it is, by
+    /// the listing of the `.crate`, without what a build script wrote there; what it did not
+    /// finish, or had from a git index, which may be another registry's, is not read, and the
+    /// `.crate` is unpacked into the cache (decided in M3b, B1-7).
+    #[tokio::test]
+    async fn what_cargo_unpacked_is_read_by_the_listing() {
+        const SPARSE: &str = "index.crates.io-1949cf8c6b5b557f";
+        for (registry, cargo_ok, origin) in [
+            (SPARSE, Some(r#"{"v":1}"#), Origin::Cargo),
+            (SPARSE, Some(r#"{"v":2}"#), Origin::Cargo),
+            (SPARSE, Some(r#"{"v":0}"#), Origin::Cache),
+            (SPARSE, Some("ok"), Origin::Cache),
+            (SPARSE, Some(""), Origin::Cache),
+            (SPARSE, None, Origin::Cache),
+            (
+                "github.com-1ecc6299db9ec823",
+                Some(r#"{"v":1}"#),
+                Origin::Cache,
+            ),
+        ] {
+            let dir = tempfile::TempDir::new().expect("a temporary directory");
+            let home = dir.path().join("cargo-home");
+            let unpacked = home.join("registry/src").join(registry).join("demo-0.1.0");
+            fs::create_dir_all(unpacked.join("src")).expect("made");
+            fs::write(unpacked.join("Cargo.toml"), "[package]\n").expect("written");
+            fs::write(unpacked.join("src/lib.rs"), "").expect("written");
+            fs::write(unpacked.join("written.rs"), "").expect("written");
+            if let Some(cargo_ok) = cargo_ok {
+                fs::write(unpacked.join(".cargo-ok"), cargo_ok).expect("written");
+            }
+            let cache = cache_with(&dir.path().join("cache"), &demo_crate());
+            let found = sources_of(&offline(Some(home)), &cache)
+                .await
+                .expect("found");
+            assert_eq!(found.origin, origin, "{registry} {cargo_ok:?}");
+            assert_eq!(found.listing.files, ["Cargo.toml", "src/lib.rs"]);
+            let place = dir.path().join("cache/static.crates.io/demo/0.1.0");
+            assert!(place.join("src.v1.json").is_file());
+            if origin == Origin::Cargo {
+                assert_eq!(found.root, unpacked);
+                assert!(!place.join("src.v1").exists());
+            } else {
+                assert_eq!(found.root, place.join("src.v1"));
+            }
+        }
+    }
+
+    /// A `.cargo-ok` that is a symlink is not followed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_for_cargo_ok_is_not_followed() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        let home = dir.path().join("cargo-home");
+        let unpacked = home.join("registry/src/index.crates.io-1949cf8c6b5b557f/demo-0.1.0");
+        fs::create_dir_all(&unpacked).expect("made");
+        fs::write(dir.path().join("ok"), r#"{"v":1}"#).expect("written");
+        std::os::unix::fs::symlink(dir.path().join("ok"), unpacked.join(".cargo-ok"))
+            .expect("linked");
+        let cache = cache_with(&dir.path().join("cache"), &demo_crate());
+        let found = sources_of(&offline(Some(home)), &cache)
+            .await
+            .expect("found");
+        assert_eq!(found.origin, Origin::Cache);
+    }
+
+    /// What is unpacked without its listing, as when the listing was not written after it, is
+    /// listed and not unpacked again; a listing without what is unpacked is unpacked again; one of
+    /// more than the limit is refused.
+    #[tokio::test]
+    async fn the_listing_and_what_is_unpacked_are_had_apart() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        let cache = cache_with(dir.path(), &demo_crate());
+        let crates = offline(None);
+        let place = dir.path().join("static.crates.io/demo/0.1.0");
+        let found = sources_of(&crates, &cache).await.expect("unpacked");
+        fs::write(place.join("src.v1/kept.rs"), "").expect("written");
+        fs::remove_file(place.join("src.v1.json")).expect("removed");
+        assert_eq!(sources_of(&crates, &cache).await.expect("listed"), found);
+        assert!(place.join("src.v1/kept.rs").is_file(), "not unpacked again");
+        assert!(place.join("src.v1.json").is_file());
+        fs::remove_dir_all(place.join("src.v1")).expect("removed");
+        assert_eq!(sources_of(&crates, &cache).await.expect("unpacked"), found);
+        assert!(place.join("src.v1/src/lib.rs").is_file());
+        let (name, version) = demo();
+        assert!(matches!(
+            sources(&crates, &cache, &name, &version, None, 9).await,
+            Err(SourcesError::Unpack(UnpackError::TooLarge { limit: 9 }))
+        ));
+    }
+
+    /// A temporary directory taken away while it is written, as by the GC with its place, is not
+    /// made again.
+    #[test]
+    fn a_temporary_directory_taken_away_is_not_made_again() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        let temp = dir.path().join(".src.v1.1.0.tmp");
+        let error = make_below(&temp, Path::new("src/bin")).expect_err("not made");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!temp.exists());
+        fs::create_dir_all(&temp).expect("made");
+        make_below(&temp, Path::new("src/bin")).expect("made");
+        make_below(&temp, Path::new("src")).expect("there already");
+        assert!(temp.join("src/bin").is_dir());
+    }
+
+    /// Without the `.crate` at hand nothing is had, offline or without its checksum; a `.crate`
+    /// that is refused leaves nothing (decided in M3b, B1-4 and B2-3).
+    #[tokio::test]
+    async fn without_a_crate_that_can_be_unpacked_nothing_is_had() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let crates = offline(None);
+        let (name, version) = demo();
+        assert!(matches!(
+            sources_of(&crates, &cache).await,
+            Err(SourcesError::NotCached)
+        ));
+        assert!(matches!(
+            sources(&crates, &cache, &name, &version, Some("00"), 1024).await,
+            Err(SourcesError::Crate(CrateError::Offline))
+        ));
+        let cache = cache_with(dir.path(), &archive(&[file("demo-0.1.0/../x.rs", b"")]));
+        assert!(matches!(
+            sources_of(&crates, &cache).await,
+            Err(SourcesError::Unpack(UnpackError::Refused { .. }))
+        ));
+        assert_eq!(names_in(&dir.path().join("static.crates.io")), [
+            "demo-0.1.0.crate",
+            "demo-0.1.0.crate.sha256",
+        ]);
+    }
+
     /// A temporary directory of the same name, which a stopped process of the same id left, is
     /// emptied, not added to.
     #[test]
@@ -817,10 +1336,10 @@ mod tests {
         let temp = dir.path().join(".src.v1.1.0.tmp");
         fs::create_dir_all(&temp).expect("made");
         fs::write(temp.join("left.rs"), "").expect("written");
-        let unpacked = unpack_into(
+        let unpacked = walk(
             &archive(&[file("demo-0.1.0/Cargo.toml", b"[package]\n")]),
             "demo-0.1.0",
-            &temp,
+            Some(&temp),
             1024,
         )
         .expect("unpacked");

@@ -368,11 +368,18 @@ impl Cache {
     /// next to it (requirement R-SC-2).
     #[must_use]
     pub fn crate_file_path(&self, name: &CrateName, version: &Version) -> PathBuf {
+        self.crate_place(name, version)
+            .join(format!("{name}-{version}.crate"))
+    }
+
+    /// The place of what the cache keeps of the release of `name` at `version` from
+    /// static.crates.io: its `.crate`, and the sources unpacked from it.
+    #[must_use]
+    pub fn crate_place(&self, name: &CrateName, version: &Version) -> PathBuf {
         self.root
             .join(super::layout::STATIC_CRATES)
             .join(name.cache_key())
             .join(version.to_string())
-            .join(format!("{name}-{version}.crate"))
     }
 
     /// Where the crates.io sparse index file at `index_path` (`se/rd/serde`) is kept. The record
@@ -621,7 +628,7 @@ fn too_large(path: &Path, max_len: u64) -> io::Error {
 /// Opens `path` for reading, failing if it is a symlink, and without waiting for a writer if it
 /// is a FIFO.
 #[cfg(unix)]
-fn open_without_following(path: &Path) -> io::Result<File> {
+pub(super) fn open_without_following(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     fs::OpenOptions::new()
@@ -633,7 +640,7 @@ fn open_without_following(path: &Path) -> io::Result<File> {
 /// Opens `path` for reading. Windows has no flag that refuses a symlink, so a symlink that
 /// replaces the file after it was checked is followed.
 #[cfg(not(unix))]
-fn open_without_following(path: &Path) -> io::Result<File> {
+pub(super) fn open_without_following(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 

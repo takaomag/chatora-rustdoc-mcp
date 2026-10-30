@@ -4,6 +4,7 @@
 
 use std::{
     collections::BTreeSet,
+    ffi::OsStr,
     fs,
     io::{self, Read as _},
     path::{Path, PathBuf},
@@ -140,10 +141,14 @@ impl StaticCrates {
         self
     }
 
+    /// `$CARGO_HOME`, where cargo has fetched `.crate` files and unpacked them, if it is known.
+    #[must_use]
+    pub fn cargo_home(&self) -> Option<&Path> {
+        self.cargo_home.as_deref()
+    }
+
     /// The `.crate` of `name` at `version` that cargo has fetched, if one with `checksum` is in
-    /// `$CARGO_HOME/registry/cache/<registry>/`. The registries are those of crates.io: its
-    /// sparse index (`index.crates.io-…`) and its git index (`github.com-…`), whose directory names
-    /// end in a hash that cargo versions may change.
+    /// `$CARGO_HOME/registry/cache/<registry>/`, of a registry of crates.io ([`is_crates_io`]).
     fn fetched_by_cargo(
         cargo_home: Option<&Path>,
         name: &CrateName,
@@ -154,11 +159,7 @@ impl StaticCrates {
         let file = format!("{name}-{version}.crate");
         registries
             .filter_map(Result::ok)
-            .filter(|registry| {
-                let name = registry.file_name();
-                let name = name.to_string_lossy();
-                name.starts_with("index.crates.io-") || name.starts_with("github.com-")
-            })
+            .filter(|registry| is_crates_io(&registry.file_name()))
             .find_map(|registry| {
                 let path = registry.path().join(&file);
                 let size = fs::metadata(&path)
@@ -288,6 +289,15 @@ impl StaticCrates {
                 BodyError::TooLarge { limit } => CrateError::TooLarge { limit },
             })
     }
+}
+
+/// Whether `registry`, a directory in `$CARGO_HOME/registry/cache`, may be one of crates.io: its
+/// sparse index (`index.crates.io-…`) or its git index (`github.com-…`), whose names end in a hash
+/// that cargo versions may change. Another registry on GitHub has the latter's prefix too, which
+/// the checksum of a `.crate` tells apart.
+fn is_crates_io(registry: &OsStr) -> bool {
+    let name = registry.to_string_lossy();
+    name.starts_with("index.crates.io-") || name.starts_with("github.com-")
 }
 
 /// How docs.rs built the documentation of a release, from `[package.metadata.docs.rs]` in its
@@ -881,8 +891,8 @@ features = ["full"]
         let dir = tempfile::tempdir().expect("a temporary directory");
         let env = [
             (ROOT, dir.path().as_os_str()),
-            (BASE_URL, std::ffi::OsStr::new(&base_url)),
-            (CHECKSUM, std::ffi::OsStr::new(&checksum)),
+            (BASE_URL, OsStr::new(&base_url)),
+            (CHECKSUM, OsStr::new(&checksum)),
         ];
         let name = "data::crate_file::tests::fetch_a_crate_file_for_another_test";
         let both = [

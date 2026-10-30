@@ -15,6 +15,9 @@ const EXTERNAL: u32 = 1;
 const RECORDS: u32 = 1;
 /// What the probes of toolchains found, under `toolchains/` (decided in M2's C1).
 const TOOLCHAINS: u32 = 1;
+/// The sources unpacked from a `.crate`, and the listing of its files, beside it under
+/// `static.crates.io/` (decided in M3b, B1-1).
+const SOURCES: u32 = 1;
 /// The schema of the archives of rustdoc JSON (requirement R-CA-2): change it with the types that
 /// an archive holds, other than those of rustdoc-types, whose `FORMAT_VERSION` is in the header and
 /// the name of the archive too.
@@ -42,6 +45,13 @@ pub fn records_dir() -> String {
 #[must_use]
 pub fn toolchains_dir() -> String {
     dir(TOOLCHAINS)
+}
+
+/// The directory of the sources unpacked from a `.crate`, of this format: `src.v<n>`. Its listing
+/// is beside it, with `.json` added.
+#[must_use]
+pub fn sources_dir() -> String {
+    format!("src.{}", dir(SOURCES))
 }
 
 /// The schema of the archives of rustdoc JSON.
@@ -87,6 +97,7 @@ mod tests {
         assert_eq!(external_dir(), "v1");
         assert_eq!(records_dir(), "v1");
         assert_eq!(toolchains_dir(), "v1");
+        assert_eq!(sources_dir(), "src.v1");
         assert_eq!(archive_schema(), 8);
     }
 }

@@ -478,6 +478,8 @@ mod tests {
         write(root, "std/local/def/x86_64-unknown-linux-gnu/std.json", 7);
         write(root, "std/nightly.json", 1);
         write(root, "static.crates.io/serde/1.0.0/serde-1.0.0.crate", 30);
+        write(root, "static.crates.io/serde/1.0.0/src.v1/src/lib.rs", 8);
+        write(root, "static.crates.io/serde/1.0.0/src.v1.json", 2);
         write(root, "index.crates.io/se/rd/serde", 2);
         write(root, "index.crates.io/se/rd/serde.meta.json", 3);
         write(root, "t/0123456789ab/target/debug/a", 100);
@@ -515,10 +517,9 @@ mod tests {
                 .all(|entry| !entry.path.ends_with("serde.meta.json")),
             "{inventory:?}"
         );
-        assert_eq!(
-            entry(&inventory, "static.crates.io/serde/1.0.0").kind,
-            Kind::Crate
-        );
+        // With the sources unpacked from it.
+        let crate_file = entry(&inventory, "static.crates.io/serde/1.0.0");
+        assert_eq!((crate_file.kind, crate_file.bytes), (Kind::Crate, 40));
         let target = entry(&inventory, "t/0123456789ab");
         assert_eq!(
             (target.kind, target.class, target.bytes),
