@@ -1554,7 +1554,12 @@ impl<'a> Query<'a> {
             } => {
                 let full = source_root::lexically(&workspace.join(&span.filename));
                 if let Ok(inside) = full.strip_prefix(package) {
-                    path = self.readable(&full);
+                    // A git or crates.io dependency's, where cargo has it (decided in M3c, C1c).
+                    path = if self.of_a_path_package() {
+                        self.readable(&full)
+                    } else {
+                        self.dependency_path(&full)
+                    };
                     (Cow::Owned(source_root::slash_separated(inside)), true)
                 } else {
                     path = self.dependency_path(&full);
@@ -1679,6 +1684,15 @@ impl<'a> Query<'a> {
             .and_then(|resolved| dunce::simplified(&resolved.path).to_str().map(Into::into));
         self.judged.insert(full.to_path_buf(), judged.clone());
         judged
+    }
+
+    /// Whether the crate is built here from a member or a path dependency, whose files are judged
+    /// as its package's; else, of a git or crates.io dependency, as cargo has them.
+    fn of_a_path_package(&self) -> bool {
+        matches!(self.request.origin, Origin::Local {
+            package_source: None | Some("path"),
+            ..
+        })
     }
 
     /// No real path of a dependency's file without the local builds.
@@ -2586,6 +2600,30 @@ pub(super) mod tests {
         assert_eq!(
             response["warnings"],
             json!([format!("{} is outside the package", slashed(filename))])
+        );
+        // A git dependency built here, its own file in its checkout (decided in M3c, C1c).
+        let response = defined_in("src/lib.rs", Origin::Local {
+            private: false,
+            package_source: Some("git"),
+            resolved_from: ResolvedFrom::Explicit,
+            project_from: None,
+            toolchain: None,
+            built_at: "2026-10-26T00:00:00Z",
+            features_requested: None,
+            features_effective: None,
+            recorded_by: None,
+            roots: Some((&checkout, &checkout)),
+            source_files: &[],
+            dependencies: Some(&dependencies),
+        });
+        assert_eq!(
+            response["data"]["source_location"],
+            json!({
+                "file": "src/lib.rs",
+                "lines": "10-12",
+                "path": opened.to_str().expect("UTF-8"),
+            }),
+            "{response}"
         );
     }
 

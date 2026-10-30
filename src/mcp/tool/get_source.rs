@@ -297,6 +297,14 @@ enum Readable {
         dir: PathBuf,
         workspace_root: PathBuf,
     },
+    /// Of a git dependency built here, in the checkout `checkout` that cargo finished, under
+    /// `dir`, in the workspace at `workspace_root`.
+    #[cfg(feature = "local")]
+    Checkout {
+        checkout: PathBuf,
+        dir: PathBuf,
+        workspace_root: PathBuf,
+    },
 }
 
 /// A file read.
@@ -465,9 +473,9 @@ async fn local_package(
         return Err(Box::new(not_read_yet(Source::Local)));
     };
     let record = &built.record;
-    // A git or registry dependency's are judged otherwise.
-    if super::local::package_source(&record.package) != "path" {
-        return Err(Box::new(not_read_yet(Source::Local)));
+    let source = super::local::package_source(&record.package);
+    if !matches!(source, "path" | "git" | "crates.io") {
+        return Err(Box::new(other_registry(found)));
     }
     let (Some(workspace_root), Some(dir)) = (&record.workspace_root, &record.package_root) else {
         return Err(Box::new(super::error_result(&json!({
@@ -482,6 +490,33 @@ async fn local_package(
             ],
         }))));
     };
+    let cargo_home = state.resolver.cargo_home();
+    match source {
+        // As docs.rs's: of its `.crate`, where cargo unpacked it from crates.io, or else unpacked
+        // in the cache. Not where it was unpacked from another source that replaces crates.io,
+        // whose files may differ, nor vendored (decided in M3c, decision 31).
+        "crates.io" => {
+            return if cargo_home.is_some_and(|home| unpacked_from_crates_io(dir, home)) {
+                release_sources(state, found, provenance, warnings)
+                    .await
+                    .map(Readable::Release)
+            } else {
+                Err(Box::new(other_registry(found)))
+            };
+        },
+        // In its checkout, where cargo checked it out, and only there: not vendored.
+        "git" => {
+            return cargo_home
+                .and_then(|home| checkout_of(dir, home))
+                .map(|checkout| Readable::Checkout {
+                    checkout,
+                    dir: dir.clone(),
+                    workspace_root: workspace_root.clone(),
+                })
+                .ok_or_else(|| Box::new(other_registry(found)));
+        },
+        _ => {},
+    }
     let mut package = source_root::Package {
         root: if dir.starts_with(workspace_root) {
             workspace_root
@@ -493,29 +528,7 @@ async fn local_package(
         source_files: record.source_files.clone(),
         ..source_root::Package::default()
     };
-    let resolution = match found.workspace {
-        // Outside the default project, what build_external_docs recorded: no cargo runs there
-        // (decided in M2e's E4b-3).
-        Some(workspace) if super::recorded_workspace::is_outside(state, workspace) => {
-            super::recorded_workspace::read(state, workspace)
-                .await
-                .ok()
-                .map(|recorded| Arc::clone(&recorded.resolution))
-        },
-        Some(workspace) => match state.resolver.resolve_until(workspace, found.until).await {
-            Joined::Done(resolved) => resolved.ok(),
-            Joined::Going(doing) => {
-                return Err(Box::new(get_item::building_response(
-                    provenance,
-                    doing,
-                    "cargo reads the packages of the workspace",
-                    warnings,
-                )));
-            },
-            Joined::Ended => None,
-        },
-        None => None,
-    };
+    let resolution = metadata_of(state, found, provenance, warnings).await?;
     let dir_text = source_root::lexically(dir);
     if let Some(resolution) = &resolution
         && let Resolution::Metadata { metadata, .. } = &**resolution
@@ -546,6 +559,88 @@ async fn local_package(
         dir: dir.clone(),
         workspace_root: workspace_root.clone(),
     })
+}
+
+/// The packages of the workspace that decided the version of `found`, as `cargo metadata` tells
+/// them: outside the default project, what `build_external_docs` recorded, as no cargo runs there
+/// (decided in M2e's E4b-3); else as the lookup had them, until its deadline, past which the
+/// answer is that cargo reads them. `None` when they cannot be had.
+#[cfg(feature = "local")]
+async fn metadata_of(
+    state: &Arc<ToolState>,
+    found: &Found<'_>,
+    provenance: Map<String, Value>,
+    warnings: &[Box<str>],
+) -> Result<Option<Arc<Resolution>>, Box<CallToolResult>> {
+    let Some(workspace) = found.workspace else {
+        return Ok(None);
+    };
+    if super::recorded_workspace::is_outside(state, workspace) {
+        return Ok(super::recorded_workspace::read(state, workspace)
+            .await
+            .ok()
+            .map(|recorded| Arc::clone(&recorded.resolution)));
+    }
+    match state.resolver.resolve_until(workspace, found.until).await {
+        Joined::Done(resolved) => Ok(resolved.ok()),
+        Joined::Going(doing) => Err(Box::new(get_item::building_response(
+            provenance,
+            doing,
+            "cargo reads the packages of the workspace",
+            warnings,
+        ))),
+        Joined::Ended => Ok(None),
+    }
+}
+
+/// Whether cargo unpacked the package at `dir` from crates.io: under
+/// `$CARGO_HOME/registry/src/index.crates.io-…/`, in `cargo_home`.
+#[cfg(feature = "local")]
+fn unpacked_from_crates_io(dir: &Path, cargo_home: &Path) -> bool {
+    source_root::lexically(dir)
+        .strip_prefix(source_root::lexically(
+            &cargo_home.join("registry").join("src"),
+        ))
+        .ok()
+        .and_then(|inside| inside.components().next())
+        .is_some_and(|index| {
+            index
+                .as_os_str()
+                .to_string_lossy()
+                .starts_with("index.crates.io-")
+        })
+}
+
+/// The checkout that the package at `dir` is in, `$CARGO_HOME/git/checkouts/<repository>/<rev>`
+/// in `cargo_home`, if cargo finished it (its `.cargo-ok`): the root that its files are judged
+/// under, and no other's (requirement R-SC-4).
+#[cfg(feature = "local")]
+fn checkout_of(dir: &Path, cargo_home: &Path) -> Option<PathBuf> {
+    let checkouts = source_root::lexically(&cargo_home.join("git").join("checkouts"));
+    let inside = source_root::lexically(dir);
+    let mut parts = inside.strip_prefix(&checkouts).ok()?.components();
+    let checkout = checkouts.join(parts.next()?).join(parts.next()?);
+    std::fs::symlink_metadata(checkout.join(".cargo-ok"))
+        .is_ok_and(|ok| ok.is_file())
+        .then_some(checkout)
+}
+
+/// The tool error for a crate of a registry other than crates.io, or vendored, whose sources are
+/// not read (decided in M3c, decision 31).
+#[cfg(feature = "local")]
+fn other_registry(found: &Found<'_>) -> CallToolResult {
+    super::error_result(&json!({
+        "code": "docs_unavailable",
+        "reason": "outside_package",
+        "message": format!(
+            "{}@{} is of a registry other than crates.io, whose sources get_source does not read",
+            found.name, found.version
+        ),
+        "retryable": false,
+        "suggestions": [
+            "read the file at source_location.path of get_item, if it has one, with your own tools",
+        ],
+    }))
 }
 
 /// The tool error for the sources of a local build or of std, which are not read yet.
@@ -611,42 +706,60 @@ async fn read_file(
 ) -> Result<ReadFile, Box<CallToolResult>> {
     let file_text = file.to_owned();
     let reading = crate::task::spawn_blocking(move || {
-        let (root, asked, dir) = match &readable {
-            Readable::Release(sources) => (
-                Root::Release(sources),
-                PathBuf::from(&file_text),
-                sources.root.as_path(),
-            ),
+        // A file not there is told so, before that it is not of the package.
+        let missing = |refusal, asked: &Path| {
+            if refusal == Refusal::NotInPackage && std::fs::symlink_metadata(asked).is_err() {
+                Refusal::Missing
+            } else {
+                refusal
+            }
+        };
+        // A span outside the package is relative to the workspace's root.
+        #[cfg(feature = "local")]
+        let under = |dir: &Path, workspace_root: &Path| {
+            let in_package = dir.join(&file_text);
+            if of_span && std::fs::symlink_metadata(&in_package).is_err() {
+                workspace_root.join(&file_text)
+            } else {
+                in_package
+            }
+        };
+        let (resolved, asked, dir) = match &readable {
+            Readable::Release(sources) => {
+                let asked = sources.root.join(&file_text);
+                let resolved = source_root::resolve(Root::Release(sources), Path::new(&file_text))
+                    .map_err(|refusal| missing(refusal, &asked))?;
+                (resolved, asked, sources.root.as_path())
+            },
             #[cfg(feature = "local")]
             Readable::Package {
                 package,
                 dir,
                 workspace_root,
             } => {
-                let in_package = dir.join(&file_text);
-                // A span outside the package is relative to the workspace's root.
-                let asked = if of_span && std::fs::symlink_metadata(&in_package).is_err() {
-                    workspace_root.join(&file_text)
-                } else {
-                    in_package
-                };
-                (Root::Package(package), asked, dir.as_path())
+                let asked = under(dir, workspace_root);
+                let resolved = source_root::resolve(Root::Package(package), &asked)
+                    .map_err(|refusal| missing(refusal, &asked))?;
+                (resolved, asked, dir.as_path())
+            },
+            #[cfg(feature = "local")]
+            Readable::Checkout {
+                checkout,
+                dir,
+                workspace_root,
+            } => {
+                let asked = under(dir, workspace_root);
+                let resolved = source_root::resolve(Root::Checkout(checkout), &asked)
+                    .map_err(|refusal| missing(refusal, &asked))?;
+                (resolved, asked, dir.as_path())
             },
         };
-        let resolved = source_root::resolve(root, &asked).map_err(|refusal| {
-            let there = std::fs::symlink_metadata(root.dir().join(&asked)).is_ok();
-            if refusal == Refusal::NotInPackage && !there {
-                Refusal::Missing
-            } else {
-                refusal
-            }
-        })?;
         let contents = std::fs::read(&resolved.path).map_err(|error| {
             tracing::debug!(path = %resolved.path.display(), %error, "a source file could not be read");
             Refusal::Missing
         })?;
         // Relative to the package's root, which the root judged under may hold.
-        let file = relative_to(&root.dir().join(&asked), dir);
+        let file = relative_to(&asked, dir);
         Ok::<_, Refusal>(ReadFile {
             resolved,
             contents,
@@ -1277,6 +1390,43 @@ mod tests {
                 "kind": "trait",
                 "path": "/cache/src.v1/src/stream.rs",
             })
+        );
+    }
+
+    /// A crates.io dependency built here is read as a release only where cargo unpacked it from
+    /// crates.io, and a git one only in the checkout that cargo finished, its root; not from a
+    /// source that replaces crates.io, nor vendored (decided in M3c, decision 31).
+    #[cfg(feature = "local")]
+    #[test]
+    fn a_dependency_built_here_is_read_where_cargo_has_it() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let home = dir.path().join("cargo-home");
+        let src = home.join("registry/src");
+        assert!(unpacked_from_crates_io(
+            &src.join("index.crates.io-1949cf8c6b5b557f/serde-1.0.0"),
+            &home
+        ));
+        for elsewhere in [
+            src.join("mirror.example-0123456789abcdef/serde-1.0.0"),
+            dir.path().join("project/vendor/serde"),
+        ] {
+            assert!(
+                !unpacked_from_crates_io(&elsewhere, &home),
+                "{}",
+                elsewhere.display()
+            );
+        }
+        let checkout = home.join("git/checkouts/repo-0123/abcdef0");
+        std::fs::create_dir_all(checkout.join("crates/sub")).expect("made");
+        assert_eq!(checkout_of(&checkout.join("crates/sub"), &home), None);
+        std::fs::write(checkout.join(".cargo-ok"), "").expect("written");
+        assert_eq!(
+            checkout_of(&checkout.join("crates/sub"), &home),
+            Some(checkout)
+        );
+        assert_eq!(
+            checkout_of(&dir.path().join("project/vendor/dep"), &home),
+            None
         );
     }
 

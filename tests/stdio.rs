@@ -3608,6 +3608,10 @@ fn build_external_docs_builds_a_release_that_no_project_uses() {
         found["structuredContent"]["data"]["path"],
         "fixture_far::extra"
     );
+    // Its source is not read: cargo unpacked it from the test's registry, which replaces
+    // crates.io, whose files may differ from crates.io's (decided in M3c, decision 31).
+    let source = called_until_done(&mut server, 200, "get_source", &lookup);
+    assert_eq!(text_json(&source)["reason"], "outside_package", "{source}");
     // Its features are those that its `.crate` asks docs.rs for.
     assert!(
         registry
@@ -4173,6 +4177,47 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
                 .to_string()
                 .contains("to resolve it anew"),
             "{tool}: {result}"
+        );
+    }
+    // Its source, in the checkout where cargo checked it out (decided in M3c, C1c).
+    server.send(&call_tool(
+        200,
+        "get_source",
+        with(json!({ "path": "fixture_git::extra" })),
+    ));
+    let source = server.response(200)["result"].clone();
+    assert_ne!(source["isError"], true, "{source}");
+    let data = &source["structuredContent"]["data"];
+    assert!(
+        data["source"]
+            .as_str()
+            .is_some_and(|text| text.contains("fn extra")),
+        "{source}"
+    );
+    assert!(
+        data["path"]
+            .as_str()
+            .is_some_and(|path| path.contains("checkouts")),
+        "{source}"
+    );
+    // Not what is outside its checkout, nor its dotfiles: of its own root only (requirement
+    // R-SC-4).
+    let elsewhere = data["path"]
+        .as_str()
+        .and_then(|path| path.split_once("/git/checkouts/"))
+        .map(|(home, _)| format!("{home}/registry/src/elsewhere.rs"))
+        .unwrap_or_default();
+    for (id, file) in [
+        (201, "../../other/rev/src/lib.rs".to_owned()),
+        (202, ".cargo-ok".to_owned()),
+        (203, elsewhere),
+    ] {
+        server.send(&call_tool(id, "get_source", with(json!({ "file": file }))));
+        let refused = server.response(id)["result"].clone();
+        assert_eq!(
+            text_json(&refused)["reason"],
+            "outside_package",
+            "{refused}"
         );
     }
     looked_up_by_hash_and_when_stale(&mut server, &commit);
