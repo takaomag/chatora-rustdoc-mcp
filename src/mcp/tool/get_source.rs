@@ -22,20 +22,23 @@ use super::{
     ToolState,
     get_item::{self, Arguments},
 };
-use crate::data::{
-    crate_file::CrateError,
-    crate_name::CrateName,
-    crate_source::{self, Sources, SourcesError, UnpackError},
-    dist::{DistError, RustSrc},
-    flight::Joined,
-    hidden,
-    source_root::{self, Refusal, Root},
-    std_json::{self, Chosen},
-};
 #[cfg(feature = "local")]
 use crate::data::{metadata::Resolution, project::Workspace};
 #[cfg(feature = "local")]
 use crate::query::local::LocalBuilt;
+use crate::{
+    data::{
+        crate_file::CrateError,
+        crate_name::CrateName,
+        crate_source::{self, Sources, SourcesError, UnpackError},
+        dist::{DistError, RustSrc},
+        flight::Joined,
+        hidden,
+        source_root::{self, Refusal, Root},
+        std_json::{self, Chosen},
+    },
+    query::get_item::Made,
+};
 
 /// The name of the tool.
 pub(super) const NAME: &str = "get_source";
@@ -166,6 +169,12 @@ fn output_schema() -> JsonObject {
                     "source": { "type": "string" },
                     "path": { "type": "string" },
                     "url": { "type": "string" },
+                    "macro": {
+                        "type": "string",
+                        "enum": ["derive", "invocation"],
+                        "description": "A macro made the item: a derive, or a macro called on \
+                                        its lines, whose code is not shown.",
+                    },
                     "truncated": { "type": "boolean" },
                 },
                 "required": ["file", "lines", "shown", "source"],
@@ -322,10 +331,31 @@ enum Readable {
     },
 }
 
+impl Readable {
+    /// The directory that this server unpacked the sources into in its cache, which the GC may
+    /// take; `None` for sources that cargo or a toolchain here keeps.
+    fn unpacked_in_cache(&self) -> Option<PathBuf> {
+        match self {
+            Self::Release(sources) if sources.origin == crate_source::Origin::Cache => {
+                Some(sources.root.clone())
+            },
+            Self::RustSrc {
+                root,
+                in_cache: true,
+            } => Some(root.clone()),
+            Self::Release(_) | Self::RustSrc { .. } => None,
+            #[cfg(feature = "local")]
+            Self::Package { .. } | Self::Checkout { .. } => None,
+        }
+    }
+}
+
 /// A file read.
 struct ReadFile {
     /// What `source_root` judged of it: its real path.
     resolved: source_root::Resolved,
+    /// The path asked for, absolute, as its text resolves: as a build's inputs have it.
+    asked: PathBuf,
     /// Its contents.
     contents: Vec<u8>,
     /// Its path relative to its package's root, with `/`.
@@ -359,35 +389,33 @@ pub(super) async fn read(
         .unwrap_or_default();
     let data = item.get("data").cloned().unwrap_or(Value::Null);
     let mut warnings = warnings.to_vec();
-    let mut asked = match where_to_read(ask, &data) {
+    let where_asked = match where_to_read(ask, &data) {
         Ok(asked) => asked,
         Err(answer) => return *answer,
     };
-    let (readable, file_crate) =
-        match readable(state, &found, ask, &mut asked, (&provenance, &mut warnings)).await {
-            Ok(readable) => readable,
-            Err(answer) => return *answer,
-        };
-    // std's is not asked for by version, which the nightly's would be.
-    let release = match (&file_crate, found.docs) {
-        (Some(of), _) => of.clone(),
-        (None, Source::Std(_)) => found.name.to_string(),
-        (None, Source::DocsRs | Source::Local) => format!("{}@{}", found.name, found.version),
-    };
-    let ReadFile {
-        resolved,
-        contents,
-        file,
-    } = match read_file(
-        readable,
-        &asked.file,
-        ask.file.is_none(),
-        file_crate.as_deref(),
+    let (asked, file_crate, read) = match read_found(
+        state,
+        &found,
+        ask,
+        &where_asked,
+        (&provenance, &mut warnings),
     )
     .await
     {
         Ok(read) => read,
         Err(answer) => return *answer,
+    };
+    let ReadFile {
+        resolved,
+        asked: asked_path,
+        contents,
+        file,
+    } = read;
+    // std's is not asked for by version, which the nightly's would be.
+    let release = match (&file_crate, found.docs) {
+        (Some(of), _) => of.clone(),
+        (None, Source::Std(_)) => found.name.to_string(),
+        (None, Source::DocsRs | Source::Local) => format!("{}@{}", found.name, found.version),
     };
     let lines = asked.lines.unwrap_or((1, usize::MAX));
     let excerpt = match excerpt(&contents, lines, ask.context) {
@@ -425,6 +453,26 @@ pub(super) async fn read(
         ask,
     );
     if let Some(answer) = answer.as_object_mut() {
+        // Whether the file is the one that the documentation was built from (decided in M3c,
+        // decisions 36 and 37).
+        let built = built_from(&found, &asked_path, &resolved.path, &contents);
+        if built == Some(false) {
+            let moved = if ask.file.is_none() {
+                ": the item's lines may have moved"
+            } else {
+                ""
+            };
+            push(
+                answer,
+                "warnings",
+                &format!("{file} has changed since the documentation was built{moved}"),
+            );
+        }
+        if ask.file.is_none() {
+            let changed = built.map_or_else(|| provenance_stale(answer), |same| !same)
+                || lines.1 > excerpt.lines_in_file;
+            made_by_macro(answer, &data, (&contents, lines), changed);
+        }
         rest_to_read(answer, call, (&file, lines), &excerpt, ask);
     }
     get_item::add_warnings(&mut answer, &warnings);
@@ -454,6 +502,44 @@ async fn readable(
         Source::Std(chosen) => std_sources(state, found, chosen, asked, (provenance, warnings))
             .await
             .map(|readable| (readable, None)),
+    }
+}
+
+/// The file of the crate of `found` that `where_asked` names, read from its sources, with where
+/// it was asked for in them and the release it is of when it is not the crate's
+/// ([`readable`]); its sources had again once if the GC took them meanwhile, as unpacked in the
+/// cache. Else the answer to give.
+async fn read_found(
+    state: &Arc<ToolState>,
+    found: &Found<'_>,
+    ask: &SourceAsk,
+    where_asked: &AskedFile,
+    (provenance, warnings): (&Map<String, Value>, &mut Vec<Box<str>>),
+) -> Result<(AskedFile, Option<String>, ReadFile), Box<CallToolResult>> {
+    let mut again = true;
+    loop {
+        let mut asked = where_asked.clone();
+        let (readable, file_crate) =
+            readable(state, found, ask, &mut asked, (provenance, warnings)).await?;
+        let unpacked = readable.unpacked_in_cache();
+        match read_file(
+            readable,
+            &asked.file,
+            ask.file.is_none(),
+            file_crate.as_deref(),
+        )
+        .await
+        {
+            Ok(read) => return Ok((asked, file_crate, read)),
+            // Taken by the GC since they were had: had again, once.
+            Err(_)
+                if again
+                    && unpacked.is_some_and(|root| std::fs::symlink_metadata(root).is_err()) =>
+            {
+                again = false;
+            },
+            Err(answer) => return Err(answer),
+        }
     }
 }
 
@@ -865,6 +951,7 @@ async fn read_file(
         let file = relative_to(&asked, dir);
         Ok::<_, Refusal>(ReadFile {
             resolved,
+            asked: source_root::lexically(&asked),
             contents,
             file,
         })
@@ -923,6 +1010,10 @@ fn answer(
 ) -> Value {
     let mut answer = Map::new();
     answer.insert("provenance".to_owned(), Value::Object(provenance));
+    // Of a build being made again, whose result is newer.
+    if let Some(after) = item.get("retry_after_secs") {
+        answer.insert("retry_after_secs".to_owned(), after.clone());
+    }
     let mut told: Vec<Value> = item
         .get("warnings")
         .and_then(Value::as_array)
@@ -1029,6 +1120,146 @@ pub(super) fn at_entry(mut result: CallToolResult, entry: &str) -> CallToolResul
         }
     }
     result
+}
+
+/// The key in `data` of the item looked up for `get_source` of its own name, which the answer does
+/// not show (decided in M3c, decision 35).
+const MADE_NAME: &str = "made_name";
+
+/// The key in `data` of the item looked up for `get_source` of whether a derive made it, which the
+/// answer does not show.
+const MADE_DERIVED: &str = "made_derived";
+
+/// Adds to `response`, of the item looked up for `get_source`, what `made` tells of a macro's
+/// output.
+pub(super) fn add_made(response: &mut Value, made: Made<'_>) {
+    if let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) {
+        if let Some(name) = made.name {
+            data.insert(MADE_NAME.to_owned(), json!(name));
+        }
+        data.insert(MADE_DERIVED.to_owned(), json!(made.derived));
+    }
+}
+
+/// The kinds whose own name is not on their lines although no macro made them: a module of its
+/// own file, a primitive, a re-export and a derive macro, whose name is in its attribute.
+const NAMES_ELSEWHERE: &[&str] = &[
+    "module",
+    "primitive",
+    "use",
+    "extern_crate",
+    "impl",
+    "proc_derive",
+];
+
+/// Marks in `answer` an item that a macro made, as `data` of its lookup tells, with its lines in
+/// `contents` (requirement R-SC-3, decided in M3c, decisions 34 and 36): made by a derive, as
+/// its attribute tells, or else, unless the file has `changed` since its build, where a macro was
+/// called, as its name is not on its lines.
+fn made_by_macro(
+    answer: &mut Map<String, Value>,
+    data: &Value,
+    (contents, (first, last)): (&[u8], (usize, usize)),
+    changed: bool,
+) {
+    let made = if data.get(MADE_DERIVED).and_then(Value::as_bool) == Some(true) {
+        (
+            "derive",
+            "the item was made by a derive: its lines are those of the derive's attribute, \
+             #[derive(…)], not of the code made"
+                .to_owned(),
+        )
+    } else if let Some(name) = data.get(MADE_NAME).and_then(Value::as_str)
+        && !changed
+        && named_on_its_lines(data.get("kind").and_then(Value::as_str), name)
+        && !String::from_utf8_lossy(contents)
+            .lines()
+            .skip(first.saturating_sub(1))
+            .take(last.saturating_sub(first).saturating_add(1))
+            .any(|line| has_word(line, name))
+    {
+        (
+            "invocation",
+            format!(
+                "{name} is not on its lines: they may be where a macro that made it was called"
+            ),
+        )
+    } else {
+        return;
+    };
+    if let Some(Value::Object(shown)) = answer.get_mut("data") {
+        shown.insert("macro".to_owned(), json!(made.0));
+    }
+    push(answer, "warnings", &made.1);
+}
+
+/// Whether an item of `kind` named `name` has its name on its lines unless a macro made it: not
+/// of [`NAMES_ELSEWHERE`], nor `_` or a tuple field's number.
+fn named_on_its_lines(kind: Option<&str>, name: &str) -> bool {
+    kind.is_some_and(|kind| !NAMES_ELSEWHERE.contains(&kind))
+        && name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_alphabetic() || first == '_')
+        && name != "_"
+}
+
+/// Whether `text` has `word` as a word, as an identifier, raw too (`r#try` has `try`): words end
+/// at a space or an ASCII character that no identifier has, as a combining mark goes on in one,
+/// and Rust has no other characters outside comments and strings.
+fn has_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| {
+        c.is_whitespace() || (c.is_ascii() && !(c.is_ascii_alphanumeric() || c == '_'))
+    })
+    .any(|found| found == word)
+}
+
+/// Whether the file read, `contents`, at `asked` (or its real path `real`), is the one that the
+/// documentation of `found`, a build here, was built from, as the SHA-256 of its inputs tells;
+/// `None` when it cannot be told: not among them, without a digest, or of another source.
+#[cfg(feature = "local")]
+fn built_from(found: &Found<'_>, asked: &Path, real: &Path, contents: &[u8]) -> Option<bool> {
+    as_input(
+        found.built.as_ref()?.record.inputs.as_ref()?,
+        [asked, real],
+        contents,
+    )
+}
+
+/// Whether `contents`, read at the first of `paths`, as asked for, or its real path, the second, is
+/// the file that `inputs` have there, as its SHA-256 tells; `None` without it among them with a
+/// digest.
+#[cfg(feature = "local")]
+fn as_input(
+    inputs: &crate::data::freshness::Inputs,
+    paths: [&Path; 2],
+    contents: &[u8],
+) -> Option<bool> {
+    let sha256 = paths.into_iter().find_map(|path| {
+        inputs
+            .files
+            .binary_search_by(|file| file.path.as_path().cmp(path))
+            .ok()
+            .and_then(|at| inputs.files.get(at))
+            .and_then(|file| file.sha256.as_deref())
+    })?;
+    Some(crate::data::cache::sha256_hex(contents).eq_ignore_ascii_case(sha256))
+}
+
+/// Without local builds, no inputs are recorded.
+#[cfg(not(feature = "local"))]
+const fn built_from(_: &Found<'_>, _: &Path, _: &Path, _: &[u8]) -> Option<bool> {
+    None
+}
+
+/// Whether the provenance of `answer` tells that the documentation is not of the files as they
+/// are: being built again, or its inputs changed.
+fn provenance_stale(answer: &Map<String, Value>) -> bool {
+    answer
+        .get("provenance")
+        .and_then(|provenance| provenance.get("stale"))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 /// The URL of `file` at `lines` (`first-last`) of the crate of `docs`: on docs.rs among the
@@ -1747,6 +1978,103 @@ mod tests {
             checkout_of(&dir.path().join("project/vendor/dep"), &home),
             None
         );
+    }
+
+    /// An item that a macro made is marked: by a derive, as its `impl` tells, or where a macro was
+    /// called, as its name is not on its lines, unless the file changed since its build or its
+    /// kind has its name elsewhere (requirement R-SC-3, decided in M3c, decisions 34 and 36).
+    #[test]
+    fn an_item_that_a_macro_made_is_marked() {
+        let source = b"#[derive(Clone)]\nstruct A;\nimpl_traits!(B);\nfn r#try() {}\n";
+        let marked = |data: Value, lines, changed| {
+            let mut answer = Map::new();
+            answer.insert("data".to_owned(), json!({}));
+            made_by_macro(&mut answer, &data, (source, lines), changed);
+            (
+                answer["data"].get("macro").cloned(),
+                answer.get("warnings").map(Value::to_string),
+            )
+        };
+        let derived = json!({
+            "path": "a::A::clone", "kind": "method", MADE_NAME: "clone", MADE_DERIVED: true,
+        });
+        let (made, told) = marked(derived.clone(), (1, 1), false);
+        assert_eq!(made, Some(json!("derive")));
+        assert!(told.is_some_and(|told| told.contains("the item was made by a derive")));
+        // Told by its attribute, even when the file changed.
+        assert_eq!(marked(derived, (1, 1), true).0, Some(json!("derive")));
+        let called = json!({
+            "path": "a::write", "kind": "function", MADE_NAME: "write", MADE_DERIVED: false,
+        });
+        let (made, told) = marked(called.clone(), (3, 3), false);
+        assert_eq!(made, Some(json!("invocation")));
+        assert!(told.is_some_and(|told| told.contains("write is not on its lines")));
+        // Not when the lines may have moved.
+        assert_eq!(marked(called, (3, 3), true), (None, None));
+        for (name, kind, lines) in [
+            // On its lines, raw too.
+            ("A", "struct", (2, 2)),
+            ("try", "function", (4, 4)),
+            // Its name is elsewhere, by its kind, or it has none to look for.
+            ("module", "module", (3, 3)),
+            ("Derive", "proc_derive", (3, 3)),
+            ("_", "constant", (3, 3)),
+            ("0", "struct_field", (3, 3)),
+        ] {
+            let data =
+                json!({ "path": "a::x", "kind": kind, MADE_NAME: name, MADE_DERIVED: false });
+            assert_eq!(marked(data, lines, false), (None, None), "{name}");
+        }
+        // A word, in its case.
+        assert!(has_word("impl Clone for A", "Clone"));
+        assert!(!has_word("impl Clone for A", "clone"));
+        assert!(!has_word("fn write_all()", "write"));
+        // A combining mark goes on in a word.
+        assert!(has_word("fn नमस्ते() {}", "नमस्ते"));
+        assert!(!has_word("fn नमस्ते() {}", "नमस"));
+    }
+
+    /// A file read is told the one built from, or not, by the SHA-256 that a build's inputs have
+    /// at its path or its real path; not without (decided in M3c, decisions 36 and 37).
+    #[cfg(feature = "local")]
+    #[test]
+    fn a_file_is_compared_with_the_builds_inputs() {
+        use crate::data::freshness::{InputFile, Inputs};
+        let input = |path: &str, sha256: Option<&str>| InputFile {
+            path: PathBuf::from(path),
+            len: 0,
+            modified: None,
+            sha256: sha256.map(Box::from),
+        };
+        let digest = crate::data::cache::sha256_hex(b"fn a() {}\n");
+        let inputs = Inputs {
+            files: vec![
+                input("/w/a.rs", Some(&digest)),
+                input("/w/b.rs", None),
+                input("/w/real.rs", Some(&digest)),
+            ],
+            taken_at: 0,
+        };
+        let compared = |asked: &str, real: &str, contents: &[u8]| {
+            as_input(&inputs, [Path::new(asked), Path::new(real)], contents)
+        };
+        assert_eq!(compared("/w/a.rs", "/w/a.rs", b"fn a() {}\n"), Some(true));
+        assert_eq!(
+            compared("/w/a.rs", "/w/a.rs", b"fn a() { 1 }\n"),
+            Some(false)
+        );
+        // By its real path, through a symlink.
+        assert_eq!(
+            compared("/w/link.rs", "/w/real.rs", b"fn a() {}\n"),
+            Some(true)
+        );
+        assert_eq!(
+            compared("/w/b.rs", "/w/real.rs", b"fn a() {}\n"),
+            Some(true)
+        );
+        // Without a digest, or not among them.
+        assert_eq!(compared("/w/b.rs", "/w/b.rs", b""), None);
+        assert_eq!(compared("/w/c.rs", "/w/c.rs", b""), None);
     }
 
     /// The sources of std that cannot be had are told as its JSON is, with what to do: the

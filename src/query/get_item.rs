@@ -493,6 +493,21 @@ pub struct ItemData<'a> {
     /// Something was cut to keep the response within its budget (requirement R-OUT-3).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// What `get_source` judges a macro's output by, which is not shown (decided in M3c,
+    /// decision 35).
+    #[serde(skip)]
+    pub made: Made<'a>,
+}
+
+/// What `get_source` judges an item made by a macro by (requirement R-SC-3, decided in M3c,
+/// decisions 34 and 35).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Made<'a> {
+    /// Its own name, which a path re-exported under another does not end with.
+    pub name: Option<&'a str>,
+    /// Whether a derive made it: it, or the `impl` that it is in, is `#[automatically_derived]`,
+    /// which the methods of a derived `impl` are not themselves.
+    pub derived: bool,
 }
 
 /// The path of the item `id` of the crate of `view` in it, `crate::a::Item`, from its definition
@@ -1022,6 +1037,16 @@ impl<'a> Query<'a> {
         } else {
             data.path = self.path_of(id);
         }
+        let derived = |item: &Item| item.attrs.contains(&Attribute::AutomaticallyDerived);
+        data.made = Made {
+            name: item.name.as_deref(),
+            derived: derived(item)
+                || parent.is_some_and(|parent| {
+                    path_index::own_impls(self.view, parent).any(|(impl_item, contents)| {
+                        contents.items.contains(&id) && derived(impl_item)
+                    })
+                }),
+        };
         self.cfg_note(id, parent, &mut data);
         if detail == Detail::Brief {
             // One line: a `macro_rules!` macro shows its rules on the lines after it.
@@ -2462,6 +2487,50 @@ pub(super) mod tests {
                 "deprecated": { "since": "1.1.0" },
             })
         );
+    }
+
+    /// A method of a derived `impl`, which only the `impl` marks, is told derived, with its own
+    /// name, for `get_source`, which the response does not show (decided in M3c, decisions 34
+    /// and 35).
+    #[test]
+    fn a_method_of_a_derived_impl_is_told_derived() {
+        let made = |derive: bool| {
+            let mut krate = parsed().krate;
+            if derive {
+                krate
+                    .index
+                    .values_mut()
+                    .filter(|item| matches!(item.inner, ItemEnum::Impl(_)))
+                    .for_each(|item| item.attrs.push(Attribute::AutomaticallyDerived));
+            }
+            let bytes = archive(krate);
+            let view = CrateView::new(archived(&bytes));
+            let name: CrateName = "my-crate".parse().expect("a crate name");
+            let version = Version::new(1, 2, 3);
+            let response = get_item(&view, ItemRequest {
+                name: &name,
+                version: &version,
+                path: "my-crate::sync::Mutex::lock",
+                origin: Origin::DocsRs {
+                    resolved_from: ResolvedFrom::Explicit,
+                    project_from: None,
+                    build: None,
+                },
+                detail: Detail::Normal,
+                project_features: None,
+                follow: false,
+                target: None,
+            })
+            .expect("found");
+            let shown = serde_json::to_value(&response).expect("serializes");
+            assert!(!shown["data"].to_string().contains("derived"), "{shown}");
+            (
+                response.data.made.name.map(str::to_owned),
+                response.data.made.derived,
+            )
+        };
+        assert_eq!(made(true), (Some("lock".to_owned()), true));
+        assert_eq!(made(false), (Some("lock".to_owned()), false));
     }
 
     #[test]

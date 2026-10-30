@@ -5323,10 +5323,16 @@ fn respond_in(
     what: &What,
 ) -> Result<Value, Failure> {
     let listing = match what {
-        // The source is read after, where the item is.
-        What::Item | What::Source(_) => {
+        What::Item => {
             let response = get_item(view, request).map_err(Failure::Item)?;
             return serde_json::to_value(&response).map_err(Failure::Serialize);
+        },
+        // The source is read after, where the item is, with what tells a macro's output.
+        What::Source(_) => {
+            let response = get_item(view, request).map_err(Failure::Item)?;
+            let mut value = serde_json::to_value(&response).map_err(Failure::Serialize)?;
+            get_source::add_made(&mut value, response.data.made);
+            return Ok(value);
         },
         What::Overview => {
             let response = crate_overview(view, request).map_err(Failure::Item)?;
@@ -5874,6 +5880,7 @@ mod tests {
             Enabled,
             ItemData,
             ItemResponse,
+            Made,
             Provenance,
             ReexportOf,
             ResolvedFrom,
@@ -5964,6 +5971,7 @@ mod tests {
                 }]),
                 attrs: many(),
                 truncated: true,
+                made: Made::default(),
             },
             hints: many(),
         };

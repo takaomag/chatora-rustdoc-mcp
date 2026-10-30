@@ -2468,7 +2468,9 @@ fn write_front_and_back(dir: &Path) {
     write(
         "front/src/lib.rs",
         "/// Only with `extra`.\n#[cfg(feature = \"extra\")]\npub fn extra() {}\n\
-         #[path = \"../../shared/imp.rs\"]\npub mod imp;\n",
+         #[path = \"../../shared/imp.rs\"]\npub mod imp;\n\
+         #[derive(Debug)]\npub struct Point;\n\
+         macro_rules! make {\n    () => {\n        pub fn made() {}\n    };\n}\nmake!();\n",
     );
     // Of the package, but outside its directory; its readme, inherited; an example; a dotfile.
     for (path, text) in [
@@ -2544,6 +2546,18 @@ fn reads_the_source_of_front(server: &mut Server) {
         assert_eq!(
             (&data["file"], &data["source"]),
             (&json!(file), &json!(text)),
+            "{read}"
+        );
+    }
+    // Made by a derive, as its impl tells, and by a macro, whose name is not on its lines
+    // (decided in M3c, decision 34).
+    for (id, path, made) in [(1000, "Point::fmt", "derive"), (1100, "made", "invocation")] {
+        let read = read(id, json!({ "crate": "front", "path": path }));
+        let content = &read["structuredContent"];
+        assert_eq!(content["data"]["macro"], made, "{read}");
+        assert!(
+            content["warnings"].to_string().contains("macro")
+                || content["warnings"].to_string().contains("derive"),
             "{read}"
         );
     }
