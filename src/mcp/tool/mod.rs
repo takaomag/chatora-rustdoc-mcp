@@ -18,6 +18,7 @@ mod external_target;
 #[cfg(feature = "local")]
 mod external_workspace;
 mod get_item;
+mod get_source;
 #[cfg(feature = "local")]
 mod list_crates;
 mod list_implementors;
@@ -94,6 +95,9 @@ pub(super) struct ToolState {
     /// The archives being made from rustdoc JSON on docs.rs, shared by the calls that want them
     /// at once (requirements R-NW-2 and R-WS-6).
     pub(super) archives: Flights<SharedArchive>,
+    /// The sources of crates.io releases being fetched and unpacked, shared by the calls that
+    /// want them at once (decided in M3c).
+    pub(super) crate_sources: Flights<get_source::SharedSources>,
     /// The JSON of std being chosen and fetched, shared by the calls that want it at once
     /// (requirements R-STD-6 and R-WS-6).
     pub(super) stds: Flights<SharedStd>,
@@ -366,6 +370,7 @@ pub(super) fn definitions() -> Vec<Tool> {
         build_external_docs::definition(),
         crate_overview::definition(),
         get_item::definition(),
+        get_source::definition(),
         // A project is needed, which only local features read (requirement R-ARCH-4).
         #[cfg(feature = "local")]
         list_crates::definition(),
@@ -786,6 +791,10 @@ async fn dispatch(
                 Err(error) => Ok(error.into_result()),
             }
         },
+        get_source::NAME => match get_source::parse_arguments(request.arguments.as_ref()) {
+            Ok(arguments) => Ok(run_tool(get_source::execute(arguments, Arc::clone(state))).await),
+            Err(error) => Ok(error.into_result()),
+        },
         list_impls::NAME => match list_impls::parse_arguments(request.arguments.as_ref()) {
             Ok(arguments) => Ok(run_tool(list_impls::execute(arguments, Arc::clone(state))).await),
             Err(error) => Ok(error.into_result()),
@@ -1169,8 +1178,9 @@ mod tests {
 
     /// The tools that look one crate up, which share the shape of their responses while it is
     /// being fetched.
-    const ONE_CRATE: [&str; 7] = [
+    const ONE_CRATE: [&str; 8] = [
         get_item::NAME,
+        get_source::NAME,
         crate_overview::NAME,
         list_module::NAME,
         list_impls::NAME,

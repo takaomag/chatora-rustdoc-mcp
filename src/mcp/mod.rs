@@ -299,6 +299,7 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
         tools: Arc::new(tool::ToolState {
             docs_rs: tool::docs_rs(&network)?,
             archives: Flights::default(),
+            crate_sources: Flights::default(),
             stds: Flights::default(),
             dist: Dist::new(&network, DistSettings::from_settings(settings))?,
             index: tool::sparse_index(cache.clone(), &network)?,

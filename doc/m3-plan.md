@@ -253,6 +253,36 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - レビュー (サブエージェント、読むだけ) の対応: 使えない理由を 1 つにまとめていたのを分けた。手元の JSON では sysroot を JSON の置き場から求め、プロセスを走らせない。rust-src そのものの commit を rustup の manifest で確かめる。起動が増えない条件 (1 分以内、同じディレクトリ) を doc に書いた。テスト: commit の照合 (完全な commit だけ)、rust-src を入れた印と manifest の commit、手元の JSON の sysroot (何も走らせない)、手元のソースでは symlink を辿り、キャッシュでは拒むこと、このマシンの nightly で無い commit には何も返さないこと、手元に合うものが無ければ dist の JSON は dist の rust-src に落ちること
 - 残したもの: M3c の `get_source` は、`neutral_dir` にキャッシュのディレクトリを渡し (起動を増やさないため)、`NoLocalSource` には `rustup component add rust-src --toolchain nightly` を案内する。dist の JSON で手元に合うものを使う経路は、このマシンの nightly の commit が JSON と合わないので通しでは確かめていない
 
+### 6.3 M3c
+
+**下調べ (2026-10-30。サブエージェント、読むだけ。LSP は使わず grep と Read。ネットワークなし)**: crate の種類ごとの読み方、ツールの形、エラーの対応表、テスト、判断の候補 8 件。手元のキャッシュで測ったこと: docs.rs の JSON で rustwide の絶対パスの span を持つのは依存の blanket impl の写しの `impl` だけ (tokio 356、axum 978)、パスで名指せる item の span はすべて相対、`OUT_DIR` の span は 0 件。span は item の本体を含み、外側の属性と doc コメントを含まない (tokio の `.crate` と照合)。マクロの中の定義は行の途中から始まる (`select!` は 559 行 7 列)。std の span はすべて `/rustc/<commit>/library/…` で、`../../stdarch`・`../../backtrace` も手元の rust-src にある
+
+**M3c で利用者が決めたこと**:
+
+- 決定 24 (D1) 引数は item の `path` か、ファイルの `file` (パッケージのルートからの相対で `source_location.file` と同じ形) と `lines` (省けば先頭から) のどちらか 1 つ。どちらも R-SC-4 の判定を通す。docs.rs と std には `source_location.path` が無いので、span の外の行や別のファイル、切り詰めた続きはこれで読む
+- 決定 25 (D2) 本文は行番号を付けない 1 つの文字列 (`source`) に、span の行 (`lines`) と返した行の範囲 (`shown`) を添える
+- 決定 26 (D3) 見える印を付けた後の 2 万文字で、行の境目で切る (R-SC-5)。`truncated: true` と、続きを読む呼び出し (`file` と `lines`) を hints に書く。`full` も `_meta` の大きな上限も入れない (R-OUT-3 の既定はページング)
+- 決定 27 (D4) 前後の行 (`context`) は既定 0、上限 200。属性と doc コメントが要るときは `context` で読む
+- 決定 28 (D5) span の無い item は `docs_unavailable` (`no_span`、再試行不可) で、親の型を引く案内を付ける。span があってマクロの生成物と判じたもの (`#[automatically_derived]`、または本文に item の名前が識別子として無い) は本文を返し、`data.macro` と warning で「マクロの呼び出し位置」と明示する (R-SC-3)
+- 決定 29 (D6) `docs_unavailable` の reason に `no_span`・`outside_package` (ルートの外・ドットファイル・パッケージに無い・symlink が外へ)・`source_missing` (ファイルが無い)・`no_source` (dist に rust-src が無い) を足す。§8 の一覧は M3 の終わりに改める
+- 決定 30 (D7) 応答に読んだファイルの実パス (`data.path`) を付ける (docs.rs と std でも)。キャッシュのパスは GC で消えうること、cargo の展開かキャッシュかで値が変わること (R-ARCH-5 の例外) は受け入れる
+- 決定 31 (D8) vendor と crates.io 以外の registry の依存は M3c では読まず、`docs_unavailable` (`outside_package`) で `source_location.file` とクライアントの Read を案内する
+
+**聞かずに決めたこと (計画・要件・前例のまま)**: 照会は `get_item` の道具立てを使う (`What::Source` を足し、re-export を辿った後の読み先で決める)。annotations は今の `annotations()` のまま (R-MCP-4)、`refresh`・`git`・`project` は既存の仕組みが足し消す。ローカル機能の無い構成は docs.rs と std だけ。`sources` に index の checksum を渡す (無ければ index を引く)。ローカルビルドの span が registry/src を指すときは span のディレクトリ (`Dependencies`)、無理なら名前と版で `sources`。`.crate` と rust-src の取得・展開は Flights に載せ、期限で `status: building` (`building_reason: fetching` で兼ねる)。エラーは決定 12・15・23 と B3a の分け方で、rust-src の案内は rust-src 用にする (`dist_error` の rust-docs-json の案内を使わない)。`hidden::mark` を切り詰めより前に、印の途中で切らない。stale の warning (R-SC-2) に加え、記録の inputs の SHA-256 と読んだファイルを比べられれば「ビルドの後に変わった」warning。GC と競った `NotFound` は 1 度だけ `sources` を呼び直す。B5 の穴 (ローカルビルドした crates.io・git の依存のパッケージの中の span に `path` が無い) は P5 のとおり埋める。偽の dist のテスト用の口 `CHATORA_RUSTDOC_TEST_DIST_URL` を足す。README の Tools の表に行を足し (検査が要る)、Security に R-SC-4 の 1 文を足す
+
+**コミットの順の案**: C1a (ツールの骨組み・本文の作り方・docs.rs の相対の span。偽のサーバーの stdio のテストで確かめられる) → C1b (member・path 依存) → C1c (git・ローカルビルドした crates.io の依存・`build_external_docs` の記録・B5 の穴) → C2 (rustwide の絶対パスの写し替え・building・オフライン) → C3 (std) → C4 (マクロ・stale・続きの案内)。合計 2,700〜3,800 行ほど (見積り)
+
+**M3 の終わり (§7) で要件に戻すもの**: R-SC-2 の `<name>-<ver>` の分け方 (名前として正しく残りが版になる最初の `-` で一通りに決まる) と、依存のソースを `manifest_path` から読むこと (vendor とオフライン)。std の失敗の分け方 (決定 23)。決定 18 の直下のターゲット。cargo の展開の symlink の扱い。`get_source` のオフライン (決定 15)。instructions と `get_item.md` の説明文の余地 (H1 で詰め直す)
+
+**C1a の実装 (2026-10-30)**:
+
+- 新しいツール `get_source` (src/mcp/tool/get_source.rs と説明文 get_source.md)。引数は `crate`・`version`・`target`・`project` (`get_item` と同じ) と、`path` か `file` (と `lines`) のどちらか (決定 24)、`context` (既定 0、上限 200。決定 27)。`get_item` の照会の道具立てをそのまま使う: `What::Source` を足し、item を `get_item` と同じく引いて (re-export を辿る)、辿り終えた所 (`conclude` と std の `finish_std`) で読む。`file` のときは crate のルートを引いて版と provenance を決め、そのファイルを読む
+- docs.rs の crate: `crate_source::sources` を Flights (`crate_sources`、鍵 `sources:<名前>@<版>`) に載せ、期限を過ぎれば `status: building` (`fetching`)。読むファイルは `source_root::resolve(Root::Release)` で判定し、実パスを開く。本文は行番号なしの 1 つの文字列で、`lines` (span)・`shown` (返した行)・`path` (実パス。Windows は `\\?\` を外す)・`url` (docs.rs) を添える (決定 25・30)。印 (`hidden::mark`) を付けてから 2 万文字で行の境目で切り、`truncated` と続きを読む `file`+`lines` の呼び出しを hints に書く (決定 26)。UTF-8 でないファイルは U+FFFD で読み warning。span の無い item は `no_span` (決定 28)。読めない理由は `outside_package`・`source_missing`、`sources` の失敗は `offline_miss`・`network_error`・`docs_unavailable` (`no_source`・`too_large`・`corrupt`)・`internal_error` に分ける (決定 29)
+- ローカルビルドと std はまだ読まず、`docs_unavailable` で `source_location.path` を案内する (C1b・C3 で埋める)。rustwide の絶対パスの span も `outside_package` (C2)。マクロの判定と stale の warning は C4
+- README の Tools の表に行、Security に `get_source` が読む範囲の 1 文を足した。`ONE_CRATE` の応答の形の検査に足した
+- テスト: 引数 (`path` か `file`、`lines` は `file` と、`context` の上限)、行の範囲、前後の行と改行、印と UTF-8 でないファイル、2 万文字で行の境目と長い 1 行 (印の途中で切らない)。stdio: span を持たせた `demo::hello` を、`.crate` から展開したソースで前後の行と印つきで返し、`file`+`lines` で別の行を読み、ドットファイル・外・`.crate` に無いファイルを `outside_package` で拒む
+- レビュー (サブエージェント、読むだけ) の対応: re-export を辿った item では `get_item` の `show_at_entry` が `data.path` (`get_source` では実パス) を入口のパスで上書きしていたので、`get_source` の応答には専用の処理を当て、`item` を入口に、定義元を `defined_at` にする。待ち時間は照会の期限 (`Request.until`) を使う (新しく取り直すと合計で `request_timeout_secs` を超えうる)。checksum の無い照会では index から取ってから `sources` を呼ぶ (一時的な取得の失敗を `no_source` にしない)。`corrupt` は壊れたアーカイブなら再試行可、`.crate` ごとの拒否なら不可。`.crate` の目録に無く、ディスクにも無いファイルは `source_missing`。空のファイルは空の本文で返し、`file` の `lines` がファイルを越えれば `invalid_argument` (行数を添える)、span がファイルを越えれば warning。1 行目が 2 万文字を超えて行の中で切ったときは warning にし、読めない続きは案内しない。続きの呼び出しは JSON として組み (`target` も入れる)、`file` は判定で正規化したもの (`./` などを除く) を返す。ローカルビルドと std の未対応のエラーに reason (`no_source`) と、std には GitHub の `url` の案内。ローカル機能の無い構成でも Windows の `\\?\` を外す。説明文から C1a では効かない「workspace の crate をここでビルド」の句を外した (C1b で戻す)。テスト: 続きの案内 (JSON・`target`)、長い 1 行、re-export の入口、`no_span` と `sources` の失敗の分け方、`./` の正規化、`source_missing`、範囲外の `lines`
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

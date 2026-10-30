@@ -49,6 +49,7 @@ use rustdoc_types::{
     Item,
     ItemEnum,
     Module,
+    Span,
     Target,
     Type,
     Visibility,
@@ -217,6 +218,148 @@ fn demo_crate_file() -> Vec<u8> {
         .into_inner()
         .and_then(GzEncoder::finish)
         .expect("finished")
+}
+
+/// The source of `demo` 0.1.0's `src/lib.rs` in [`demo_source_cache`]: `hello` on lines 3 to 5,
+/// with a bidirectional control in its body.
+const DEMO_LIB: &str = "//! Demo.\n/// Says hello.\npub fn hello() -> u8 {\n    1 // \u{202E}\n}\n";
+
+/// A cache directory with [`demo_crate`], whose `hello` has its span in `src/lib.rs`, and the
+/// `.crate` of `demo` 0.1.0 with that file and a dotfile, for `get_source`.
+fn demo_source_cache() -> TempDir {
+    let dir = TempDir::new().expect("a temporary directory");
+    let mut krate = demo_crate();
+    if let Some(hello) = krate.index.get_mut(&Id(1)) {
+        hello.span = Some(Span {
+            filename: PathBuf::from("src/lib.rs"),
+            begin: (3, 1),
+            end: (5, 2),
+        });
+    }
+    let json = serde_json::to_vec(&krate).expect("serializes");
+    let name: CrateName = "demo".parse().expect("a crate name");
+    let cache = Cache::at(dir.path());
+    cache
+        .write_docs_rs_json(
+            &cache.docs_rs_dir(
+                &name,
+                &Version::new(0, 1, 0),
+                Some(&TARGET.parse().expect("a target")),
+            ),
+            rustdoc_types::FORMAT_VERSION,
+            &json,
+        )
+        .expect("the cache is writable");
+    let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+    for (path, contents) in [
+        (
+            "demo-0.1.0/Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        ),
+        ("demo-0.1.0/src/lib.rs", DEMO_LIB),
+        ("demo-0.1.0/.env", "SECRET=1\n"),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len().try_into().expect("small"));
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, contents.as_bytes())
+            .expect("appended");
+    }
+    let contents = builder
+        .into_inner()
+        .and_then(GzEncoder::finish)
+        .expect("finished");
+    let path = cache.crate_file_path(&name, &Version::new(0, 1, 0));
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+    std::fs::write(&path, &contents).expect("written");
+    std::fs::write(path.with_extension("crate.sha256"), sha256_hex(&contents)).expect("written");
+    dir
+}
+
+/// `get_source` reads an item's lines, with lines of context, from its release's sources,
+/// unpacked from its `.crate`, marking what would hide code; and lines of a file of the crate; a
+/// dotfile or a file outside the crate is not read (decided in M3c, decisions 24 to 30).
+#[test]
+fn get_source_reads_an_items_lines_from_its_crate() {
+    // Without the `.crate` files and the sources of the user's cargo.
+    let cargo_home = TempDir::new().expect("a temporary directory");
+    let home = cargo_home.path().display().to_string();
+    let mut server =
+        Server::start_with_cache(demo_source_cache(), None, &[("CARGO_HOME", home.as_str())]);
+    let call = |server: &mut Server, id, arguments: Value| {
+        server.send(&call_tool(id, "get_source", arguments));
+        server.response(id)["result"].clone()
+    };
+    let found = call(
+        &mut server,
+        1,
+        json!({ "crate": "demo@0.1.0", "path": "hello", "target": TARGET, "context": 1 }),
+    );
+    assert_eq!(found["isError"], false, "{found}");
+    let content = &found["structuredContent"];
+    let data = &content["data"];
+    assert_eq!(content["provenance"]["source"], "docs.rs", "{found}");
+    assert_eq!(data["item"], "demo::hello", "{found}");
+    assert_eq!(data["kind"], "function", "{found}");
+    assert_eq!(data["file"], "src/lib.rs", "{found}");
+    assert_eq!(data["lines"], "3-5", "{found}");
+    assert_eq!(data["shown"], "2-5", "{found}");
+    assert_eq!(
+        data["source"], "/// Says hello.\npub fn hello() -> u8 {\n    1 // <U+202E>\n}\n",
+        "{found}"
+    );
+    let path = PathBuf::from(data["path"].as_str().expect("a path"));
+    assert!(path.ends_with("src/lib.rs") && path.is_file(), "{found}");
+    assert!(
+        content["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("<U+202E>")))),
+        "{found}"
+    );
+    // Lines of a file of the crate, as source_location.file gives it.
+    let lines = call(
+        &mut server,
+        2,
+        json!({ "crate": "demo@0.1.0", "file": "./src/lib.rs", "lines": "1-2", "target": TARGET }),
+    );
+    let data = &lines["structuredContent"]["data"];
+    assert_eq!(data["source"], "//! Demo.\n/// Says hello.\n", "{lines}");
+    assert_eq!(data["file"], "src/lib.rs", "{lines}");
+    for (id, file, reason) in [
+        (3, ".env", "outside_package"),
+        (4, "../../../../etc/passwd", "outside_package"),
+        (5, "src/none.rs", "source_missing"),
+    ] {
+        let refused = call(
+            &mut server,
+            id,
+            json!({ "crate": "demo@0.1.0", "file": file, "target": TARGET }),
+        );
+        assert_eq!(refused["isError"], true, "{refused}");
+        // Not of the package (a dotfile, outside it), or not there.
+        let body = text_json(&refused);
+        assert_eq!(body["code"], "docs_unavailable", "{refused}");
+        assert_eq!(body["reason"], reason, "{refused}");
+    }
+    // Lines that the file does not have.
+    let beyond = call(
+        &mut server,
+        6,
+        json!({ "crate": "demo@0.1.0", "file": "src/lib.rs", "lines": "9-10", "target": TARGET }),
+    );
+    let body = text_json(&beyond);
+    assert_eq!(body["code"], "invalid_argument", "{beyond}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("has 5 lines")),
+        "{beyond}"
+    );
+    assert!(server.finish().success());
 }
 
 /// The directory of the server's logs, in its cache directory.
@@ -996,7 +1139,7 @@ fn tools_list_is_cacheable_and_not_paginated() {
     if cfg!(feature = "local") {
         expected.push("build_external_docs");
     }
-    expected.extend(["crate_overview", "get_item"]);
+    expected.extend(["crate_overview", "get_item", "get_source"]);
     if cfg!(feature = "local") {
         expected.push("list_crates");
     }

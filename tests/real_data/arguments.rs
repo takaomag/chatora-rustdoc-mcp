@@ -108,6 +108,24 @@ fn item_cases() -> Vec<Case> {
         ("path", Change::Set(json!("sync::RwLock"))),
         ("detail", Change::Set(json!("brief"))),
     ]));
+    let lock = json!({ "path": "sync::Mutex::lock" });
+    cases.extend(shared("get_source", &lock));
+    cases.extend(each(
+        "get_source",
+        &with(&lock, &json!({ "crate": TOKIO })),
+        vec![
+            ("path", Change::Set(json!("sync::RwLock::read"))),
+            ("context", Change::Set(json!(3))),
+        ],
+    ));
+    cases.extend(each(
+        "get_source",
+        &json!({ "crate": TOKIO, "file": "src/sync/mutex.rs", "lines": "1-5" }),
+        vec![
+            ("file", Change::Set(json!("src/sync/rwlock.rs"))),
+            ("lines", Change::Set(json!("6-9"))),
+        ],
+    ));
     cases.extend(shared("crate_overview", &json!({})));
     cases.extend(each("crate_overview", &json!({ "crate": TOKIO }), vec![(
         "detail",
@@ -241,6 +259,7 @@ fn refresh_cases() -> Vec<Case> {
     [
         "crate_overview",
         "get_item",
+        "get_source",
         "list_crates",
         "list_implementors",
         "list_impls",
@@ -295,6 +314,7 @@ fn git_cases() -> Vec<Case> {
         "build_external_docs",
         "crate_overview",
         "get_item",
+        "get_source",
         "list_implementors",
         "list_impls",
         "list_methods",

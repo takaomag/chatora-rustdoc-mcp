@@ -21,6 +21,7 @@ use super::{
     InvalidArgument,
     ToolState,
     error_result,
+    get_source::{self, SourceAsk},
     project::{self, InProject},
 };
 #[cfg(feature = "local")]
@@ -169,6 +170,8 @@ pub(super) enum What {
     Methods(Box<MethodFilter>),
     /// The types that implement the trait (`list_implementors`).
     Implementors(Box<Paging>),
+    /// The source of the item, or a file of its crate (`get_source`).
+    Source(Box<SourceAsk>),
 }
 
 /// Which methods `list_methods` lists (requirement R-LS-3), and the page.
@@ -321,6 +324,24 @@ impl Arguments {
             shape: Shape {
                 detail,
                 what: What::Methods(Box::new(filter)),
+            },
+        }
+    }
+
+    /// The arguments of `get_source`: those that name a release, the item's path (the crate's,
+    /// for a file of it), and what is read.
+    pub(super) fn for_source(release: ReleaseArguments, path: &str, ask: SourceAsk) -> Self {
+        Self {
+            path: with_crate_name(&release.name, path.trim_start_matches("::")),
+            name: release.name,
+            version: release.version,
+            project: release.project,
+            target: release.target,
+            refresh: release.refresh,
+            git: release.git,
+            shape: Shape {
+                detail: Detail::Normal,
+                what: What::Source(Box::new(ask)),
             },
         }
     }
@@ -3882,8 +3903,56 @@ async fn conclude(
         Err(Failure::Item(GetItemError::Elsewhere(destination))) => {
             follow(state, *destination, arguments, warnings).await
         },
+        Ok(item) if let What::Source(ask) = &arguments.shape.what => {
+            let found = get_source::Found {
+                name: &arguments.name,
+                version: &arguments.version,
+                checksum: arguments.checksum.as_deref(),
+                docs: if built_here(&arguments) {
+                    get_source::Source::Local
+                } else {
+                    get_source::Source::DocsRs
+                },
+                until: arguments.until,
+            };
+            get_source::read(state, found, ask, item, &warnings).await
+        },
         looked_up => finish(looked_up, &arguments, &warnings),
     }
+}
+
+/// The result of a lookup in std: the source of the item for `get_source`, or else the result.
+async fn finish_std(
+    state: &Arc<ToolState>,
+    looked_up: Result<Value, Failure>,
+    request: &Request,
+    warnings: &[Box<str>],
+) -> CallToolResult {
+    match looked_up {
+        Ok(item) if let What::Source(ask) = &request.shape.what => {
+            let found = get_source::Found {
+                name: &request.name,
+                version: &request.version,
+                checksum: None,
+                docs: get_source::Source::Std,
+                until: request.until,
+            };
+            get_source::read(state, found, ask, item, warnings).await
+        },
+        looked_up => finish(looked_up, request, warnings),
+    }
+}
+
+/// Whether the crate that `arguments` looks up in is built here.
+#[cfg(feature = "local")]
+const fn built_here(arguments: &Request) -> bool {
+    arguments.here.local.is_some()
+}
+
+/// Whether the crate that `arguments` looks up in is built here: never without local builds.
+#[cfg(not(feature = "local"))]
+const fn built_here(_arguments: &Request) -> bool {
+    false
 }
 
 /// Looks the path up in the crate that it goes on in, through a re-export of that crate's item
@@ -3905,6 +3974,10 @@ async fn follow(
     for destination in candidates {
         let result = follow_into(state, &destination, &origin, &warnings).await;
         if result.is_error != Some(true) {
+            // `get_source` tells the item as `item`, and has a path of a file as `path`.
+            if let What::Source(_) = origin.shape.what {
+                return get_source::at_entry(result, &destination.entry);
+            }
             return result_at_entry(result, &destination.entry);
         }
         if destination.via_glob && error_code(&result).as_deref() == Some("item_not_found") {
@@ -4875,7 +4948,7 @@ async fn execute_std(
                     show_at_entry(response, asked);
                 }
             }
-            finish(looked_up, &request, &warnings)
+            finish_std(&state, looked_up, &request, &warnings).await
         },
         Err(error) => {
             let error = crate::task::resume_if_panic(error);
@@ -5125,7 +5198,7 @@ fn finish(
 
 /// Puts `warnings` first among the `warnings` of `response`, which come right after `provenance`
 /// and the fields of its state, as `retry_after_secs` (§7.3).
-fn add_warnings(response: &mut Value, warnings: &[Box<str>]) {
+pub(super) fn add_warnings(response: &mut Value, warnings: &[Box<str>]) {
     if warnings.is_empty() {
         return;
     }
@@ -5230,7 +5303,8 @@ fn respond_in(
     what: &What,
 ) -> Result<Value, Failure> {
     let listing = match what {
-        What::Item => {
+        // The source is read after, where the item is.
+        What::Item | What::Source(_) => {
             let response = get_item(view, request).map_err(Failure::Item)?;
             return serde_json::to_value(&response).map_err(Failure::Serialize);
         },

@@ -69,6 +69,26 @@ fn item_questions() -> Vec<Question> {
             |result| has(&result["data"], "start") && has(&result["data"], "end"),
         ),
         question(
+            "get_source",
+            "how is `tokio::sync::Mutex::lock` implemented?",
+            json!({ "crate": "tokio@1.53.3", "path": "tokio::sync::Mutex::lock" }),
+            |result| {
+                result["data"]["file"] == "src/sync/mutex.rs"
+                    && has(&result["data"]["source"], "pub async fn lock")
+            },
+        ),
+        question(
+            "get_source",
+            "what does lines 400-500 of `src/sync/mutex.rs` of tokio do?",
+            json!({ "crate": "tokio@1.53.3", "file": "src/sync/mutex.rs", "lines": "400-500" }),
+            |result| {
+                result["data"]["shown"] == "400-500"
+                    && result["data"]["source"]
+                        .as_str()
+                        .is_some_and(|source| source.lines().count() == 101)
+            },
+        ),
+        question(
             "list_implementors",
             "which types in tokio implement `AsyncRead`?",
             json!({ "crate": "tokio@1.53.3", "path": "io::AsyncRead" }),
