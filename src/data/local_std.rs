@@ -166,7 +166,14 @@ pub async fn rust_src(neutral_dir: &Path, commit: &str) -> Result<PathBuf, NoSou
         return Err(NoSourceHere::OtherCommit);
     }
     let sysroot = rustc(&["--print", "sysroot"]).await?;
-    rust_src_in(Path::new(sysroot.trim()), commit)
+    let (sysroot, commit) = (PathBuf::from(sysroot.trim()), commit.to_owned());
+    // Its manifests are read on a blocking thread.
+    crate::task::spawn_blocking(move || rust_src_in(&sysroot, &commit))
+        .await
+        .map_err(|error| {
+            crate::task::resume_if_panic(error);
+            NoSourceHere::NotRun { timed_out: false }
+        })?
 }
 
 /// The sources of std of the nightly toolchain whose JSON of std `local` is, without running it:

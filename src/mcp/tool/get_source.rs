@@ -26,9 +26,11 @@ use crate::data::{
     crate_file::CrateError,
     crate_name::CrateName,
     crate_source::{self, Sources, SourcesError, UnpackError},
+    dist::{DistError, RustSrc},
     flight::Joined,
     hidden,
     source_root::{self, Refusal, Root},
+    std_json::{self, Chosen},
 };
 #[cfg(feature = "local")]
 use crate::data::{metadata::Resolution, project::Workspace};
@@ -61,6 +63,10 @@ const LINES_EXAMPLE: &[&str] = &[r#"pass a line or a range, for example {"lines"
 /// them at once (requirements R-NW-2 and R-WS-6).
 pub(super) type SharedSources = Arc<Result<Sources, SourcesError>>;
 
+/// The sources of std of one nightly being had, fetched and unpacked from the distribution server
+/// if need be, shared by the calls that want them at once (decided in M3c, C3).
+pub(super) type SharedRustSrc = Arc<Result<RustSrc, DistError>>;
+
 /// What is read, besides the item or the crate that `get_item` looks up (decided in M3c,
 /// decisions 24 and 27).
 #[derive(Debug, Clone)]
@@ -69,6 +75,9 @@ pub(super) struct SourceAsk {
     context: usize,
     /// The file asked for, if one was: else the item's.
     file: Option<AskedFile>,
+    /// The project asked for, if one was, which decides the version, or for std the nightly, of
+    /// what the hint to read the rest reads.
+    project: Option<Box<str>>,
 }
 
 /// A file asked for, relative to the package's root, and its lines: all of them if `None`.
@@ -204,6 +213,7 @@ pub(super) fn parse_arguments(
                 )
             })?,
     };
+    let project = text("project")?.map(Box::from);
     let lines = match text("lines")? {
         None => None,
         Some(lines) => Some(parse_lines(lines).ok_or_else(|| {
@@ -224,6 +234,7 @@ pub(super) fn parse_arguments(
             Ok(Arguments::for_source(release, path, SourceAsk {
                 context,
                 file: None,
+                project,
             }))
         },
         (None, Some(file)) => {
@@ -235,6 +246,7 @@ pub(super) fn parse_arguments(
                     file: file.into(),
                     lines,
                 }),
+                project,
             }))
         },
         (Some(_), Some(_)) => Err(InvalidArgument::new(
@@ -274,7 +286,7 @@ pub(super) struct Found<'a> {
     /// The sha256 of its `.crate` in the crates.io index, when the index was read.
     pub(super) checksum: Option<&'a str>,
     /// Where its documentation came from.
-    pub(super) docs: Source,
+    pub(super) docs: Source<'a>,
     /// Until when the call waits for the sources (requirement R-ARCH-6): the lookup's deadline.
     pub(super) until: Instant,
     /// The build here, for [`Source::Local`].
@@ -290,6 +302,8 @@ pub(super) struct Found<'a> {
 enum Readable {
     /// Of a crates.io release.
     Release(Sources),
+    /// Of std, the `rust-src` at `root`, in the cache or else a toolchain's here.
+    RustSrc { root: PathBuf, in_cache: bool },
     /// Of a package built here, under the directory of its `Cargo.toml`, `dir`, in the workspace
     /// at `workspace_root`, which its spans outside it are relative to.
     #[cfg(feature = "local")]
@@ -320,13 +334,13 @@ struct ReadFile {
 
 /// Where the documentation that the item was found in came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Source {
+pub(super) enum Source<'a> {
     /// docs.rs, built from the release's `.crate`.
     DocsRs,
     /// A build here.
     Local,
-    /// The std of a nightly.
-    Std,
+    /// The std of a nightly, whose JSON this is.
+    Std(&'a Chosen),
 }
 
 /// The response of `get_source` for the item that `get_item` found, `item` (its response), in
@@ -344,34 +358,21 @@ pub(super) async fn read(
         .cloned()
         .unwrap_or_default();
     let data = item.get("data").cloned().unwrap_or(Value::Null);
+    let mut warnings = warnings.to_vec();
     let mut asked = match where_to_read(ask, &data) {
         Ok(asked) => asked,
         Err(answer) => return *answer,
     };
-    let mut release = format!("{}@{}", found.name, found.version);
-    // The release that the file is of, when it is not the crate's.
-    let mut file_crate = None;
-    let readable = match found.docs {
-        Source::DocsRs => {
-            match docs_rs_sources(state, &found, ask, &mut asked, (&provenance, warnings)).await {
-                Ok((sources, of)) => {
-                    if let Some(of) = of {
-                        release.clone_from(&of);
-                        file_crate = Some(of);
-                    }
-                    Readable::Release(sources)
-                },
-                Err(answer) => return *answer,
-            }
-        },
-        #[cfg(feature = "local")]
-        Source::Local => match local_package(state, &found, provenance.clone(), warnings).await {
+    let (readable, file_crate) =
+        match readable(state, &found, ask, &mut asked, (&provenance, &mut warnings)).await {
             Ok(readable) => readable,
             Err(answer) => return *answer,
-        },
-        #[cfg(not(feature = "local"))]
-        Source::Local => return not_read_yet(found.docs),
-        Source::Std => return not_read_yet(found.docs),
+        };
+    // std's is not asked for by version, which the nightly's would be.
+    let release = match (&file_crate, found.docs) {
+        (Some(of), _) => of.clone(),
+        (None, Source::Std(_)) => found.name.to_string(),
+        (None, Source::DocsRs | Source::Local) => format!("{}@{}", found.name, found.version),
     };
     let ReadFile {
         resolved,
@@ -409,18 +410,51 @@ pub(super) async fn read(
         "crate": release,
         // A dependency's on docs.rs, of its own target.
         "target": if file_crate.is_none() { provenance.get("target") } else { None },
+        "project": ask.project,
     });
+    let url = file_url(
+        found.docs,
+        file_crate.as_deref(),
+        &file,
+        &range(lines.0, lines.1.min(excerpt.lines_in_file)),
+    );
     let mut answer = answer(
         (provenance, &item, &data),
         (&file, file_crate.as_deref(), lines, &resolved),
-        &excerpt,
+        (&excerpt, url),
         ask,
     );
     if let Some(answer) = answer.as_object_mut() {
         rest_to_read(answer, call, (&file, lines), &excerpt, ask);
     }
-    get_item::add_warnings(&mut answer, warnings);
+    get_item::add_warnings(&mut answer, &warnings);
     CallToolResult::structured(answer)
+}
+
+/// The sources of the crate of `found` that `asked` is read from, and the release (`name@version`)
+/// that the file is of when it is not the crate's, as a dependency's that docs.rs's build read;
+/// `asked` is made the path in them. Else the answer to give.
+async fn readable(
+    state: &Arc<ToolState>,
+    found: &Found<'_>,
+    ask: &SourceAsk,
+    asked: &mut AskedFile,
+    (provenance, warnings): (&Map<String, Value>, &mut Vec<Box<str>>),
+) -> Result<(Readable, Option<String>), Box<CallToolResult>> {
+    match found.docs {
+        Source::DocsRs => docs_rs_sources(state, found, ask, asked, (provenance, warnings))
+            .await
+            .map(|(sources, of)| (Readable::Release(sources), of)),
+        #[cfg(feature = "local")]
+        Source::Local => local_package(state, found, provenance.clone(), warnings)
+            .await
+            .map(|readable| (readable, None)),
+        #[cfg(not(feature = "local"))]
+        Source::Local => Err(Box::new(not_read_yet())),
+        Source::Std(chosen) => std_sources(state, found, chosen, asked, (provenance, warnings))
+            .await
+            .map(|readable| (readable, None)),
+    }
 }
 
 /// Adds to `answer` the hint to read what was cut of `lines` of `file`, and the warning of a line
@@ -499,7 +533,7 @@ async fn local_package(
     warnings: &[Box<str>],
 ) -> Result<Readable, Box<CallToolResult>> {
     let Some(built) = &found.built else {
-        return Err(Box::new(not_read_yet(Source::Local)));
+        return Err(Box::new(not_read_yet()));
     };
     let record = &built.record;
     let source = super::local::package_source(&record.package);
@@ -708,24 +742,15 @@ async fn docs_rs_sources(
     Ok((sources, Some(format!("{name}@{version}"))))
 }
 
-/// The tool error for the sources of a local build or of std, which are not read yet.
-fn not_read_yet(docs: Source) -> CallToolResult {
-    let (of, suggestion) = match docs {
-        Source::Local | Source::DocsRs => (
-            "local builds",
-            "read the file at source_location.path of get_item, if it has one",
-        ),
-        Source::Std => (
-            "std",
-            "read the file at source_location.url of get_item, on GitHub",
-        ),
-    };
+/// The tool error for the sources of a local build, which are not read: without local builds, or
+/// one without its build.
+fn not_read_yet() -> CallToolResult {
     super::error_result(&json!({
         "code": "docs_unavailable",
         "reason": "no_source",
-        "message": format!("get_source does not read the sources of {of} yet"),
+        "message": "get_source does not read the sources of this local build",
         "retryable": false,
-        "suggestions": [suggestion],
+        "suggestions": ["read the file at source_location.path of get_item, if it has one"],
     }))
 }
 
@@ -796,6 +821,18 @@ async fn read_file(
                 let resolved = source_root::resolve(Root::Release(sources), Path::new(&file_text))
                     .map_err(|refusal| missing(refusal, &asked))?;
                 (resolved, asked, sources.root.as_path())
+            },
+            Readable::RustSrc { root, in_cache } => {
+                let asked = root.join(&file_text);
+                let resolved = source_root::resolve(
+                    Root::RustSrc {
+                        root,
+                        in_cache: *in_cache,
+                    },
+                    Path::new(&file_text),
+                )
+                .map_err(|refusal| missing(refusal, &asked))?;
+                (resolved, asked, root.as_path())
             },
             #[cfg(feature = "local")]
             Readable::Package {
@@ -881,7 +918,7 @@ fn answer(
         (usize, usize),
         &source_root::Resolved,
     ),
-    excerpt: &Excerpt,
+    (excerpt, url): (&Excerpt, Option<String>),
     ask: &SourceAsk,
 ) -> Value {
     let mut answer = Map::new();
@@ -936,16 +973,6 @@ fn answer(
     shown.insert("file".to_owned(), json!(file));
     if let Some(file_crate) = file_crate {
         shown.insert("file_crate".to_owned(), json!(file_crate));
-        // On docs.rs, among that release's sources.
-        if let Some((name, version)) = file_crate.split_once('@') {
-            shown.insert(
-                "url".to_owned(),
-                json!(format!(
-                    "https://docs.rs/crate/{name}/{version}/source/{file}#{}",
-                    range(lines.0, lines.1.min(excerpt.lines_in_file))
-                )),
-            );
-        }
     }
     let shown_range = |first: usize, last: usize| {
         if excerpt.lines_in_file == 0 {
@@ -963,8 +990,9 @@ fn answer(
     if let Some(path) = shown_path(&resolved.path) {
         shown.insert("path".to_owned(), json!(path));
     }
-    if ask.file.is_none()
-        && file_crate.is_none()
+    if let Some(url) = url {
+        shown.insert("url".to_owned(), json!(url));
+    } else if ask.file.is_none()
         && let Some(url) = data.pointer("/source_location/url")
     {
         shown.insert("url".to_owned(), url.clone());
@@ -1003,6 +1031,23 @@ pub(super) fn at_entry(mut result: CallToolResult, entry: &str) -> CallToolResul
     result
 }
 
+/// The URL of `file` at `lines` (`first-last`) of the crate of `docs`: on docs.rs among the
+/// sources of `file_crate`, a release, or on GitHub at the commit of std; else none, as the span's
+/// own goes.
+fn file_url(docs: Source<'_>, file_crate: Option<&str>, file: &str, lines: &str) -> Option<String> {
+    match (docs, file_crate) {
+        (_, Some(file_crate)) => file_crate.split_once('@').map(|(name, version)| {
+            format!("https://docs.rs/crate/{name}/{version}/source/{file}#{lines}")
+        }),
+        (Source::Std(chosen), None) => Some(format!(
+            "https://github.com/rust-lang/rust/blob/{}/{file}#L{}",
+            chosen.json.commit_hash(),
+            lines.replace('-', "-L")
+        )),
+        (Source::DocsRs | Source::Local, None) => None,
+    }
+}
+
 /// `first-last`, or `first` alone when they are the same.
 fn range(first: usize, last: usize) -> String {
     if first == last {
@@ -1024,6 +1069,130 @@ fn shown_path(path: &Path) -> Option<String> {
         .filter(|rest| rest.get(1..3) == Some(r":\"))
         .unwrap_or(text);
     Some(text.to_owned())
+}
+
+/// The sources of std of `chosen`, the JSON that the item of `found` was found in, to read `asked`
+/// from: under their root, as `library/…`, which a span of the JSON, `/rustc/<commit>/library/…`,
+/// is made (decided in M3c, decision 32). They are the nightly's here of the JSON's commit, or
+/// else fetched and unpacked from the distribution server once, while the call waits (decided in
+/// M3b, decisions 20 to 22); what that tells is added to `warnings`. Else the answer to give.
+async fn std_sources(
+    state: &Arc<ToolState>,
+    found: &Found<'_>,
+    chosen: &Chosen,
+    asked: &mut AskedFile,
+    (provenance, warnings): (&Map<String, Value>, &mut Vec<Box<str>>),
+) -> Result<Readable, Box<CallToolResult>> {
+    let commit = chosen.json.commit_hash();
+    if asked.file.starts_with("/rustc/") {
+        // Built on Windows, the rest of the span has its separators: `/rustc/<commit>\library\…`.
+        let span = asked.file.replace('\\', "/");
+        let Some(inside) = source_root::std_span(Path::new(&span), commit) else {
+            return Err(Box::new(super::error_result(&json!({
+                "code": "docs_unavailable",
+                "reason": "outside_package",
+                "message": format!(
+                    "{} is not of the sources of std of commit {commit}, under its library/",
+                    asked.file
+                ),
+                "retryable": false,
+                "suggestions": [
+                    "pass a file under library/, as library/core/src/option.rs, or \
+                     source_location.file of get_item",
+                ],
+            }))));
+        };
+        asked.file = inside
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+            .into();
+    } else if !source_root::lexically(Path::new(&*asked.file)).starts_with("library") {
+        // Refused before the sources are had.
+        return Err(Box::new(refused(&asked.file, Refusal::NotInPackage)));
+    }
+    // The nightly here is asked of its commit at most once a minute; what is in the cache, read.
+    let key = format!("rust-src:{}:{commit}", chosen.json.source());
+    let what = format!("the sources of std of {}", chosen.json.toolchain());
+    let (cache, dist, json) = (state.cache.clone(), state.dist.clone(), chosen.json.clone());
+    let joined = state
+        .rust_srcs
+        .join(&key, &what, found.until, async move |_stage| {
+            Arc::new(std_json::rust_src(&cache, &dist, cache.dir(), &json).await)
+        })
+        .await;
+    match joined {
+        Joined::Done(had) => match &*had {
+            Ok(rust_src) => {
+                warnings.extend(rust_src.warnings.iter().cloned());
+                Ok(Readable::RustSrc {
+                    root: rust_src.root.clone(),
+                    in_cache: rust_src.in_cache,
+                })
+            },
+            Err(error) => {
+                // rustup is looked for only to be named.
+                #[cfg(feature = "local")]
+                let rustup = matches!(error, DistError::Disabled { .. } | DistError::Offline)
+                    && crate::data::toolchain::rustup_here(&state.cache).await;
+                #[cfg(not(feature = "local"))]
+                let rustup = false;
+                Err(Box::new(rust_src_error(&what, error, rustup)))
+            },
+        },
+        Joined::Going(doing) => Err(Box::new(get_item::building_response(
+            provenance.clone(),
+            doing,
+            &format!(
+                "{what} are looked for in the nightly toolchain here, or fetched and unpacked from \
+                 the Rust distribution server"
+            ),
+            warnings,
+        ))),
+        Joined::Ended => Err(Box::new(get_item::stopped())),
+    }
+}
+
+/// The tool error for `what`, the sources of std, that could not be had: as for its JSON, with
+/// what to do about it, with rustup's command if `rustup` is here (decided in M3b, decision 23,
+/// and in M3c, decision 33).
+fn rust_src_error(what: &str, error: &DistError, rustup: bool) -> CallToolResult {
+    let message = format!("{what} could not be had: {}", super::ErrorChain(error));
+    // Its JSON and sources from the nightly here, which another nightly than this may be.
+    let here = "or install them for the nightly toolchain here, whose std is then read, of its \
+                own version: rustup component add rust-src rust-docs-json --toolchain nightly";
+    let suggestions: Vec<&str> = match error {
+        DistError::Disabled { .. } | DistError::Offline => {
+            let setting = if matches!(error, DistError::Offline) {
+                "turn network.offline off, to fetch them from the Rust distribution server"
+            } else {
+                "turn std.fetch_from_dist on, to fetch them from the Rust distribution server"
+            };
+            if rustup {
+                vec![setting, here]
+            } else {
+                vec![setting]
+            }
+        },
+        #[cfg(feature = "local")]
+        DistError::NoLocalSource {
+            why: crate::data::local_std::NoSourceHere::NotRun { timed_out: true },
+        } => vec!["try again in a while"],
+        #[cfg(feature = "local")]
+        DistError::NoLocalSource { .. } => vec![
+            "install them for the nightly toolchain here: rustup component add rust-src \
+             --toolchain nightly",
+        ],
+        DistError::Network(_) | DistError::Status { .. } | DistError::RecentFailure { .. } => {
+            vec!["try again in a while"]
+        },
+        DistError::Cache(_) | DistError::Unpack(UnpackError::Cache(_)) => {
+            vec!["check that the cache directory can be written"]
+        },
+        _ => vec!["read the file on GitHub, at the url of source_location of get_item"],
+    };
+    super::error_result(&get_item::dist_error_body(error, &message, &suggestions))
 }
 
 /// The sources of the release of `found`, a crates.io release documented on docs.rs: where cargo
@@ -1077,7 +1246,7 @@ async fn release_sources(
             &format!("the sources of {release} are fetched and unpacked"),
             warnings,
         ))),
-        Joined::Ended => Err(Box::new(get_item::shutting_down())),
+        Joined::Ended => Err(Box::new(get_item::stopped())),
     }
 }
 
@@ -1481,6 +1650,7 @@ mod tests {
         let ask = SourceAsk {
             context: 0,
             file: None,
+            project: None,
         };
         let call = json!({ "crate": "a\"b@1.0.0", "target": "x86_64-unknown-linux-gnu" });
         let mut answer = Map::new();
@@ -1577,6 +1747,107 @@ mod tests {
             checkout_of(&dir.path().join("project/vendor/dep"), &home),
             None
         );
+    }
+
+    /// The sources of std that cannot be had are told as its JSON is, with what to do: the
+    /// settings that keep them from being fetched, and rustup's command if it is here (decided in
+    /// M3b, decision 23, and in M3c, decision 33).
+    #[test]
+    fn the_sources_of_std_that_cannot_be_had_are_told_why() {
+        let body = |result: CallToolResult| {
+            let text = result.content[0].as_text().expect("text").text.clone();
+            serde_json::from_str::<Value>(&text).expect("JSON")
+        };
+        let disabled = DistError::Disabled { why: "off".into() };
+        for (error, rustup, code, reason, suggestions) in [
+            (&disabled, true, "toolchain_missing", None, 2),
+            (&disabled, false, "toolchain_missing", None, 1),
+            (&DistError::Offline, true, "offline_miss", None, 2),
+            (
+                &DistError::NoSource,
+                false,
+                "docs_unavailable",
+                Some("no_source"),
+                1,
+            ),
+            (
+                &DistError::ChecksumMismatch,
+                false,
+                "docs_unavailable",
+                Some("corrupt"),
+                1,
+            ),
+        ] {
+            let told = body(rust_src_error("the sources of std", error, rustup));
+            assert_eq!(
+                (told["code"].as_str(), told["reason"].as_str()),
+                (Some(code), reason),
+                "{error:?}"
+            );
+            let given = told["suggestions"].as_array().map_or(0, Vec::len);
+            assert_eq!(given, suggestions, "{error:?}: {told}");
+        }
+        let told = body(rust_src_error("the sources of std", &disabled, true));
+        assert!(
+            told["suggestions"]
+                .to_string()
+                .contains("std.fetch_from_dist")
+                && told["suggestions"]
+                    .to_string()
+                    .contains("rustup component add rust-src rust-docs-json --toolchain nightly"),
+            "{told}"
+        );
+        // Of the nightly here, as its run ran too long: again.
+        #[cfg(feature = "local")]
+        {
+            use crate::data::local_std::NoSourceHere;
+            for (why, retryable) in [
+                (NoSourceHere::NotRun { timed_out: true }, true),
+                (NoSourceHere::NoComponent, false),
+            ] {
+                let error = DistError::NoLocalSource { why };
+                let told = body(rust_src_error("the sources of std", &error, true));
+                assert_eq!(told["code"], "toolchain_missing", "{told}");
+                assert_eq!(told["retryable"], retryable, "{told}");
+            }
+        }
+    }
+
+    /// A file of std is on GitHub at the JSON's commit, and a dependency's that docs.rs's build
+    /// read on docs.rs among that release's sources.
+    #[test]
+    fn a_files_url_is_of_its_crate() {
+        let commit = "b6eeb93c9a1b2c3d4e5f60718293a4b5c6d7e8f9";
+        let chosen = Chosen {
+            json: std_json::StdJson::Dist(crate::data::dist::StdDocs {
+                dir: PathBuf::new(),
+                nightly: crate::data::dist::Nightly {
+                    date: "2026-10-19".into(),
+                    version: "1.101.0-nightly (b6eeb93c9 2026-10-18)".into(),
+                    commit_hash: commit.into(),
+                    triple: "x86_64-unknown-linux-gnu".parse().expect("a triple"),
+                },
+                warnings: Vec::new(),
+            }),
+            why: Cow::Borrowed("asked"),
+            warnings: Vec::new(),
+        };
+        let file = "library/core/src/option.rs";
+        assert_eq!(
+            file_url(Source::Std(&chosen), None, file, "3-5"),
+            Some(format!(
+                "https://github.com/rust-lang/rust/blob/{commit}/{file}#L3-L5"
+            ))
+        );
+        assert_eq!(
+            file_url(Source::Std(&chosen), None, file, "7").as_deref(),
+            Some(format!("https://github.com/rust-lang/rust/blob/{commit}/{file}#L7").as_str())
+        );
+        assert_eq!(
+            file_url(Source::DocsRs, Some("dep@1.0.0"), "src/lib.rs", "1-2").as_deref(),
+            Some("https://docs.rs/crate/dep/1.0.0/source/src/lib.rs#1-2")
+        );
+        assert_eq!(file_url(Source::DocsRs, None, "src/lib.rs", "1"), None);
     }
 
     /// A span of docs.rs in a dependency from crates.io names that release and the path in it;

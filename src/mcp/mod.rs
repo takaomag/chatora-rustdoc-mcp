@@ -35,7 +35,7 @@ use crate::{
     data::{
         Network,
         cache::{Cache, CacheError},
-        dist::{Dist, DistSettings},
+        dist::DistSettings,
         flight::Flights,
     },
 };
@@ -301,7 +301,8 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
             archives: Flights::default(),
             crate_sources: Flights::default(),
             stds: Flights::default(),
-            dist: Dist::new(&network, DistSettings::from_settings(settings))?,
+            rust_srcs: Flights::default(),
+            dist: tool::dist(&network, DistSettings::from_settings(settings))?,
             index: tool::sparse_index(cache.clone(), &network)?,
             // The `.crate` files that cargo has fetched are read before static.crates.io is asked.
             static_crates: tool::static_crates(&network)?

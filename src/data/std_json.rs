@@ -118,6 +118,16 @@ impl StdJson {
         Version::parse(release).ok()
     }
 
+    /// The commit of rustc, in full, which the spans of the JSON name (`/rustc/<commit>/…`).
+    #[must_use]
+    pub fn commit_hash(&self) -> &str {
+        match self {
+            #[cfg(feature = "local")]
+            Self::Local(local) => &local.rustc.commit_hash,
+            Self::Dist(docs) => &docs.nightly.commit_hash,
+        }
+    }
+
     /// `dist` or `local`, for the provenance.
     #[must_use]
     pub const fn source(&self) -> &'static str {
@@ -233,11 +243,21 @@ pub async fn rust_src(
             }
             dist::rust_src(cache, dist, &docs.nightly).await
         },
-        // Its own sysroot's, without running it.
+        // Its own sysroot's, without running it, its manifests read on a blocking thread.
         #[cfg(feature = "local")]
-        StdJson::Local(local) => local_std::rust_src_of(local)
-            .map(here)
-            .map_err(|why| DistError::NoLocalSource { why }),
+        StdJson::Local(local) => {
+            let local = local.clone();
+            crate::task::spawn_blocking(move || local_std::rust_src_of(&local))
+                .await
+                .map_err(|error| {
+                    crate::task::resume_if_panic(error);
+                    DistError::NoLocalSource {
+                        why: local_std::NoSourceHere::NotRun { timed_out: false },
+                    }
+                })?
+                .map(here)
+                .map_err(|why| DistError::NoLocalSource { why })
+        },
     }
 }
 

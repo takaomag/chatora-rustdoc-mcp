@@ -408,8 +408,8 @@ impl Dist {
     }
 
     /// The client with `settings` instead.
-    #[cfg(test)]
-    pub(super) const fn with_settings(mut self, settings: DistSettings) -> Self {
+    #[must_use]
+    pub const fn with_settings(mut self, settings: DistSettings) -> Self {
         self.settings = settings;
         self
     }
@@ -433,6 +433,13 @@ impl Dist {
                 BodyError::TooLarge { limit } => DistError::TooLarge { limit },
             })
     }
+}
+
+/// Whether `url` is under the server's base URL, as `{base}/…`: not a host whose name only starts
+/// the same.
+fn under_base_url(dist: &Dist, url: &str) -> bool {
+    url.strip_prefix(&*dist.base_url)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The error for a failed request.
@@ -489,7 +496,7 @@ pub async fn std_docs(
             warnings,
         });
     }
-    if !archive.url.starts_with(&*dist.base_url) {
+    if !under_base_url(dist, &archive.url) {
         return Err(DistError::Manifest(
             format!("the archive is not on {}: {}", dist.base_url, archive.url).into(),
         ));
@@ -590,7 +597,7 @@ pub async fn rust_src(cache: &Cache, dist: &Dist, nightly: &Nightly) -> Result<R
         .map_err(|error: NightlyDateError| DistError::Manifest(error.into()))?;
     let summary = summary(cache, dist, Some(&date), &mut warnings, true).await?;
     let archive = summary.src.ok_or(DistError::NoSource)?;
-    if !archive.url.starts_with(&*dist.base_url) {
+    if !under_base_url(dist, &archive.url) {
         return Err(DistError::Manifest(
             format!("the archive is not on {}: {}", dist.base_url, archive.url).into(),
         ));

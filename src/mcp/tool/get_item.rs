@@ -3934,7 +3934,7 @@ async fn conclude(
 async fn finish_std(
     state: &Arc<ToolState>,
     looked_up: Result<Value, Failure>,
-    request: &Request,
+    (request, chosen): (&Request, &Chosen),
     warnings: &[Box<str>],
 ) -> CallToolResult {
     match looked_up {
@@ -3943,7 +3943,7 @@ async fn finish_std(
                 name: &request.name,
                 version: &request.version,
                 checksum: None,
-                docs: get_source::Source::Std,
+                docs: get_source::Source::Std(chosen),
                 until: request.until,
                 #[cfg(feature = "local")]
                 built: None,
@@ -4946,7 +4946,7 @@ async fn execute_std(
             );
         },
     }
-    let cache = state.cache.clone();
+    let (cache, kept) = (state.cache.clone(), Arc::clone(&chosen));
     let task = crate::task::spawn_blocking(move || {
         let looked_up = look_up_std(&cache, &chosen, &request, at_least.as_ref());
         (looked_up, request)
@@ -4961,7 +4961,7 @@ async fn execute_std(
                     show_at_entry(response, asked);
                 }
             }
-            finish_std(&state, looked_up, &request, &warnings).await
+            finish_std(&state, looked_up, (&request, &kept), &warnings).await
         },
         Err(error) => {
             let error = crate::task::resume_if_panic(error);
@@ -5092,6 +5092,16 @@ pub(super) fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
         krate.as_str(),
         ErrorChain(error)
     );
+    error_result(&dist_error_body(error, &message, &[
+        "install rust-docs-json for a nightly toolchain: rustup component add rust-docs-json \
+         --toolchain nightly",
+    ]))
+}
+
+/// The body of the tool error for `error` of the distribution server, with `message` and
+/// `suggestions`: its code, reason and whether it may pass, as for the JSON of std and for its
+/// sources (decided in M3b, decision 23).
+pub(super) fn dist_error_body(error: &DistError, message: &str, suggestions: &[&str]) -> Value {
     let (code, reason, retryable): (&str, Option<&str>, bool) = match error {
         DistError::Network(_) | DistError::Status { .. } | DistError::RecentFailure { .. } => {
             ("network_error", None, true)
@@ -5108,7 +5118,7 @@ pub(super) fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
         DistError::Unpack(UnpackError::TooLarge { .. }) => {
             ("docs_unavailable", Some("too_large"), false)
         },
-        DistError::NoSource => ("docs_unavailable", None, false),
+        DistError::NoSource => ("docs_unavailable", Some("no_source"), false),
         DistError::Cache(_) | DistError::Unpack(UnpackError::Cache(_)) => {
             ("internal_error", None, false)
         },
@@ -5120,17 +5130,14 @@ pub(super) fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
             None,
             matches!(why, NoSourceHere::NotRun { timed_out: true }),
         ),
-        // The install command below goes with it too (requirement R-STD-4).
+        // The install command goes with it too (requirement R-STD-4).
         DistError::Offline => ("offline_miss", None, false),
     };
     let mut body = json!({
         "code": code,
         "message": message,
         "retryable": retryable,
-        "suggestions": [
-            "install rust-docs-json for a nightly toolchain: rustup component add rust-docs-json \
-             --toolchain nightly",
-        ],
+        "suggestions": suggestions,
     });
     if let (Some(reason), Some(body)) = (reason, body.as_object_mut()) {
         body.insert("reason".to_owned(), json!(reason));
@@ -5141,7 +5148,7 @@ pub(super) fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
             json!(retry_after.as_secs().max(1)),
         );
     }
-    error_result(&body)
+    body
 }
 
 /// Looks the item up in the archive of the crate in `dir`, on a blocking thread. `Some(Ok(_))`

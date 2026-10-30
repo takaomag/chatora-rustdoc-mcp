@@ -73,7 +73,7 @@ use crate::{
         Network,
         cache::Cache,
         crate_file::StaticCrates,
-        dist::Dist,
+        dist::{Dist, DistSettings},
         docs_rs::DocsRs,
         fetches::Fetches,
         flight::Flights,
@@ -101,6 +101,9 @@ pub(super) struct ToolState {
     /// The JSON of std being chosen and fetched, shared by the calls that want it at once
     /// (requirements R-STD-6 and R-WS-6).
     pub(super) stds: Flights<SharedStd>,
+    /// The sources of std being fetched and unpacked from the distribution server, shared by the
+    /// calls that want them at once (decided in M3c, C3).
+    pub(super) rust_srcs: Flights<get_source::SharedRustSrc>,
     /// The client of the Rust distribution server, for std (requirement R-STD-6).
     pub(super) dist: Dist,
     /// The crates.io sparse index, for the versions of crates.
@@ -328,6 +331,12 @@ const TEST_INDEX_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_INDEX_URL";
 #[cfg(debug_assertions)]
 const TEST_STATIC_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_STATIC_URL";
 
+/// The environment variable that points the client of the Rust distribution server of a debug
+/// build with the tool for testing at a fake one of the tests, for std (`tests/stdio.rs`). Like
+/// [`TEST_DOCS_RS_ENV_VAR`], it is not a setting.
+#[cfg(debug_assertions)]
+const TEST_DIST_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_DIST_URL";
+
 /// The URL that the environment variable `name` gives a debug build with the tool for testing.
 #[cfg(debug_assertions)]
 fn test_url(name: &str) -> Option<String> {
@@ -346,6 +355,20 @@ pub(super) fn sparse_index(cache: Cache, network: &Network) -> Result<SparseInde
         return SparseIndex::with_base_url(cache, &base_url, network);
     }
     SparseIndex::new(cache, network)
+}
+
+/// The client of the Rust distribution server, with `settings`: of static.rust-lang.org, or of the
+/// server of the tests that [`TEST_DIST_ENV_VAR`] names in a debug build with the tool for testing.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be set up.
+pub(super) fn dist(network: &Network, settings: DistSettings) -> Result<Dist, reqwest::Error> {
+    #[cfg(debug_assertions)]
+    if let Some(base_url) = test_url(TEST_DIST_ENV_VAR) {
+        return Ok(Dist::with_base_url(&base_url, network)?.with_settings(settings));
+    }
+    Dist::new(network, settings)
 }
 
 /// The client of static.crates.io: of it, or of the server of the tests that

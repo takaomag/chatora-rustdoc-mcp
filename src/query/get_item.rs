@@ -1532,6 +1532,7 @@ impl<'a> Query<'a> {
                 } else {
                     format!("L{}-L{}", span.begin.0, span.end.0)
                 };
+                let path = path.replace('\\', "/");
                 format!("https://github.com/rust-lang/rust/blob/{commit}/{path}#{anchor}").into()
             });
             return Some(SourceLocation {
@@ -1929,9 +1930,10 @@ impl<'a> Query<'a> {
 }
 
 /// The commit and the path in the rust repository of a file of std, which rustdoc writes as
-/// `/rustc/<commit>/library/alloc/src/vec/mod.rs`.
+/// `/rustc/<commit>/library/alloc/src/vec/mod.rs`, or, built on Windows, with its separators after
+/// the commit: `/rustc/<commit>\library\alloc\src\vec\mod.rs`.
 fn std_source(file: &str) -> Option<(&str, &str)> {
-    let (commit, path) = file.strip_prefix("/rustc/")?.split_once('/')?;
+    let (commit, path) = file.strip_prefix("/rustc/")?.split_once(['/', '\\'])?;
     (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .then_some((commit, path))
 }
@@ -2121,6 +2123,11 @@ pub(super) mod tests {
             Some((commit, "library/alloc/src/vec/mod.rs"))
         );
         assert_eq!(std_source("/rustc/short/library/x.rs"), None);
+        let windows = format!("/rustc/{commit}\\library\\core\\src\\lib.rs");
+        assert_eq!(
+            std_source(&windows),
+            Some((commit, "library\\core\\src\\lib.rs"))
+        );
         assert_eq!(std_source("src/lib.rs"), None);
     }
     use crate::{

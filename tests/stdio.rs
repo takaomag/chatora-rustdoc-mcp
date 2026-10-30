@@ -439,6 +439,273 @@ fn get_source_reads_an_items_lines_from_its_crate() {
     assert!(server.finish().success());
 }
 
+/// The commit of the nightly of [`fake_dist`].
+#[cfg(debug_assertions)]
+const NIGHTLY_COMMIT: &str = "b6eeb93c9a1b2c3d4e5f60718293a4b5c6d7e8f9";
+
+/// The source of std's `src/lib.rs` in the `rust-src` of [`fake_dist`]: `hello` on lines 3 to 5.
+#[cfg(debug_assertions)]
+const STD_LIB: &str = "//! std.\n/// Says hello.\npub fn hello() -> u8 {\n    1\n}\n";
+
+/// An xz archive of `files`, under `top`, as the Rust distribution server makes them.
+#[cfg(debug_assertions)]
+fn dist_archive(top: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (path, contents) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len().try_into().expect("small"));
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("{top}/{path}"), *contents)
+            .expect("appended");
+    }
+    let tar = builder.into_inner().expect("a tar");
+    let mut xz = lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1))
+        .expect("an encoder");
+    xz.write_all(&tar).expect("compressed");
+    xz.finish().expect("finished")
+}
+
+/// The URL of a fake Rust distribution server on this machine, which serves the nightly of
+/// 2026-10-19 for [`TARGET`]: its manifest, the rustdoc JSON of std, core and alloc as
+/// [`demo_crate`] with `hello` in std's `src/lib.rs`, and, `with_rust_src`, its `rust-src`, with
+/// [`STD_LIB`]. Other paths are not found.
+#[cfg(debug_assertions)]
+fn fake_dist(with_rust_src: bool) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port is free");
+    let url = format!("http://{}", listener.local_addr().expect("bound"));
+    let json = |name: &str| {
+        let mut krate = demo_crate();
+        if let Some(root) = krate.index.get_mut(&Id(0)) {
+            root.name = Some(name.to_owned());
+        }
+        if let Some(hello) = krate.index.get_mut(&Id(1)) {
+            hello.span = Some(Span {
+                filename: PathBuf::from(format!(
+                    "/rustc/{NIGHTLY_COMMIT}/library/{name}/src/lib.rs"
+                )),
+                begin: (3, 1),
+                end: (5, 2),
+            });
+        }
+        serde_json::to_vec(&krate).expect("serializes")
+    };
+    let (std, core, alloc) = (json("std"), json("core"), json("alloc"));
+    let docs = dist_archive(&format!("rust-docs-json-nightly-{TARGET}"), &[
+        ("git-commit-hash", NIGHTLY_COMMIT.as_bytes()),
+        ("rust-docs-json-preview/share/doc/rust/json/std.json", &std),
+        (
+            "rust-docs-json-preview/share/doc/rust/json/core.json",
+            &core,
+        ),
+        (
+            "rust-docs-json-preview/share/doc/rust/json/alloc.json",
+            &alloc,
+        ),
+    ]);
+    let sources = dist_archive("rust-src-nightly", &[
+        ("git-commit-hash", NIGHTLY_COMMIT.as_bytes()),
+        (
+            "rust-src/lib/rustlib/src/rust/library/std/src/lib.rs",
+            STD_LIB.as_bytes(),
+        ),
+        (
+            "rust-src/lib/rustlib/src/rust/library/core/src/lib.rs",
+            b"//! core.\n",
+        ),
+        (
+            "rust-src/lib/rustlib/src/rust/library/.cargo/config.toml",
+            b"",
+        ),
+    ]);
+    let (docs_path, sources_path) = (
+        format!("/dist/2026-10-19/rust-docs-json-nightly-{TARGET}.tar.xz"),
+        "/dist/2026-10-19/rust-src-nightly.tar.xz".to_owned(),
+    );
+    let version = "1.101.0-nightly (b6eeb93c9 2026-10-18)";
+    let rust_src = if with_rust_src {
+        format!(
+            "\n[pkg.rust-src]\nversion = \"{version}\"\n\n[pkg.rust-src.target.\"*\"]\n\
+             available = true\nxz_url = \"{url}{sources_path}\"\nxz_hash = \"{}\"\n",
+            sha256_hex(&sources)
+        )
+    } else {
+        String::new()
+    };
+    let manifest = format!(
+        "manifest-version = \"2\"\ndate = \"2026-10-19\"\n\n[pkg.rustc]\nversion = \"{version}\"\n\n\
+         [pkg.rust-docs-json-preview]\nversion = \"{version}\"\n\n\
+         [pkg.rust-docs-json-preview.target.{TARGET}]\navailable = true\nxz_url = \"{url}{docs_path}\"\n\
+         xz_hash = \"{}\"\n{rust_src}",
+        sha256_hex(&docs)
+    );
+    let files: HashMap<String, Vec<u8>> = [
+        (
+            "/dist/channel-rust-nightly.toml".to_owned(),
+            manifest.clone().into_bytes(),
+        ),
+        (
+            "/dist/2026-10-19/channel-rust-nightly.toml".to_owned(),
+            manifest.into_bytes(),
+        ),
+        (docs_path, docs),
+        (sources_path, sources),
+    ]
+    .into_iter()
+    .collect();
+    serve_paths(listener, files);
+    url
+}
+
+/// Serves on `listener`, in the background, the bodies of `files` by path, and 404 for others.
+#[cfg(debug_assertions)]
+fn serve_paths(listener: std::net::TcpListener, files: HashMap<String, Vec<u8>>) {
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let mut reader = BufReader::new(stream);
+            let mut first = String::new();
+            if reader.read_line(&mut first).is_err() {
+                continue;
+            }
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|read| read > 0) && line != "\r\n" {
+                line.clear();
+            }
+            let body = first
+                .split_whitespace()
+                .nth(1)
+                .and_then(|path| files.get(path));
+            let mut stream = reader.into_inner();
+            // What the server makes of it is what the test looks at.
+            let _written = match body {
+                Some(body) => stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .and_then(|()| stream.write_all(body)),
+                None => stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+            };
+        }
+    });
+}
+
+/// `get_source` reads an item of std from the `rust-src` of the nightly that its JSON came from,
+/// fetched and unpacked once from the distribution server; and a file of it as its span gives it,
+/// under `library/`, with its URL on GitHub at that commit; not a file of another commit; and a
+/// nightly without `rust-src` is told (decided in M3c, C3, and decisions 32 and 33).
+#[cfg(debug_assertions)]
+#[test]
+fn get_source_reads_std_from_the_rust_src_of_its_nightly() {
+    // Without the nightly toolchain here, whose std would be read instead.
+    let bin = TempDir::new().expect("a temporary directory");
+    let path = bin.path().display().to_string();
+    let dist = fake_dist(true);
+    let env = [
+        ("CHATORA_RUSTDOC_TEST_DIST_URL", dist.as_str()),
+        ("PATH", path.as_str()),
+    ];
+    let mut server = Server::start_with(None, &env);
+    // While the sources are fetched and unpacked, the calls are made again, by ids of their own.
+    let call = |server: &mut Server, id: u64, arguments: Value| {
+        called_until_done(server, id * 100, "get_source", &arguments)
+    };
+    let found = call(
+        &mut server,
+        1,
+        json!({ "crate": "std", "path": "hello", "target": TARGET, "context": 1 }),
+    );
+    let content = &found["structuredContent"];
+    let data = &content["data"];
+    assert_eq!(content["provenance"]["source"], "std", "{found}");
+    assert_eq!(data["file"], "library/std/src/lib.rs", "{found}");
+    assert_eq!(
+        (&data["lines"], &data["shown"]),
+        (&json!("3-5"), &json!("2-5")),
+        "{found}"
+    );
+    assert_eq!(
+        data["source"], "/// Says hello.\npub fn hello() -> u8 {\n    1\n}\n",
+        "{found}"
+    );
+    assert_eq!(
+        data["url"],
+        format!(
+            "https://github.com/rust-lang/rust/blob/{NIGHTLY_COMMIT}/library/std/src/lib.rs#L3-L5"
+        ),
+        "{found}"
+    );
+    let file = PathBuf::from(data["path"].as_str().expect("a path"));
+    assert!(
+        file.starts_with(server.cache.path()) && file.is_file(),
+        "{found}"
+    );
+    // A file as its span gives it, of another crate of std, and as a path under the root.
+    let span = format!("/rustc/{NIGHTLY_COMMIT}/library/core/src/lib.rs");
+    // As std built on Windows writes it.
+    let windows = format!("/rustc/{NIGHTLY_COMMIT}\\library\\core\\src\\lib.rs");
+    for (id, file) in [
+        (2, span.as_str()),
+        (3, "library/core/src/lib.rs"),
+        (6, windows.as_str()),
+    ] {
+        let read = call(
+            &mut server,
+            id,
+            json!({ "crate": "std", "file": file, "target": TARGET }),
+        );
+        let data = &read["structuredContent"]["data"];
+        assert_eq!(
+            (&data["file"], &data["source"]),
+            (&json!("library/core/src/lib.rs"), &json!("//! core.\n")),
+            "{read}"
+        );
+    }
+    // Not of the JSON's commit, nor a dotfile, nor outside library/.
+    let other = format!("/rustc/{}/library/core/src/lib.rs", "0".repeat(40));
+    for (id, file) in [
+        (4, other.as_str()),
+        (5, "library/.cargo/config.toml"),
+        (7, "src/lib.rs"),
+    ] {
+        let refused = call(
+            &mut server,
+            id,
+            json!({ "crate": "std", "file": file, "target": TARGET }),
+        );
+        let body = text_json(&refused);
+        assert_eq!(
+            (&body["code"], &body["reason"]),
+            (&json!("docs_unavailable"), &json!("outside_package")),
+            "{refused}"
+        );
+    }
+    assert!(server.finish().success());
+    // A nightly that publishes no rust-src.
+    let dist = fake_dist(false);
+    let env = [
+        ("CHATORA_RUSTDOC_TEST_DIST_URL", dist.as_str()),
+        ("PATH", path.as_str()),
+    ];
+    let mut server = Server::start_with(None, &env);
+    let arguments = json!({ "crate": "std", "path": "hello", "target": TARGET });
+    let missed = called_until_done(&mut server, 1, "get_source", &arguments);
+    let body = text_json(&missed);
+    assert_eq!(
+        (&body["code"], &body["reason"]),
+        (&json!("docs_unavailable"), &json!("no_source")),
+        "{missed}"
+    );
+    assert!(server.finish().success());
+}
+
 /// The directory of the server's logs, in its cache directory.
 const LOG_DIR: &str = "logs";
 
@@ -1794,7 +2061,7 @@ fn trap_workspace(resolver: &str, target: Option<&str>) -> (TempDir, PathBuf) {
 
 /// Calls `tool` with `arguments` in `server`, from `id` on, again while it tells `status:
 /// building`; returns its result.
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local", debug_assertions))]
 fn called_until_done(server: &mut Server, id: u64, tool: &str, arguments: &Value) -> Value {
     let mut result = Value::Null;
     for next in id..id.saturating_add(90) {

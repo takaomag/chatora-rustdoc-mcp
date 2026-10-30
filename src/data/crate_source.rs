@@ -44,6 +44,16 @@ const IN_USE: &str = ".chatora-rustdoc-mcp.in-use";
 /// that the removal of stale temporaries, which looks at its time, leaves it.
 const FILES_PER_NOTE: usize = 256;
 
+/// The most files synced at once: a few at a time take a fraction of the time of one at a time
+/// (`rust-src` with 3,725 files, on Linux: 7.4 seconds synced as each was written, 3.0 after all
+/// were written, 1.0 eight at a time; decided in M3c, C3).
+const MAX_SYNCS: usize = 8;
+
+/// How many files are synced between two notes that their temporary directory is in use: of an
+/// unpacking of the most files on a slow disk too, well within the age at which it is taken for
+/// stale.
+const SYNCS_PER_NOTE: usize = 1024;
+
 /// Largest `.cargo-ok` read: cargo writes `{"v":1}`.
 const MAX_CARGO_OK_BYTES: u64 = 1024;
 
@@ -662,9 +672,9 @@ fn check_sizes(packed: Packed<'_>, max_bytes: u64) -> Result<(), UnpackError> {
     Ok(())
 }
 
-/// Writes the entries of `contents` under `prefix/` into the new directory `temp`, each file
-/// synced to the disk (requirement R-CA-4), or, without `temp`, only checks them. The limits are
-/// checked again as it goes.
+/// Writes the entries of `contents` under `prefix/` into the new directory `temp`, and then syncs
+/// each file to the disk (requirement R-CA-4), or, without `temp`, only checks them. The limits
+/// are checked again as it goes.
 #[expect(
     clippy::create_dir,
     reason = "the temporary directory is made alone, so that one left there is found"
@@ -688,6 +698,7 @@ fn walk(
     }
     let mut archive = tar::Archive::new(decompressed(packed, max_bytes));
     let mut written = Written::default();
+    let mut to_sync = Vec::new();
     // The note's name is not an entry's.
     written
         .claim(Path::new(IN_USE), true)
@@ -748,12 +759,13 @@ fn walk(
             Err(error) => return Err(UnpackError::Cache(error)),
         };
         io::copy(&mut entry.by_ref().take(size), &mut file).map_err(UnpackError::Archive)?;
-        file.sync_all().map_err(UnpackError::Cache)?;
         written.files.push(slashed(&relative));
+        to_sync.push(path);
     }
-    // Gone, if the removal of stale temporaries or the GC took it meanwhile: what is in it is not
-    // whole.
     if let Some(temp) = temp {
+        sync_files(temp, &to_sync)?;
+        // Gone, if the removal of stale temporaries or the GC took it meanwhile: what is in it is
+        // not whole.
         note_in_use(temp)?;
     }
     let mut files = written.files;
@@ -762,6 +774,42 @@ fn walk(
         files,
         bytes: written.bytes,
     })
+}
+
+/// Syncs the files at `paths`, written in `temp`, to the disk, [`MAX_SYNCS`] at once, noting
+/// `temp` in use between batches of them.
+fn sync_files(temp: &Path, paths: &[PathBuf]) -> Result<(), UnpackError> {
+    let at_once = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(MAX_SYNCS);
+    for batch in paths.chunks(SYNCS_PER_NOTE) {
+        std::thread::scope(|scope| {
+            let mut syncs = Vec::new();
+            for some in batch.chunks(batch.len().div_ceil(at_once)) {
+                syncs.push(
+                    std::thread::Builder::new()
+                        .spawn_scoped(scope, move || some.iter().try_for_each(sync_file))?,
+                );
+            }
+            syncs.into_iter().try_for_each(|sync| {
+                sync.join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+        })
+        .map_err(UnpackError::Cache)?;
+        note_in_use(temp)?;
+    }
+    Ok(())
+}
+
+/// Syncs the file at `path` to the disk: opened to read, which a file made read-only by the umask
+/// lets, but on Windows to write, as it syncs no file opened only to read.
+fn sync_file(path: &PathBuf) -> io::Result<()> {
+    #[cfg(windows)]
+    let file = fs::OpenOptions::new().write(true).open(path)?;
+    #[cfg(not(windows))]
+    let file = File::open(path)?;
+    file.sync_all()
 }
 
 /// Makes the directory `relative` under `temp`, and those that it is in, but not `temp`: one that
