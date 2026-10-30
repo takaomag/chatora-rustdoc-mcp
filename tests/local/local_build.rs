@@ -843,6 +843,20 @@ async fn a_file_that_the_dep_info_of_a_member_tells_is_in_its_key() {
         "{:?}",
         told.record.deps
     );
+    // The files that rustdoc read are kept apart, as the package's sources (decided in M3b, B2-2).
+    let sources = &told.record.source_files;
+    for read in ["ws/notes.md", "one/src/lib.rs"] {
+        assert!(
+            sources.iter().any(|file| file.ends_with(read)),
+            "{read}: {sources:?}"
+        );
+    }
+    assert!(
+        sources
+            .iter()
+            .all(|file| told.record.deps.files.contains(file)),
+        "{sources:?}"
+    );
     // The record with the dep-info is of the same build, which is fresh.
     assert_eq!(taken(&told), taken(&first));
     assert_ne!(told.record.key, first.record.key);
@@ -1060,6 +1074,16 @@ async fn what_the_build_script_of_a_member_watches_is_in_its_key() {
             .iter()
             .all(|file| !file.starts_with(dir.join("cache"))),
         "{deps:?}"
+    );
+    // The package's sources are what rustdoc read, not what the build script watches, nor what
+    // the build wrote (decided in M3b, B2-2).
+    let sources = &told.record.source_files;
+    assert!(
+        sources.iter().any(|file| file.ends_with("cfgenv/src/lib.rs"))
+            && sources
+                .iter()
+                .all(|file| !file.ends_with("ws/flags.txt") && !file.starts_with(dir.join("cache"))),
+        "{sources:?}"
     );
     assert_eq!(taken(&*members.built("cfgenv").await), taken(&first));
     fs::write(&flags, "two\n").expect("written");

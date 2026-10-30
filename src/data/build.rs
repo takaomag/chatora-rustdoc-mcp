@@ -1030,6 +1030,12 @@ pub struct BuildRecord {
     /// Whether its dep-info was had, or tried: a server may have ended before.
     #[serde(default)]
     pub dep_info: bool,
+    /// The files that rustdoc itself read, as its dep-info told, but those of the build's target
+    /// directory: the package's sources that may be read besides its targets' (requirement
+    /// R-SC-4, decided in M3b, B2-2). Without those that build scripts told cargo to watch, which
+    /// may be anywhere. Empty until its dep-info is had, and in a record from before.
+    #[serde(default)]
+    pub source_files: Vec<PathBuf>,
     /// What it was planned with, before the tries changed it: a later build of the same plan,
     /// with the same toolchain, begins as this one ended (decided in M2's D4).
     #[serde(default)]
@@ -1312,6 +1318,7 @@ pub async fn build(
         // Until the dep-info of this build tells them.
         deps: fresh.map(|fresh| fresh.deps.clone()).unwrap_or_default(),
         dep_info: false,
+        source_files: Vec::new(),
         planned: None,
         private: plan.document_private,
         workspace_root: Some(plan.root.clone()),

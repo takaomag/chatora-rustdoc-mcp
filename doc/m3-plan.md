@@ -209,6 +209,14 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 新しい `data::source_root`: `resolve(root, asked)` が、読んでよいファイルの実パスか拒否の理由 (`Refusal`: `Outside`・`Dotfile`・`NotInPackage`・`SymlinkOutside`・`SymlinkInCache`・`Missing`・`NotAFile`) を返す。字面で `.` と `..` を解いてルートの下 (ルートの下の絶対パスも受ける) → どの段もドットで始まらない → パッケージのファイル (`Root::Release` は `.crate` の目録) → 実パス (キャッシュの中は symlink を 1 つでも拒否、cargo の展開は辿った先がルートの実パスの下で、同じ規則を通るもの) → 通常のファイル。`lexically` と `slash_separated` は query から移した (動きは同じ)
 - レビュー (サブエージェント、読むだけ) の対応: 実パスは feature によらず `fs::canonicalize` で両側を作る (`dunce` は長いパスに `\\?\` を残し、短いルートと比べられなくなるため。clippy の禁止には理由付きの `#[expect]`)。ルートは `std::path::absolute` と字面の解決をしてから比べる (`$CARGO_HOME` が相対や `..` を含むと何も読めなかった)。cargo の展開で symlink を辿った先にも、ドットファイルと目録の判定を同じに掛ける。UTF-8 でない名前は目録に無いものとする (判定は lossy、開くのは元の名前、という食い違いを防ぐ)。`Missing` の文を「無いか見られない」に直した。テスト: Windows の `\` の区切り・UNC・verbatim・ドライブの根、大文字小文字だけ違う名前、`//` と末尾の `/`、`..` を含むルート、UTF-8 でない名前、キャッシュの中のディレクトリの symlink、symlink の先が目録に無い・ドットファイル
 
+**B2b の実装 (2026-10-30)**:
+
+- 決定 14: ローカルビルドの記録に `source_files` を足した (`#[serde(default)]`、形式の版は上げない)。rustdoc 自身の dep-info に載ったファイルだけで、ビルドの target ディレクトリの中のものと build script が見張らせたファイル (`rerun-if-changed`) は入らない。dep-info を取る裏のタスクが記録を書き直すときに入る
+- `source_root` に local 機能だけの `Root::Package` (member と path 依存) と `Root::Checkout` (git の checkout、ドットファイル以外のすべて) を足した。`Package` は workspace のルートを基準に照合し、読めるのは、ターゲットのファイル (cargo の `src_path`) のディレクトリの下の `.rs`、rustdoc が読んだファイル、`Cargo.toml`、readme (P8 の規則)、example。この 2 つでは、symlink を辿った先はルートの実パスの下でドットファイルでなければ読む (要件の文言どおり。workspace の中なら他の member のファイルも読める)。呼ぶ側は M3c 以降
+- 決定 18 (B2b、レビューの指摘から利用者が決めた): ターゲットのファイルがパッケージの直下にあるとき (`build.rs`、ルートに置いた `lib.rs` など) は、そのファイルだけを読む。直下の下の木は対象にしない (要件の文言どおりでは、workspace のルートのパッケージで他の member・`vendor/`・`target/` の生成物の `.rs` まで読めるため)。lib のモジュールのファイルは rustdoc の dep-info で読める。読めなくなるのは、直下に置いた bin の、dep-info に載らないモジュールくらい
+- レビュー (サブエージェント、読むだけ) の対応: dep-info の `..` を含むパスは `freshness` が実パスにして記録するので、workspace が symlink の下にあると (macOS の `/var` など) 字面の照合で外れた。字面で合わなければ、両側の実パスでも比べる。doc の直し (`Package.root` は path・git の依存でもその workspace のルート、`Checkout` はドットファイルを除く)。テスト: workspace のルートのパッケージ (他の member と `target/` を読まない)、symlink の下の workspace、build script が見張らせたファイルが `source_files` に入らないこと (結合テスト)
+- 残したもの: 作り直したビルドの記録は、`deps` を前の記録から引き継ぐが `source_files` は空から始まり、dep-info が取れるまで dep-info 由来のファイルは読めない (取れなかったときは次に作り直すまで)。形式の版を上げないので、`source_files` を知らない前の版のサーバーが記録を書き直すと (`refresh`)、`source_files` は落ちて作り直すまで戻らない (決定 14 の範囲)
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

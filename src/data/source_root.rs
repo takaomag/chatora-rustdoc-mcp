@@ -21,6 +21,40 @@ pub enum Root<'a> {
     /// The sources of a crates.io release: the files of its `.crate`'s listing, where cargo
     /// unpacked them or in the cache (decided in M3b, B2-3).
     Release(&'a Sources),
+    /// A package built here: a member of the workspace, or a path dependency.
+    #[cfg(feature = "local")]
+    Package(&'a Package),
+    /// The checkout of a git dependency, where cargo checked it out: every file in it but the
+    /// dotfiles.
+    #[cfg(feature = "local")]
+    Checkout(&'a Path),
+}
+
+/// A package built here, and what of it may be read (requirement R-SC-4).
+///
+/// Those are its targets' `.rs` files, the files that rustdoc read, its `Cargo.toml`, its readme
+/// and its examples. The paths are absolute: as cargo tells them, and as the dep-info told them,
+/// whose paths with `..` were made real; each is compared by its text, and else by its real path.
+#[cfg(feature = "local")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Package {
+    /// The known source root that its paths are judged under: the root of its workspace, where its
+    /// inherited readme and the files that rustdoc read may be, a path or git dependency's own
+    /// workspace's too; or the package's own directory, if it is in none.
+    pub root: PathBuf,
+    /// The directory of its `Cargo.toml`.
+    pub dir: PathBuf,
+    /// Its targets' files, as cargo tells them (`src_path`), its build script's among them: the
+    /// `.rs` files under a target's directory are its, but for one directly in the package's
+    /// directory, as `build.rs`, that file only, so that nothing else under the package's
+    /// directory is taken by it, as its target directory or other packages (decided in M3b).
+    pub targets: Vec<PathBuf>,
+    /// The files that rustdoc read, as the build's record tells (decided in M3b, B2-2).
+    pub source_files: Vec<PathBuf>,
+    /// Its readme, as its manifest tells, inherited from the workspace too (decided in M3, P8).
+    pub readme: Option<PathBuf>,
+    /// Its examples' files.
+    pub examples: Vec<PathBuf>,
 }
 
 /// A file that may be read.
@@ -64,6 +98,10 @@ impl<'a> Root<'a> {
     pub fn dir(self) -> &'a Path {
         match self {
             Self::Release(sources) => &sources.root,
+            #[cfg(feature = "local")]
+            Self::Package(package) => &package.root,
+            #[cfg(feature = "local")]
+            Self::Checkout(checkout) => checkout,
         }
     }
 
@@ -71,19 +109,92 @@ impl<'a> Root<'a> {
     const fn in_cache(self) -> bool {
         match self {
             Self::Release(sources) => matches!(sources.origin, Origin::Cache),
+            #[cfg(feature = "local")]
+            Self::Package(_) | Self::Checkout(_) => false,
         }
     }
 
-    /// Whether the file at `relative`, with `/`, is the package's.
-    fn holds(self, relative: &str) -> bool {
+    /// Whether where a symlink leads is to be one of the package's files too, as a file of a
+    /// listing is; else it is enough that it is under the root, as the requirement has it for the
+    /// roots of the project and of git, whose files are not listed.
+    const fn follows_to_files(self) -> bool {
         match self {
-            Self::Release(sources) => sources
-                .listing
-                .files
-                .binary_search_by(|file| file.as_str().cmp(relative))
-                .is_ok(),
+            Self::Release(_) => true,
+            #[cfg(feature = "local")]
+            Self::Package(_) | Self::Checkout(_) => false,
         }
     }
+
+    /// Whether the file at `relative` under the root, with `/`, whose absolute path is `full`
+    /// with its text resolved, is the package's.
+    fn holds(self, relative: &str, full: &Path) -> bool {
+        match self {
+            Self::Release(sources) => {
+                let _ = full;
+                sources
+                    .listing
+                    .files
+                    .binary_search_by(|file| file.as_str().cmp(relative))
+                    .is_ok()
+            },
+            #[cfg(feature = "local")]
+            Self::Package(package) => {
+                let _ = relative;
+                package.holds(full)
+            },
+            #[cfg(feature = "local")]
+            Self::Checkout(_) => true,
+        }
+    }
+}
+
+#[cfg(feature = "local")]
+impl Package {
+    /// Whether the file at `full`, absolute with its text resolved, is the package's: by the text
+    /// of its paths, or else by the real paths of both, as the dep-info's paths with `..` are.
+    fn holds(&self, full: &Path) -> bool {
+        self.holds_as(full, |path| Some(lexically(path)))
+            || real(full).is_ok_and(|full| self.holds_as(&full, |path| real(path).ok()))
+    }
+
+    /// Whether the file at `full` is the package's, with its paths in the `form` of `full`.
+    fn holds_as(&self, full: &Path, form: impl Fn(&Path) -> Option<PathBuf>) -> bool {
+        let is = |path: &Path| form(path).is_some_and(|path| path == full);
+        let dir = form(&self.dir);
+        let of_target = |target: &PathBuf| match target.parent().and_then(&form) {
+            Some(parent) if Some(&parent) == dir.as_ref() => is(target),
+            Some(parent) => {
+                full.extension().is_some_and(|extension| extension == "rs")
+                    && full.starts_with(parent)
+            },
+            None => false,
+        };
+        is(&self.dir.join("Cargo.toml"))
+            || self.targets.iter().any(of_target)
+            || self.source_files.iter().any(|file| is(file))
+            || self.examples.iter().any(|example| is(example))
+            || self
+                .readme
+                .as_deref()
+                .is_some_and(|readme| is(readme) && is_document(readme))
+    }
+}
+
+/// Whether the readme at `path` is a document (requirement R-SC-4, decided in M3, P8): of the
+/// extensions of one, or named `README` without one, in any case.
+#[cfg(feature = "local")]
+fn is_document(path: &Path) -> bool {
+    path.extension().map_or_else(
+        || {
+            path.file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("README"))
+        },
+        |extension| {
+            ["md", "markdown", "txt", "rst", "adoc"]
+                .iter()
+                .any(|document| extension.eq_ignore_ascii_case(document))
+        },
+    )
 }
 
 /// The file at `asked` under `root`, if it may be read: `asked` is relative to the root, or
@@ -101,7 +212,7 @@ pub fn resolve(root: Root<'_>, asked: &Path) -> Result<Resolved, Refusal> {
     let inside = full
         .strip_prefix(&dir)
         .map_err(|_outside| Refusal::Outside)?;
-    let relative = package_path(root, inside)?;
+    let relative = package_path(root, inside, &full)?;
     let path = if root.in_cache() {
         without_symlinks(&dir, inside)?
     } else {
@@ -111,7 +222,11 @@ pub fn resolve(root: Root<'_>, asked: &Path) -> Result<Resolved, Refusal> {
             .strip_prefix(&real_dir)
             .map_err(|_outside| Refusal::SymlinkOutside)?;
         if real_inside != inside {
-            package_path(root, real_inside)?;
+            if root.follows_to_files() {
+                package_path(root, real_inside, &real)?;
+            } else if has_dotfile(real_inside) {
+                return Err(Refusal::Dotfile);
+            }
         }
         real
     };
@@ -123,26 +238,32 @@ pub fn resolve(root: Root<'_>, asked: &Path) -> Result<Resolved, Refusal> {
 }
 
 /// `inside`, a path relative to `root`, with `/`, if it names a file of the package by its text:
-/// not the root itself, no dotfile, and of the package as the root tells. A name that is not
-/// UTF-8 is not the package's, whose files' names are.
-fn package_path(root: Root<'_>, inside: &Path) -> Result<String, Refusal> {
+/// not the root itself, no dotfile, and of the package as the root tells by it or by `full`, its
+/// absolute path. A name that is not UTF-8 is not the package's, whose files' names are.
+fn package_path(root: Root<'_>, inside: &Path, full: &Path) -> Result<String, Refusal> {
     if inside.as_os_str().is_empty() {
         return Err(Refusal::NotAFile);
     }
-    let mut names = Vec::new();
-    for component in inside.components() {
-        let name = component.as_os_str();
-        if name.as_encoded_bytes().starts_with(b".") {
-            return Err(Refusal::Dotfile);
-        }
-        names.push(name.to_str().ok_or(Refusal::NotInPackage)?);
+    if has_dotfile(inside) {
+        return Err(Refusal::Dotfile);
     }
-    let relative = names.join("/");
-    if root.holds(&relative) {
+    let names: Option<Vec<&str>> = inside
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect();
+    let relative = names.ok_or(Refusal::NotInPackage)?.join("/");
+    if root.holds(&relative, full) {
         Ok(relative)
     } else {
         Err(Refusal::NotInPackage)
     }
+}
+
+/// Whether a component of `inside` is a dotfile, or a dot directory.
+fn has_dotfile(inside: &Path) -> bool {
+    inside
+        .components()
+        .any(|component| component.as_os_str().as_encoded_bytes().starts_with(b"."))
 }
 
 /// `dir` joined with `inside`, if no component of `inside` is a symlink.
@@ -400,6 +521,177 @@ mod tests {
             resolved(&by_cargo, "a.rs").map(|resolved| resolved.path),
             Ok(real)
         );
+    }
+
+    /// Writes each of `files` under `root`.
+    #[cfg(feature = "local")]
+    fn write_all(root: &Path, files: &[&str]) {
+        for file in files {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+            fs::write(path, "x").expect("written");
+        }
+    }
+
+    /// Of a member, its targets' `.rs` files, the files that rustdoc read, its `Cargo.toml`, its
+    /// readme of a document's name, inherited from the workspace too, and its examples are read,
+    /// under the workspace's root; nothing else of the workspace (requirement R-SC-4, decided in
+    /// M3, P8, and M3b, B2-2).
+    #[cfg(feature = "local")]
+    #[test]
+    fn of_a_package_its_sources_are_read() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let workspace = dir.path().join("ws");
+        write_all(&workspace, &[
+            "Cargo.toml",
+            "README.md",
+            "notes.md",
+            "secret.txt",
+            "one/Cargo.toml",
+            "one/build.rs",
+            "one/src/lib.rs",
+            "one/src/deep/mod.rs",
+            "one/src/data.json",
+            "one/examples/hi.rs",
+            "one/README",
+            "one/other.rs",
+            "one/target/debug/x.rs",
+            "two/src/lib.rs",
+        ]);
+        let one = workspace.join("one");
+        let mut package = Package {
+            root: workspace.clone(),
+            dir: one.clone(),
+            targets: vec![one.join("src/lib.rs"), one.join("build.rs")],
+            source_files: vec![one.join("src/lib.rs"), workspace.join("notes.md")],
+            readme: Some(one.join("../README.md")),
+            examples: vec![one.join("examples/hi.rs")],
+        };
+        let read = |package: &Package, asked: &str| {
+            resolve(Root::Package(package), Path::new(asked)).map(|resolved| resolved.relative)
+        };
+        for asked in [
+            "one/Cargo.toml",
+            "one/build.rs",
+            "one/src/lib.rs",
+            "one/src/deep/mod.rs",
+            "one/examples/hi.rs",
+            "notes.md",
+            "README.md",
+        ] {
+            assert_eq!(read(&package, asked), Ok(asked.to_owned()), "{asked}");
+        }
+        for (asked, refusal) in [
+            ("one/src/data.json", Refusal::NotInPackage),
+            ("one/README", Refusal::NotInPackage),
+            ("one/other.rs", Refusal::NotInPackage),
+            ("one/target/debug/x.rs", Refusal::NotInPackage),
+            ("secret.txt", Refusal::NotInPackage),
+            ("Cargo.toml", Refusal::NotInPackage),
+            ("two/src/lib.rs", Refusal::NotInPackage),
+            ("../ws/secret.txt", Refusal::NotInPackage),
+            ("../outside.rs", Refusal::Outside),
+        ] {
+            assert_eq!(read(&package, asked), Err(refusal), "{asked}");
+        }
+        // A readme of no document's name is not read, but `README` without an extension is.
+        package.readme = Some(workspace.join("secret.txt").with_extension("json"));
+        assert_eq!(read(&package, "secret.json"), Err(Refusal::NotInPackage));
+        package.readme = Some(one.join("README"));
+        assert_eq!(read(&package, "one/README"), Ok("one/README".to_owned()));
+        // A package at the workspace's root, with its build script there: not its members, nor
+        // its target directory.
+        let root = Package {
+            root: workspace.clone(),
+            dir: workspace.clone(),
+            targets: vec![workspace.join("build.rs"), workspace.join("src/lib.rs")],
+            ..Package::default()
+        };
+        write_all(&workspace, &["build.rs", "src/lib.rs", "target/debug/x.rs"]);
+        for asked in ["build.rs", "src/lib.rs", "Cargo.toml"] {
+            assert_eq!(read(&root, asked), Ok(asked.to_owned()), "{asked}");
+        }
+        for asked in ["one/src/lib.rs", "two/src/lib.rs", "target/debug/x.rs"] {
+            assert_eq!(read(&root, asked), Err(Refusal::NotInPackage), "{asked}");
+        }
+    }
+
+    /// The files that rustdoc read through `..` are kept as their real paths, which a workspace
+    /// under a symlink, as macOS's `/var` is, does not have: they are read by their real paths.
+    #[cfg(all(feature = "local", unix))]
+    #[test]
+    fn a_file_kept_by_its_real_path_is_read_under_a_symlink() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let workspace = dir.path().join("real");
+        write_all(&workspace, &["notes.md", "one/src/lib.rs"]);
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&workspace, &linked).expect("linked");
+        let package = Package {
+            root: linked.clone(),
+            dir: linked.join("one"),
+            targets: vec![linked.join("one/src/lib.rs")],
+            source_files: vec![real(&workspace.join("notes.md")).expect("there")],
+            ..Package::default()
+        };
+        assert_eq!(
+            resolve(Root::Package(&package), Path::new("notes.md"))
+                .map(|resolved| resolved.relative),
+            Ok("notes.md".to_owned())
+        );
+    }
+
+    /// Where a symlink in a package or a checkout leads, under the root, is read, as a file of the
+    /// workspace outside the package is, but not a dotfile, and outside the root nothing is; a
+    /// checkout's files are all read but dotfiles.
+    #[cfg(all(feature = "local", unix))]
+    #[test]
+    fn a_symlink_of_a_package_leads_under_its_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let workspace = dir.path().join("ws");
+        write_all(&workspace, &[
+            "Cargo.toml",
+            "shared/util.rs",
+            ".env",
+            "src/lib.rs",
+        ]);
+        fs::write(dir.path().join("outside.rs"), "x").expect("written");
+        for (link, target) in [
+            ("src/util.rs", workspace.join("shared/util.rs")),
+            ("src/env.rs", workspace.join(".env")),
+            ("src/out.rs", dir.path().join("outside.rs")),
+        ] {
+            symlink(target, workspace.join(link)).expect("linked");
+        }
+        let package = Package {
+            root: workspace.clone(),
+            dir: workspace.clone(),
+            targets: vec![workspace.join("src/lib.rs")],
+            ..Package::default()
+        };
+        let read = |root: Root<'_>, asked: &str| resolve(root, Path::new(asked));
+        assert_eq!(
+            read(Root::Package(&package), "src/util.rs").map(|resolved| resolved.path),
+            Ok(real(&workspace.join("shared/util.rs")).expect("there"))
+        );
+        assert_eq!(
+            read(Root::Package(&package), "src/env.rs"),
+            Err(Refusal::Dotfile)
+        );
+        assert_eq!(
+            read(Root::Package(&package), "src/out.rs"),
+            Err(Refusal::SymlinkOutside)
+        );
+        let checkout = Root::Checkout(&workspace);
+        for asked in ["shared/util.rs", "src/util.rs"] {
+            assert_eq!(
+                read(checkout, asked).map(|resolved| resolved.relative),
+                Ok(asked.to_owned())
+            );
+        }
+        assert_eq!(read(checkout, ".env"), Err(Refusal::Dotfile));
+        assert_eq!(read(checkout, "src/out.rs"), Err(Refusal::SymlinkOutside));
     }
 
     #[test]

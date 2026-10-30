@@ -872,20 +872,20 @@ async fn follow(
             return None;
         }
         Some(run.map(|run| {
-            let deps = deps_of(&run, &plan, &packages);
+            let (deps, sources) = deps_of(&run, &plan, &packages);
             let more = freshness::collect_after(&deps.files, &deps.dirs, taken_at);
-            (deps, more)
+            (deps, sources, more)
         }))
     })
     .await;
-    let (deps, more) = match found {
+    let (deps, sources, more) = match found {
         Ok(None) => {
             tracing::debug!(json = %built.json.display(), "the sources changed since the build, so it is to be made again");
             built.record.key = None;
             return written(built, still).await;
         },
-        Ok(Some(Ok((deps, Ok(more))))) => (deps, more),
-        Ok(Some(Ok((_, Err(error))))) => {
+        Ok(Some(Ok((deps, sources, Ok(more))))) => (deps, sources, more),
+        Ok(Some(Ok((_, _, Err(error))))) => {
             tracing::info!(%error, "the files of a dep-info could not be read");
             return false;
         },
@@ -916,15 +916,22 @@ async fn follow(
     let facts = fresh.facts + &freshness::environment(&deps.env);
     built.record.key = Some(freshness::key(&inputs, &facts).into());
     (built.record.inputs, built.record.deps) = (Some(inputs), deps);
+    built.record.source_files = sources;
     written(built, still).await
 }
 
 /// What the dep-info of the build of `plan`, `run`, tells it read, with what the build scripts of
 /// `packages` told cargo to watch, but what the build wrote in its target directory (decided in
-/// M2's D4). Of the variables that rustdoc read, those of the environment that the server passes
-/// on: cargo and build scripts set the others from what the key has.
-fn deps_of(run: &DepInfoRun, plan: &Plan, packages: &[(PackageId, PathBuf)]) -> freshness::Deps {
+/// M2's D4); and, apart, the files that rustdoc itself read, which are of the package's sources
+/// (decided in M3b, B2-2). Of the variables that rustdoc read, those of the environment that the
+/// server passes on: cargo and build scripts set the others from what the key has.
+fn deps_of(
+    run: &DepInfoRun,
+    plan: &Plan,
+    packages: &[(PackageId, PathBuf)],
+) -> (freshness::Deps, Vec<PathBuf>) {
     let found = freshness::dep_info(&run.dep_info, &plan.root);
+    let mut sources = found.files.clone();
     let mut paths = found.files;
     let mut env: Vec<Box<str>> = found
         .env
@@ -945,9 +952,13 @@ fn deps_of(run: &DepInfoRun, plan: &Plan, packages: &[(PackageId, PathBuf)]) -> 
     // As the OS names it too, as `..` in a path is.
     let outputs = plan.target_dir.path();
     let real = dunce::canonicalize(outputs).ok();
-    paths.retain(|path| {
-        !path.starts_with(outputs) && real.as_ref().is_none_or(|real| !path.starts_with(real))
-    });
+    let written = |path: &Path| {
+        path.starts_with(outputs) || real.as_ref().is_some_and(|real| path.starts_with(real))
+    };
+    paths.retain(|path| !written(path));
+    sources.retain(|path| !written(path));
+    sources.sort();
+    sources.dedup();
     let (mut dirs, mut files): (Vec<PathBuf>, Vec<PathBuf>) =
         paths.into_iter().partition(|path| path.is_dir());
     for paths in [&mut files, &mut dirs] {
@@ -956,7 +967,7 @@ fn deps_of(run: &DepInfoRun, plan: &Plan, packages: &[(PackageId, PathBuf)]) -> 
     }
     env.sort();
     env.dedup();
-    freshness::Deps { files, dirs, env }
+    (freshness::Deps { files, dirs, env }, sources)
 }
 
 /// What the response warns about a member whose build's dep-info could not be had (decided in M2's
