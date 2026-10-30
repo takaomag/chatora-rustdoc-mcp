@@ -230,6 +230,23 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - レビュー (サブエージェント、読むだけ) の対応: 目録を作るときのロックは、同じプロセスの中では上限なしに待ち、`get_source` の取得の間も待ちうるので、先に `.crate` が手元にあるかを確かめ、ロックは待たずに試し取りする (取れなければその回は `path` を付けない)。checksum を確かめていない cargo の `.crate` から作った目録は、共有のキャッシュに印 (`unchecked`) を付けて置き、checksum を持つ `sources` はそれを使わずに作り直す (B1 の「目録は確かめた `.crate` から」を `get_source` の側で弱めない)。位置を捨てる一覧 (`search`・`list_module` の `normal`・`implementors`) では実パスの判定そのものを走らせない。cargo の `.crate` は symlink を辿らず上限付きで読む。目録を使ったら置き場に `used` を付ける。`$CARGO_HOME` は起動時に決めたもの (ほかのツールと同じ)。テスト: 印の付いた目録を `sources` が作り直すこと、ロックを他が持てば待たないこと、cargo の `.crate` の symlink
 - 残したもの: vendor (`cargo metadata` の `manifest_path` が要る) と、crates.io 以外の registry の依存には付けない。`$CARGO_HOME` は、このサーバーが見るものと cargo が span に書いたものが同じであることに頼る (Windows で綴りの大文字小文字が違えば付かない。安全側)。`index.crates.io-*` が cargo の版で 2 つ並ぶと、`sources` は先に見つけたほうを、`path` は span が指すほうを使う (M3c の `get_source` が `path` を受けるときに合わせる)。目録を作れなかったこと (大きすぎるなど) は照会の中でしか覚えない
 
+**B3 の実測 (2026-10-30、利用者の許可の上で 1 回。`channel-rust-nightly.toml` の 2026-10-30)**: `pkg.rust-src` は target `*` の 1 つで、`xz_url`・`xz_hash` と `git_commit_hash` (完全な commit) を持つ。xz は 6.0MB (gz は 9.6MB)、sha256 は manifest と一致。展開後は 74MB・ファイル 3,819・ディレクトリ 987。手元の `xz` と `tar` で展開 0.8 秒、`sync` 0.25 秒 (`lzma-rust2` とファイルごとの `sync_all` では未測定)。中は `rust-src-nightly/rust-src/lib/rustlib/src/rust/` の下に `library/` と `src/`、その外に 18 個のメタデータ (`git-commit-hash` は完全な commit、`version` など)。エントリは通常のファイルとディレクトリと GNU の長い名前 (`L`、1,201 個) だけで、symlink・hardlink・PAX は無い。ドットファイルは 85 個 (`library/.cargo` など)
+
+**B3 で利用者が決めたこと**:
+
+- 決定 20 (B3-1) 手元の rust-src は、span の完全な commit で照合して使う: std を手元の nightly から取ったときのその sysroot か、`rustc -vV` の commit-hash が span の commit と同じ nightly の sysroot (local 機能だけ。`local_std` が走らせた `rustc -vV` と `--print sysroot` の結果を使い、起動を増やさない)。ほかは dist から取る
+- 決定 21 (B3-2) dist から取った rust-src は `std/<短い commit>/src.v1/` (target によらない 1 つ) に置く。今の 7 日の片付け・在庫・GC にそのまま乗る。JSON (target ごと) とは別に 7 日を数える
+- 決定 22 (B3-3) 既定で取る。取るかどうかは今の `std.fetch_from_dist` に従い、設定は足さない。`get_source` で std を初めて引いたときだけ取る
+- 決定 23 (B3-4) 読めないときのエラーは理由ごとに分ける: オフラインでキャッシュに無ければ `offline_miss`、`std.fetch_from_dist = false` なら `toolchain_missing`、dist の失敗は `network_error`。導入の案内は rustup があれば `rustup toolchain install nightly-<日付> --component rust-src`、無ければ `std.fetch_from_dist` を有効にする案内。どれも別の版のソースは返さない
+
+**B3a の実装 (2026-10-30)**: B3 は B3a (dist から取る rust-src と std の規則) と B3b (手元の nightly の sysroot の照合、決定 20) に分けた。
+
+- `dist::rust_src(cache, dist, nightly)`: JSON の nightly の日付の manifest (`nightly-<日付>.json`、前の版のサーバーが書いた要約に `rust-src` が無ければ取り直す) の `pkg.rust-src` (target `*`) を、ベース URL の下に限って取り、sha256 で照合し、`std/<短い commit>/src.v1/` に展開する (B1 の `crate_source::unpack` を xz にも広げた。アーカイブの最上位 `rust-src-nightly/` を剥がす)。中の `git-commit-hash` が JSON の完全な commit と違えば消して `CommitMismatch`。そのあと完了印 `complete.json` (JSON と同じ `Nightly`) を書くので、今の 7 日の片付け・在庫・GC にそのまま乗る。使ったら `used` を付ける。オフラインは `Offline`、`std.fetch_from_dist = false` は `Disabled`、manifest に無ければ `NoSource` (決定 23 の分け方は M3c の `get_source` で応答の形にする)
+- `source_root::Root::RustSrc`: `library/` の下だけを読む (ドットファイルを除く)。キャッシュの中なら symlink を拒み、手元の toolchain なら辿った先も同じ規則。`std_span` は std の JSON の span (`/rustc/<commit>/library/…`) を、その commit のときだけ、字面で `..` を解いて `library/` の下のパスにする
+- テスト: 取って照合して展開し、2 回目はオフラインでもキャッシュから。commit の違い・sha256 の不一致・manifest に `rust-src` が無いこと。オフラインと取得を止めた設定。std の規則と span の写し替え (`../../stdarch` を含む)。7 日の片付けで `src.v1` が消え、新しいものは残ること。在庫で `std/<commit>/src.v1` が JSON と別の置き場になること
+- レビュー (サブエージェント、読むだけ) の対応: 前の版のサーバーが書いた日付の要約 (`rust-src` を読んでいない) が残っていると、取り直しの失敗 (オフラインなど) が `NoSource` に化けたので、要約に `rust-src` を読んだかの印 (`src_read`) を持たせ、印の無い要約しか無ければ失敗をそのまま返す。印があれば `rust-src` の無い日付でも manifest を取り直さない。`get_item` の対応表で、commit の違いと展開の拒否は再試行不可、展開のディスクの失敗は `internal_error` に分けた (M3c の `get_source` でも同じ分け方を使う)。`git-commit-hash` の無いアーカイブは壊れたアーカイブとして返す。doc の直し。テスト: 前の版の要約とオフライン、印のある要約で取らずに `NoSource`、xz の GNU の長い名前、キャッシュにあれば取得を止めた設定でも返ること
+- 残したもの: 展開の途中でプロセスが落ちると `std/<commit>/.src.v1.<pid>.<n>.tmp` (最大 74MB ほど) が残り、同じ commit をもう一度展開するときの古い一時の片付けか GC の容量の上限まで消えない (`.crate` の展開と同じ設計)。同時の 2 回の呼び出しで取得と展開が 1 回になることは、ロックに頼り、テストでは数えていない
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

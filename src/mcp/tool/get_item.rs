@@ -46,6 +46,7 @@ use crate::{
         cache::Cache,
         crate_file::{self, DocsRsBuild},
         crate_name::CrateName,
+        crate_source::UnpackError,
         dist::{DistError, StdCrate},
         docs_rs::FetchError,
         flight::{Doing, Joined},
@@ -5011,10 +5012,19 @@ pub(super) fn dist_error(krate: StdCrate, error: &DistError) -> CallToolResult {
         DistError::Certificate(_) | DistError::Manifest(_) => ("network_error", None, false),
         DistError::NotAvailable { .. } => ("docs_unavailable", Some("no_json"), false),
         DistError::TooLarge { .. } => ("docs_unavailable", Some("too_large"), false),
-        DistError::ChecksumMismatch | DistError::Archive(_) => {
-            ("docs_unavailable", Some("corrupt"), true)
+        DistError::ChecksumMismatch
+        | DistError::Archive(_)
+        | DistError::Unpack(UnpackError::Archive(_)) => ("docs_unavailable", Some("corrupt"), true),
+        // Of the sources of std, which the JSON's fetch does not give: the same again each time.
+        DistError::Unpack(UnpackError::Refused { .. } | UnpackError::TooManyFiles { .. })
+        | DistError::CommitMismatch { .. } => ("docs_unavailable", Some("corrupt"), false),
+        DistError::Unpack(UnpackError::TooLarge { .. }) => {
+            ("docs_unavailable", Some("too_large"), false)
         },
-        DistError::Cache(_) => ("internal_error", None, false),
+        DistError::NoSource => ("docs_unavailable", None, false),
+        DistError::Cache(_) | DistError::Unpack(UnpackError::Cache(_)) => {
+            ("internal_error", None, false)
+        },
         // With the dist turned off, the nightly here is the only source (requirement R-STD-4).
         DistError::Disabled { .. } => ("toolchain_missing", None, false),
         // The install command below goes with it too (requirement R-STD-4).

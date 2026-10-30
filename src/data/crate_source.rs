@@ -83,6 +83,15 @@ pub enum UnpackError {
     Cache(#[source] io::Error),
 }
 
+/// A tar archive, compressed.
+#[derive(Debug, Clone, Copy)]
+pub enum Packed<'a> {
+    /// With gzip, as a `.crate`.
+    Gzip(&'a [u8]),
+    /// With xz, as the components of the Rust distribution server (decided in M3b, B3).
+    Xz(&'a [u8]),
+}
+
 /// The files of a `.crate`, relative to the package's root with `/`, sorted, and their bytes: what
 /// is unpacked from it, and what of a directory that cargo unpacked is read (decided in M3b, B1-7).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -461,14 +470,18 @@ fn make(
     trust: Trust,
 ) -> Result<Sources, SourcesError> {
     let (listing, root, origin) = match by_cargo {
-        Some(root) => (list(contents, prefix, max_bytes)?, root, Origin::Cargo),
+        Some(root) => (
+            list(Packed::Gzip(contents), prefix, max_bytes)?,
+            root,
+            Origin::Cargo,
+        ),
         None if is_unpacked(dir) => (
-            list(contents, prefix, max_bytes)?,
+            list(Packed::Gzip(contents), prefix, max_bytes)?,
             dir.to_path_buf(),
             Origin::Cache,
         ),
         None => (
-            unpack(contents, prefix, dir, max_bytes)?,
+            unpack(Packed::Gzip(contents), prefix, dir, max_bytes)?,
             dir.to_path_buf(),
             Origin::Cache,
         ),
@@ -511,16 +524,16 @@ fn listing_path(dir: &Path) -> PathBuf {
 /// Returns an error when an entry is refused, a limit is passed, the archive cannot be read, or the
 /// cache cannot be written; what was at `into` is left then, unless it could not be moved away.
 pub fn unpack(
-    contents: &[u8],
+    packed: Packed<'_>,
     prefix: &str,
     into: &Path,
     max_bytes: u64,
 ) -> Result<Listing, UnpackError> {
-    check_sizes(contents, max_bytes)?;
+    check_sizes(packed, max_bytes)?;
     let parent = into.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(UnpackError::Cache)?;
     let temp = temporary(into);
-    let unpacked = walk(contents, prefix, Some(&temp), max_bytes)
+    let unpacked = walk(packed, prefix, Some(&temp), max_bytes)
         .and_then(|unpacked| replace(into, &temp).map(|()| unpacked));
     if unpacked.is_err() {
         remove_quietly(&temp);
@@ -539,9 +552,9 @@ pub fn unpack(
 /// # Errors
 ///
 /// Returns an error when an entry is refused, a limit is passed, or the archive cannot be read.
-pub fn list(contents: &[u8], prefix: &str, max_bytes: u64) -> Result<Listing, UnpackError> {
-    check_sizes(contents, max_bytes)?;
-    walk(contents, prefix, None, max_bytes)
+pub fn list(packed: Packed<'_>, prefix: &str, max_bytes: u64) -> Result<Listing, UnpackError> {
+    check_sizes(packed, max_bytes)?;
+    walk(packed, prefix, None, max_bytes)
 }
 
 /// A new name next to `into` for a temporary directory: `.<name>.<process>.<count>.tmp`, which the
@@ -585,21 +598,25 @@ fn remove_quietly(dir: &Path) {
     }
 }
 
-/// `contents` decompressed, up to what `max_bytes` of entries with their headers can take: past
+/// `packed` decompressed, up to what `max_bytes` of entries with their headers can take: past
 /// that, the archive reads as cut short.
-fn decompressed(contents: &[u8], max_bytes: u64) -> io::Take<GzDecoder<&[u8]>> {
+fn decompressed(packed: Packed<'_>, max_bytes: u64) -> io::Take<Box<dyn io::Read + '_>> {
     let headers = u64::try_from(MAX_ENTRIES)
         .unwrap_or(u64::MAX)
         .saturating_mul(1024);
-    GzDecoder::new(contents).take(max_bytes.saturating_add(headers))
+    let reader: Box<dyn io::Read + '_> = match packed {
+        Packed::Gzip(contents) => Box::new(GzDecoder::new(contents)),
+        Packed::Xz(contents) => Box::new(lzma_rust2::XzReader::new(contents, false)),
+    };
+    reader.take(max_bytes.saturating_add(headers))
 }
 
 /// Checks, over the raw entries of `contents`, that no extension header is larger than
 /// [`MAX_EXTENSION_BYTES`] nor changes the size of an entry, that there are not too many entries,
 /// and that what they hold is within `max_bytes`; before a long name is read into memory, or a
 /// file is written.
-fn check_sizes(contents: &[u8], max_bytes: u64) -> Result<(), UnpackError> {
-    let mut archive = tar::Archive::new(decompressed(contents, max_bytes));
+fn check_sizes(packed: Packed<'_>, max_bytes: u64) -> Result<(), UnpackError> {
+    let mut archive = tar::Archive::new(decompressed(packed, max_bytes));
     let mut entries = 0_usize;
     let mut files = 0_usize;
     let mut bytes = 0_u64;
@@ -652,7 +669,7 @@ fn check_sizes(contents: &[u8], max_bytes: u64) -> Result<(), UnpackError> {
     reason = "the temporary directory is made alone, so that one left there is found"
 )]
 fn walk(
-    contents: &[u8],
+    packed: Packed<'_>,
     prefix: &str,
     temp: Option<&Path>,
     max_bytes: u64,
@@ -668,7 +685,7 @@ fn walk(
             .and_then(|()| fs::create_dir(temp))
             .map_err(UnpackError::Cache)?;
     }
-    let mut archive = tar::Archive::new(decompressed(contents, max_bytes));
+    let mut archive = tar::Archive::new(decompressed(packed, max_bytes));
     let mut written = Written::default();
     // The note's name is not an entry's.
     written
@@ -986,7 +1003,12 @@ mod tests {
     ) -> (tempfile::TempDir, Result<Listing, UnpackError>) {
         let dir = tempfile::TempDir::new().expect("a temporary directory");
         let into = dir.path().join("demo/0.1.0/src.v1");
-        let result = unpack(&archive(entries), "demo-0.1.0", &into, max_bytes);
+        let result = unpack(
+            Packed::Gzip(&archive(entries)),
+            "demo-0.1.0",
+            &into,
+            max_bytes,
+        );
         (dir, result)
     }
 
@@ -1136,7 +1158,7 @@ mod tests {
         fs::create_dir_all(&into).expect("made");
         fs::write(into.join("left.rs"), "").expect("written");
         unpack(
-            &archive(&[file("demo-0.1.0/Cargo.toml", b"[package]\n")]),
+            Packed::Gzip(&archive(&[file("demo-0.1.0/Cargo.toml", b"[package]\n")])),
             "demo-0.1.0",
             &into,
             1024,
@@ -1623,7 +1645,7 @@ mod tests {
         fs::create_dir_all(&temp).expect("made");
         fs::write(temp.join("left.rs"), "").expect("written");
         let unpacked = walk(
-            &archive(&[file("demo-0.1.0/Cargo.toml", b"[package]\n")]),
+            Packed::Gzip(&archive(&[file("demo-0.1.0/Cargo.toml", b"[package]\n")])),
             "demo-0.1.0",
             Some(&temp),
             1024,

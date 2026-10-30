@@ -30,6 +30,15 @@ pub enum Root<'a> {
     /// dotfiles.
     #[cfg(feature = "local")]
     Checkout(&'a Path),
+    /// The sources of std, of `rust-src`: those under its `library/` (requirement R-SC-4,
+    /// decided in M3b, B3).
+    RustSrc {
+        /// The directory of `rust-src`, whose `library/` is read.
+        root: &'a Path,
+        /// Whether it is in the cache, unpacked from the distribution server's, where no symlink
+        /// is followed; else a toolchain's here.
+        in_cache: bool,
+    },
 }
 
 /// A package built here, and what of it may be read (requirement R-SC-4).
@@ -104,6 +113,7 @@ impl<'a> Root<'a> {
             Self::Package(package) => &package.root,
             #[cfg(feature = "local")]
             Self::Checkout(checkout) => checkout,
+            Self::RustSrc { root, .. } => root,
         }
     }
 
@@ -113,6 +123,7 @@ impl<'a> Root<'a> {
             Self::Release(sources) => matches!(sources.origin, Origin::Cache),
             #[cfg(feature = "local")]
             Self::Package(_) | Self::Checkout(_) => false,
+            Self::RustSrc { in_cache, .. } => in_cache,
         }
     }
 
@@ -121,7 +132,7 @@ impl<'a> Root<'a> {
     /// roots of the project and of git, whose files are not listed.
     const fn follows_to_files(self) -> bool {
         match self {
-            Self::Release(_) => true,
+            Self::Release(_) | Self::RustSrc { .. } => true,
             #[cfg(feature = "local")]
             Self::Package(_) | Self::Checkout(_) => false,
         }
@@ -146,8 +157,20 @@ impl<'a> Root<'a> {
             },
             #[cfg(feature = "local")]
             Self::Checkout(_) => true,
+            Self::RustSrc { .. } => relative.starts_with("library/"),
         }
     }
+}
+
+/// The path under the sources of std that a span of the JSON of std of `commit` tells (decided in
+/// M3b, B3).
+///
+/// The span is as `/rustc/<commit>/library/core/src/../../stdarch/…`, resolved by its text here.
+/// `None` for a span of another commit, or that is not under `library/`.
+#[must_use]
+pub fn std_span(span: &Path, commit: &str) -> Option<PathBuf> {
+    let inside = lexically(span.strip_prefix(Path::new("/rustc").join(commit)).ok()?);
+    inside.starts_with("library").then_some(inside)
 }
 
 #[cfg(feature = "local")]
@@ -809,6 +832,57 @@ mod tests {
             dir.path().join("elsewhere.rs"),
         ] {
             assert_eq!(read(&path), None, "{}", path.display());
+        }
+    }
+
+    /// Of the sources of std, only those under `library/` are read, but dotfiles; a span of the
+    /// JSON of std is resolved under them, by its text, only of the commit of the JSON (decided in
+    /// M3b, B3).
+    #[test]
+    fn of_the_sources_of_std_the_library_is_read() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path().join("rust");
+        for file in [
+            "library/core/src/lib.rs",
+            "library/stdarch/crates/core_arch/src/lib.rs",
+            "library/.cargo/config.toml",
+            "src/bootstrap/README.md",
+        ] {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+            fs::write(path, "x").expect("written");
+        }
+        let commit = "b6eeb93c9a1b2c3d4e5f60718293a4b5c6d7e8f9";
+        let span = |rest: &str| std_span(&Path::new("/rustc").join(commit).join(rest), commit);
+        let stdarch = span("library/core/src/../../stdarch/crates/core_arch/src/lib.rs")
+            .expect("under library/");
+        assert_eq!(
+            stdarch,
+            Path::new("library/stdarch/crates/core_arch/src/lib.rs")
+        );
+        assert_eq!(span("library/../src/bootstrap/README.md"), None);
+        assert_eq!(
+            std_span(Path::new("/rustc/0123/library/core/src/lib.rs"), commit),
+            None
+        );
+        let rust_src = Root::RustSrc {
+            root: &root,
+            in_cache: true,
+        };
+        for asked in [stdarch.as_path(), Path::new("library/core/src/lib.rs")] {
+            assert_eq!(
+                resolve(rust_src, asked).map(|resolved| resolved.path),
+                Ok(root.join(asked)),
+                "{}",
+                asked.display()
+            );
+        }
+        for (asked, refusal) in [
+            ("library/.cargo/config.toml", Refusal::Dotfile),
+            ("src/bootstrap/README.md", Refusal::NotInPackage),
+            ("library/../../outside.rs", Refusal::Outside),
+        ] {
+            assert_eq!(resolve(rust_src, Path::new(asked)), Err(refusal), "{asked}");
         }
     }
 

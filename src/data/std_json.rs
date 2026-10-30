@@ -273,10 +273,11 @@ async fn local(
     ))
 }
 
-/// Notes that the std in `dir` (that of one nightly for one target) is used now, and removes the
+/// Notes that the std in `dir` (that of one nightly for one target, or its sources for every
+/// target) is used now, and removes the
 /// std of the nightlies unused for [`UNUSED_FOR`], at most once in [`super::used::NOTE_EVERY`] for
 /// each directory, on a blocking thread that the call does not wait for.
-fn note_use(cache: &Cache, dir: PathBuf) {
+pub(super) fn note_use(cache: &Cache, dir: PathBuf) {
     if !super::used::due(&dir) {
         return;
     }
@@ -318,8 +319,9 @@ pub(super) struct Unused {
     pub left: Vec<(PathBuf, io::Error)>,
 }
 
-/// Removes the directories of a nightly's std under `std_dir` (`<commit>/<target>` and
-/// `local/<commit>/<target>`) last used longer than [`UNUSED_FOR`] before `now`, except `keep`,
+/// Removes the directories of a nightly's std under `std_dir` (`<commit>/<target>`, its sources
+/// `<commit>/src.v<n>` and `local/<commit>/<target>`) last used longer than [`UNUSED_FOR`] before
+/// `now`, except `keep`,
 /// and then their parents left empty; in a dry run, only tells them. Only directories that this
 /// server made (with the mark that the unpacking is complete, or archives) are removed, and
 /// symbolic links are not followed. Each that cannot be removed is left (Windows does not remove a
@@ -619,6 +621,9 @@ mod tests {
             30,
         );
         let recent = make("bbbbbbbbb/x86_64-unknown-linux-gnu", dist::COMPLETE_FILE, 1);
+        // The sources of std, of every target, counted apart (decided in M3b, decision 21).
+        let old_sources = make("aaaaaaaaa/src.v1", dist::COMPLETE_FILE, 30);
+        let recent_sources = make("aaaaaaaaa/src.v2", dist::COMPLETE_FILE, 1);
         let in_use = make(
             "ccccccccc/x86_64-unknown-linux-gnu",
             dist::COMPLETE_FILE,
@@ -643,7 +648,8 @@ mod tests {
                 .left
                 .is_empty()
         );
-        assert!(!old.exists() && !std_dir.join("aaaaaaaaa").exists());
+        assert!(!old.exists() && !old_sources.exists());
+        assert!(recent_sources.exists());
         assert!(!local.exists() && !std_dir.join("local/0123abcd").exists());
         assert!(recent.exists() && in_use.exists() && not_ours.exists());
         assert!(held.join(dist::COMPLETE_FILE).exists(), "left whole");

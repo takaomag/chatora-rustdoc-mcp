@@ -39,7 +39,8 @@ const MANIFEST_TTL: Duration = Duration::from_hours(1);
 /// Largest manifest held in memory. The nightly one is about 1 MB.
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Largest archive held in memory. The one for Linux on x86-64 is about 4 MB.
+/// Largest archive held in memory. The one of the JSON for Linux on x86-64 is about 4 MB, and that of
+/// `rust-src` 6 MB (measured in M3b, B3).
 const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// `limits.extract_max_size` unless set: the most bytes unpacked from one archive (requirement
@@ -205,6 +206,18 @@ pub enum DistError {
     /// R-CA-7).
     #[error("the server is offline (network.offline), and the cache does not have it")]
     Offline,
+    /// The nightly channel publishes no `rust-src` (decided in M3b, B3).
+    #[error("the nightly channel publishes no rust-src")]
+    NoSource,
+    /// The archive of `rust-src` could not be unpacked, or is refused.
+    #[error("the archive of rust-src could not be unpacked")]
+    Unpack(#[source] super::crate_source::UnpackError),
+    /// The archive of `rust-src` is of another commit than the JSON of std.
+    #[error("the rust-src of the nightly is of commit {found}, not of the JSON's")]
+    CommitMismatch {
+        /// The commit that the archive tells.
+        found: Box<str>,
+    },
 }
 
 /// The JSON of std of one nightly, unpacked in the cache.
@@ -270,6 +283,13 @@ struct Summary {
     date: Box<str>,
     version: Box<str>,
     archives: BTreeMap<Box<str>, Archive>,
+    /// The archive of `rust-src`, the same for every target (decided in M3b, B3).
+    #[serde(default)]
+    src: Option<Archive>,
+    /// Whether `src` was read from the manifest, so that its `None` tells that the nightly has no
+    /// `rust-src`: not in a summary from before.
+    #[serde(default)]
+    src_read: bool,
     /// When the manifest was fetched, in seconds since the Unix epoch.
     fetched_at: u64,
 }
@@ -292,6 +312,14 @@ struct Manifest {
 struct Packages {
     #[serde(rename = "rust-docs-json-preview")]
     docs: Package,
+    #[serde(rename = "rust-src", default)]
+    src: Option<SourcePackage>,
+}
+
+/// `rust-src`, whose one archive is for every target, `*`.
+#[derive(Deserialize)]
+struct SourcePackage {
+    target: BTreeMap<String, TargetPackage>,
 }
 
 #[derive(Deserialize)]
@@ -423,7 +451,7 @@ pub async fn std_docs(
     date: Option<&NightlyDate>,
 ) -> Result<StdDocs, DistError> {
     let mut warnings = Vec::new();
-    let summary = summary(cache, dist, date, &mut warnings).await?;
+    let summary = summary(cache, dist, date, &mut warnings, false).await?;
     let archive = summary
         .archives
         .get(target.as_str())
@@ -483,6 +511,135 @@ pub async fn std_docs(
     })
 }
 
+/// The sources of std of one nightly, unpacked in the cache (decided in M3b, B3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustSrc {
+    /// The directory of the sources, whose `library/` the spans of the JSON of std are in, as
+    /// `/rustc/<commit>/library/…`.
+    pub root: PathBuf,
+    /// What the response warns about, such as a manifest that could not be fetched again.
+    pub warnings: Vec<Box<str>>,
+}
+
+/// Where `rust-src` puts the sources in its archive, under the archive's own directory.
+const RUST_SRC_ROOT: &str = "rust-src/lib/rustlib/src/rust";
+
+/// The sources of std of `nightly`, unpacked in the cache from its `rust-src` (decisions 21 and
+/// 22, requirement R-SC-2).
+///
+/// `nightly` is the one that the JSON of std came from, whose `rust-src` on the distribution
+/// server is of the same commit.
+///
+/// They are in `std/<short commit>/src.v1/`, for every target, with the mark that they are
+/// complete, which tells the commit, so that the removal of the nightlies unused for a week takes
+/// them too. The archive is checked against the manifest of the nightly's date, and its commit
+/// against the JSON's; it is fetched only when `std.fetch_from_dist` lets it.
+///
+/// # Errors
+///
+/// Returns an error when the sources are not in the cache and `std.fetch_from_dist` is false
+/// ([`DistError::Disabled`]), the server is offline ([`DistError::Offline`]), the manifest has no
+/// `rust-src`, the archive cannot be had or does not check out, or the cache cannot be used.
+pub async fn rust_src(cache: &Cache, dist: &Dist, nightly: &Nightly) -> Result<RustSrc, DistError> {
+    let short_hash = short_commit_hash(&nightly.version).ok_or_else(|| {
+        DistError::Manifest(format!("unexpected version {}", nightly.version).into())
+    })?;
+    let dir = cache
+        .dir()
+        .join(super::layout::STD)
+        .join(short_hash)
+        .join(super::formats::sources_dir());
+    let root = dir.join(RUST_SRC_ROOT);
+    let mut warnings = Vec::new();
+    let held = cache.lock(&dir).await;
+    let complete = |found: &Nightly| found.commit_hash == nightly.commit_hash;
+    if read_complete(cache, &dir)
+        .await?
+        .as_ref()
+        .is_some_and(complete)
+    {
+        drop(held);
+        super::std_json::note_use(cache, dir);
+        return Ok(RustSrc { root, warnings });
+    }
+    if !dist.fetches() {
+        return Err(DistError::Disabled {
+            why: "the sources of std of this nightly are not in the cache".into(),
+        });
+    }
+    let date: NightlyDate = nightly
+        .date
+        .parse()
+        .map_err(|error: NightlyDateError| DistError::Manifest(error.into()))?;
+    let summary = summary(cache, dist, Some(&date), &mut warnings, true).await?;
+    let archive = summary.src.ok_or(DistError::NoSource)?;
+    if !archive.url.starts_with(&*dist.base_url) {
+        return Err(DistError::Manifest(
+            format!("the archive is not on {}: {}", dist.base_url, archive.url).into(),
+        ));
+    }
+    let body = get_remembering(cache, dist, &archive.url, MAX_ARCHIVE_BYTES, &dir).await?;
+    let unpacked = {
+        let (cache, dir, nightly) = (cache.clone(), dir.clone(), nightly.clone());
+        let max = dist.settings.extract_max_size;
+        // With the lock, which goes when the unpacking is done, even when this call is dropped,
+        // as for the JSON of std.
+        blocking(move || {
+            let unpacked = if cache::sha256_hex(&body).eq_ignore_ascii_case(&archive.sha256) {
+                unpack_source(&cache, &body, &dir, &nightly, max)
+            } else {
+                Err(DistError::ChecksumMismatch)
+            };
+            drop(held);
+            Ok(unpacked)
+        })
+        .await
+        .map_err(DistError::Cache)?
+    };
+    unpacked?;
+    super::std_json::note_use(cache, dir);
+    Ok(RustSrc { root, warnings })
+}
+
+/// Unpacks the `rust-src` archive `body` into `dir`, checks that it is of the commit of
+/// `nightly`, and then writes the mark that it is complete, which is `nightly` itself: of the
+/// JSON's target, though the sources are of every target, as only its commit is read.
+fn unpack_source(
+    cache: &Cache,
+    body: &[u8],
+    dir: &Path,
+    nightly: &Nightly,
+    max_unpacked: u64,
+) -> Result<(), DistError> {
+    use super::crate_source::{Packed, unpack};
+
+    unpack(Packed::Xz(body), "rust-src-nightly", dir, max_unpacked).map_err(DistError::Unpack)?;
+    let found = cache
+        .read_file(&dir.join("git-commit-hash"))
+        .map_err(DistError::Cache)?
+        .map(|hash| String::from_utf8_lossy(hash.trim_ascii()).into_owned());
+    let mismatch = match found {
+        Some(found) if found == *nightly.commit_hash => None,
+        Some(found) => Some(DistError::CommitMismatch {
+            found: found.into(),
+        }),
+        None => Some(DistError::Archive(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the archive of rust-src has no git-commit-hash",
+        ))),
+    };
+    if let Some(mismatch) = mismatch {
+        if let Err(error) = std::fs::remove_dir_all(dir) {
+            tracing::warn!(path = %dir.display(), %error, "a rust-src that does not check out could not be removed");
+        }
+        return Err(mismatch);
+    }
+    let json = serde_json::to_vec(nightly).map_err(|error| DistError::Cache(error.into()))?;
+    cache
+        .write_verified(&dir.join(COMPLETE_FILE), &json)
+        .map_err(DistError::Cache)
+}
+
 /// Reads the JSON of `krate` from `docs`.
 ///
 /// # Errors
@@ -522,6 +679,7 @@ async fn summary(
     dist: &Dist,
     date: Option<&NightlyDate>,
     warnings: &mut Vec<Box<str>>,
+    needs_src: bool,
 ) -> Result<Summary, DistError> {
     let path = cache.dir().join(super::layout::STD).join(date.map_or_else(
         || "nightly.json".to_owned(),
@@ -544,15 +702,19 @@ async fn summary(
             .duration_since(system_time(summary.fetched_at))
             .unwrap_or(Duration::ZERO)
     };
-    // The manifest of a past date does not change.
+    // The manifest of a past date does not change, but a summary from before has not read its
+    // rust-src.
+    let usable = |kept: &Summary| !needs_src || kept.src_read;
     if let Some(kept) = kept
         .as_ref()
-        .filter(|kept| date.is_some() || age(kept) < MANIFEST_TTL)
+        .filter(|kept| (date.is_some() || age(kept) < MANIFEST_TTL) && usable(kept))
     {
         return Ok(Summary {
             date: kept.date.clone(),
             version: kept.version.clone(),
             archives: kept.archives.clone(),
+            src: kept.src.clone(),
+            src_read: kept.src_read,
             fetched_at: kept.fetched_at,
         });
     }
@@ -577,7 +739,7 @@ async fn summary(
             }
             Ok(summary)
         },
-        (Err(error), Some(kept)) => {
+        (Err(error), Some(kept)) if usable(&kept) => {
             tracing::warn!(error = %error, "using the manifest of the nightly channel kept before");
             warnings.push(
                 format!(
@@ -589,7 +751,8 @@ async fn summary(
             );
             Ok(kept)
         },
-        (Err(error), None) => Err(error),
+        // None, or one that cannot tell what is asked: the failure, as offline.
+        (Err(error), _) => Err(error),
     }
 }
 
@@ -641,10 +804,27 @@ fn parse_manifest(body: &[u8]) -> Result<Summary, DistError> {
             TargetPackage { .. } => None,
         })
         .collect();
+    let src = manifest
+        .pkg
+        .src
+        .and_then(|package| package.target.into_iter().find(|(target, _)| target == "*"))
+        .and_then(|(_, package)| match package {
+            TargetPackage {
+                available: true,
+                xz_url: Some(url),
+                xz_hash: Some(sha256),
+            } => Some(Archive {
+                url: url.into(),
+                sha256: sha256.into(),
+            }),
+            TargetPackage { .. } => None,
+        });
     Ok(Summary {
         date: manifest.date.into(),
         version: manifest.pkg.docs.version.into(),
         archives,
+        src,
+        src_read: true,
         fetched_at: unix_seconds(SystemTime::now()),
     })
 }
@@ -929,6 +1109,202 @@ available = false
             requests,
             dir,
         )
+    }
+
+    /// The nightly of the tests' archives, whose commit is [`HASH`].
+    fn nightly() -> Nightly {
+        Nightly {
+            date: "2026-10-19".into(),
+            version: "1.101.0-nightly (b6eeb93c9 2026-10-18)".into(),
+            commit_hash: HASH.into(),
+            triple: linux(),
+        }
+    }
+
+    /// The `rust-src` archive of `commit`, as the distribution server makes it: the sources under
+    /// `rust-src/lib/rustlib/src/rust`, with the commit beside them.
+    fn source_archive(commit: &str) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (path, contents) in [
+            ("git-commit-hash", commit.as_bytes()),
+            (
+                "version",
+                b"1.101.0-nightly (b6eeb93c9 2026-10-18)".as_slice(),
+            ),
+            (
+                "rust-src/lib/rustlib/src/rust/library/core/src/lib.rs",
+                b"//! core\n".as_slice(),
+            ),
+            (
+                "rust-src/lib/rustlib/src/rust/library/.cargo/config.toml",
+                b"".as_slice(),
+            ),
+            // A GNU long name, as the real one has many.
+            (
+                "rust-src/lib/rustlib/src/rust/library/stdarch/crates/core_arch/src/x86_64/\
+                 a_name_long_enough_to_need_a_gnu_long_name_entry.rs",
+                b"".as_slice(),
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(u64::try_from(contents.len()).expect("small"));
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, format!("rust-src-nightly/{path}"), contents)
+                .expect("appended");
+        }
+        let tar = tar.into_inner().expect("a tar");
+        let mut xz = lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1))
+            .expect("an encoder");
+        io::Write::write_all(&mut xz, &tar).expect("compressed");
+        xz.finish().expect("finished")
+    }
+
+    /// A cache, and a distribution server that answers the manifest of the nightly's date with
+    /// `rust-src` at `sha256` (or its own), and then `archive`.
+    fn source_setup(
+        archive: &[u8],
+        sha256: Option<&str>,
+    ) -> (Cache, Dist, mpsc::Receiver<String>, tempfile::TempDir) {
+        let (base_url, requests) = test_http::serve_sequence_with(|base_url| {
+            let url = format!("{base_url}/dist/2026-10-19/rust-src-nightly.tar.xz");
+            let sha256 = sha256.map_or_else(|| cache::sha256_hex(archive), str::to_owned);
+            let mut manifest = manifest(&url, "0");
+            manifest.extend_from_slice(
+                format!(
+                    "\n[pkg.rust-src]\nversion = \"1.101.0-nightly (b6eeb93c9 2026-10-18)\"\n\n\
+                     [pkg.rust-src.target.\"*\"]\navailable = true\nxz_url = \"{url}\"\n\
+                     xz_hash = \"{sha256}\"\n"
+                )
+                .as_bytes(),
+            );
+            vec![ok(&manifest), ok(archive)]
+        });
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        (
+            Cache::at(dir.path()),
+            Dist::for_local_test(&base_url),
+            requests,
+            dir,
+        )
+    }
+
+    /// The sources of std of a nightly are fetched once from its `rust-src`, checked against the
+    /// manifest of its date and its commit, and unpacked in `std/<commit>/src.v1/` with the mark
+    /// that they are complete (decisions 21 and 22).
+    #[tokio::test]
+    async fn the_sources_of_std_are_fetched_once() {
+        let (cache, dist, requests, dir) = source_setup(&source_archive(HASH), None);
+        let found = rust_src(&cache, &dist, &nightly()).await.expect("fetched");
+        let unpacked = dir.path().join("std/b6eeb93c9/src.v1");
+        assert_eq!(found.root, unpacked.join("rust-src/lib/rustlib/src/rust"));
+        assert_eq!(
+            std::fs::read_to_string(found.root.join("library/core/src/lib.rs")).expect("unpacked"),
+            "//! core\n"
+        );
+        assert!(unpacked.join(COMPLETE_FILE).is_file());
+        assert!(
+            requests.try_iter().next().is_some_and(
+                |request| request.contains("/dist/2026-10-19/channel-rust-nightly.toml")
+            ),
+            "the manifest of the nightly's date"
+        );
+        assert!(
+            found
+                .root
+                .join("library/stdarch/crates/core_arch/src/x86_64")
+                .join("a_name_long_enough_to_need_a_gnu_long_name_entry.rs")
+                .is_file()
+        );
+        // Again, offline, or with `std.fetch_from_dist` false: from the cache.
+        let offline = Dist::for_local_test("http://127.0.0.1:9").offline();
+        assert_eq!(
+            rust_src(&cache, &offline, &nightly()).await.expect("kept"),
+            found
+        );
+        let disabled = Dist::for_local_test("http://127.0.0.1:9").with_settings(DistSettings {
+            fetch: false,
+            ..DistSettings::default()
+        });
+        assert_eq!(
+            rust_src(&cache, &disabled, &nightly()).await.expect("kept"),
+            found
+        );
+    }
+
+    /// A summary of the nightly's manifest kept by a server from before, which did not read its
+    /// `rust-src`, is fetched again, and offline the failure is told, not that it has none; one
+    /// that read it tells that it has none without fetching (decision 23).
+    #[tokio::test]
+    async fn a_summary_from_before_is_fetched_again_for_the_sources() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let kept = dir.path().join("std/nightly-2026-10-19.json");
+        let summary = |read: bool| {
+            format!(
+                r#"{{"date":"2026-10-19","version":"1.101.0-nightly (b6eeb93c9 2026-10-18)","archives":{{}},"fetched_at":0{}}}"#,
+                if read { r#","src_read":true"# } else { "" }
+            )
+        };
+        cache
+            .write_verified(&kept, summary(false).as_bytes())
+            .expect("written");
+        let offline = Dist::for_local_test("http://127.0.0.1:9").offline();
+        assert!(matches!(
+            rust_src(&cache, &offline, &nightly()).await,
+            Err(DistError::Offline)
+        ));
+        cache
+            .write_verified(&kept, summary(true).as_bytes())
+            .expect("written");
+        assert!(matches!(
+            rust_src(&cache, &offline, &nightly()).await,
+            Err(DistError::NoSource)
+        ));
+    }
+
+    /// Sources of another commit than the JSON's, or that do not match the manifest's SHA-256,
+    /// are not kept; a nightly that publishes none has none.
+    #[tokio::test]
+    async fn the_sources_of_std_must_check_out() {
+        let other = "0123456789012345678901234567890123456789";
+        let (cache, dist, _requests, dir) = source_setup(&source_archive(other), None);
+        assert!(matches!(
+            rust_src(&cache, &dist, &nightly()).await,
+            Err(DistError::CommitMismatch { found }) if &*found == other
+        ));
+        assert!(!dir.path().join("std/b6eeb93c9/src.v1").exists());
+        let (cache, dist, _requests, _dir) = source_setup(&source_archive(HASH), Some("00"));
+        assert!(matches!(
+            rust_src(&cache, &dist, &nightly()).await,
+            Err(DistError::ChecksumMismatch)
+        ));
+        let (cache, dist, _requests, _dir) = setup(&archive(&json_files()), None);
+        assert!(matches!(
+            rust_src(&cache, &dist, &nightly()).await,
+            Err(DistError::NoSource)
+        ));
+    }
+
+    /// Without them in the cache, nothing is fetched offline or with `std.fetch_from_dist`
+    /// false, each told apart (decision 23).
+    #[tokio::test]
+    async fn the_sources_of_std_are_not_fetched_when_they_may_not_be() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(dir.path());
+        let offline = Dist::for_local_test("http://127.0.0.1:9").offline();
+        assert!(matches!(
+            rust_src(&cache, &offline, &nightly()).await,
+            Err(DistError::Offline)
+        ));
+        let disabled = Dist::for_local_test("http://127.0.0.1:9").with_settings(DistSettings {
+            fetch: false,
+            ..DistSettings::default()
+        });
+        assert!(matches!(
+            rust_src(&cache, &disabled, &nightly()).await,
+            Err(DistError::Disabled { .. })
+        ));
     }
 
     pub(crate) fn linux() -> TargetTriple {

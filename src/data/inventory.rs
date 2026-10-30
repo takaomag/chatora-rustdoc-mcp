@@ -475,6 +475,7 @@ mod tests {
         write(root, "docs.rs/serde/1.0.0/_default/used", 0);
         write(root, "docs.rs/old/0.1.0/rustdoc.json", 5);
         write(root, "std/abc123/x86_64-unknown-linux-gnu/std.json", 20);
+        write(root, "std/abc123/src.v1/library/core/src/lib.rs", 9);
         write(root, "std/local/def/x86_64-unknown-linux-gnu/std.json", 7);
         write(root, "std/nightly.json", 1);
         write(root, "static.crates.io/serde/1.0.0/serde-1.0.0.crate", 30);
@@ -508,6 +509,9 @@ mod tests {
             7
         );
         assert_eq!(entry(&inventory, "std/nightly.json").kind, Kind::Std);
+        // The sources of std, apart from the JSON (decided in M3b, decision 21).
+        let sources = entry(&inventory, "std/abc123/src.v1");
+        assert_eq!((sources.kind, sources.bytes), (Kind::Std, 9));
         let index = entry(&inventory, "index.crates.io/se/rd/serde");
         assert_eq!((index.kind, index.bytes), (Kind::Index, 5));
         assert!(
