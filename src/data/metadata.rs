@@ -192,6 +192,9 @@ pub struct Target {
     /// that did not keep it.
     #[serde(default)]
     pub src_path: PathBuf,
+    /// The features that it needs, as `required-features` names them (decided in M3e).
+    #[serde(default, rename = "required-features")]
+    pub required_features: Box<[Box<str>]>,
 }
 
 /// The dependency graph.

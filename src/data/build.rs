@@ -1945,6 +1945,7 @@ mod tests {
             name: long.into(),
             kind: vec!["lib".into()].into(),
             src_path: PathBuf::new(),
+            required_features: Box::default(),
         }]
         .into();
         assert_eq!(Bootstrap::of(&metadata), Bootstrap::All);

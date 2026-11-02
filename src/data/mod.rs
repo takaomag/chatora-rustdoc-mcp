@@ -22,6 +22,7 @@ pub mod crate_name;
 pub mod crate_source;
 pub mod dist;
 pub mod docs_rs;
+pub mod examples;
 #[cfg(feature = "local")]
 pub mod external;
 #[cfg(feature = "local")]

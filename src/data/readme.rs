@@ -168,7 +168,8 @@ pub fn chosen(declared: &Declared, has: impl Fn(&str) -> bool) -> Result<Box<str
 
 /// `path`, relative to the package's root, with `/` and without `.`; `None` when it leaves the
 /// root or is not relative, as with a drive (`C:`), which no file of the package is at.
-fn relative(path: &str) -> Option<String> {
+#[must_use]
+pub fn relative(path: &str) -> Option<String> {
     let mut parts = Vec::new();
     for part in path.split(['/', '\\']) {
         if part.contains(':') {

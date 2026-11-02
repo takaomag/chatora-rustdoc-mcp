@@ -18,6 +18,7 @@ use semver::Version;
 use super::{
     cache::{Cache, Verified},
     crate_name::CrateName,
+    examples,
     feature_tree::{FeatureTree, is_name},
     http::{self, BodyError, Network},
     readme::{self, Declared},
@@ -364,6 +365,19 @@ pub fn manifest_features(manifest: &Path) -> io::Result<FeatureTree> {
 /// Returns an error when the manifest cannot be read, is too large or is not TOML.
 pub fn manifest_readme(manifest: &Path) -> io::Result<Declared> {
     Ok(readme::declared(&manifest_table(manifest)?))
+}
+
+/// The examples of the package whose manifest is at `manifest` and whose files are `files`,
+/// relative to its root with `/` (decided in M3e), as [`examples::of_package`] finds them.
+///
+/// # Errors
+///
+/// Returns an error when the manifest cannot be read, is too large or is not TOML.
+pub fn manifest_examples<'f>(
+    manifest: &Path,
+    files: impl IntoIterator<Item = &'f str>,
+) -> io::Result<Vec<examples::Example>> {
+    Ok(examples::of_package(&manifest_table(manifest)?, files))
 }
 
 /// What the `[workspace.package]` of the workspace's manifest at `manifest` names as the readme
