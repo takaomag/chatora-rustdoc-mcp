@@ -234,6 +234,7 @@ mod tests {
                 checksum: "00".into(),
                 yanked,
                 rust_version: None,
+                line: 0..0,
             })
             .collect()
     }

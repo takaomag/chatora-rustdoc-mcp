@@ -18,6 +18,7 @@ use semver::Version;
 use super::{
     cache::{Cache, Verified},
     crate_name::CrateName,
+    feature_tree::{FeatureTree, is_name},
     http::{self, BodyError, Network},
 };
 
@@ -414,25 +415,24 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
             .map(|values| values.iter().filter_map(toml::Value::as_str).collect())
             .unwrap_or_default()
     };
-    let features_table = table.get("features").and_then(toml::Value::as_table);
-    let declared = declared_features(table);
+    let tree = FeatureTree::from_manifest(table);
     let all_features = flag("all-features");
     let features: BTreeSet<&str> = if all_features {
-        declared.iter().map(String::as_str).collect()
+        tree.names().collect()
     } else {
         let mut features: BTreeSet<&str> = strings("features")
             .into_iter()
             .flat_map(|list| list.split([',', ' ']))
             .filter(|feature| is_feature_name(feature))
             .collect();
-        if !flag("no-default-features") && declared.contains("default") {
+        if !flag("no-default-features") && tree.contains("default") {
             features.insert("default");
         }
         features
     };
-    let enabled = closure(&features, features_table);
-    let default: Box<[Box<str>]> = if declared.contains("default") {
-        closure(&BTreeSet::from(["default"]), features_table)
+    let enabled = tree.closure(features.iter().copied());
+    let default: Box<[Box<str>]> = if tree.contains("default") {
+        tree.closure(["default"])
             .into_iter()
             .filter(|&feature| feature != "default")
             .map(Into::into)
@@ -440,10 +440,10 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
     } else {
         Box::default()
     };
-    let missing = declared
-        .iter()
-        .filter(|feature| !enabled.contains(feature.as_str()))
-        .map(|feature| feature.as_str().into())
+    let missing = tree
+        .names()
+        .filter(|feature| !enabled.contains(feature))
+        .map(Into::into)
         .collect();
     let mut cfg = BTreeSet::new();
     let mut rustdoc_cfg = BTreeSet::new();
@@ -479,10 +479,7 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
         features: features.into_iter().map(Into::into).collect(),
         cfg: cfg.into_iter().map(Into::into).collect(),
         missing,
-        declared: declared
-            .iter()
-            .map(|feature| feature.as_str().into())
-            .collect(),
+        declared: tree.names().map(Into::into).collect(),
         default,
         asked: metadata.is_some(),
         asks_features: ["features", "all-features", "no-default-features"]
@@ -492,89 +489,11 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
     }
 }
 
-/// The features of the manifest `table`: those of `[features]`, and one for each optional
-/// dependency that no feature names as `dep:<name>`, as Cargo makes them.
-fn declared_features(table: &toml::Table) -> BTreeSet<String> {
-    let features_table = table.get("features").and_then(toml::Value::as_table);
-    let mut declared: BTreeSet<String> = features_table
-        .map(|features| features.keys().cloned().collect())
-        .unwrap_or_default();
-    let named_with_dep: BTreeSet<&str> = features_table
-        .into_iter()
-        .flat_map(|features| features.values())
-        .filter_map(toml::Value::as_array)
-        .flatten()
-        .filter_map(toml::Value::as_str)
-        .filter_map(|entry| entry.strip_prefix("dep:"))
-        .collect();
-    let targets = table
-        .get("target")
-        .and_then(toml::Value::as_table)
-        .into_iter()
-        .flat_map(|targets| targets.values());
-    let tables = std::iter::once(table).chain(targets.filter_map(toml::Value::as_table));
-    for owner in tables {
-        for kind in ["dependencies", "build-dependencies"] {
-            let Some(dependencies) = owner.get(kind).and_then(toml::Value::as_table) else {
-                continue;
-            };
-            for (name, dependency) in dependencies {
-                let optional = dependency
-                    .get("optional")
-                    .and_then(toml::Value::as_bool)
-                    .unwrap_or(false);
-                if optional && !named_with_dep.contains(name.as_str()) {
-                    declared.insert(name.clone());
-                }
-            }
-        }
-    }
-    declared
-}
-
-/// The features that `features` enable, with those they enable in turn through `[features]`
-/// (`features_table`). `dep/feature` enables the feature of the optional dependency `dep`;
-/// `dep?/feature` does not enable `dep`.
-fn closure<'a>(
-    features: &BTreeSet<&'a str>,
-    features_table: Option<&'a toml::Table>,
-) -> BTreeSet<&'a str> {
-    let mut enabled = features.clone();
-    let mut pending: Vec<&str> = features.iter().copied().collect();
-    while let Some(feature) = pending.pop() {
-        let entries = features_table
-            .and_then(|table| table.get(feature))
-            .and_then(toml::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(toml::Value::as_str);
-        for entry in entries {
-            let next = match entry.split_once('/') {
-                Some((dependency, _)) if !dependency.ends_with('?') => dependency,
-                Some(_) => continue,
-                None => entry,
-            };
-            if !next.starts_with("dep:") && enabled.insert(next) {
-                pending.push(next);
-            }
-        }
-    }
-    enabled
-}
-
 /// Whether `name` is a feature as Cargo takes it, or a feature of a dependency (`dep/feature`).
 pub(super) fn is_feature_name(name: &str) -> bool {
-    let part = |part: &str| {
-        part.chars()
-            .next()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_')
-            && part
-                .chars()
-                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '+' | '.'))
-    };
     match name.split_once('/') {
-        Some((dependency, feature)) => part(dependency) && part(feature),
-        None => part(name),
+        Some((dependency, feature)) => is_name(dependency) && is_name(feature),
+        None => is_name(name),
     }
 }
 
@@ -795,6 +714,29 @@ features = ["full"]
             "macros".into(),
             "serde".into()
         ]);
+    }
+
+    /// A feature of a dependency asked for, `serde/derive`, enables the optional dependency's
+    /// feature too, as Cargo does; one of a dependency that is not optional none, nor one that
+    /// `dep:` names (decided in M3d, D1a).
+    #[test]
+    fn a_dependencys_feature_asked_for_enables_its_feature() {
+        let build = build(
+            r#"[package]
+name = "demo"
+[features]
+default = ["bytes/std", "dep:mio", "mio/net"]
+[dependencies]
+serde = { version = "1", optional = true }
+mio = { version = "1", optional = true }
+bytes = "1"
+[package.metadata.docs.rs]
+features = ["serde/derive"]
+"#,
+        );
+        assert!(build.missing.is_empty(), "{build:?}");
+        assert!(build.default.is_empty(), "{build:?}");
+        assert_eq!(&*build.declared, [Box::from("default"), "serde".into()]);
     }
 
     #[test]

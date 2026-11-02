@@ -320,6 +320,28 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - C4 のレビュー (サブエージェント、読むだけ) の対応: 識別子の語の区切りを空白と ASCII の記号だけにした (結合文字を含む識別子を途中で切らない。NFD のソースと NFC の名前の食い違いは扱わない)。inputs の比較は digest のある記録まで探す (要求したパスに無ければ実パス)。`file` を渡した読みでは「行がずれうる」と言わず「ビルドの後に変わった」とだけ言う。derive の warning は定義元のパスを書かない (re-export で引いたときに `data.item` と食い違うため)。説明文 (`get_source.md`) には `macro` を書いていない (残り 21 字。schema の description と warning で伝える)。`Made` は item_data のたびに作る (メンバーごとに impl を見る。小さいので get_source のときだけにはしていない)
 - 残したもの: SHA の違いの warning は通しのテストで確かめていない (作り直しと競うので時刻に依る)。切り詰めは文字数のまま (決定 26)。JSON の長さでは数えない。dep-info 由来のファイルを拒むときに「dep-info がまだ無い」を添える件は入れていない。get_item の hints (作り直し中の LSP の案内など) は get_source に写していない。GC で消えたときの取り直しと `retry_after_secs` の写しには単体テストが無い
 
+### 6.4 M3d
+
+**下調べ (2026-11-02。サブエージェント、読むだけ。LSP は使わず grep と Read。ネットワークなし)**: 使い回せる部品は、`.crate` の Cargo.toml の feature (`crate_file::DocsRsBuild` の `declared`・`default`・`missing`。値は外へ出していない。`closure` は `dep:x` を使う crate でも `x/f` から実在しない feature `x` を入れる)、プロジェクトの feature の組 (`features::FeatureSets`)、item の条件 (`get_item::cfg_note`。連言を返す部分を切り出す)、get_item の版・target・project の解決 (`What::*` を足す前例は get_source)。sparse index は `features`・`features2`・`v`・`deps` を今は読まない。`metadata::Package.features` は名前だけを残し値を捨てている (cargo metadata は暗黙の feature を `"x": ["dep:x"]` で含む)。手元の index で測ると、`features2` を持つ行は `v: 2` の行と一致し、index の `features` には optional 依存の暗黙の feature が載らない (tokio 1.54.1: `features` 15・`features2` 2・暗黙 9 で 26。`tracing` は `cfg(tokio_unstable)` の target の下だけ)。reqwest 0.13.5 は optional 依存 26 個のうち 21 個が `[target.*]` の下で、rename が 2 つ。docs.rs の JSON で feature の条件を持つ item は tokio 4,087/6,469 (`net` 1,114)、axum 1,524/4,793、reqwest 482/1,416
+
+**M3d で利用者が決めたこと**:
+
+- 決定 38 (M3d) 応答は、既定で全 feature の一覧 (各 feature の直接の値・default か・閉包・`enabled_by`・`enabled_in_project`・item の数)。引数 `feature` を渡したときだけ、その feature の item の上位 N 件をページングで返す
+- 決定 39 (M3d) feature の一覧も cursor のページングにし、既定 100 件
+- 決定 40 (M3d) 閉包と `enabled_by` は同じ crate の feature だけで推移的にたどる。依存を有効にするもの (`dep:x`・`x/f`・`x?/f`) は別の欄に書かれたとおり並べ、依存の crate の中は追わない
+- 決定 41 (M3d) crates.io のリリースの feature の木は、いつも sparse index のその版の行 (`features`・`features2`・optional の `deps`) から作る。`.crate` は docs.rs のビルドの情報 (文書に無い feature) にだけ使う。要件 §5.9 の「`.crate` の Cargo.toml、無ければ index から先に」は M3 の終わりに改める
+- 決定 42 (M3d) rustdoc JSON がまだ無いとき (docs.rs の取得中・member のビルド中) は、feature の木をすぐ返し、item の数と一覧だけを省いて、取得中の印・`retry_after_secs`・呼び直しの案内を付ける (`status: building` にしない)
+- 決定 43 (M3d) ある feature の item として数えるのは、公開パスを持つ item と関連 item で、正準パスの条件にその feature が現れるもの (肯定でも否定でも)。各 item に条件の文 (`required_features`) を添える
+- 決定 44 (M3d) item の並べ方は、その feature が自分の条件として付く item (入口) を先に、親から受け継いだだけの item を後に。その中はパスの深さ、次に文字列の順
+- 決定 45 (M3d) プロジェクトが使わない crate や使う版と違う版では `enabled_in_project` を出さず、warnings に書く (get_item と同じく、プロジェクトの Cargo.lock の同じ版と分かったときだけ出す)
+- 決定 46 (M3d) docs.rs のビルドで有効にならなかった feature は、item の数も一覧も出さず、`in_docs: false` と「この文書には無い」を明示し、`build_external_docs` でその feature を含む文書を作る案内を付ける
+
+**コミットの順の案**: D1a (データ層: index のその版の行の `features`・`features2`・`deps`、feature の木の型 (暗黙の feature・`dep:`・`?/`・target・build・rename・名前の検証・閉包・`enabled_by`)、`crate_file` の `declared`/`closure` をこの型の上に作り直す) → D1b (ツールの骨組み: `What::Features`、docs.rs の crate、JSON の無い応答、README、偽の index の拡張と stdio のテスト) → D2 (member・path・git: `Package.features` の値、feature ごとの `enabled_in_project`・`enabled_in_dev_only`、tests/local) → D3 (逆引き: `cfg_note` の連言を切り出し、検索索引の entry を回して feature ごとに数え、上位 N 件とページング。testdata の tokio・axum で時間を測る) → D4 (get_item.md・crate_overview.md・instructions の案内、eval の Q11)。合計 2,000〜2,700 行 (見積り)
+
+**D1a の実装 (2026-11-02)**: 新しい `data::feature_tree` (`FeatureTree`・`Enables`・`is_name`)。`[features]` と、`dep:` で名指しされない optional 依存の暗黙の feature (値は `dep:<名前>`)、値の読み (`x`・`dep:x`・`x/f`・`x?/f`)、名前の検証 (R-SEC-4)、閉包 (同じ crate の feature だけ。`x/f` は `x` が optional の依存なら名前 `x` の feature、`x?/f` と `dep:x` は何も)、`enabled_by` (全 feature の分を閉包 1 回ずつで)、依存を有効にする値 (書かれたとおり)。`crate_file` の docs.rs の feature (`declared`・`default`・`missing`) をこの型の上に作り直し、前の `declared_features`・`closure` を消した (前の閉包は、`dep:x` で名指しされた `x` や optional でない依存の `x/f` から、実在しない feature `x` を入れていた。`missing` は `declared` で絞るので害は無かった。docs.rs の `features = ["serde/derive"]` が `serde` を有効にするのは Cargo と同じく正しくなった)。sparse index は `IndexEntry` に本文を、各版に行の位置を持たせ、`IndexEntry::features(版)` がその行の `features`・`features2` (Cargo と同じく統合)・optional の `deps` から木を作る (本文は `Arc` を共有するだけで写さない。Debug には長さだけ)
+
+- D1a のレビュー (サブエージェント、読むだけ) の対応: `features2` を上書きでなく統合する。`x/f` が名前 `x` の feature を有効にするのは `x` が optional の依存のときだけ。`enabled_by` を全 feature の分を 1 回で求める形に (feature が千を超える crate のため)。`IndexEntry` の Debug に本文を出さない。`is_feature_name` の重複を `is_name` に。テスト: 統合、明示した同名の feature、optional でない依存、循環、docs.rs の `serde/derive`
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

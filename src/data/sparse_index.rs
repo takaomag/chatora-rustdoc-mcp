@@ -10,8 +10,9 @@
 //! (requirement R-ERR-3).
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io,
+    ops::Range,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -26,6 +27,7 @@ use super::{
     blocking,
     cache::{self, Cache},
     crate_name::CrateName,
+    feature_tree::FeatureTree,
     http::{self, BodyError, Network},
     system_time,
     unix_seconds,
@@ -65,7 +67,7 @@ pub struct SparseIndex {
 }
 
 /// The index entry of a crate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IndexEntry {
     /// The name as published (`Inflector`, `tokio-util`), which may differ from the one asked
     /// for in case and in `-` and `_` (requirement R-PR-1).
@@ -77,9 +79,52 @@ pub struct IndexEntry {
     /// Why a file in the cache older than the TTL was used: the index could not be reached, or the
     /// server is offline. The latest versions may be missing from it.
     pub stale: Option<Box<str>>,
+    /// The index file, whose line of a version [`IndexVersion::line`] is, read again for what
+    /// is not kept of it, as its features.
+    pub body: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for IndexEntry {
+    /// Without the file, which may have megabytes, but its length.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IndexEntry")
+            .field("name", &self.name)
+            .field("versions", &self.versions)
+            .field("fetched_at", &self.fetched_at)
+            .field("stale", &self.stale)
+            .field("body", &format_args!("{} bytes", self.body.len()))
+            .finish()
+    }
 }
 
 impl IndexEntry {
+    /// The features of `version`, from its line of the index: `features`, `features2` and those
+    /// that its optional dependencies make (decided in M3d, decision 41). `None` if the index does
+    /// not list it or its line cannot be read.
+    #[must_use]
+    pub fn features(&self, version: &Version) -> Option<FeatureTree> {
+        let listed = self
+            .versions
+            .iter()
+            .find(|listed| listed.version == *version)?;
+        let line: FeatureLine = serde_json::from_slice(self.body.get(listed.line.clone())?).ok()?;
+        // Merged, as Cargo merges them.
+        let mut declared: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (name, values) in line.features.iter().chain(&line.features2) {
+            declared
+                .entry(name)
+                .or_default()
+                .extend(values.iter().map(String::as_str));
+        }
+        let optional = line
+            .deps
+            .iter()
+            .filter(|dependency| dependency.optional)
+            .map(|dependency| dependency.name.as_str());
+        Some(FeatureTree::new(declared, optional))
+    }
+
     /// When the index file was fetched, in RFC 3339, if it is [`Self::stale`]: for the provenance
     /// (requirement R-CA-7).
     #[must_use]
@@ -101,6 +146,8 @@ pub struct IndexVersion {
     pub yanked: bool,
     /// The MSRV it declares, if any.
     pub rust_version: Option<Box<str>>,
+    /// Where its line is in [`IndexEntry::body`].
+    pub line: Range<usize>,
 }
 
 /// Why the index entry of a crate could not be read.
@@ -184,6 +231,26 @@ struct Line {
     yanked: bool,
     #[serde(default)]
     rust_version: Option<String>,
+}
+
+/// The fields of an index line that tell its features: `features2` has those that older Cargo
+/// could not read (`v: 2`), and the optional dependencies make features too.
+#[derive(Debug, Deserialize)]
+struct FeatureLine {
+    #[serde(default)]
+    features: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    features2: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    deps: Vec<DependencyLine>,
+}
+
+/// A dependency of an index line, by the name that the crate gives it.
+#[derive(Debug, Deserialize)]
+struct DependencyLine {
+    name: String,
+    #[serde(default)]
+    optional: bool,
 }
 
 /// How a cached index file was fetched, kept next to it.
@@ -504,14 +571,20 @@ fn index_path(name: &str) -> String {
 }
 
 /// Parses an index file, with `fetched_at` as when it was fetched.
-fn parse(body: &[u8], fetched_at: SystemTime) -> Result<IndexEntry, MalformedLine> {
+fn parse(body: Arc<[u8]>, fetched_at: SystemTime) -> Result<IndexEntry, MalformedLine> {
     let mut name = None;
     let mut versions = Vec::new();
+    let mut start: usize = 0;
     let lines = body
         .split(|&byte| byte == b'\n')
+        .map(|line| {
+            let at = start..start.saturating_add(line.len());
+            start = at.end.saturating_add(1);
+            (line, at)
+        })
         .enumerate()
-        .filter(|(_, line)| !line.iter().all(u8::is_ascii_whitespace));
-    for (index, line) in lines {
+        .filter(|(_, (line, _))| !line.iter().all(u8::is_ascii_whitespace));
+    for (index, (line, at)) in lines {
         let number = index.saturating_add(1);
         let line: Line = serde_json::from_slice(line).map_err(|source| MalformedLine::Json {
             line: number,
@@ -527,6 +600,7 @@ fn parse(body: &[u8], fetched_at: SystemTime) -> Result<IndexEntry, MalformedLin
             checksum: line.cksum.into(),
             yanked: line.yanked,
             rust_version: line.rust_version.map(String::into_boxed_str),
+            line: at,
         });
     }
     Ok(IndexEntry {
@@ -534,12 +608,13 @@ fn parse(body: &[u8], fetched_at: SystemTime) -> Result<IndexEntry, MalformedLin
         versions: versions.into(),
         fetched_at,
         stale: None,
+        body,
     })
 }
 
 /// [`parse`] on a blocking thread: megabytes for a crate with many versions.
 async fn parse_off(body: Arc<[u8]>, fetched_at: SystemTime) -> Result<IndexEntry, IndexError> {
-    blocking(move || Ok(parse(&body, fetched_at)))
+    blocking(move || Ok(parse(body, fetched_at)))
         .await
         .map_err(IndexError::Cache)?
         .map_err(IndexError::Malformed)
@@ -643,6 +718,45 @@ mod tests {
         let (base_url, requests) = serve_sequence(responses);
         let index = SparseIndex::for_local_test(Cache::at(dir.path()), &base_url, ttl);
         (index, requests, dir)
+    }
+
+    /// A version's features are read from its line: `features`, `features2` and the optional
+    /// dependencies, of a target too, unless named with `dep:`; a version not listed has none
+    /// (decided in M3d, decision 41).
+    #[test]
+    fn a_versions_features_are_read_from_its_line() {
+        let body: &[u8] = b"{\"name\":\"tokio\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"aa\",\"features\":{\"fs\":[]}}\n\
+            \n\
+            {\"name\":\"tokio\",\"vers\":\"1.54.1\",\"cksum\":\"bb\",\"v\":2,\
+            \"features\":{\"default\":[],\"net\":[\"libc\",\"mio/net\"]},\
+            \"features2\":{\"io-uring\":[\"dep:io-uring\",\"rt\"],\"rt\":[],\"net\":[\"rt\"]},\
+            \"deps\":[\
+            {\"name\":\"libc\",\"req\":\"^0.2\",\"optional\":true,\"target\":\"cfg(unix)\"},\
+            {\"name\":\"mio\",\"req\":\"^1\",\"optional\":true},\
+            {\"name\":\"io-uring\",\"req\":\"^0.7\",\"optional\":true},\
+            {\"name\":\"bytes\",\"req\":\"^1\"}]}\n";
+        let entry = parse(Arc::from(body), SystemTime::UNIX_EPOCH).expect("parses");
+        let features = entry.features(&Version::new(1, 54, 1)).expect("listed");
+        assert_eq!(features.names().collect::<Vec<_>>(), [
+            "default", "io-uring", "libc", "mio", "net", "rt"
+        ]);
+        assert!(features.is_implicit("libc") && !features.is_implicit("io-uring"));
+        // Of `features` and `features2` both, merged.
+        assert_eq!(
+            features.values("net").map(<[_]>::len),
+            Some(3),
+            "{:?}",
+            features.values("net")
+        );
+        assert_eq!(
+            entry
+                .features(&Version::new(1, 0, 0))
+                .expect("listed")
+                .names()
+                .collect::<Vec<_>>(),
+            ["fs"]
+        );
+        assert_eq!(entry.features(&Version::new(2, 0, 0)), None);
     }
 
     #[test]

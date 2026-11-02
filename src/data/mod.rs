@@ -26,6 +26,7 @@ pub mod docs_rs;
 pub mod external;
 #[cfg(feature = "local")]
 pub mod external_workspace;
+pub mod feature_tree;
 #[cfg(feature = "local")]
 pub mod features;
 pub mod fetches;

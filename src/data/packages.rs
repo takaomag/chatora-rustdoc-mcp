@@ -753,10 +753,12 @@ checksum = "ab"
                 checksum: checksum.into(),
                 yanked: false,
                 rust_version: None,
+                line: 0..0,
             }]
             .into(),
             fetched_at: SystemTime::UNIX_EPOCH,
             stale: None,
+            body: std::sync::Arc::default(),
         };
         let check = |name: &str, checksum: &str| {
             let package = packages
