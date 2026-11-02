@@ -22,6 +22,7 @@ use super::{
     ToolState,
     error_result,
     get_source::{self, SourceAsk},
+    inspect_features::{self, FeatureItemsAsk},
     project::{self, InProject},
 };
 #[cfg(feature = "local")]
@@ -172,6 +173,27 @@ pub(super) enum What {
     Implementors(Box<Paging>),
     /// The source of the item, or a file of its crate (`get_source`).
     Source(Box<SourceAsk>),
+    /// The items that each feature of the crate enables (`inspect_features`), found at its root
+    /// (decided in M3d, D3).
+    FeatureItems(Box<FeatureItemsAsk>),
+}
+
+impl What {
+    /// Until when the lookup waits: the deadline of the call that asks, if it gives one, or else a
+    /// new one from `state` (requirement R-ARCH-6).
+    fn until(&self, state: &ToolState) -> Instant {
+        match self {
+            Self::FeatureItems(asked) => asked.until,
+            Self::Item
+            | Self::List(_)
+            | Self::Overview
+            | Self::Search(_)
+            | Self::Impls(_)
+            | Self::Methods(_)
+            | Self::Implementors(_)
+            | Self::Source(_) => state.until(),
+        }
+    }
 }
 
 /// Which methods `list_methods` lists (requirement R-LS-3), and the page.
@@ -342,6 +364,25 @@ impl Arguments {
             shape: Shape {
                 detail: Detail::Normal,
                 what: What::Source(Box::new(ask)),
+            },
+        }
+    }
+
+    /// The arguments of `inspect_features` for the items of each feature of `release`, at its
+    /// root, as `asked`; what failed of the project was forgotten when its version was resolved,
+    /// and what failed of the release is forgotten as `asked` tells.
+    pub(super) fn for_feature_items(release: ReleaseArguments, asked: FeatureItemsAsk) -> Self {
+        Self {
+            path: release.name.as_str().replace('-', "_").into(),
+            name: release.name,
+            version: release.version,
+            project: release.project,
+            target: release.target,
+            refresh: false,
+            git: release.git,
+            shape: Shape {
+                detail: Detail::Brief,
+                what: What::FeatureItems(Box::new(asked)),
             },
         }
     }
@@ -1063,7 +1104,7 @@ pub(super) fn parse_refresh(arguments: Option<&JsonObject>) -> Result<bool, Inva
 }
 
 /// The arguments that name a release, checked.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct ReleaseArguments {
     pub(super) name: CrateName,
     /// The version asked for, in `crate` or `version`. Without one, the project's is used.
@@ -3054,7 +3095,7 @@ pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> Call
 /// package of the project (decided in M2e, 11).
 #[cfg(feature = "local")]
 async fn look_up_git(arguments: Arguments, git: &GitSpec, state: Arc<ToolState>) -> CallToolResult {
-    let until = state.until();
+    let until = arguments.shape.what.until(&state);
     let target = match &arguments.target {
         Some(target) => target.clone(),
         None => state.host().await.triple.clone(),
@@ -3107,7 +3148,7 @@ async fn look_up(
     state: Arc<ToolState>,
     #[cfg(feature = "local")] refresh: bool,
 ) -> CallToolResult {
-    let until = state.until();
+    let until = arguments.shape.what.until(&state);
     // What failed is forgotten before it is read again (§6.4, decided in M2's D5); of std,
     // whatever the project, which only builds in the default project.
     #[cfg(feature = "local")]
@@ -3183,6 +3224,11 @@ async fn look_up(
     if arguments.here.local.is_none() && !for_host {
         arguments.here.docs_rs_default = target.docs_rs_default;
     }
+    // What failed of the release alone, as `inspect_features` resolved the rest (decided in M3d,
+    // D3).
+    #[cfg(feature = "local")]
+    let refresh =
+        refresh || matches!(&arguments.shape.what, What::FeatureItems(asked) if asked.refresh);
     #[cfg(feature = "local")]
     if refresh {
         // Not what `build_external_docs` recorded, which only it makes again (requirement
@@ -5326,6 +5372,21 @@ fn respond_in(
         What::Item => {
             let response = get_item(view, request).map_err(Failure::Item)?;
             return serde_json::to_value(&response).map_err(Failure::Serialize);
+        },
+        // The root, with the items of each feature, and those that docs.rs's build left out.
+        What::FeatureItems(asked) => {
+            let lacking = match request.origin {
+                Origin::DocsRs {
+                    build: Some(build), ..
+                } => Some(build.missing.clone()),
+                Origin::DocsRs { build: None, .. } | Origin::Local { .. } | Origin::Std { .. } => {
+                    None
+                },
+            };
+            let response = get_item(view, request).map_err(Failure::Item)?;
+            let mut value = serde_json::to_value(&response).map_err(Failure::Serialize)?;
+            inspect_features::add_items(&mut value, view, asked.feature.as_deref(), lacking);
+            return Ok(value);
         },
         // The source is read after, where the item is, with what tells a macro's output.
         What::Source(_) => {

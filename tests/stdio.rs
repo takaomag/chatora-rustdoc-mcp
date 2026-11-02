@@ -2471,19 +2471,18 @@ fn inspect_features_tells_a_members_features_and_whether_the_project_enables_the
         .expect("cargo runs");
     assert!(status.success(), "cargo generate-lockfile");
     let mut server = Server::start_in(Some(dir.path()));
-    // Again while cargo reads the features of the project's build past the call's deadline.
+    // Again while cargo reads the features of the project's build, and builds its documentation
+    // for the items, past the call's deadline.
     let mut told = Value::Null;
-    for id in 1..30 {
+    for id in 1..90 {
         server.send(&call_tool(
             id,
             "inspect_features",
             json!({ "crate": "front" }),
         ));
         told = server.response(id)["result"].clone();
-        if told["structuredContent"]["data"]["features"][0]
-            .get("enabled_in_project")
-            .is_some()
-        {
+        let feature = &told["structuredContent"]["data"]["features"][0];
+        if feature.get("enabled_in_project").is_some() && feature.get("items").is_some() {
             break;
         }
         thread::sleep(Duration::from_secs(1));
@@ -2493,11 +2492,9 @@ fn inspect_features_tells_a_members_features_and_whether_the_project_enables_the
     assert_eq!(content["provenance"]["source"], "project", "{told}");
     assert_eq!(
         content["data"]["features"],
-        json!([{ "name": "extra", "enables": [], "enabled_in_project": true }]),
+        json!([{ "name": "extra", "enables": [], "items": 1, "enabled_in_project": true }]),
         "{told}"
     );
-    // Nothing was built for it.
-    assert!(!dir.path().join("target").exists());
     assert!(server.finish().success());
 }
 
@@ -4596,7 +4593,10 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
     // `[package.metadata.docs.rs]` asks (decided in M3d, decision 49).
     server.send(&call_tool(200, "inspect_features", with(json!({}))));
     let features = server.response(200)["result"]["structuredContent"]["data"]["features"].clone();
-    assert_eq!(features, json!([{ "name": "extra", "enables": [] }]));
+    assert_eq!(
+        features,
+        json!([{ "name": "extra", "enables": [], "items": 1 }])
+    );
     reads_the_source_of_the_git_crate(&mut server, &with(json!({})));
     looked_up_by_hash_and_when_stale(&mut server, &commit);
     looked_up_while_rebuilding(&mut server, &commit);
@@ -7241,14 +7241,12 @@ fn a_crate_that_takes_long_to_fetch_is_building_and_then_answered() {
     assert_eq!(last["cache"], "hit", "{last}");
 }
 
-/// `inspect_features` tells a release's features from its index line, offline, and those that
-/// docs.rs's build did not enable from its `.crate`, without its documentation; one feature
-/// alone, and one that the crate does not have (decided in M3d, decisions 38, 41, 46 and 47).
-#[test]
-fn inspect_features_tells_the_features_from_the_index_and_the_crate_file() {
+/// A cache with demo 0.2.0: its `.crate`, whose features docs.rs's build of the default ones does
+/// not all enable, its index line, with a feature in `features2` and optional dependencies, and its
+/// documentation, where `hello` needs `extra`.
+fn features_cache() -> TempDir {
     let cache = test_cache();
-    // demo 0.2.0, whose documentation is not in the cache, and whose `.crate` has features that
-    // docs.rs's build, of the default ones, does not all enable.
+    // Its `.crate`.
     let manifest = "[package]\nname = \"demo\"\nversion = \"0.2.0\"\n[features]\n\
                     default = [\"extra\"]\nextra = []\nfull = [\"extra\", \"dep:serde\"]\n\
                     [dependencies]\nserde = { version = \"1\", optional = true }\n\
@@ -7292,6 +7290,34 @@ fn inspect_features_tells_the_features_from_the_index_and_the_crate_file() {
         json!({ "etag": null, "last_modified": null, "fetched_at": 1_700_000_000 }).to_string(),
     )
     .expect("written");
+    // Its documentation, where `hello` needs `extra`.
+    let mut documented = demo_crate();
+    documented.crate_version = Some("0.2.0".to_owned());
+    if let Some(hello) = documented.index.get_mut(&Id(1)) {
+        hello.attrs.push(rustdoc_types::Attribute::Other(
+            r#"#[doc(cfg(feature = "extra"))]"#.to_owned(),
+        ));
+    }
+    store
+        .write_docs_rs_json(
+            &store.docs_rs_dir(
+                &"demo".parse().expect("a name"),
+                &Version::new(0, 2, 0),
+                Some(&TARGET.parse().expect("a target")),
+            ),
+            rustdoc_types::FORMAT_VERSION,
+            &serde_json::to_vec(&documented).expect("serializes"),
+        )
+        .expect("the cache is writable");
+    cache
+}
+
+/// `inspect_features` tells a release's features from its index line, offline, and those that
+/// docs.rs's build did not enable from its `.crate`, without its documentation; one feature
+/// alone, and one that the crate does not have (decided in M3d, decisions 38, 41, 46 and 47).
+#[test]
+fn inspect_features_tells_the_features_from_the_index_and_the_crate_file() {
+    let cache = features_cache();
     let mut server = Server::start_with_cache(cache, None, &[(
         "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE",
         "true",
@@ -7325,6 +7351,16 @@ fn inspect_features_tells_the_features_from_the_index_and_the_crate_file() {
         );
     }
     assert_eq!(features[3]["implicit"], true, "{all}");
+    // The items of each feature that the documentation has, from it; `default` gathers `extra`.
+    assert_eq!(features[1]["items"], 1, "{all}");
+    assert_eq!(features[0]["items"], 0, "{all}");
+    assert!(features[2].get("items").is_none(), "{all}");
+    assert!(
+        content["hints"]
+            .to_string()
+            .contains("items: 0 and a closure"),
+        "{all}"
+    );
     assert_eq!(content["page"]["total"], 4, "{all}");
     let one = call(
         &mut server,
@@ -7334,6 +7370,16 @@ fn inspect_features_tells_the_features_from_the_index_and_the_crate_file() {
     assert_eq!(
         one["structuredContent"]["data"]["features"][0]["enabled_by"],
         json!(["default", "full"]),
+        "{one}"
+    );
+    assert_eq!(
+        one["structuredContent"]["data"]["items"],
+        json!([{
+            "path": "demo::hello",
+            "kind": "function",
+            "required_features": "extra",
+            "entry": true,
+        }]),
         "{one}"
     );
     let none = call(

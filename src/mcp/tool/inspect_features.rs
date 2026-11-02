@@ -40,8 +40,14 @@ use crate::{
         crate_name::CrateName,
         feature_tree::FeatureTree,
         sparse_index::{IndexEntry, IndexError},
+        version::VersionSpec,
     },
-    query::{get_item::MAX_RESPONSE_CHARS, search::edit_distance},
+    query::{
+        feature_items::{FeatureItem, feature_items},
+        get_item::MAX_RESPONSE_CHARS,
+        search::edit_distance,
+        view::CrateView,
+    },
 };
 
 /// The name of the tool.
@@ -71,6 +77,16 @@ pub(super) struct FeatureAsk {
     feature: Option<Box<str>>,
     /// The page of the features.
     paging: Paging,
+}
+
+/// What `get_item` is asked for of the items of each feature: until when, whether to forget what
+/// failed of the release, and the feature whose items are told.
+#[derive(Debug, Clone)]
+pub(super) struct FeatureItemsAsk {
+    pub(super) until: Instant,
+    #[cfg(feature = "local")]
+    pub(super) refresh: bool,
+    pub(super) feature: Option<Box<str>>,
 }
 
 /// The arguments checked: the release's, for `resolve_version`, and what is asked of its
@@ -132,6 +148,21 @@ pub(super) fn definition() -> Tool {
         .with_annotations(super::annotations())
 }
 
+/// The schema of `items_pending`: the `building_reason` of the documentation being had.
+fn items_pending_schema() -> Value {
+    let mut schema = super::building_reason_schema();
+    if let Some(pending) = schema.as_object_mut() {
+        pending.insert(
+            "description".to_owned(),
+            json!(
+                "The documentation is being had, as this tells: call again after \
+                 retry_after_secs for the items."
+            ),
+        );
+    }
+    schema
+}
+
 /// The schema of the structured content (requirement R-OUT-1).
 fn output_schema() -> JsonObject {
     let strings = json!({ "type": "array", "items": { "type": "string" } });
@@ -143,6 +174,7 @@ fn output_schema() -> JsonObject {
         "type": "object",
         "properties": {
             "provenance": resolve_version::provenance_schema(),
+            "retry_after_secs": { "type": "integer" },
             "warnings": strings,
             "data": {
                 "type": "object",
@@ -154,6 +186,23 @@ fn output_schema() -> JsonObject {
                         "enum": ["available", "no_json", "no_target_json", "not_on_docs_rs", "unknown"],
                         "description": "Whether docs.rs has the documentation, as resolve_version \
                                         tells.",
+                    },
+                    "items_pending": items_pending_schema(),
+                    "items": {
+                        "type": "array",
+                        "description": "With feature: its items, entries first.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "kind": { "type": "string" },
+                                "required_features": { "type": "string" },
+                                "other_cfg": strings,
+                                "entry": { "type": "boolean" },
+                                "negated": { "type": "boolean" },
+                            },
+                            "required": ["path", "kind", "entry"],
+                        },
                     },
                     "features": {
                         "type": "array",
@@ -172,6 +221,11 @@ fn output_schema() -> JsonObject {
                                 "default": { "type": "boolean" },
                                 "implicit": { "type": "boolean" },
                                 "in_docs": { "type": "boolean" },
+                                "items": {
+                                    "type": "integer",
+                                    "description": "How many items its documentation has that \
+                                                    need it, when that is known.",
+                                },
                                 "enabled_in_project": {
                                     "type": "boolean",
                                     "description": "Whether the project's normal build enables \
@@ -366,6 +420,8 @@ pub(super) async fn execute(inspect: Inspect, state: Arc<ToolState>) -> CallTool
     let until = state.until();
     #[cfg(feature = "local")]
     let (refresh, project) = (release.refresh, release.project.clone());
+    // For `get_item`, which loads its documentation.
+    let asked = (release.clone(), until);
     #[cfg_attr(
         not(feature = "local"),
         expect(
@@ -386,7 +442,7 @@ pub(super) async fn execute(inspect: Inspect, state: Arc<ToolState>) -> CallTool
     #[cfg(feature = "local")]
     if let Some(git) = &taken.git {
         return match git_features(git).await {
-            Ok(known) => answer(&release, &known, None, &ask),
+            Ok(known) => answer(&state, asked, (&mut release, &known, None), &ask).await,
             Err(answer) => *answer,
         };
     }
@@ -399,7 +455,13 @@ pub(super) async fn execute(inspect: Inspect, state: Arc<ToolState>) -> CallTool
             Err(answer) => return *answer,
         };
         let in_project = in_project(&state, &found.workspace, until, &mut release).await;
-        return answer(&release, &known, in_project.as_ref(), &ask);
+        return answer(
+            &state,
+            asked,
+            (&mut release, &known, in_project.as_ref()),
+            &ask,
+        )
+        .await;
     }
     if !release.on_crates_io {
         let of = if release.source.as_ref() == "crates.io" {
@@ -409,6 +471,10 @@ pub(super) async fn execute(inspect: Inspect, state: Arc<ToolState>) -> CallTool
         };
         return not_a_release(&format!("{} {}", release.name, release.version), of);
     }
+    #[cfg(feature = "local")]
+    let refreshing = refresh;
+    #[cfg(not(feature = "local"))]
+    let refreshing = false;
     #[cfg_attr(
         not(feature = "local"),
         expect(
@@ -416,30 +482,10 @@ pub(super) async fn execute(inspect: Inspect, state: Arc<ToolState>) -> CallTool
             reason = "only a project tells whether it uses the release"
         )
     )]
-    let (tree, checksum, entry) =
-        match release_features(&state, &release.name, &release.version).await {
-            Ok(found) => found,
-            Err(answer) => return *answer,
-        };
-    // A `.crate` that failed to be fetched a moment ago is asked for again (§6.4).
-    #[cfg(feature = "local")]
-    if refresh {
-        crate::data::forget_failure_of(
-            &state.cache.crate_file_path(&release.name, &release.version),
-        );
-    }
-    let not_in_docs = if matches!(release.docs_rs_json.as_ref(), "available" | "unknown") {
-        let Release {
-            name,
-            version,
-            warnings,
-            ..
-        } = &mut release;
-        not_in_docs(&state, (name, version), (&checksum, until), warnings).await
-    } else {
-        None
+    let (known, entry) = match release_known(&state, &mut release, (refreshing, until)).await {
+        Ok(found) => found,
+        Err(answer) => return *answer,
     };
-    let known = Known { tree, not_in_docs };
     #[cfg(feature = "local")]
     {
         let workspace = match taken.found {
@@ -452,29 +498,263 @@ pub(super) async fn execute(inspect: Inspect, state: Arc<ToolState>) -> CallTool
             Some(workspace) => in_project(&state, workspace, until, &mut release).await,
             None => None,
         };
-        answer(&release, &known, in_project.as_ref(), &ask)
+        answer(
+            &state,
+            asked,
+            (&mut release, &known, in_project.as_ref()),
+            &ask,
+        )
+        .await
     }
     #[cfg(not(feature = "local"))]
-    answer(&release, &known, None, &ask)
+    answer(&state, asked, (&mut release, &known, None), &ask).await
 }
 
-/// The response for `release`, whose features `known` tells, with whether the project's build
-/// enables each, `in_project`, as `ask` asks: those that the project enables but the
-/// documentation does not have are warned about, and how to read them told (decided in M3d,
-/// decisions 51 and 52).
-fn answer(
+/// The key in `data` of the crate's root looked up for `inspect_features` of how many items each
+/// feature has, which the answer does not show.
+const FEATURE_COUNTS: &str = "feature_counts";
+
+/// The key of the items of the feature asked for, which the answer shows otherwise.
+const FEATURE_ITEMS: &str = "feature_items";
+
+/// The key of the features that docs.rs's build left out.
+const LACKING: &str = "lacking";
+
+/// The key of the digest of the documentation, for the cursor of the items.
+const SOURCE_DIGEST: &str = "source_digest";
+
+/// Adds to `response`, of the root of the crate of `view` looked up for `inspect_features`, how
+/// many items each feature has, the items of `feature` if one is asked for, and the features that
+/// docs.rs's build left out, `lacking`, if it is docs.rs's (decided in M3d, D3): only those, as a
+/// crate may have thousands of features.
+pub(super) fn add_items(
+    response: &mut Value,
+    view: &CrateView<'_>,
+    feature: Option<&str>,
+    lacking: Option<Box<[Box<str>]>>,
+) {
+    let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let by_feature = feature_items(view);
+    let counts: Map<String, Value> = by_feature
+        .iter()
+        .map(|(name, items)| (name.to_string(), json!(items.len())))
+        .collect();
+    data.insert(FEATURE_COUNTS.to_owned(), Value::Object(counts));
+    if let Some(items) = feature.and_then(|feature| by_feature.get(feature)) {
+        data.insert(
+            FEATURE_ITEMS.to_owned(),
+            items.iter().map(item_value).collect(),
+        );
+    }
+    if let Some(lacking) = lacking {
+        data.insert(LACKING.to_owned(), json!(lacking));
+    }
+    data.insert(SOURCE_DIGEST.to_owned(), json!(view.source_digest()));
+}
+
+/// `item` as the answer shows it.
+fn item_value(item: &FeatureItem) -> Value {
+    let mut shown = Map::new();
+    shown.insert("path".to_owned(), json!(item.path));
+    shown.insert("kind".to_owned(), json!(item.kind));
+    if let Some(features) = &item.required_features {
+        shown.insert("required_features".to_owned(), json!(features));
+    }
+    if !item.other_cfg.is_empty() {
+        shown.insert("other_cfg".to_owned(), json!(item.other_cfg));
+    }
+    shown.insert("entry".to_owned(), json!(item.entry));
+    if item.negated {
+        shown.insert("negated".to_owned(), json!(true));
+    }
+    Value::Object(shown)
+}
+
+/// What the documentation tells of the items of each feature (decided in M3d, decisions 42 and
+/// 47).
+enum Items {
+    /// They were found: how many each feature has, and the items of the one asked for, in the
+    /// documentation whose digest is `digest`, which lacks the features `lacking` as docs.rs built
+    /// it, or was built here with the features `built_with`.
+    Found {
+        counts: BTreeMap<Box<str>, usize>,
+        listed: Vec<Value>,
+        digest: Box<str>,
+        lacking: Option<Box<[Box<str>]>>,
+        built_with: Option<BTreeSet<Box<str>>>,
+    },
+    /// The documentation is being had, as the `building_reason` tells, which goes on without the
+    /// call.
+    Pending(Box<str>),
+    /// They are not known, which a warning tells.
+    Unknown,
+}
+
+/// The items of each feature of `release`, from its documentation, which `get_item` loads as
+/// for `asked` until `until`, with what failed of the release forgotten if `refresh`: fetched
+/// from docs.rs, or built here as it builds them (decided in M3d, decisions 42 and 47). What it
+/// warns of is added to `release`.
+async fn items_of(
+    state: &Arc<ToolState>,
+    (mut asked, feature, until): (ReleaseArguments, Option<&str>, Instant),
+    release: &mut Release,
+) -> Items {
+    asked.name = release.name.clone();
+    #[cfg(feature = "local")]
+    let refresh = asked.refresh;
+    // The version resolved, which a crate of git has from its record.
+    if asked.git.is_none() {
+        asked.version = Some(VersionSpec::Exact(release.version.clone()));
+    }
+    let mut result = get_item::execute(
+        get_item::Arguments::for_feature_items(asked, FeatureItemsAsk {
+            until,
+            #[cfg(feature = "local")]
+            refresh,
+            feature: feature.map(Box::from),
+        }),
+        Arc::clone(state),
+    )
+    .await;
+    if result.is_error == Some(true) {
+        not_had(&result, release);
+        return Items::Unknown;
+    }
+    match result.structured_content.take() {
+        Some(Value::Object(content)) => found(content, release),
+        _ => Items::Unknown,
+    }
+}
+
+/// Warns in `release` that the items are not known, as the error `result` of `get_item` tells,
+/// with when to call again if it may pass.
+fn not_had(result: &CallToolResult, release: &mut Release) {
+    let body = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .and_then(|text| serde_json::from_str::<Value>(&text.text).ok())
+        .unwrap_or_default();
+    let message = body
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty())
+        .unwrap_or("its documentation could not be had");
+    release
+        .warnings
+        .push(format!("which items each feature enables is not known: {message}").into());
+    // Of what may pass, when to call again.
+    if body.get("retryable") == Some(&json!(true)) {
+        release
+            .hints
+            .push(json!("call again in a while for the items of each feature"));
+        if release.retry_after.is_none() {
+            release.retry_after = body.get("retry_after_secs").cloned();
+        }
+    }
+}
+
+/// The items of each feature as the response `content` of `get_item` tells them, of the
+/// documentation of `release` or another version, or being had; what it warns of is added to
+/// `release`.
+fn found(mut content: Map<String, Value>, release: &mut Release) -> Items {
+    if content.get("status").and_then(Value::as_str) == Some("building") {
+        if release.retry_after.is_none() {
+            release.retry_after = content.remove("retry_after_secs");
+        }
+        let doing = content
+            .get("building_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("fetching");
+        return Items::Pending(doing.into());
+    }
+    let mut provenance = match content.remove("provenance") {
+        Some(Value::Object(provenance)) => provenance,
+        _ => Map::new(),
+    };
+    let version = provenance
+        .get("version")
+        .and_then(Value::as_str)
+        .and_then(|version| Version::parse(version).ok());
+    if version.as_ref() != Some(&release.version) {
+        release.warnings.push(
+            "which items each feature enables is not known: the documentation is of another \
+             version"
+                .into(),
+        );
+        return Items::Unknown;
+    }
+    // The build before, while the member is built again.
+    if provenance.get("stale_reason").and_then(Value::as_str) == Some("rebuilding") {
+        release
+            .warnings
+            .push("the items are those of the build before, which is being built again".into());
+        if release.retry_after.is_none() {
+            release.retry_after = content.remove("retry_after_secs");
+        }
+    }
+    let Some(Value::Object(mut data)) = content.remove("data") else {
+        return Items::Unknown;
+    };
+    let strings = |value: Option<Value>| -> Option<Vec<Box<str>>> {
+        match value {
+            Some(Value::Array(values)) => Some(
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(Box::from)
+                    .collect(),
+            ),
+            _ => None,
+        }
+    };
+    let built_with = (provenance.get("source").and_then(Value::as_str) == Some("local"))
+        .then(|| strings(provenance.remove("features_effective")))
+        .flatten()
+        .map(|features| features.into_iter().collect());
+    let counts = match data.remove(FEATURE_COUNTS) {
+        Some(Value::Object(counts)) => counts
+            .into_iter()
+            .filter_map(|(name, count)| {
+                Some((
+                    name.into_boxed_str(),
+                    usize::try_from(count.as_u64()?).ok()?,
+                ))
+            })
+            .collect(),
+        _ => BTreeMap::new(),
+    };
+    Items::Found {
+        counts,
+        listed: match data.remove(FEATURE_ITEMS) {
+            Some(Value::Array(items)) => items,
+            _ => Vec::new(),
+        },
+        digest: data
+            .get(SOURCE_DIGEST)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        lacking: strings(data.remove(LACKING)).map(Vec::into_boxed_slice),
+        built_with,
+    }
+}
+
+/// The warnings and the hints of `release`, with those of what its features, `tree`, those that
+/// its documentation does not have, `not_in_docs`, `in_project` and `items` tell: the features
+/// that the project enables but the documentation does not have, how to read those in neither,
+/// those that a build here was without, and when to call again for the items
+/// (decided in M3d, decisions 51, 52 and 57).
+fn notes(
     release: &Release,
-    known: &Known,
-    in_project: Option<&ProjectBuild>,
-    ask: &FeatureAsk,
-) -> CallToolResult {
+    (tree, not_in_docs, in_project): (&FeatureTree, Option<&[Box<str>]>, Option<&ProjectBuild>),
+    items: &Items,
+) -> (Vec<Box<str>>, Vec<Value>) {
     let mut warnings = release.warnings.clone();
     let mut hints = release.hints.clone();
-    if let Some(missing) = known
-        .not_in_docs
-        .as_deref()
-        .filter(|missing| !missing.is_empty())
-    {
+    if let Some(missing) = not_in_docs.filter(|missing| !missing.is_empty()) {
         let enabled: Vec<&str> = in_project
             .and_then(|in_project| in_project.normal.as_ref())
             .map(|normal| {
@@ -502,16 +782,102 @@ fn answer(
             release.name
         )));
     }
+    // A build here without some features: their items are not in its documentation. Those that
+    // it lacks as docs.rs's does are told above.
+    if let Items::Found {
+        built_with: Some(built_with),
+        ..
+    } = items
+    {
+        let without: Vec<&str> = tree
+            .names()
+            .filter(|&feature| {
+                !built_with.contains(feature)
+                    && !not_in_docs
+                        .is_some_and(|missing| missing.iter().any(|name| name.as_ref() == feature))
+            })
+            .collect();
+        if !without.is_empty() {
+            let more = without.len().saturating_sub(MAX_LISTED);
+            warnings.push(
+                format!(
+                    "the documentation was built without {}{}, whose items are not counted",
+                    without
+                        .iter()
+                        .take(MAX_LISTED)
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    }
+                )
+                .into(),
+            );
+        }
+    }
+    if let Items::Pending(doing) = items {
+        hints.push(json!(format!(
+            "the documentation is {}, which goes on without this call; call again in about {} \
+             seconds for the items of each feature",
+            pending_doing(doing),
+            get_item::RETRY_AFTER_SECS
+        )));
+    }
+    (warnings, hints)
+}
+
+/// The features that the documentation lacks, as `known` tells, or else as `get_item` tells of
+/// docs.rs's build in `items`, when its `.crate` did not tell them.
+fn lacking_of<'k>(known: &'k Known, items: &'k Items) -> Option<&'k [Box<str>]> {
+    known.not_in_docs.as_deref().or(match items {
+        Items::Found { lacking, .. } => lacking.as_deref(),
+        Items::Pending(_) | Items::Unknown => None,
+    })
+}
+
+/// What is done of the documentation, as the `building_reason` `doing` tells.
+fn pending_doing(doing: &str) -> &'static str {
+    match doing {
+        "fetching" => "being fetched",
+        "building" => "being built",
+        "indexing" => "being indexed",
+        "waiting_for_lock" => "waiting for another call that has it",
+        "waiting_for_slot" => "waiting for a build to end before it is built",
+        _ => "being had",
+    }
+}
+
+/// The response for `release`, whose features `known` tells, with whether the project's build
+/// enables each, `in_project`, and the items of each from its documentation, which `get_item`
+/// loads as for `asked` until the deadline, as `ask` asks: those that the project enables but the
+/// documentation does not have are warned about, and how to read them told (decided in M3d,
+/// decisions 51, 52 and 57).
+async fn answer(
+    state: &Arc<ToolState>,
+    asked: (ReleaseArguments, Instant),
+    (release, known, in_project): (&mut Release, &Known, Option<&ProjectBuild>),
+    ask: &FeatureAsk,
+) -> CallToolResult {
+    let (asked, until) = asked;
+    let items = items_of(state, (asked, ask.feature.as_deref(), until), release).await;
+    let not_in_docs = lacking_of(known, &items);
+    let (warnings, hints) = notes(release, (&known.tree, not_in_docs, in_project), &items);
     respond(
-        &release.provenance,
-        (&known.tree, known.not_in_docs.as_deref(), in_project),
+        &Told {
+            provenance: &release.provenance,
+            tree: &known.tree,
+            not_in_docs,
+            in_project,
+            items: &items,
+            docs_rs_json: &release.docs_rs_json,
+            warnings: &warnings,
+            hints: &hints,
+            retry_after: release.retry_after.as_ref(),
+        },
         ask,
-        (
-            &release.docs_rs_json,
-            &warnings,
-            &hints,
-            release.retry_after.as_ref(),
-        ),
     )
     .map_or_else(|error| *error, CallToolResult::structured)
 }
@@ -754,6 +1120,35 @@ async fn in_project(
     })
 }
 
+/// The features of `release`, a crates.io release, from its line of the index, with those that
+/// docs.rs's build did not enable when docs.rs may have its documentation, and its index entry;
+/// what failed of its `.crate` is forgotten first when `refresh` (§6.4); waiting until `until`.
+async fn release_known(
+    state: &ToolState,
+    release: &mut Release,
+    (refresh, until): (bool, Instant),
+) -> Result<(Known, IndexEntry), Box<CallToolResult>> {
+    let (tree, checksum, entry) = release_features(state, &release.name, &release.version).await?;
+    // A `.crate` that failed to be fetched a moment ago is asked for again.
+    if refresh {
+        crate::data::forget_failure_of(
+            &state.cache.crate_file_path(&release.name, &release.version),
+        );
+    }
+    let not_in_docs = if matches!(release.docs_rs_json.as_ref(), "available" | "unknown") {
+        let Release {
+            name,
+            version,
+            warnings,
+            ..
+        } = release;
+        not_in_docs(state, (name, version), (&checksum, until), warnings).await
+    } else {
+        None
+    };
+    Ok((Known { tree, not_in_docs }, entry))
+}
+
 /// The tool error for `what`, a crate of `of`, not a crates.io release, whose features are not
 /// read yet (decided in M3d, D2).
 fn not_a_release(what: &str, of: &str) -> CallToolResult {
@@ -877,84 +1272,134 @@ async fn not_in_docs(
     }
 }
 
-/// The response for the features `tree`, those of `not_in_docs` not in the documentation, whether
-/// the project's build enables them, `in_project`, as `ask` asks, with `provenance`, whether
-/// docs.rs has the documentation, `docs_rs_json`, `warnings`, `hints` and when to call again,
-/// `retry_after`; within the budget of a response, with fewer features than `limit` if
-/// need be (requirement R-OUT-3, decided in M3d, decisions 38, 39, 40 and 46).
-fn respond(
-    provenance: &Map<String, Value>,
-    (tree, not_in_docs, in_project): (&FeatureTree, Option<&[Box<str>]>, Option<&ProjectBuild>),
-    ask: &FeatureAsk,
-    (docs_rs_json, warnings, hints, retry_after): (&str, &[Box<str>], &[Value], Option<&Value>),
-) -> Result<Value, Box<CallToolResult>> {
+/// What the answer tells of the features of a release.
+struct Told<'t> {
+    provenance: &'t Map<String, Value>,
+    tree: &'t FeatureTree,
+    /// Those that the documentation does not have, when known.
+    not_in_docs: Option<&'t [Box<str>]>,
+    /// Whether the project's build enables each.
+    in_project: Option<&'t ProjectBuild>,
+    /// The items of each.
+    items: &'t Items,
+    /// Whether docs.rs has the documentation.
+    docs_rs_json: &'t str,
+    warnings: &'t [Box<str>],
+    hints: &'t [Value],
+    /// When to call again.
+    retry_after: Option<&'t Value>,
+}
+
+impl Told<'_> {
+    /// How many items of `feature` the documentation tells, if it has them: not of one that it
+    /// does not have (decided in M3d, decisions 46 and 57).
+    fn count_of(&self, feature: &str) -> Option<usize> {
+        let Items::Found {
+            counts, built_with, ..
+        } = self.items
+        else {
+            return None;
+        };
+        let lacking = self
+            .not_in_docs
+            .is_some_and(|missing| missing.iter().any(|name| name.as_ref() == feature))
+            || built_with
+                .as_ref()
+                .is_some_and(|built_with| !built_with.contains(feature));
+        (!lacking).then(|| counts.get(feature).copied().unwrap_or_default())
+    }
+
+    /// The items of `feature`, the one asked for, if the documentation has them.
+    fn listed(&self, feature: &str) -> Option<&[Value]> {
+        let Items::Found { listed, .. } = self.items else {
+            return None;
+        };
+        self.count_of(feature).map(|_| listed.as_slice())
+    }
+}
+
+/// The response for the features that `told` tells, as `ask` asks: a page of the features, or,
+/// for one feature asked for, a page of its items (decided in M3d, decisions 38, 39, 40, 46 and
+/// 56); within the budget of a response, with fewer than `limit` if need be (requirement R-OUT-3).
+fn respond(told: &Told<'_>, ask: &FeatureAsk) -> Result<Value, Box<CallToolResult>> {
+    let tree = told.tree;
     let names = names_asked(tree, ask.feature.as_deref())?;
-    let digest = digest_of(tree);
-    let paging = &ask.paging;
-    if paging
-        .cursor_data
+    // One feature with the items that the documentation tells: the page is of them.
+    let listed: Option<&[Value]> = ask
+        .feature
         .as_deref()
-        .is_some_and(|data| data != digest)
-    {
-        return Err(Box::new(
-            InvalidArgument::new(
-                "the features changed since the cursor was made; list again without the cursor",
-                CURSOR_EXAMPLE,
-            )
-            .into_result(),
-        ));
-    }
-    let total = names.len();
-    if paging.offset > total {
-        return Err(Box::new(
-            InvalidArgument::new(
-                "the cursor goes past the end of the list; list again without the cursor",
-                CURSOR_EXAMPLE,
-            )
-            .into_result(),
-        ));
-    }
+        .and_then(|feature| told.listed(feature));
+    let digest = match (listed, told.items) {
+        (Some(_), Items::Found { digest, .. }) => digest_of_items(tree, digest),
+        _ => digest_of(tree),
+    };
+    let paging = &ask.paging;
+    let total = listed.map_or(names.len(), <[Value]>::len);
+    check_cursor(paging, &digest, total)?;
     let default: BTreeSet<&str> = if tree.contains("default") {
         tree.closure(["default"])
     } else {
         BTreeSet::new()
     };
     let enabled_by = tree.enabled_by();
-    let not_in_docs: BTreeSet<&str> = not_in_docs
+    let not_in_docs: BTreeSet<&str> = told
+        .not_in_docs
         .into_iter()
         .flatten()
         .map(AsRef::as_ref)
         .collect();
-    let mut features: Vec<Value> = names
-        .iter()
-        .skip(paging.offset)
-        .take(paging.limit)
-        .map(|&name| {
-            feature_of(
-                tree,
-                name,
-                (&default, &enabled_by, &not_in_docs),
-                in_project,
+    let feature = |name: &str| {
+        feature_of(
+            tree,
+            name,
+            (&default, &enabled_by, &not_in_docs),
+            (told.in_project, told.count_of(name)),
+        )
+    };
+    let page = |list: &mut dyn Iterator<Item = Value>| -> Vec<Value> {
+        list.skip(paging.offset).take(paging.limit).collect()
+    };
+    let (features, mut paged): (Vec<Value>, Vec<Value>) = listed.map_or_else(
+        || {
+            (
+                Vec::new(),
+                page(&mut names.iter().map(|&name| feature(name))),
             )
-        })
-        .collect();
-    let mut data = Map::new();
-    let default_list: Vec<&str> = default
-        .iter()
-        .copied()
-        .filter(|&feature| feature != "default")
-        .collect();
-    insert_listed(&mut data, "default", &default_list);
-    if !docs_rs_json.is_empty() {
-        data.insert("docs_rs_json".to_owned(), json!(docs_rs_json));
+        },
+        |items| {
+            (
+                names.iter().map(|&name| feature(name)).collect(),
+                page(&mut items.iter().cloned()),
+            )
+        },
+    );
+    let data = data_of(told, &default);
+    let mut hints = told.hints.to_vec();
+    // A feature that gathers others has their items, not its own (decided in M3d, decision 58).
+    let gathering = |feature: &Value| {
+        feature.get("items") == Some(&json!(0)) && feature.get("closure").is_some()
+    };
+    if features.iter().chain(&paged).any(gathering) {
+        hints.push(json!(
+            "a feature with items: 0 and a closure enables the items of the features of its \
+             closure, which are counted there"
+        ));
     }
-    let answer = |features: &[Value]| {
-        let page = page_of(paging, (&digest, total), features.len());
+    let answer = |paged: &[Value]| {
+        let page = page_of(paging, (&digest, total), paged.len());
         let mut data = data.clone();
-        data.insert("features".to_owned(), json!(features));
+        if listed.is_some() {
+            data.insert("features".to_owned(), json!(features));
+            data.insert("items".to_owned(), json!(paged));
+        } else {
+            data.insert("features".to_owned(), json!(paged));
+        }
         let mut answer = Map::new();
-        answer.insert("provenance".to_owned(), Value::Object(provenance.clone()));
-        if let Some(after) = retry_after {
+        answer.insert(
+            "provenance".to_owned(),
+            Value::Object(told.provenance.clone()),
+        );
+        if let Some(after) = told.retry_after {
             answer.insert("retry_after_secs".to_owned(), after.clone());
         }
         answer.insert("data".to_owned(), Value::Object(data));
@@ -963,25 +1408,67 @@ fn respond(
             answer.insert("hints".to_owned(), json!(hints));
         }
         let mut answer = Value::Object(answer);
-        get_item::add_warnings(&mut answer, warnings);
+        get_item::add_warnings(&mut answer, told.warnings);
         answer
     };
-    // Fewer features while the response is over its budget, one at least; the rest on the next
-    // page.
+    // Fewer while the response is over its budget, one at least; the rest on the next page.
     loop {
-        let response = answer(&features);
+        let response = answer(&paged);
         let size = response.to_string().chars().count();
-        if size <= MAX_RESPONSE_CHARS || features.len() <= 1 {
+        if size <= MAX_RESPONSE_CHARS || paged.len() <= 1 {
             return Ok(response);
         }
-        // In proportion to what is over, a feature less at least.
-        let fits = features
+        // In proportion to what is over, one less at least.
+        let fits = paged
             .len()
             .saturating_mul(MAX_RESPONSE_CHARS)
             .checked_div(size)
             .unwrap_or_default();
-        features.truncate(fits.clamp(1, features.len().saturating_sub(1)));
+        paged.truncate(fits.clamp(1, paged.len().saturating_sub(1)));
     }
+}
+
+/// Checks the cursor of `paging` against the list of `total` whose digest is `digest`: it was made
+/// for the same, and does not go past its end.
+fn check_cursor(paging: &Paging, digest: &str, total: usize) -> Result<(), Box<CallToolResult>> {
+    let refused = |message: &'static str| {
+        Err(Box::new(
+            InvalidArgument::new(message, CURSOR_EXAMPLE).into_result(),
+        ))
+    };
+    if paging
+        .cursor_data
+        .as_deref()
+        .is_some_and(|data| data != digest)
+    {
+        return refused(
+            "the features or their documentation changed since the cursor was made; list again \
+             without the cursor",
+        );
+    }
+    if paging.offset > total {
+        return refused("the cursor goes past the end of the list; list again without the cursor");
+    }
+    Ok(())
+}
+
+/// What `data` has besides the list that `told` tells: the features that `default` enables,
+/// whether docs.rs has the documentation, and that the items are being had.
+fn data_of(told: &Told<'_>, default: &BTreeSet<&str>) -> Map<String, Value> {
+    let mut data = Map::new();
+    let default_list: Vec<&str> = default
+        .iter()
+        .copied()
+        .filter(|&feature| feature != "default")
+        .collect();
+    insert_listed(&mut data, "default", &default_list);
+    if !told.docs_rs_json.is_empty() {
+        data.insert("docs_rs_json".to_owned(), json!(told.docs_rs_json));
+    }
+    if let Items::Pending(doing) = told.items {
+        data.insert("items_pending".to_owned(), json!(doing));
+    }
+    data
 }
 
 /// The page of `shown` features after those that `paging` skips, of `total` in the list whose
@@ -1050,7 +1537,7 @@ fn names_asked<'t>(
 /// it enables of dependencies, and what enables it, as `enabled_by` has it, each list of at most
 /// [`MAX_LISTED`] names with its total when cut; whether `default` enables it, an optional
 /// dependency makes it, `not_in_docs` has it, and the project's build, `in_project`, or only its
-/// build with the dev-dependencies, enables it.
+/// build with the dev-dependencies, enables it; and how many `items` its documentation tells.
 fn feature_of(
     tree: &FeatureTree,
     name: &str,
@@ -1059,7 +1546,7 @@ fn feature_of(
         &BTreeMap<&str, BTreeSet<&str>>,
         &BTreeSet<&str>,
     ),
-    in_project: Option<&ProjectBuild>,
+    (in_project, items): (Option<&ProjectBuild>, Option<usize>),
 ) -> Value {
     let closure = tree.closure([name]);
     let mut feature = Map::new();
@@ -1106,6 +1593,9 @@ fn feature_of(
             feature.insert(key.to_owned(), json!(value));
         }
     }
+    if let Some(items) = items {
+        feature.insert("items".to_owned(), json!(items));
+    }
     if let Some(in_project) = in_project {
         let has =
             |set: &Option<BTreeSet<Box<str>>>| set.as_ref().is_some_and(|set| set.contains(name));
@@ -1128,6 +1618,15 @@ fn insert_listed(object: &mut Map<String, Value>, key: &str, list: &[&str]) {
     if list.len() > MAX_LISTED {
         object.insert(format!("{key}_total"), json!(list.len()));
     }
+}
+
+/// The digest of the items of a feature of `tree` that a cursor is made for, in the documentation
+/// whose digest is `documentation`: the list goes on only over the same.
+fn digest_of_items(tree: &FeatureTree, documentation: &str) -> String {
+    sha256_hex(format!("{}\n{documentation}", digest_of(tree)).as_bytes())
+        .get(..16)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// The digest of the features `tree` that a cursor is made for: the list goes on only over the
@@ -1170,11 +1669,58 @@ mod tests {
         )
     }
 
+    /// demo 1.0.0 of crates.io, as `resolve_version` tells it.
+    fn release() -> Release {
+        Release {
+            provenance: Map::new(),
+            warnings: Vec::new(),
+            hints: Vec::new(),
+            name: "demo".parse().expect("a name"),
+            version: Version::new(1, 0, 0),
+            source: "crates.io".into(),
+            on_crates_io: true,
+            docs_rs_json: "available".into(),
+            retry_after: None,
+        }
+    }
+
     fn asked(arguments: Value) -> FeatureAsk {
         let Value::Object(arguments) = arguments else {
             panic!("an object");
         };
         parse_arguments(Some(&arguments)).expect("valid").ask
+    }
+
+    /// The response for the features of `tree`, of which `not_in_docs` the documentation does not
+    /// have, and whose items `items` tells, as `ask` asks.
+    fn respond_with(
+        (tree, not_in_docs, in_project): (&FeatureTree, Option<&[Box<str>]>, Option<&ProjectBuild>),
+        ask: &FeatureAsk,
+        (docs_rs_json, items): (&str, &Items),
+    ) -> Result<Value, Box<CallToolResult>> {
+        respond(
+            &Told {
+                provenance: &Map::new(),
+                tree,
+                not_in_docs,
+                in_project,
+                items,
+                docs_rs_json,
+                warnings: &[],
+                hints: &[],
+                retry_after: None,
+            },
+            ask,
+        )
+    }
+
+    /// [`respond_with`] without the items.
+    fn respond_to(
+        told: (&FeatureTree, Option<&[Box<str>]>, Option<&ProjectBuild>),
+        ask: &FeatureAsk,
+        docs_rs_json: &str,
+    ) -> Result<Value, Box<CallToolResult>> {
+        respond_with(told, ask, (docs_rs_json, &Items::Unknown))
     }
 
     /// Each feature is told with its values, the crate's features that it enables, what it
@@ -1184,11 +1730,10 @@ mod tests {
     #[test]
     fn each_feature_tells_what_it_enables_and_what_enables_it() {
         let ask = asked(json!({ "crate": "demo" }));
-        let answer = respond(
-            &Map::new(),
+        let answer = respond_to(
             (&tree(), Some(&[Box::from("net")]), None),
             &ask,
-            ("available", &[], &[], None),
+            "available",
         )
         .expect("answered");
         let data = &answer["data"];
@@ -1226,19 +1771,17 @@ mod tests {
     /// 39, requirement R-PR-7).
     #[test]
     fn the_features_are_paged_and_one_is_asked_for_alone() {
-        let first = respond(
-            &Map::new(),
+        let first = respond_to(
             (&tree(), None, None),
             &asked(json!({ "crate": "demo", "limit": 4 })),
-            ("", &[], &[], None),
+            "",
         )
         .expect("answered");
         let cursor = first["page"]["next_cursor"].as_str().expect("a cursor");
-        let rest = respond(
-            &Map::new(),
+        let rest = respond_to(
             (&tree(), None, None),
             &asked(json!({ "crate": "demo", "limit": 4, "cursor": cursor })),
-            ("", &[], &[], None),
+            "",
         )
         .expect("answered");
         assert_eq!(
@@ -1248,28 +1791,25 @@ mod tests {
         assert_eq!(rest["data"]["features"][0]["name"], "net");
         // Of other features, the cursor is refused.
         let other = FeatureTree::new([("x", vec![])], []);
-        let refused = respond(
-            &Map::new(),
+        let refused = respond_to(
             (&other, None, None),
             &asked(json!({ "crate": "demo", "limit": 4, "cursor": cursor })),
-            ("", &[], &[], None),
+            "",
         )
         .expect_err("refused");
         assert_eq!(refused.is_error, Some(true));
-        let one = respond(
-            &Map::new(),
+        let one = respond_to(
             (&tree(), None, None),
             &asked(json!({ "crate": "demo", "feature": "net" })),
-            ("", &[], &[], None),
+            "",
         )
         .expect("answered");
         assert_eq!(one["data"]["features"].as_array().map(Vec::len), Some(1));
         for (asked_for, near) in [("Full", true), ("fulll", true), ("c", false)] {
-            let missing = respond(
-                &Map::new(),
+            let missing = respond_to(
                 (&tree(), None, None),
                 &asked(json!({ "crate": "demo", "feature": asked_for })),
-                ("", &[], &[], None),
+                "",
             )
             .expect_err("not a feature");
             let text = format!("{:?}", missing.content);
@@ -1299,22 +1839,20 @@ mod tests {
                 .chain([("Win32", vec![])]),
             [],
         );
-        let answer = respond(
-            &Map::new(),
+        let answer = respond_to(
             (&tree, None, None),
             &asked(json!({ "crate": "windows", "limit": 200 })),
-            ("", &[], &[], None),
+            "",
         )
         .expect("answered");
         assert!(answer.to_string().chars().count() <= MAX_RESPONSE_CHARS);
         let shown = answer["page"]["shown"].as_u64().expect("a number");
         assert!((1..200).contains(&shown), "{shown}");
         assert_eq!(answer["page"]["has_more"], true);
-        let win32 = respond(
-            &Map::new(),
+        let win32 = respond_to(
             (&tree, None, None),
             &asked(json!({ "crate": "windows", "feature": "Win32" })),
-            ("", &[], &[], None),
+            "",
         )
         .expect("answered");
         let feature = &win32["data"]["features"][0];
@@ -1331,17 +1869,7 @@ mod tests {
     /// told (decided in M3d, decisions 45, 51, 52 and 54).
     #[test]
     fn whether_the_project_enables_each_feature_is_told() {
-        let release = Release {
-            provenance: Map::new(),
-            warnings: Vec::new(),
-            hints: Vec::new(),
-            name: "demo".parse().expect("a name"),
-            version: Version::new(1, 0, 0),
-            source: "crates.io".into(),
-            on_crates_io: true,
-            docs_rs_json: "available".into(),
-            retry_after: None,
-        };
+        let release = release();
         let known = Known {
             tree: tree(),
             not_in_docs: Some(Box::from([Box::from("net"), Box::from("full")])),
@@ -1352,9 +1880,15 @@ mod tests {
             with_dev: set(&["default", "rt", "net", "mio", "full"]),
         };
         let ask = asked(json!({ "crate": "demo" }));
-        let told = answer(&release, &known, Some(&in_project), &ask)
-            .structured_content
-            .expect("structured");
+        let answered = |in_project: &ProjectBuild| {
+            respond_to(
+                (&known.tree, known.not_in_docs.as_deref(), Some(in_project)),
+                &ask,
+                &release.docs_rs_json,
+            )
+            .expect("answered")
+        };
+        let told = answered(&in_project);
         let features = told["data"]["features"].as_array().expect("features");
         let of = |name: &str| {
             features
@@ -1367,13 +1901,19 @@ mod tests {
         assert_eq!(of("full")["enabled_in_project"], false);
         assert_eq!(of("full")["enabled_in_dev_only"], true);
         assert!(of("rt").get("enabled_in_dev_only").is_none());
-        let warnings = told["warnings"].to_string();
-        assert!(
-            warnings.contains("the project enables net, whose items"),
-            "{told}"
+        let (warnings, hints) = notes(
+            &release,
+            (&known.tree, known.not_in_docs.as_deref(), Some(&in_project)),
+            &Items::Unknown,
         );
         assert!(
-            told["hints"]
+            warnings
+                .iter()
+                .any(|warning| warning.contains("the project enables net, whose items")),
+            "{warnings:?}"
+        );
+        assert!(
+            json!(hints)
                 .to_string()
                 .contains("read their source with get_source")
         );
@@ -1382,9 +1922,7 @@ mod tests {
             normal: None,
             with_dev: None,
         };
-        let told = answer(&release, &known, Some(&none), &ask)
-            .structured_content
-            .expect("structured");
+        let told = answered(&none);
         assert!(
             told["data"]["features"]
                 .as_array()
@@ -1393,6 +1931,141 @@ mod tests {
                 .all(|feature| feature["enabled_in_project"] == false),
             "{told}"
         );
+    }
+
+    /// The items of each feature that the documentation tells: their number by each feature, not
+    /// of one that a build here was without; one feature's, entries first, paged with a cursor
+    /// made for that documentation; a feature that gathers others told so; and, while the
+    /// documentation is had, none, but that they are coming (decided in M3d, decisions 42, 56, 57
+    /// and 58).
+    #[test]
+    fn the_items_of_each_feature_are_told() {
+        let item =
+            |path: &str, entry: bool| json!({ "path": path, "kind": "function", "entry": entry });
+        let found = |built_with: Option<&[&str]>| Items::Found {
+            counts: [(Box::from("net"), 2), (Box::from("rt"), 1)]
+                .into_iter()
+                .collect(),
+            listed: vec![item("a::net", true), item("a::net::x", false)],
+            digest: "ab".into(),
+            lacking: None,
+            built_with: built_with.map(|names| names.iter().map(|&name| Box::from(name)).collect()),
+        };
+        let all = asked(json!({ "crate": "demo" }));
+        let told = respond_with((&tree(), None, None), &all, ("", &found(None))).expect("answered");
+        let count = |told: &Value, name: &str| {
+            told["data"]["features"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|feature| feature["name"] == name)
+                .and_then(|feature| feature.get("items").cloned())
+        };
+        assert_eq!(count(&told, "net"), Some(json!(2)));
+        assert_eq!(count(&told, "full"), Some(json!(0)));
+        assert!(
+            told["hints"].to_string().contains("items: 0 and a closure"),
+            "{told}"
+        );
+        // Built here without `full`: its items are not counted.
+        let built = found(Some(&["default", "rt", "net", "mio"]));
+        let told = respond_with((&tree(), None, None), &all, ("", &built)).expect("answered");
+        assert_eq!(count(&told, "full"), None);
+        assert_eq!(count(&told, "rt"), Some(json!(1)));
+        // One feature: a page of its items.
+        let found = found(None);
+        let net = asked(json!({ "crate": "demo", "feature": "net", "limit": 1 }));
+        let first = respond_with((&tree(), None, None), &net, ("", &found)).expect("answered");
+        assert_eq!(first["data"]["items"], json!([item("a::net", true)]));
+        assert_eq!(first["data"]["features"][0]["items"], 2);
+        let cursor = first["page"]["next_cursor"].as_str().expect("a cursor");
+        let second =
+            asked(json!({ "crate": "demo", "feature": "net", "limit": 1, "cursor": cursor }));
+        let rest = respond_with((&tree(), None, None), &second, ("", &found)).expect("answered");
+        assert_eq!(rest["data"]["items"], json!([item("a::net::x", false)]));
+        assert_eq!(rest["page"]["has_more"], false);
+        // The cursor is of that documentation.
+        let other = Items::Found {
+            counts: BTreeMap::new(),
+            listed: Vec::new(),
+            digest: "cd".into(),
+            lacking: None,
+            built_with: None,
+        };
+        let refused =
+            respond_with((&tree(), None, None), &second, ("", &other)).expect_err("refused");
+        assert_eq!(refused.is_error, Some(true));
+        // While the documentation is fetched.
+        let pending = Items::Pending("fetching".into());
+        let told = respond_with((&tree(), None, None), &all, ("", &pending)).expect("answered");
+        assert_eq!(told["data"]["items_pending"], "fetching");
+        assert_eq!(count(&told, "net"), None);
+    }
+
+    /// The features that the documentation lacks are those of its `.crate`, or else those that
+    /// `get_item` tells of docs.rs's build; a build here without features is warned of without
+    /// those, its list cut; and what is done of the documentation is told as it is.
+    #[test]
+    fn what_the_documentation_lacks_is_told() {
+        let found = |lacking: Option<&[&str]>, built_with: Option<&[&str]>| Items::Found {
+            counts: BTreeMap::new(),
+            listed: Vec::new(),
+            digest: "ab".into(),
+            lacking: lacking.map(|names| names.iter().map(|&name| Box::from(name)).collect()),
+            built_with: built_with.map(|names| names.iter().map(|&name| Box::from(name)).collect()),
+        };
+        let unknown = Known {
+            tree: tree(),
+            not_in_docs: None,
+        };
+        let from_get_item = found(Some(&["net"]), None);
+        assert_eq!(
+            lacking_of(&unknown, &from_get_item),
+            Some(&[Box::from("net")][..])
+        );
+        let known = Known {
+            tree: tree(),
+            not_in_docs: Some(Box::from([Box::from("full")])),
+        };
+        assert_eq!(
+            lacking_of(&known, &from_get_item),
+            Some(&[Box::from("full")][..])
+        );
+        assert_eq!(lacking_of(&unknown, &Items::Unknown), None);
+        // Built here without `full` and `net`, of which `full` is told as not in the docs.
+        let built = found(None, Some(&["default", "rt", "mio", "hyper"]));
+        let (warnings, _) = notes(
+            &release(),
+            (&known.tree, known.not_in_docs.as_deref(), None),
+            &built,
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("built without net, whose items")),
+            "{warnings:?}"
+        );
+        // Of many features, with the one that `mio` makes, the list is cut.
+        let names: Vec<String> = (0..MAX_LISTED + 3).map(|n| format!("f{n}")).collect();
+        let many = FeatureTree::new(names.iter().map(|name| (name.as_str(), vec![])), ["mio"]);
+        let (warnings, _) = notes(&release(), (&many, None, None), &found(None, Some(&[])));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains(" and 4 more")),
+            "{warnings:?}"
+        );
+        for (doing, told) in [
+            ("indexing", "being indexed"),
+            ("waiting_for_slot", "waiting for a build"),
+        ] {
+            let (_, hints) = notes(
+                &release(),
+                (&known.tree, None, None),
+                &Items::Pending(doing.into()),
+            );
+            assert!(json!(hints).to_string().contains(told), "{hints:?}");
+        }
     }
 
     /// std has no features to enable; `feature` is a name, and `limit` within its bounds.
