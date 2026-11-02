@@ -354,6 +354,66 @@ fn the_items_of_each_feature_are_found_in_a_short_time() {
     }
 }
 
+/// The Rust code blocks of the docs of large crates are found and ranked in a short time: once
+/// for each call of `find_examples` (decided in M3e, decision 74, which keeps a memory cache for
+/// over 200 ms), with the item's own first and those that name it and its type next.
+#[test]
+#[ignore = "needs the JSON of testdata/docs-rs-json.txt in the cache"]
+fn the_examples_in_the_docs_are_found_in_a_short_time() {
+    use chatora_rustdoc_mcp::query::examples::{Asked, Rank, doc_blocks, ranked};
+
+    let cache = Cache::open_default().expect("the cache directory is known");
+    for (crate_name, version, asked, parent) in [
+        ("tokio", "1.53.3", "tokio::sync::Mutex::lock", Some("Mutex")),
+        ("axum", "0.8.9", "axum::Router::route", Some("Router")),
+    ] {
+        let json = cached_json(&cache, &entry(crate_name, version));
+        let parsed = rustdoc_json::parse(&json).expect("parses");
+        let mapped = Mapped::in_memory(&Indexed::new(parsed)).expect("archived");
+        let view = CrateView::new(mapped.get());
+        let started = Instant::now();
+        let blocks = doc_blocks(&view);
+        let name = asked.rsplit("::").next().unwrap_or(asked);
+        let id = blocks
+            .iter()
+            .find(|block| &*block.item == asked)
+            .map(|block| block.id)
+            .expect("the item has examples of its own");
+        let asked = Asked {
+            id,
+            path: asked,
+            name,
+            parent,
+        };
+        let order = ranked(&blocks, Some(&asked));
+        let took = started.elapsed();
+        let count = |wanted: Rank| order.iter().filter(|(rank, _)| *rank == wanted).count();
+        eprintln!(
+            "{crate_name}: {} blocks, {}: own {}, both {}, name {}, in {took:?}",
+            blocks.len(),
+            asked.path,
+            count(Rank::Own),
+            count(Rank::Both),
+            count(Rank::Name)
+        );
+        assert!(blocks.len() > 100, "{crate_name}: {} blocks", blocks.len());
+        assert_eq!(order.first().map(|(rank, _)| *rank), Some(Rank::Own));
+        assert!(count(Rank::Both) > 0);
+        // Its own example names it.
+        assert!(
+            order
+                .first()
+                .is_some_and(|(_, block)| block.code.contains(name)),
+            "{crate_name}: its own example does not name {name}"
+        );
+        // Over 200 ms, decision 74 keeps them in memory.
+        assert!(
+            took.as_millis() < 200,
+            "{crate_name}: {took:?} for the examples"
+        );
+    }
+}
+
 /// The rustdoc subtree that the response renders: the item, and the fields or variants of a type.
 fn rendered_subtree<'v>(
     view: &'v CrateView<'_>,

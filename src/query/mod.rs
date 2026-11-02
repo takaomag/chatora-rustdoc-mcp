@@ -3,6 +3,7 @@
 pub mod across;
 pub mod cfg;
 pub mod docs;
+pub mod examples;
 pub mod feature_items;
 pub mod get_item;
 pub mod implementors;

@@ -103,6 +103,17 @@ impl<'a> CrateView<'a> {
         Some(self.items.insert(id, Box::new(item)))
     }
 
+    /// The docs of the item `id` of this crate, read where they are archived, without taking the
+    /// item out (decided in M3e, decision 74).
+    #[must_use]
+    pub fn docs(&self, id: Id) -> Option<&'a str> {
+        let archived = self.archived.parsed.krate.index.get(&archived_id(id))?;
+        archived
+            .docs
+            .as_ref()
+            .map(rkyv::string::ArchivedString::as_str)
+    }
+
     /// The summary of the item `id`, of this crate or another, with its definition path.
     #[must_use]
     pub fn summary(&self, id: Id) -> Option<&ItemSummary> {

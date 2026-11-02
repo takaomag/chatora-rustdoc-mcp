@@ -117,30 +117,61 @@ pub fn without_hidden_lines(docs: &str) -> String {
 }
 
 /// Whether a code block with this info string is Rust, as rustdoc decides it: no language, or
-/// only the attributes of a doctest.
-fn is_rust(info: &str) -> bool {
-    info.split([',', ' ', '\t'])
-        .map(str::trim)
+/// only the attributes of a doctest (`no_run`, `edition2021`, `ignore-wasm32`, an error code as
+/// `E0277`), or `rust` named with others; not `custom`. Classes (`{.class}`) tell nothing.
+pub(super) fn is_rust(info: &str) -> bool {
+    let mut rust = false;
+    let mut other = false;
+    for word in info
+        .split([',', ' ', '\t'])
+        .map(|word| word.trim().trim_start_matches('{').trim_end_matches('}'))
         .filter(|word| !word.is_empty())
-        .all(|word| {
-            matches!(
-                word,
-                "rust"
-                    | "ignore"
-                    | "no_run"
-                    | "should_panic"
-                    | "compile_fail"
-                    | "test_harness"
-                    | "standalone_crate"
-            ) || word.starts_with("edition")
-                || word.starts_with("ignore-")
-                || word.starts_with('{')
-        })
+    {
+        if word.starts_with('.') || word.contains('=') {
+            continue;
+        }
+        let error_code = word.len() == 5
+            && word.starts_with('E')
+            && word.bytes().skip(1).all(|byte| byte.is_ascii_digit());
+        match word {
+            "rust" => rust = true,
+            "custom" => return false,
+            "ignore" | "no_run" | "should_panic" | "compile_fail" | "test_harness"
+            | "standalone_crate" => {},
+            _ if error_code || word.starts_with("edition") || word.starts_with("ignore-") => {},
+            _ => other = true,
+        }
+    }
+    rust || !other
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block is Rust as rustdoc decides it: no language, attributes of a doctest, error codes,
+    /// or `rust` named with others; classes tell nothing; another language or `custom` is not.
+    #[test]
+    fn a_block_is_rust_as_rustdoc_decides_it() {
+        for (info, rust) in [
+            ("", true),
+            ("rust", true),
+            ("no_run,edition2021", true),
+            ("compile_fail,E0277", true),
+            ("ignore-wasm32", true),
+            ("rust,foo", true),
+            ("{.rust}", true),
+            ("{.a .b}", true),
+            ("text", false),
+            ("sh", false),
+            ("not_rust", false),
+            ("custom", false),
+            ("rust,custom", false),
+            ("E027", false),
+        ] {
+            assert_eq!(is_rust(info), rust, "{info:?}");
+        }
+    }
 
     #[test]
     fn docs_are_split_at_their_headings_outside_code() {
