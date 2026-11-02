@@ -280,6 +280,55 @@ pub fn workspace_of(path: &Path) -> Result<Workspace, ProjectError> {
     find_workspace(path, None)
 }
 
+/// The root of the workspace that the package in `dir` inherits its readme from, as its paths are
+/// written (decided in M3e, decisions 78 and 80).
+///
+/// It is its own directory if its manifest has `[workspace]`; else the workspace that its
+/// `package.workspace` names, or the first above it, only if that workspace lists the package
+/// among its `members`, and only under `boundary` (as the root of a git checkout) when one is
+/// given. `None` when no workspace lists it, so that a manifest cannot make a directory of its
+/// choice the root that its readme is read under.
+///
+/// # Errors
+///
+/// Returns an error when a manifest cannot be read.
+pub fn listing_workspace(
+    dir: &Path,
+    boundary: Option<&Path>,
+) -> Result<Option<PathBuf>, ProjectError> {
+    let dir = super::source_root::lexically(dir);
+    let within = |root: &Path| boundary.is_none_or(|boundary| root.starts_with(boundary));
+    let parsed = read_manifest(&dir.join("Cargo.toml"))?;
+    if parsed.workspace.is_some() {
+        return Ok(Some(dir));
+    }
+    let named = parsed
+        .package
+        .and_then(|package| package.workspace)
+        .map(|root| super::source_root::lexically(&dir.join(root)));
+    let candidates: Vec<PathBuf> = named.map_or_else(
+        || dir.ancestors().skip(1).map(Path::to_path_buf).collect(),
+        |root| vec![root],
+    );
+    for root in candidates {
+        if !within(&root) {
+            break;
+        }
+        let manifest = root.join("Cargo.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        let Some(table) = read_manifest(&manifest)?.workspace else {
+            continue;
+        };
+        if excludes(&table, &root, &dir) {
+            continue;
+        }
+        return Ok(lists(&table, &root, &dir).then_some(root));
+    }
+    Ok(None)
+}
+
 /// [`workspace_of`], looking for a workspace above the package no higher than `boundary`.
 fn find_workspace(path: &Path, boundary: Option<&Path>) -> Result<Workspace, ProjectError> {
     let manifest = if path.file_name().is_some_and(|name| name == "Cargo.toml") {
@@ -524,6 +573,43 @@ mod tests {
     }
 
     const PACKAGE: &str = "[package]\nname = \"p\"\nversion = \"0.1.0\"\n";
+
+    /// The workspace that a package inherits its readme from lists it, under the boundary if one
+    /// is given; a manifest that names another directory, as `/`, does not make it the root
+    /// (decided in M3e, decisions 78 and 80).
+    #[test]
+    fn a_readme_is_inherited_only_from_a_workspace_that_lists_the_package() {
+        let dir = tree(&[
+            ("ws/Cargo.toml", "[workspace]\nmembers = [\"listed\"]\n"),
+            ("ws/listed/Cargo.toml", "[package]\nname = \"listed\"\n"),
+            ("ws/unlisted/Cargo.toml", "[package]\nname = \"unlisted\"\n"),
+            (
+                "ws/named/Cargo.toml",
+                "[package]\nname = \"named\"\nworkspace = \"/\"\n",
+            ),
+            (
+                "ws/self/Cargo.toml",
+                "[package]\nname = \"self\"\n[workspace]\n",
+            ),
+            (
+                "ws/pointed/Cargo.toml",
+                "[package]\nname = \"pointed\"\nworkspace = \"..\"\n",
+            ),
+        ]);
+        let ws = super::super::source_root::lexically(&dir.path().join("ws"));
+        let of = |member: &str, boundary: Option<&Path>| {
+            listing_workspace(&ws.join(member), boundary).expect("read")
+        };
+        assert_eq!(of("listed", None), Some(ws.clone()));
+        assert_eq!(of("unlisted", None), None);
+        assert_eq!(of("named", None), None);
+        assert_eq!(of("self", None), Some(ws.join("self")));
+        // `..` is the workspace, which does not list it.
+        assert_eq!(of("pointed", None), None);
+        // Above the boundary, as a checkout's root, it is not looked for.
+        assert_eq!(of("listed", Some(&ws.join("listed"))), None);
+        assert_eq!(of("listed", Some(&ws)), Some(ws.clone()));
+    }
 
     #[test]
     fn a_member_belongs_to_the_workspace_that_lists_it() {

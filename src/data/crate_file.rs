@@ -366,6 +366,16 @@ pub fn manifest_readme(manifest: &Path) -> io::Result<Declared> {
     Ok(readme::declared(&manifest_table(manifest)?))
 }
 
+/// What the `[workspace.package]` of the workspace's manifest at `manifest` names as the readme
+/// that its packages inherit (decided in M3e, decision 80), as [`readme::of_workspace`] reads it.
+///
+/// # Errors
+///
+/// Returns an error when the manifest cannot be read, is too large or is not TOML.
+pub fn workspace_readme(manifest: &Path) -> io::Result<Option<Declared>> {
+    Ok(readme::of_workspace(&manifest_table(manifest)?))
+}
+
 /// The manifest at `manifest`, which one larger than [`MAX_MANIFEST_BYTES`] is not, rather than
 /// read in part.
 fn manifest_table(manifest: &Path) -> io::Result<toml::Table> {

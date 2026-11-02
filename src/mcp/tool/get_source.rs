@@ -745,7 +745,7 @@ async fn metadata_of(
 /// Whether cargo unpacked the package at `dir` from crates.io: under
 /// `$CARGO_HOME/registry/src/index.crates.io-…/`, in `cargo_home`.
 #[cfg(feature = "local")]
-fn unpacked_from_crates_io(dir: &Path, cargo_home: &Path) -> bool {
+pub(super) fn unpacked_from_crates_io(dir: &Path, cargo_home: &Path) -> bool {
     source_root::lexically(dir)
         .strip_prefix(source_root::lexically(
             &cargo_home.join("registry").join("src"),
@@ -764,7 +764,7 @@ fn unpacked_from_crates_io(dir: &Path, cargo_home: &Path) -> bool {
 /// in `cargo_home`, if cargo finished it (its `.cargo-ok`): the root that its files are judged
 /// under, and no other's (requirement R-SC-4).
 #[cfg(feature = "local")]
-fn checkout_of(dir: &Path, cargo_home: &Path) -> Option<PathBuf> {
+pub(super) fn checkout_of(dir: &Path, cargo_home: &Path) -> Option<PathBuf> {
     let checkouts = source_root::lexically(&cargo_home.join("git").join("checkouts"));
     let inside = source_root::lexically(dir);
     let mut parts = inside.strip_prefix(&checkouts).ok()?.components();
@@ -974,7 +974,7 @@ async fn read_file(
 
 /// `path` relative to `dir`, by their text, with `/`, and `..` for what of `dir` it is not under,
 /// as `../README.md` for a readme that a member inherits from its workspace.
-fn relative_to(path: &Path, dir: &Path) -> String {
+pub(super) fn relative_to(path: &Path, dir: &Path) -> String {
     let (path, dir) = (source_root::lexically(path), source_root::lexically(dir));
     let common = path
         .components()

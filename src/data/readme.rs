@@ -31,6 +31,9 @@ pub enum Declared {
     Default,
     /// `readme = false`: the package has none.
     Disabled,
+    /// `readme.workspace = true`: the package inherits its workspace's, as a manifest that Cargo
+    /// did not write has it (decided in M3e, decision 80).
+    Workspace,
 }
 
 /// Why a package has no readme that may be read.
@@ -39,6 +42,13 @@ pub enum NoReadme {
     /// Its manifest tells that it has none (`readme = false`).
     #[error("its manifest tells that it has no readme (`readme = false`)")]
     Disabled,
+    /// It inherits its workspace's readme, which the workspace does not name (decided in M3e,
+    /// decision 80).
+    #[error(
+        "it inherits the readme of its workspace, which names none in [workspace.package], or no \
+         workspace lists it among its members"
+    )]
+    NotInherited,
     /// Its manifest names none, and none of the default names is in the package.
     #[error("it has no README.md, README.txt or README, and its manifest names none")]
     NoDefault,
@@ -72,8 +82,56 @@ pub fn declared(table: &toml::Table) -> Declared {
         Some(toml::Value::String(path)) => Declared::Path(path.as_str().into()),
         Some(toml::Value::Boolean(true)) => Declared::Path("README.md".into()),
         Some(toml::Value::Boolean(false)) => Declared::Disabled,
+        Some(toml::Value::Table(inherited))
+            if inherited.get("workspace") == Some(&toml::Value::Boolean(true)) =>
+        {
+            Declared::Workspace
+        },
         _ => Declared::Default,
     }
+}
+
+/// What the `[workspace.package]` of the workspace's manifest `table` names as the readme that
+/// its packages inherit, relative to the workspace's root (decided in M3e, decision 80); `None`
+/// when it names none.
+#[must_use]
+pub fn of_workspace(table: &toml::Table) -> Option<Declared> {
+    match table
+        .get("workspace")
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(|package| package.get("readme"))?
+    {
+        toml::Value::String(path) => Some(Declared::Path(path.as_str().into())),
+        toml::Value::Boolean(true) => Some(Declared::Path("README.md".into())),
+        toml::Value::Boolean(false) => Some(Declared::Disabled),
+        toml::Value::Integer(_)
+        | toml::Value::Float(_)
+        | toml::Value::Datetime(_)
+        | toml::Value::Array(_)
+        | toml::Value::Table(_) => None,
+    }
+}
+
+/// Whether the readme `named` at `relative` may be read: a document, not under a hidden directory
+/// (requirement R-SC-4, decided in M3e, decision 76).
+///
+/// `named` is as the manifest names it; `relative` is a path with `/`, which may start with `..`
+/// as an inherited one does.
+///
+/// # Errors
+///
+/// Returns why it is not read.
+pub fn judged(named: &str, relative: &str) -> Result<(), NoReadme> {
+    if !is_document(Path::new(relative)) {
+        return Err(NoReadme::NotADocument(named.into()));
+    }
+    if relative
+        .split('/')
+        .any(|part| part.starts_with('.') && part != ".." && part != ".")
+    {
+        return Err(NoReadme::Hidden(named.into()));
+    }
+    Ok(())
 }
 
 /// The readme that `declared` tells, relative to the package's root with `/`, of the files of the
@@ -87,6 +145,8 @@ pub fn declared(table: &toml::Table) -> Declared {
 pub fn chosen(declared: &Declared, has: impl Fn(&str) -> bool) -> Result<Box<str>, NoReadme> {
     match declared {
         Declared::Disabled => Err(NoReadme::Disabled),
+        // Cargo resolves it into the manifest that it writes into a `.crate`.
+        Declared::Workspace => Err(NoReadme::NotInherited),
         Declared::Default => DEFAULT_NAMES
             .into_iter()
             .find(|&name| has(name))
@@ -96,12 +156,7 @@ pub fn chosen(declared: &Declared, has: impl Fn(&str) -> bool) -> Result<Box<str
             let Some(relative) = relative(path) else {
                 return Err(NoReadme::Missing(path.clone()));
             };
-            if !is_document(Path::new(&relative)) {
-                return Err(NoReadme::NotADocument(path.clone()));
-            }
-            if relative.split('/').any(|part| part.starts_with('.')) {
-                return Err(NoReadme::Hidden(path.clone()));
-            }
+            judged(path, &relative)?;
             if has(&relative) {
                 Ok(relative.into())
             } else {
@@ -239,6 +294,55 @@ mod tests {
             Err(NoReadme::NoDefault)
         );
         assert_eq!(chosen(&Declared::Disabled, has), Err(NoReadme::Disabled));
+    }
+
+    /// A readme inherited from the workspace, and what the workspace names: a path, `true` for
+    /// its `README.md`, `false`, or none (decided in M3e, decision 80).
+    #[test]
+    fn a_readme_is_inherited_from_the_workspace() {
+        assert_eq!(
+            declared(&table("[package]\nreadme.workspace = true")),
+            Declared::Workspace
+        );
+        assert_eq!(
+            declared(&table("[package]\nreadme = { workspace = false }")),
+            Declared::Default
+        );
+        // Cargo resolves it into the manifest of a `.crate`.
+        assert_eq!(
+            chosen(&Declared::Workspace, |_| true),
+            Err(NoReadme::NotInherited)
+        );
+        let of = |text: &str| of_workspace(&table(text));
+        assert_eq!(
+            of("[workspace.package]\nreadme = \"docs/README.md\""),
+            Some(Declared::Path("docs/README.md".into()))
+        );
+        assert_eq!(
+            of("[workspace.package]\nreadme = true"),
+            Some(Declared::Path("README.md".into()))
+        );
+        assert_eq!(
+            of("[workspace.package]\nreadme = false"),
+            Some(Declared::Disabled)
+        );
+        assert_eq!(of("[workspace]\nmembers = []"), None);
+    }
+
+    /// A readme above the package, as an inherited one is, is judged by what it is and where:
+    /// not under a hidden directory, `..` aside (decided in M3e, decision 76).
+    #[test]
+    fn an_inherited_readme_is_judged() {
+        assert_eq!(judged("../README.md", "../README.md"), Ok(()));
+        assert_eq!(judged("./docs/a.md", "docs/a.md"), Ok(()));
+        assert_eq!(
+            judged("../.github/README.md", "../.github/README.md"),
+            Err(NoReadme::Hidden("../.github/README.md".into()))
+        );
+        assert_eq!(
+            judged("../LICENSE", "../LICENSE"),
+            Err(NoReadme::NotADocument("../LICENSE".into()))
+        );
     }
 
     /// The extensions of a document in any case, and `README` without one.

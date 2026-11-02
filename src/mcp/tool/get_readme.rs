@@ -271,7 +271,14 @@ pub(super) async fn execute(readme: Readme, state: Arc<ToolState>) -> CallToolRe
     let Readme { release, ask } = readme;
     // One deadline for every step (requirement R-ARCH-6).
     let until = state.until();
-    let (resolved, _) = resolve_version::resolving(release, Arc::clone(&state), until).await;
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(
+            unused_variables,
+            reason = "only a project or a record has more to tell"
+        )
+    )]
+    let (resolved, taken) = resolve_version::resolving(release, Arc::clone(&state), until).await;
     // An error, or the response while the release is resolved, as it is.
     let Some(release) = resolved
         .structured_content
@@ -281,7 +288,33 @@ pub(super) async fn execute(readme: Readme, state: Arc<ToolState>) -> CallToolRe
     else {
         return resolved;
     };
-    if !release.on_crates_io {
+    // A crate of git that `build_external_docs` recorded, in its checkout (decided in M3e,
+    // decision 80).
+    #[cfg(feature = "local")]
+    if let Some(git) = &taken.git {
+        return match here::of_git(&state, git) {
+            Ok(here) => answered(release, ask, move || here::read(&here)).await,
+            Err(answer) => *answer,
+        };
+    }
+    // Another package of the project, where it is (decided in M3e, decisions 78 and 79).
+    #[cfg(feature = "local")]
+    if let Some(found) = taken.found.as_deref()
+        && !release.on_crates_io
+        && !here::unpacked_from_crates_io(&state, found)
+    {
+        return match here::of_project(&state, found, &release, until).await {
+            Ok(here) => answered(release, ask, move || here::read(&here)).await,
+            Err(answer) => *answer,
+        };
+    }
+    // As one that the project takes from crates.io, which cargo unpacked as it is (decided in M3e,
+    // decision 79), its `.crate`.
+    #[cfg(feature = "local")]
+    let on_crates_io = release.on_crates_io || taken.found.is_some();
+    #[cfg(not(feature = "local"))]
+    let on_crates_io = release.on_crates_io;
+    if !on_crates_io {
         return not_a_release(&release);
     }
     let of = SourcesOf {
@@ -301,12 +334,20 @@ pub(super) async fn execute(readme: Readme, state: Arc<ToolState>) -> CallToolRe
         Ok(sources) => sources,
         Err(answer) => return with_overview(*answer),
     };
+    answered(release, ask, move || read_readme(&sources)).await
+}
+
+/// The answer for the readme of `release` that `read` reads, as `ask` asks: read, outlined and
+/// paged off the runtime's workers, as a readme may be of 8 MiB.
+async fn answered(
+    release: Release,
+    ask: ReadmeAsk,
+    read: impl FnOnce() -> Result<ReadReadme, Failure> + Send + 'static,
+) -> CallToolResult {
     let what = format!("{} {}", release.name, release.version);
-    // Read, outlined and paged off the runtime's workers: a readme may be of 8 MiB.
-    let answered = crate::task::spawn_blocking(move || {
-        read_readme(&sources).map(|read| respond(&release, &read, &ask))
-    })
-    .await;
+    let answered =
+        crate::task::spawn_blocking(move || read().map(|read| respond(&release, &read, &ask)))
+            .await;
     let answered = match answered {
         Ok(Ok(answered)) => answered,
         Ok(Err(failure)) => return failure.into_result(&what),
@@ -356,11 +397,12 @@ fn not_a_release(release: &Release) -> CallToolResult {
         "code": "docs_unavailable",
         "reason": "build_unsupported",
         "message": format!(
-            "{} {} is of {of}: get_readme reads the readmes of crates.io releases",
+            "{} {} is of {of}: get_readme reads the readme of a release of crates.io, from its \
+             .crate",
             release.name, release.version
         ),
         "retryable": false,
-        "suggestions": ["read the readme that its Cargo.toml names with get_source"],
+        "suggestions": [OVERVIEW],
     }))
 }
 
@@ -405,7 +447,7 @@ impl Failure {
             ),
             Self::Manifest(error) => (
                 "corrupt",
-                format!("the Cargo.toml of {what} could not be read: {error}"),
+                format!("a Cargo.toml of {what}, or of its workspace, could not be read: {error}"),
             ),
             Self::TooLarge(file) => (
                 "too_large",
@@ -441,8 +483,26 @@ fn read_readme(sources: &Sources) -> Result<ReadReadme, Failure> {
             .is_ok()
     })
     .map_err(Failure::NoReadme)?;
-    let resolved = source_root::resolve(root, Path::new(file.as_ref()))
-        .map_err(|refusal| Failure::Refused(file.clone(), refusal))?;
+    let asked = Path::new(file.as_ref()).to_path_buf();
+    read_at(root, &asked, file)
+}
+
+/// The readme at `asked` under `root`, judged as `get_source` judges its files, shown as `file`.
+fn read_at(root: Root<'_>, asked: &Path, file: Box<str>) -> Result<ReadReadme, Failure> {
+    let resolved = source_root::resolve(root, asked).map_err(|refusal| match refusal {
+        // A hidden directory on its way (decided in M3e, decision 76).
+        Refusal::Dotfile => Failure::NoReadme(NoReadme::Hidden(file.clone())),
+        Refusal::Outside
+        | Refusal::NotInPackage
+        | Refusal::SymlinkOutside
+        | Refusal::SymlinkInCache
+        | Refusal::Missing
+        | Refusal::NotAFile => Failure::Refused(file.clone(), refusal),
+    })?;
+    // A readme that leads through a symlink to a file that is not a document is not read.
+    if !readme::is_document(&resolved.path) {
+        return Err(Failure::NoReadme(NoReadme::NotADocument(file)));
+    }
     let mut contents = Vec::new();
     std::fs::File::open(&resolved.path)
         .and_then(|opened| {
@@ -853,6 +913,375 @@ fn no_section(asked: &str, outline: &[(Heading, String)]) -> CallToolResult {
         false,
         &[&suggestion],
     )
+}
+
+/// The readmes of the packages built here: the project's members, path and git dependencies, and
+/// the crates of git that `build_external_docs` recorded, where they are (decided in M3e, decisions
+/// 78 to 80). No cargo is run but what resolved the version.
+#[cfg(feature = "local")]
+mod here {
+    use std::path::{Path, PathBuf};
+
+    use rmcp::model::CallToolResult;
+
+    use super::{Failure, ReadReadme, read_at};
+    use crate::{
+        data::{
+            crate_file,
+            flight::Joined,
+            metadata::Resolution,
+            packages::Source,
+            project as workspaces,
+            readme::{self, DEFAULT_NAMES, Declared, NoReadme},
+            source_root::{self, Root},
+        },
+        mcp::tool::{
+            ErrorChain,
+            ToolState,
+            get_item,
+            get_source,
+            project::{self, Found},
+            recorded_git::GitFound,
+            resolve_version::Release,
+        },
+    };
+
+    /// Where a package's readme is looked for.
+    #[derive(Debug)]
+    pub(super) struct Here {
+        /// The directory of its `Cargo.toml`.
+        dir: PathBuf,
+        /// What its files are judged under.
+        root: HereRoot,
+        /// Its readme as `cargo metadata` resolved it, relative to `dir`; else its manifest is
+        /// read, as of a crate of git that was recorded.
+        resolved: Option<PathBuf>,
+    }
+
+    /// What the files of a package here are judged under (requirement R-SC-4).
+    #[derive(Debug)]
+    enum HereRoot {
+        /// A path package, under the root of its workspace: the project's, or else its own, which
+        /// is looked for above it (decided in M3e, decision 78).
+        Package { workspace: Option<PathBuf> },
+        /// A git package, in the checkout that cargo finished: an inherited readme is looked for
+        /// no higher than it (decided in M3e, decision 80).
+        Checkout(PathBuf),
+    }
+
+    /// Where the readme of the crate of git `git`, as `build_external_docs` recorded it, is.
+    pub(super) fn of_git(state: &ToolState, git: &GitFound) -> Result<Here, Box<CallToolResult>> {
+        let build_again = |message: String| {
+            Box::new(crate::mcp::tool::tool_error(
+                "docs_unavailable",
+                &message,
+                false,
+                &["build it again with build_external_docs"],
+            ))
+        };
+        let Some(dir) = git.built.record.package_root.clone() else {
+            return Err(build_again(format!(
+                "the record of {} is from before where its package is was kept",
+                git.package
+            )));
+        };
+        let checkout = state
+            .resolver
+            .cargo_home()
+            .and_then(|home| get_source::checkout_of(&dir, home))
+            .ok_or_else(|| {
+                build_again(format!(
+                    "the checkout of {} that was built is not there any more",
+                    git.package
+                ))
+            })?;
+        Ok(Here {
+            dir,
+            root: HereRoot::Checkout(checkout),
+            resolved: None,
+        })
+    }
+
+    /// Where the readme of the project's package `found` of `release` is, from the project's
+    /// `cargo metadata`, waiting for it until `until`; copies of crates.io and other registries are
+    /// not read (decided in M3e, decision 79).
+    pub(super) async fn of_project(
+        state: &ToolState,
+        found: &Found,
+        release: &Release,
+        until: tokio::time::Instant,
+    ) -> Result<Here, Box<CallToolResult>> {
+        let what = format!("{} {}", release.name, release.version);
+        let not_known = |why: String| {
+            Box::new(crate::mcp::tool::tool_error(
+                "docs_unavailable",
+                &format!("the readme of {what} is not known: {why}"),
+                false,
+                &[super::OVERVIEW],
+            ))
+        };
+        let resolution = match project::resolve_until(state, &found.workspace, until).await {
+            Joined::Done(Ok(resolution)) => resolution,
+            Joined::Done(Err(error)) => {
+                return Err(not_known(format!(
+                    "the project could not be read: {}",
+                    ErrorChain(&error)
+                )));
+            },
+            Joined::Going(doing) => {
+                let target = match release.target() {
+                    Some(target) => target,
+                    None => state.host().await.triple.clone(),
+                };
+                return Err(Box::new(project::resolving_crate(
+                    &release.name,
+                    &target,
+                    (doing, found.project_from),
+                    &release.warnings,
+                )));
+            },
+            Joined::Ended => return Err(Box::new(get_item::stopped())),
+        };
+        let Resolution::Metadata { metadata, .. } = &*resolution else {
+            return Err(not_known("cargo metadata of the project failed".to_owned()));
+        };
+        let Some(listed) = project::metadata_package(metadata, &found.package) else {
+            return Err(not_known(
+                "it is not in the project's cargo metadata".to_owned(),
+            ));
+        };
+        let dir = listed
+            .manifest_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let root = match &found.package.source {
+            Source::Local => HereRoot::Package {
+                workspace: dir
+                    .starts_with(&metadata.workspace_root)
+                    .then(|| metadata.workspace_root.clone()),
+            },
+            Source::Git(_) => {
+                let checkout = state
+                    .resolver
+                    .cargo_home()
+                    .and_then(|home| get_source::checkout_of(&dir, home));
+                match checkout {
+                    Some(checkout) => HereRoot::Checkout(checkout),
+                    None => return Err(copy(&what, "a vendored copy of a git repository")),
+                }
+            },
+            Source::CratesIo => {
+                return Err(copy(
+                    &what,
+                    "a copy of crates.io's, vendored or from a source that replaces crates.io, \
+                     which may differ from it",
+                ));
+            },
+            Source::Registry(registry) => {
+                return Err(copy(&what, &format!("the registry {registry}")));
+            },
+        };
+        Ok(Here {
+            dir,
+            root,
+            resolved: listed.readme.clone(),
+        })
+    }
+
+    /// Whether the project's package `found` is one of crates.io that cargo unpacked as it is,
+    /// whose `.crate` is read (decided in M3e, decision 79, as in M3c, decision 31).
+    pub(super) fn unpacked_from_crates_io(state: &ToolState, found: &Found) -> bool {
+        matches!(found.package.source, Source::CratesIo)
+            && found
+                .package
+                .manifest_path
+                .as_deref()
+                .and_then(Path::parent)
+                .zip(state.resolver.cargo_home())
+                .is_some_and(|(dir, home)| get_source::unpacked_from_crates_io(dir, home))
+    }
+
+    /// The tool error for the readme of `what`, a copy from `of`, which is not read (decided in
+    /// M3e, decision 79, as in M3c, decision 31).
+    fn copy(what: &str, of: &str) -> Box<CallToolResult> {
+        Box::new(crate::mcp::tool::error_result(&serde_json::json!({
+            "code": "docs_unavailable",
+            "reason": "outside_package",
+            "message": format!("the readme of {what} is not read: the project uses {of}"),
+            "retryable": false,
+            "suggestions": [super::OVERVIEW],
+        })))
+    }
+
+    /// The readme of the package `here`: as `cargo metadata` resolved it, or else as its manifest
+    /// names it, inherited from its workspace too, or of a default name; judged as `get_source`
+    /// judges its files, and shown relative to its directory (`../README.md`).
+    pub(super) fn read(here: &Here) -> Result<ReadReadme, Failure> {
+        let dir = &here.dir;
+        let (named, path, inherited_from) = match &here.resolved {
+            Some(resolved) => (resolved.display().to_string(), dir.join(resolved), None),
+            None => declared(here)?,
+        };
+        let file = get_source::relative_to(&path, dir);
+        readme::judged(&named, &file).map_err(Failure::NoReadme)?;
+        let file: Box<str> = file.into();
+        match &here.root {
+            HereRoot::Package { workspace } => {
+                // The project's workspace; else, for one outside it, its own directory, or the
+                // workspace that lists it, if it inherits its readme (decided in M3e, decision 78).
+                let root = match (workspace, inherited_from) {
+                    (Some(root), _) => root.clone(),
+                    (None, Some(root)) => root,
+                    (None, None) => inherited_root(dir)?.unwrap_or_else(|| dir.clone()),
+                };
+                let package = source_root::Package {
+                    root,
+                    dir: dir.clone(),
+                    readme: Some(path.clone()),
+                    ..source_root::Package::default()
+                };
+                read_at(Root::Package(&package), &path, file)
+            },
+            HereRoot::Checkout(checkout) => read_at(Root::Checkout(checkout), &path, file),
+        }
+    }
+
+    /// The root of the workspace that lists the package in `dir`, if its manifest inherits the
+    /// readme from it (decided in M3e, decision 78).
+    fn inherited_root(dir: &Path) -> Result<Option<PathBuf>, Failure> {
+        let declared =
+            crate_file::manifest_readme(&dir.join("Cargo.toml")).map_err(Failure::Manifest)?;
+        if declared != Declared::Workspace {
+            return Ok(None);
+        }
+        workspaces::listing_workspace(dir, None)
+            .map_err(|error| Failure::Manifest(std::io::Error::other(error)))
+    }
+
+    /// The readme that the manifest of `here` names, as written, where it is, and the root of the
+    /// workspace that it is inherited from, if it is: one that lists the package, no higher than
+    /// the checkout of a git package (decided in M3e, decision 80); or of a default name in its
+    /// directory.
+    fn declared(here: &Here) -> Result<(String, PathBuf, Option<PathBuf>), Failure> {
+        let dir = &here.dir;
+        let declared =
+            crate_file::manifest_readme(&dir.join("Cargo.toml")).map_err(Failure::Manifest)?;
+        match declared {
+            Declared::Path(path) => Ok((path.to_string(), dir.join(&*path), None)),
+            Declared::Disabled => Err(Failure::NoReadme(NoReadme::Disabled)),
+            Declared::Default => DEFAULT_NAMES
+                .into_iter()
+                .find(|name| dir.join(name).is_file())
+                .map(|name| (name.to_owned(), dir.join(name), None))
+                .ok_or(Failure::NoReadme(NoReadme::NoDefault)),
+            Declared::Workspace => {
+                let root = match &here.root {
+                    HereRoot::Checkout(checkout) => {
+                        workspaces::listing_workspace(dir, Some(checkout))
+                    },
+                    HereRoot::Package {
+                        workspace: Some(root),
+                    } => Ok(Some(root.clone())),
+                    HereRoot::Package { workspace: None } => {
+                        workspaces::listing_workspace(dir, None)
+                    },
+                }
+                .map_err(|error| Failure::Manifest(std::io::Error::other(error)))?
+                .ok_or(Failure::NoReadme(NoReadme::NotInherited))?;
+                let inherited = crate_file::workspace_readme(&root.join("Cargo.toml"))
+                    .map_err(Failure::Manifest)?;
+                match inherited {
+                    Some(Declared::Path(path)) => {
+                        Ok((path.to_string(), root.join(&*path), Some(root)))
+                    },
+                    Some(Declared::Disabled) => Err(Failure::NoReadme(NoReadme::Disabled)),
+                    Some(Declared::Default | Declared::Workspace) | None => {
+                        Err(Failure::NoReadme(NoReadme::NotInherited))
+                    },
+                }
+            },
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::data::source_root::Refusal;
+
+        /// Writes `files` under a new temporary directory, whose path is returned as written.
+        fn tree(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+            let dir = tempfile::tempdir().expect("a temporary directory");
+            for (path, contents) in files {
+                let path = dir.path().join(path);
+                std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+                std::fs::write(path, contents).expect("written");
+            }
+            let root = source_root::lexically(dir.path());
+            (dir, root)
+        }
+
+        fn outside(dir: PathBuf, resolved: Option<&str>) -> Here {
+            Here {
+                dir,
+                root: HereRoot::Package { workspace: None },
+                resolved: resolved.map(PathBuf::from),
+            }
+        }
+
+        /// A path dependency outside the project reads its readme under its own directory, or,
+        /// inherited, under the workspace that lists it; a manifest that names `/` as its
+        /// workspace does not widen what is read (decided in M3e, decision 78).
+        #[test]
+        fn a_path_dependency_outside_reads_no_higher_than_it_may() {
+            let (_dir, root) = tree(&[
+                ("secret.md", "secret\n"),
+                (
+                    "dep/Cargo.toml",
+                    "[package]\nname = \"dep\"\nworkspace = \"/\"\nreadme = \"../secret.md\"\n",
+                ),
+                (
+                    "ws/Cargo.toml",
+                    "[workspace]\nmembers = [\"m\"]\n[workspace.package]\nreadme = \"README.md\"\n",
+                ),
+                ("ws/README.md", "# Inherited\n"),
+                (
+                    "ws/m/Cargo.toml",
+                    "[package]\nname = \"m\"\nreadme.workspace = true\n",
+                ),
+            ]);
+            // As cargo metadata resolves it, and as its manifest names it.
+            for resolved in [Some("../secret.md"), None] {
+                let read = read(&outside(root.join("dep"), resolved));
+                assert!(
+                    matches!(read, Err(Failure::Refused(_, Refusal::Outside))),
+                    "{read:?}"
+                );
+            }
+            for resolved in [Some("../README.md"), None] {
+                let read = read(&outside(root.join("ws/m"), resolved)).expect("read");
+                assert_eq!(&*read.file, "../README.md");
+                assert_eq!(read.contents, b"# Inherited\n");
+            }
+        }
+
+        /// A readme that leads through a symlink to a file that is not a document is not read.
+        #[cfg(unix)]
+        #[test]
+        fn a_readme_that_links_to_another_file_is_not_read() {
+            let (_dir, root) = tree(&[
+                ("dep/Cargo.toml", "[package]\nname = \"dep\"\n"),
+                ("dep/Cargo.lock", "# lock\n"),
+            ]);
+            std::os::unix::fs::symlink(root.join("dep/Cargo.lock"), root.join("dep/README.md"))
+                .expect("linked");
+            let read = read(&outside(root.join("dep"), None));
+            assert!(
+                matches!(read, Err(Failure::NoReadme(NoReadme::NotADocument(_)))),
+                "{read:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

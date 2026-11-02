@@ -2499,6 +2499,63 @@ fn inspect_features_tells_a_members_features_and_whether_the_project_enables_the
     assert!(server.finish().success());
 }
 
+/// `get_readme` reads a member's readme where it is, without building it: `front`'s, inherited
+/// from the workspace, and `back`'s of a default name (decided in M3e, decisions 78 and 80, as in
+/// M3, P8).
+#[cfg(feature = "local")]
+#[test]
+fn get_readme_reads_a_members_readme_where_it_is() {
+    let dir = TempDir::new().expect("a temporary directory");
+    write_front_and_back(dir.path());
+    std::fs::write(dir.path().join("back/README.txt"), "Back.\n").expect("written");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = Server::start_in(Some(dir.path()));
+    // Again while cargo reads the project, past the call's deadline.
+    let mut id = 0_u64;
+    let mut call = |crate_name: &str| {
+        let mut told = Value::Null;
+        for _ in 0..60 {
+            id += 1;
+            server.send(&call_tool(id, "get_readme", json!({ "crate": crate_name })));
+            told = server.response(id)["result"].clone();
+            if told["structuredContent"]["status"] != "building" {
+                break;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        told
+    };
+    let front = call("front");
+    assert_ne!(front["isError"], true, "{front}");
+    let data = &front["structuredContent"]["data"];
+    assert_eq!(data["file"], "../README.md", "{front}");
+    assert_eq!(data["text"], "# The workspace\n", "{front}");
+    assert_eq!(
+        front["structuredContent"]["provenance"]["source"],
+        "project"
+    );
+    let back = call("back");
+    assert_ne!(back["isError"], true, "{back}");
+    assert_eq!(
+        back["structuredContent"]["data"]["file"], "README.txt",
+        "{back}"
+    );
+    assert_eq!(
+        back["structuredContent"]["data"]["format"], "text",
+        "{back}"
+    );
+    assert!(server.finish().success());
+}
+
 /// Writes the workspace of [`a_member_is_built_with_the_features_of_the_workspace`] in `dir`.
 #[cfg(feature = "local")]
 fn write_front_and_back(dir: &Path) {
@@ -3976,6 +4033,7 @@ fn build_external_docs_builds_a_release_that_no_project_uses() {
             .feature("default", &[])
             .feature("extra", &[])
             .manifest_tail("\n[package.metadata.docs.rs]\nfeatures = [\"extra\"]\n")
+            .file("README.md", "# Far\n")
             .file(
                 "src/lib.rs",
                 "pub use fixture_leaf::leaf;\npub fn far() {}\n#[cfg(feature = \"extra\")]\n\
@@ -4022,6 +4080,18 @@ fn build_external_docs_builds_a_release_that_no_project_uses() {
     // crates.io, whose files may differ from crates.io's (decided in M3c, decision 31).
     let source = called_until_done(&mut server, 200, "get_source", &lookup);
     assert_eq!(text_json(&source)["reason"], "outside_package", "{source}");
+    // Its readme is read from its `.crate`, a release that the project does not use, whose
+    // manifest names none: of the first default name (decided in M3e).
+    let readme = called_until_done(
+        &mut server,
+        300,
+        "get_readme",
+        &json!({ "crate": "fixture-far@0.2.0" }),
+    );
+    assert_eq!(
+        readme["structuredContent"]["data"]["text"], "# Far\n",
+        "{readme}"
+    );
     // Its features are those that its `.crate` asks docs.rs for.
     assert!(
         registry
@@ -4442,6 +4512,8 @@ fn git_repository(dir: &Path) -> (PathBuf, PathBuf, String) {
          pub trait Shape {}\nimpl Shape for Thing {}\n",
     )
     .expect("written");
+    // A readme that the manifest does not name, of the first default name.
+    std::fs::write(work.join("README.md"), "# Fixture\n").expect("written");
     git_in(&work, &gitconfig, &[
         "init",
         "--quiet",
@@ -4569,6 +4641,7 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
         ("search_items", with(json!({ "query": "first" }))),
         ("resolve_version", with(json!({}))),
         ("inspect_features", with(json!({}))),
+        ("get_readme", with(json!({}))),
     ];
     for (id, (tool, arguments)) in (100_u64..).zip(tools) {
         server.send(&call_tool(id, tool, arguments));
@@ -4598,6 +4671,11 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
         features,
         json!([{ "name": "extra", "enables": [], "items": 1 }])
     );
+    // Its readme, from its checkout (decided in M3e, decision 80).
+    server.send(&call_tool(201, "get_readme", with(json!({}))));
+    let readme = server.response(201)["result"]["structuredContent"]["data"].clone();
+    assert_eq!(readme["file"], "README.md", "{readme}");
+    assert_eq!(readme["text"], "# Fixture\n", "{readme}");
     reads_the_source_of_the_git_crate(&mut server, &with(json!({})));
     looked_up_by_hash_and_when_stale(&mut server, &commit);
     looked_up_while_rebuilding(&mut server, &commit);

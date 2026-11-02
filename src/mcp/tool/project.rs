@@ -21,7 +21,7 @@ use crate::data::flight::{Doing, Joined};
 use crate::data::{
     cargo::{Failure, GitFetchFailure},
     cargo_config::{self, CargoConfig},
-    metadata::{CargoError, Featured, Resolution, ResolveError, Resolved},
+    metadata::{self, CargoError, Featured, Resolution, ResolveError, Resolved},
     packages::{Candidate, Lookup, PackageGraph, ProjectPackage},
     project::{self, DefaultProject, ProjectFrom, Workspace},
 };
@@ -808,6 +808,23 @@ pub(super) fn resolve_error(workspace: &Workspace, error: &ResolveError) -> Call
         ResolveError::Stopped => super::get_item::stopped(),
         ResolveError::NotRecorded => recorded_workspace::no_record(&workspace.root, None),
     }
+}
+
+/// The package of `metadata` that is the project's `package`: of its name and version, and of its
+/// manifest when that is known.
+#[cfg(feature = "local")]
+pub(super) fn metadata_package<'m>(
+    metadata: &'m metadata::Metadata,
+    package: &ProjectPackage,
+) -> Option<&'m metadata::Package> {
+    metadata.packages.iter().find(|listed| {
+        *listed.name == *package.name
+            && listed.version == package.version
+            && package
+                .manifest_path
+                .as_ref()
+                .is_none_or(|manifest| *manifest == listed.manifest_path)
+    })
 }
 
 /// The packages of `workspace` as `cargo metadata` resolves them, waiting for it until `until`;

@@ -906,15 +906,7 @@ async fn project_features(
             &["read the [features] of its Cargo.toml"],
         )));
     };
-    let Some(package) = metadata.packages.iter().find(|package| {
-        *package.name == *found.package.name
-            && package.version == found.package.version
-            && found
-                .package
-                .manifest_path
-                .as_ref()
-                .is_none_or(|manifest| *manifest == package.manifest_path)
-    }) else {
+    let Some(package) = project::metadata_package(metadata, &found.package) else {
         return Err(Box::new(super::tool_error(
             "docs_unavailable",
             &format!("the features of {what} are not in the project's cargo metadata"),
