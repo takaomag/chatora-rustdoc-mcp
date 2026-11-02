@@ -86,50 +86,10 @@ pub(super) fn definition() -> Tool {
 /// ones is left out when it has no value.
 fn output_schema() -> JsonObject {
     let strings = json!({ "type": "array", "items": { "type": "string" } });
-    let mut schema = object(json!({
+    object(json!({
         "type": "object",
         "properties": {
-            "provenance": {
-                "type": "object",
-                "properties": {
-                    "source": {
-                        "type": "string",
-                        "enum": ["crates.io", "project", "local"],
-                        "description": "local: a crate of git that build_external_docs recorded.",
-                    },
-                    "crate": { "type": "string" },
-                    "version": { "type": "string" },
-                    "resolved_from": {
-                        "type": "string",
-                        "enum": ["explicit", "explicit_req", "latest", "cargo_lock", "cargo_lock_raw", "git", "external"],
-                    },
-                    "project_from": {
-                        "type": "string",
-                        "enum": ["argument", "claude_project_dir", "cwd"],
-                    },
-                    "index_fetched_at": {
-                        "type": "string",
-                        "description": "When the crates.io index was read (RFC 3339), when it \
-                                        was older than it is trusted for, as offline.",
-                    },
-                    "target": { "type": "string" },
-                    "package_source": { "type": "string", "enum": ["git"] },
-                    "recorded_by": { "type": "string", "enum": ["build_external_docs"] },
-                    "stale": { "type": "boolean" },
-                    "stale_reason": {
-                        "type": "string",
-                        "enum": ["ref_ttl_expired", "inputs_changed", "project_missing"],
-                        "description": "ref_ttl_expired: a branch or a tag of git was resolved \
-                                        more than a day ago, at resolved_at. inputs_changed: the \
-                                        workspace outside the default project that \
-                                        build_external_docs recorded changed since. \
-                                        project_missing: its directory is gone.",
-                    },
-                },
-                // Before the version is known, a response while it is resolved has no `version`
-                // or `source` (requirement R-OUT-9).
-                "required": ["crate", "target"],
-            },
+            "provenance": provenance_schema(),
             "warnings": strings,
             "data": {
                 "type": "object",
@@ -155,15 +115,56 @@ fn output_schema() -> JsonObject {
             "hints": strings,
         },
         "required": ["provenance", "data"],
-    }));
-    if let Some(Value::Object(provenance)) = schema
-        .get_mut("properties")
-        .and_then(|properties| properties.get_mut("provenance"))
-        && let Some(Value::Object(properties)) = provenance.get_mut("properties")
-    {
+    }))
+}
+
+/// The schema of the provenance of a release resolved, which `inspect_features` tells too.
+pub(super) fn provenance_schema() -> Value {
+    let mut provenance = json!({
+        "type": "object",
+        "properties": {
+            "source": {
+                "type": "string",
+                "enum": ["crates.io", "project", "local"],
+                "description": "local: a crate of git that build_external_docs recorded.",
+            },
+            "crate": { "type": "string" },
+            "version": { "type": "string" },
+            "resolved_from": {
+                "type": "string",
+                "enum": ["explicit", "explicit_req", "latest", "cargo_lock", "cargo_lock_raw", "git", "external"],
+            },
+            "project_from": {
+                "type": "string",
+                "enum": ["argument", "claude_project_dir", "cwd"],
+            },
+            "index_fetched_at": {
+                "type": "string",
+                "description": "When the crates.io index was read (RFC 3339), when it \
+                                was older than it is trusted for, as offline.",
+            },
+            "target": { "type": "string" },
+            "package_source": { "type": "string", "enum": ["git"] },
+            "recorded_by": { "type": "string", "enum": ["build_external_docs"] },
+            "stale": { "type": "boolean" },
+            "stale_reason": {
+                "type": "string",
+                "enum": ["ref_ttl_expired", "inputs_changed", "project_missing"],
+                "description": "ref_ttl_expired: a branch or a tag of git was resolved \
+                                more than a day ago, at resolved_at. inputs_changed: the \
+                                workspace outside the default project that \
+                                build_external_docs recorded changed since. \
+                                project_missing: its directory is gone.",
+            },
+        },
+        // Before the version is known, a response while it is resolved has no `version`
+        // or `source` (requirement R-OUT-9).
+        "required": ["crate", "target"],
+    });
+    if let Some(Value::Object(properties)) = provenance.get_mut("properties") {
         properties.extend(get_item::git_provenance_properties());
     }
-    schema
+    provenance
 }
 
 /// The object inside `value`, which is always an object here.

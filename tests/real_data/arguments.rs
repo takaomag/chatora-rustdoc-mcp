@@ -126,6 +126,16 @@ fn item_cases() -> Vec<Case> {
             ("lines", Change::Set(json!("6-9"))),
         ],
     ));
+    cases.extend(shared("inspect_features", &json!({})));
+    cases.extend(each("inspect_features", &json!({ "crate": TOKIO }), vec![
+        ("feature", Change::Set(json!("net"))),
+        ("limit", Change::Set(json!(2))),
+    ]));
+    cases.extend(each(
+        "inspect_features",
+        &json!({ "crate": TOKIO, "limit": 2 }),
+        vec![("cursor", Change::NextCursor)],
+    ));
     cases.extend(shared("crate_overview", &json!({})));
     cases.extend(each("crate_overview", &json!({ "crate": TOKIO }), vec![(
         "detail",
@@ -260,6 +270,7 @@ fn refresh_cases() -> Vec<Case> {
         "crate_overview",
         "get_item",
         "get_source",
+        "inspect_features",
         "list_crates",
         "list_implementors",
         "list_impls",

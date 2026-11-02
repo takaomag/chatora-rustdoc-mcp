@@ -252,13 +252,12 @@ impl FeatureTree {
     }
 
     /// The values of the features `enabled` that enable a dependency or its feature, as written
-    /// (`dep:mio`, `hyper/http1`, `hyper?/http1`), but those of the features that optional
-    /// dependencies make, whose features tell them.
+    /// (`dep:mio`, `hyper/http1`, `hyper?/http1`), with `dep:x` of a feature that an optional
+    /// dependency `x` makes.
     #[must_use]
     pub fn dependencies<'s>(&'s self, enabled: &BTreeSet<&'s str>) -> BTreeSet<&'s str> {
         enabled
             .iter()
-            .filter(|feature| !self.is_implicit(feature))
             .filter_map(|feature| self.values(feature))
             .flatten()
             .map(AsRef::as_ref)
@@ -412,6 +411,9 @@ mod tests {
         assert!(enabled_by["full"].is_empty());
         let full = tree.closure(["net"]);
         assert_eq!(tree.dependencies(&full).into_iter().collect::<Vec<_>>(), [
+            "dep:libc",
+            "dep:mio",
+            "dep:socket2",
             "mio/net",
             "mio/os-poll"
         ]);
@@ -419,7 +421,13 @@ mod tests {
             tree.dependencies(&tree.closure(["io-uring"]))
                 .into_iter()
                 .collect::<Vec<_>>(),
-            ["dep:io-uring", "dep:slab", "mio/os-poll"]
+            [
+                "dep:io-uring",
+                "dep:libc",
+                "dep:mio",
+                "dep:slab",
+                "mio/os-poll"
+            ]
         );
     }
 

@@ -19,6 +19,7 @@ mod external_target;
 mod external_workspace;
 mod get_item;
 mod get_source;
+mod inspect_features;
 #[cfg(feature = "local")]
 mod list_crates;
 mod list_implementors;
@@ -394,6 +395,7 @@ pub(super) fn definitions() -> Vec<Tool> {
         crate_overview::definition(),
         get_item::definition(),
         get_source::definition(),
+        inspect_features::definition(),
         // A project is needed, which only local features read (requirement R-ARCH-4).
         #[cfg(feature = "local")]
         list_crates::definition(),
@@ -455,7 +457,11 @@ fn with_git(mut tool: Tool) -> Tool {
     let Some(Value::Object(properties)) = schema.get_mut("properties") else {
         return tool;
     };
-    if !properties.contains_key("crate") || tool.name == "list_crates" {
+    // `inspect_features` reads the features of crates.io releases only, for now (M3d, D1b).
+    if !properties.contains_key("crate")
+        || tool.name == "list_crates"
+        || tool.name == inspect_features::NAME
+    {
         return tool;
     }
     let arguments = if tool.name == "build_external_docs" {
@@ -817,6 +823,14 @@ async fn dispatch(
         get_source::NAME => match get_source::parse_arguments(request.arguments.as_ref()) {
             Ok(arguments) => Ok(run_tool(get_source::execute(arguments, Arc::clone(state))).await),
             Err(error) => Ok(error.into_result()),
+        },
+        inspect_features::NAME => {
+            match inspect_features::parse_arguments(request.arguments.as_ref()) {
+                Ok(inspect) => {
+                    Ok(run_tool(inspect_features::execute(inspect, Arc::clone(state))).await)
+                },
+                Err(error) => Ok(error.into_result()),
+            }
         },
         list_impls::NAME => match list_impls::parse_arguments(request.arguments.as_ref()) {
             Ok(arguments) => Ok(run_tool(list_impls::execute(arguments, Arc::clone(state))).await),
@@ -1269,7 +1283,7 @@ mod tests {
         let name = "serde".parse().expect("a crate name");
         let going = (Doing::WaitingForLock, "claude_project_dir");
         let mut tools = ONE_CRATE.to_vec();
-        tools.push(resolve_version::NAME);
+        tools.extend([resolve_version::NAME, inspect_features::NAME]);
         fits_the_schemas(project::resolving_crate(&name, &target, going, &[]), &tools);
         let mut provenance = serde_json::Map::new();
         provenance.insert("source".to_owned(), json!("project"));

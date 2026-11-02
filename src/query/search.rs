@@ -1347,7 +1347,7 @@ fn did_you_mean(searched: &[Searched<'_>], query: &str) -> Box<[Box<str>]> {
 }
 
 /// The edit distance between `a` and `b`, counted in characters (requirement R-PR-7).
-fn edit_distance(a: &str, b: &str) -> usize {
+pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let mut row: Vec<usize> = (0..=b.len()).collect();
     for (i, a_char) in a.chars().enumerate() {

@@ -214,8 +214,36 @@ fn other_questions() -> Vec<Question> {
     ]
 }
 
+/// The questions about crates' features.
+fn feature_questions() -> Vec<Question> {
+    vec![
+        question(
+            "inspect_features",
+            "which feature of axum do I enable for websockets?",
+            json!({ "crate": "axum@0.8.9", "feature": "ws" }),
+            |result| {
+                result["data"]["features"][0]["name"] == "ws"
+                    && has(
+                        &result["data"]["features"][0]["dependencies"],
+                        "tungstenite",
+                    )
+            },
+        ),
+        question(
+            "inspect_features",
+            "what does tokio's `full` enable?",
+            json!({ "crate": "tokio@1.53.3", "feature": "full" }),
+            |result| {
+                has(&result["data"]["features"][0]["closure"], "rt-multi-thread")
+                    && has(&result["data"]["features"][0]["closure"], "net")
+            },
+        ),
+    ]
+}
+
 fn questions() -> Vec<Question> {
     let mut questions = item_questions();
+    questions.extend(feature_questions());
     questions.extend(other_questions());
     questions.extend(
         [

@@ -1483,7 +1483,12 @@ fn tools_list_is_cacheable_and_not_paginated() {
     if cfg!(feature = "local") {
         expected.push("build_external_docs");
     }
-    expected.extend(["crate_overview", "get_item", "get_source"]);
+    expected.extend([
+        "crate_overview",
+        "get_item",
+        "get_source",
+        "inspect_features",
+    ]);
     if cfg!(feature = "local") {
         expected.push("list_crates");
     }
@@ -7165,6 +7170,112 @@ fn a_crate_that_takes_long_to_fetch_is_building_and_then_answered() {
     let last = calls.last().expect("a record of the last call");
     assert!(last.get("status").is_none(), "{last}");
     assert_eq!(last["cache"], "hit", "{last}");
+}
+
+/// `inspect_features` tells a release's features from its index line, offline, and those that
+/// docs.rs's build did not enable from its `.crate`, without its documentation; one feature
+/// alone, and one that the crate does not have (decided in M3d, decisions 38, 41, 46 and 47).
+#[test]
+fn inspect_features_tells_the_features_from_the_index_and_the_crate_file() {
+    let cache = test_cache();
+    // demo 0.2.0, whose documentation is not in the cache, and whose `.crate` has features that
+    // docs.rs's build, of the default ones, does not all enable.
+    let manifest = "[package]\nname = \"demo\"\nversion = \"0.2.0\"\n[features]\n\
+                    default = [\"extra\"]\nextra = []\nfull = [\"extra\", \"dep:serde\"]\n\
+                    [dependencies]\nserde = { version = \"1\", optional = true }\n\
+                    [target.'cfg(unix)'.dependencies]\nlog = { version = \"0.4\", optional = true }\n";
+    let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest.len().try_into().expect("small"));
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "demo-0.2.0/Cargo.toml", manifest.as_bytes())
+        .expect("appended");
+    let crate_file = builder
+        .into_inner()
+        .and_then(GzEncoder::finish)
+        .expect("finished");
+    let store = Cache::at(cache.path());
+    let path = store.crate_file_path(&"demo".parse().expect("a name"), &Version::new(0, 2, 0));
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+    std::fs::write(&path, &crate_file).expect("written");
+    std::fs::write(path.with_extension("crate.sha256"), sha256_hex(&crate_file)).expect("written");
+    // Its index line, with a feature in `features2` and the optional dependencies.
+    let line = json!({
+        "name": "demo",
+        "vers": "0.2.0",
+        "deps": [
+            { "name": "serde", "req": "^1", "optional": true },
+            { "name": "log", "req": "^0.4", "optional": true, "target": "cfg(unix)" },
+        ],
+        "cksum": sha256_hex(&crate_file),
+        "features": { "default": ["extra"], "extra": [] },
+        "features2": { "full": ["extra", "dep:serde"] },
+        "yanked": false,
+        "v": 2,
+    });
+    let index = cache.path().join("index.crates.io/de/mo/demo");
+    std::fs::create_dir_all(index.parent().expect("a parent")).expect("made");
+    std::fs::write(&index, format!("{line}\n")).expect("written");
+    std::fs::write(
+        index.with_file_name("demo.meta.json"),
+        json!({ "etag": null, "last_modified": null, "fetched_at": 1_700_000_000 }).to_string(),
+    )
+    .expect("written");
+    let mut server = Server::start_with_cache(cache, None, &[(
+        "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE",
+        "true",
+    )]);
+    let call = |server: &mut Server, id, arguments: Value| {
+        server.send(&call_tool(id, "inspect_features", arguments));
+        server.response(id)["result"].clone()
+    };
+    let all = call(
+        &mut server,
+        1,
+        json!({ "crate": "demo@0.2.0", "target": TARGET }),
+    );
+    assert_eq!(all["isError"], false, "{all}");
+    let content = &all["structuredContent"];
+    assert_eq!(content["provenance"]["version"], "0.2.0", "{all}");
+    assert_eq!(content["data"]["default"], json!(["extra"]), "{all}");
+    let features = content["data"]["features"].as_array().expect("features");
+    let names: Vec<&str> = features
+        .iter()
+        .filter_map(|feature| feature["name"].as_str())
+        .collect();
+    assert_eq!(names, ["default", "extra", "full", "log"], "{all}");
+    // Neither `full` nor the one that `log` makes is in docs.rs's build of the default features.
+    for feature in features {
+        let in_docs = !matches!(feature["name"].as_str(), Some("full" | "log"));
+        assert_eq!(
+            feature.get("in_docs").is_none(),
+            in_docs,
+            "{feature}: {all}"
+        );
+    }
+    assert_eq!(features[3]["implicit"], true, "{all}");
+    assert_eq!(content["page"]["total"], 4, "{all}");
+    let one = call(
+        &mut server,
+        2,
+        json!({ "crate": "demo@0.2.0", "target": TARGET, "feature": "extra" }),
+    );
+    assert_eq!(
+        one["structuredContent"]["data"]["features"][0]["enabled_by"],
+        json!(["default", "full"]),
+        "{one}"
+    );
+    let none = call(
+        &mut server,
+        3,
+        json!({ "crate": "demo@0.2.0", "target": TARGET, "feature": "ful" }),
+    );
+    let body = text_json(&none);
+    assert_eq!(body["code"], "invalid_argument", "{none}");
+    assert!(body["suggestions"].to_string().contains("full"), "{none}");
+    assert!(server.finish().success());
 }
 
 /// A server whose docs.rs is the server `docs_rs`, whose calls wait for work two thirds of
