@@ -472,7 +472,7 @@ pub fn declared_features<'a>(
     features
         .into_iter()
         .filter(|feature| {
-            package.features.contains(*feature) && super::crate_file::is_feature_name(feature)
+            package.features.contains_key(*feature) && super::crate_file::is_feature_name(feature)
         })
         .cloned()
         .collect()

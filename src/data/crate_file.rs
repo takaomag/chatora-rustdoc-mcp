@@ -342,13 +342,33 @@ pub struct DocsRsBuild {
 ///
 /// Returns an error when the manifest cannot be read or is not TOML.
 pub fn member_docs_rs(manifest: &Path) -> io::Result<DocsRsBuild> {
+    Ok(build_of(&manifest_table(manifest)?))
+}
+
+/// The features of the package whose `Cargo.toml` is at `manifest`, as Cargo reads them: of a
+/// crate of git whose `cargo metadata` is not kept (decided in M3d, D2).
+///
+/// # Errors
+///
+/// Returns an error when the manifest cannot be read or is not TOML.
+pub fn manifest_features(manifest: &Path) -> io::Result<FeatureTree> {
+    Ok(FeatureTree::from_manifest(&manifest_table(manifest)?))
+}
+
+/// The manifest at `manifest`, which one larger than [`MAX_MANIFEST_BYTES`] is not, rather than
+/// read in part.
+fn manifest_table(manifest: &Path) -> io::Result<toml::Table> {
     let mut text = String::new();
     fs::File::open(manifest)?
-        .take(MAX_MANIFEST_BYTES)
+        .take(MAX_MANIFEST_BYTES.saturating_add(1))
         .read_to_string(&mut text)?;
-    let table: toml::Table =
-        toml::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    Ok(build_of(&table))
+    if u64::try_from(text.len()).is_ok_and(|len| len > MAX_MANIFEST_BYTES) {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("the manifest is larger than {MAX_MANIFEST_BYTES} bytes"),
+        ));
+    }
+    toml::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// How docs.rs built `name` at `version`, from the `Cargo.toml` in its `.crate` `contents`.
@@ -737,6 +757,34 @@ features = ["serde/derive"]
         assert!(build.missing.is_empty(), "{build:?}");
         assert!(build.default.is_empty(), "{build:?}");
         assert_eq!(&*build.declared, [Box::from("default"), "serde".into()]);
+    }
+
+    /// The features of a manifest on disk, as of a crate of git; one that is not TOML is an
+    /// error (decided in M3d, D2).
+    #[test]
+    fn a_manifest_on_disk_tells_its_features() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let manifest = dir.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"demo\"\n[features]\nfull = [\"dep:x\"]\n\
+             [dependencies]\nx = { version = \"1\", optional = true }\n\
+             y = { version = \"1\", optional = true }\n",
+        )
+        .expect("written");
+        let tree = manifest_features(&manifest).expect("read");
+        assert_eq!(tree.names().collect::<Vec<_>>(), ["full", "y"]);
+        fs::write(&manifest, "[package").expect("written");
+        let error = manifest_features(&manifest).expect_err("not TOML");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // One too large is not read in part.
+        let large = format!(
+            "[package]\nname = \"demo\"\n#{}\n",
+            "x".repeat(usize::try_from(MAX_MANIFEST_BYTES).expect("small"))
+        );
+        fs::write(&manifest, large).expect("written");
+        let error = manifest_features(&manifest).expect_err("too large");
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
     }
 
     #[test]

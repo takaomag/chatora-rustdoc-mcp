@@ -21,6 +21,7 @@ use super::{
     cargo::{self, Failure, RunError},
     cargo_config,
     cargo_lock::CargoLock,
+    feature_tree::FeatureTree,
     features::{self, FeatureSets},
     flight::{Flights, Joined, Stage},
     project::{self, Workspace},
@@ -121,22 +122,63 @@ pub struct Package {
     pub manifest_path: PathBuf,
     /// Its targets: the lib, bins, examples, tests, benches and build script.
     pub targets: Box<[Target]>,
-    /// The names of the features it declares, with those of its optional dependencies.
-    #[serde(default, deserialize_with = "feature_names")]
-    pub features: BTreeSet<Box<str>>,
+    /// The features it declares, with what each enables, and those of its optional dependencies,
+    /// as `"x": ["dep:x"]` (decided in M3d, decision 48).
+    #[serde(default)]
+    pub features: BTreeMap<Box<str>, Box<[Box<str>]>>,
+    /// Its dependencies, of every kind.
+    #[serde(default)]
+    pub dependencies: Box<[Dependency]>,
     /// Its readme, as its manifest names it, relative to its directory, inherited from its
     /// workspace too; `None` without one (requirement R-SC-4).
     #[serde(default)]
     pub readme: Option<PathBuf>,
 }
 
-/// The names of the features of a package: the keys of its `features`.
-fn feature_names<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<BTreeSet<Box<str>>, D::Error> {
-    // Each with what it enables, which is not kept.
-    let features: BTreeMap<Box<str>, Vec<Box<str>>> = Deserialize::deserialize(deserializer)?;
-    Ok(features.into_keys().collect())
+/// A dependency of a package, as its manifest declares it.
+#[derive(Debug, Deserialize)]
+pub struct Dependency {
+    /// The name of the package it is.
+    pub name: Box<str>,
+    /// The name that the manifest gives it, if another (`package =`), which its features use.
+    #[serde(default)]
+    pub rename: Option<Box<str>>,
+    /// Whether it is optional, which makes a feature of its name.
+    #[serde(default)]
+    pub optional: bool,
+}
+
+impl Package {
+    /// Its features as Cargo reads them (decided in M3d, decision 48). Those that `cargo
+    /// metadata` lists for its optional dependencies, `"x": ["dep:x"]` where no other names
+    /// `dep:x`, are taken for the ones that Cargo makes, which one written so means too.
+    #[must_use]
+    pub fn feature_tree(&self) -> FeatureTree {
+        let optional: BTreeSet<&str> = self
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.optional)
+            .map(|dependency| dependency.rename.as_deref().unwrap_or(&dependency.name))
+            .collect();
+        let named = |dependency: &str| {
+            self.features
+                .values()
+                .flatten()
+                .filter(|value| value.strip_prefix("dep:") == Some(dependency))
+                .count()
+        };
+        let made = |name: &str, values: &[Box<str>]| {
+            optional.contains(name)
+                && matches!(values, [value] if value.strip_prefix("dep:") == Some(name))
+                && named(name) == 1
+        };
+        let declared = self
+            .features
+            .iter()
+            .filter(|(name, values)| !made(name, values))
+            .map(|(name, values)| (name.as_ref(), values.iter().map(AsRef::as_ref).collect()));
+        FeatureTree::new(declared, optional.iter().copied())
+    }
 }
 
 /// A target of a package.
@@ -1242,6 +1284,83 @@ mod tests {
         let other = failed(Failure::Other);
         assert!(lasts(&other, Duration::ZERO));
         assert!(!lasts(&other, long_after));
+    }
+
+    /// A package's features are read with their values, and those that `cargo metadata` lists for
+    /// its optional dependencies, by the names that it gives them, are taken for the ones that
+    /// Cargo makes; one that another feature names with `dep:` is the package's own (decided in
+    /// M3d, decision 48).
+    #[test]
+    fn a_packages_features_are_read_with_its_optional_dependencies() {
+        let package: Package = serde_json::from_value(serde_json::json!({
+            "id": "path+file:///w#app@0.1.0",
+            "name": "app",
+            "version": "0.1.0",
+            "source": null,
+            "manifest_path": "/w/Cargo.toml",
+            "targets": [],
+            "features": {
+                "default": ["tls"],
+                "tls": ["dep:native-tls", "log"],
+                "serde": ["dep:serde"],
+                "hyper": ["dep:hyper"],
+                "log": ["dep:log"],
+                "json": ["serde/std", "dep:log"],
+            },
+            "dependencies": [
+                { "name": "native-tls", "optional": true, "kind": null },
+                { "name": "serde", "optional": true, "kind": null },
+                { "name": "hyper-x", "rename": "hyper", "optional": true, "kind": null },
+                { "name": "log", "optional": true, "kind": "build" },
+                { "name": "bytes", "optional": false, "kind": null },
+            ],
+        }))
+        .expect("a package");
+        let tree = package.feature_tree();
+        assert_eq!(tree.names().collect::<Vec<_>>(), [
+            "default", "hyper", "json", "log", "serde", "tls"
+        ]);
+        for (feature, implicit) in [
+            ("serde", true),
+            ("hyper", true),
+            ("log", false),
+            ("tls", false),
+        ] {
+            assert_eq!(tree.is_implicit(feature), implicit, "{feature}");
+        }
+        assert_eq!(tree.closure(["json"]).into_iter().collect::<Vec<_>>(), [
+            "json", "serde"
+        ]);
+        // A dependency of two kinds or targets, one of them optional, makes a feature; so does one
+        // that the features do not list, as an old Cargo gives them.
+        let old: Package = serde_json::from_value(serde_json::json!({
+            "id": "path+file:///w#app@0.1.0",
+            "name": "app",
+            "version": "0.1.0",
+            "source": null,
+            "manifest_path": "/w/Cargo.toml",
+            "targets": [],
+            "features": { "default": [] },
+            "dependencies": [
+                { "name": "libc", "optional": false, "kind": null, "target": "cfg(unix)" },
+                { "name": "libc", "optional": true, "kind": null, "target": "cfg(windows)" },
+            ],
+        }))
+        .expect("a package");
+        let tree = old.feature_tree();
+        assert_eq!(tree.names().collect::<Vec<_>>(), ["default", "libc"]);
+        assert!(tree.is_implicit("libc"));
+        // Without them, as `cargo metadata` of an old Cargo might give it.
+        let bare: Package = serde_json::from_value(serde_json::json!({
+            "id": "path+file:///w#app@0.1.0",
+            "name": "app",
+            "version": "0.1.0",
+            "source": null,
+            "manifest_path": "/w/Cargo.toml",
+            "targets": [],
+        }))
+        .expect("a package");
+        assert!(bare.feature_tree().is_empty());
     }
 
     #[test]

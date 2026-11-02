@@ -349,6 +349,25 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 組み替えた後の再レビュー (サブエージェント、読むだけ) の対応: プロジェクトの crates.io の写しで index に無いもの (provenance の source が `project`) も crates.io のリリースと扱わず `build_unsupported` に。中身が crates.io と違う写し (`docs_rs_json: not_on_docs_rs` で Cargo.lock から) には「crates.io のリリースの feature で、プロジェクトの写しには無いかもしれない」warning。`git`・`rev`・`branch`・`tag` は D2 まで inputSchema に足さない (`with_git` の例外。checks の検査と実データのケースも)。`enables` と `data.default` も 50 件で切り `*_total`、warnings と hints を含めて大きさを測る。resolve_version の hints を写す。`refresh` で `.crate` の取得の失敗を忘れる。`.crate` の取得は呼び出しの期限まで (過ぎれば warning)。index に載る版の行が読めないときは `version_not_found` でなく読めない旨。`dependencies` に暗黙の feature の `dep:x` も入れる (古い書き方の `ws = ["tokio-tungstenite"]` も依存として見える)。説明文に crates.io のリリースだけ・`in_docs` は docs.rs が文書を持つときだけ・`_total` を書いた (1,612 字)
 - 残したもの: `enabled_in_project` (決定 45) と crates.io 以外の crate は D2、item の数と一覧は D3。`in_docs: false` の feature に `build_external_docs` の案内 (決定 46) はまだ付けていない (D2 で、ローカル機能のある構成だけ)
 
+**D2 の下調べ (2026-11-02。サブエージェント、読むだけ。LSP は使わず grep と Read。ネットワークなし)**: resolve_version の応答の JSON には package の位置 (workspace・manifest) が無く、member と path 依存も見分けられないので、D2 では resolve_version の内部の結果 (`project::Found`・`GitFound`) を受け取る形にする。プロジェクトの feature の組は `project::features_until` (cargo tree を 2 回。同時の呼び出しは合流し、結果は保持され、外の workspace は記録を読むだけ)。cargo metadata は暗黙の feature を `"x": ["dep:x"]` で持ち、`metadata::Package` は値を捨てて名前だけを残している。依存 (`dependencies` の `name`・`rename`・`optional`) は読んでいない。外の workspace の記録は cargo metadata の全文を持つ。引数 `git` の crate は metadata を残さず、記録の `package_root` と `features_effective` がある。`build_external_docs` に `features` 引数は無く (v1 では持たせないと要件で決定済み)、crates.io のリリースは docs.rs と同じ `[package.metadata.docs.rs]` の組で作る
+
+**D2 で利用者が決めたこと**:
+
+- 決定 48 (D2) プロジェクトの package (member・path・git の依存・外の workspace の記録) の feature は cargo metadata から読む (`Package` に feature の値と optional の依存を残す。値がちょうど `dep:x` の feature は暗黙と推定する)
+- 決定 49 (D2) ローカルでビルドする member・path・git の依存には `in_docs` を付けない (文書はプロジェクトの通常の組で作るので `enabled_in_project` と同じ)。member の `[package.metadata.docs.rs]` が組を求めるときだけ「get_item はその組で作ることがある」warning。引数 `git` の crate と外の記録の member は、記録の `features_effective` から正確な `in_docs` を付ける
+- 決定 50 (D2) プロジェクトの feature の組がまだ取れていないときは、木をすぐ返し、`enabled_in_project` を省いて「プロジェクトの組を読んでいる」warning と呼び直しの案内を付ける (get_item と list_crates の前例、決定 42 と同じ形)
+- 決定 51 (D2) 決定 46 の `build_external_docs` の案内は正しくない (`features` 引数が無く、docs.rs と同じ組で作る) ので改める: 「docs.rs も build_external_docs も `[package.metadata.docs.rs]` の組で作るので、この feature の item はどちらの文書にも無い。ソースは get_source で読める」。決定 46 は M3 の終わりに要件と一緒に直す
+- 決定 52 (D2) crates.io の依存で `enabled_in_project: true` かつ `in_docs: false` の feature は、両方の欄を出し、「プロジェクトでは使えるが get_item (docs.rs の文書) にはその item が出ない」を 1 本の warning にまとめる
+- 決定 53 (D2) 中身が crates.io と違う写し (checksum の不一致)、index に無い写し、別の registry の package は、cargo metadata のその package から木を作り、`enabled_in_project` も付ける (D1b の warning と `build_unsupported` を置き換える)
+- 決定 54 (D2) プロジェクトが使う版でも、その target ではビルドされない package は、get_item と同じく `enabled_in_project: false` と warning
+
+**D2 の分け方**: D2a (データ層: `metadata::Package` に feature の値と依存、`FeatureTree` を metadata から作る、引数 `git` の crate の Cargo.toml を読む部品) → D2b (inspect_features: resolve_version の内部の結果を受け取り、プロジェクトの package・写し・別の registry・git・外の記録の木、`enabled_in_project`・`enabled_in_dev_only`、決定 49〜54 の warning と案内、`git` の引数を戻す)
+
+**D2a の実装 (2026-11-02)**: `metadata::Package` に feature の値 (`features` を名前の集合から値付きの表に) と依存 (`dependencies` の `name`・`rename`・`optional`。`#[serde(default)]` で前の記録もそのまま読める) を持たせ、`Package::feature_tree()` で木を作る (決定 48。値がちょうど `dep:x` で、`x` が optional の依存 (rename ならその名前) で、ほかに `dep:x` を書く feature が無いものを、Cargo が作る暗黙の feature とみなす)。`build::declared_features` は表の鍵を見る形に。引数 `git` の crate のように cargo metadata が残らない package のために、Cargo.toml のファイルから木を読む `crate_file::manifest_features` を足した (`member_docs_rs` と読み方を共有)。テスト: 暗黙の feature の推定 (rename、ほかの feature も `dep:x` を書くもの)、`features`・`dependencies` の無い metadata、Cargo.toml のファイルと TOML でないもの
+
+- D2a のレビュー (サブエージェント、読むだけ) の対応: metadata から読むと明示の `x = ["dep:x"]` も暗黙と見える (Cargo の意味は同じで、木は変わらない) ことを `is_implicit` に書き、テストで固定した。前の綴り `build_dependencies` の optional 依存も読む。4 MiB を超える Cargo.toml は途中まで読まずに `FileTooLarge` のエラーにする (`member_docs_rs` も)。テスト: 2 つの target の同じ依存の片方だけ optional、metadata が暗黙の feature を載せない古い Cargo、大きすぎる Cargo.toml
+- 残したもの: 今の Cargo の metadata は暗黙の feature をすべて載せるので `FeatureTree::new` が足すものは無いが、将来の edition で暗黙の feature が無くなれば (RFC 3491)、metadata に無い feature を作ってしまう。そのときは metadata の表を正として足さない形にする
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

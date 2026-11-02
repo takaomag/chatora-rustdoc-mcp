@@ -153,7 +153,8 @@ impl FeatureTree {
         let optional = std::iter::once(table)
             .chain(targets)
             .flat_map(|owner| {
-                ["dependencies", "build-dependencies"]
+                // `build_dependencies`, as older manifests spell it, too.
+                ["dependencies", "build-dependencies", "build_dependencies"]
                     .into_iter()
                     .filter_map(|kind| owner.get(kind).and_then(toml::Value::as_table))
             })
@@ -197,7 +198,9 @@ impl FeatureTree {
         self.features.get(feature).map(AsRef::as_ref)
     }
 
-    /// Whether `feature` is one that an optional dependency makes, which no one wrote.
+    /// Whether `feature` is one that an optional dependency makes, which no one wrote; read from
+    /// `cargo metadata`, which lists those too, one written as Cargo makes them, `x = ["dep:x"]`,
+    /// which means the same.
     #[must_use]
     pub fn is_implicit(&self, feature: &str) -> bool {
         self.implicit.contains(feature)
@@ -454,6 +457,10 @@ mod tests {
             version = "1"
             optional = true
 
+            [build_dependencies.old]
+            version = "1"
+            optional = true
+
             [target.'cfg(unix)'.dependencies.libc]
             version = "0.2"
             optional = true
@@ -465,7 +472,7 @@ mod tests {
         .expect("TOML");
         let tree = FeatureTree::from_manifest(&manifest);
         assert_eq!(tree.names().collect::<Vec<_>>(), [
-            "cc", "default", "libc", "serde", "tls"
+            "cc", "default", "libc", "old", "serde", "tls"
         ]);
         assert_eq!(tree.closure(["default"]).into_iter().collect::<Vec<_>>(), [
             "default", "tls"
