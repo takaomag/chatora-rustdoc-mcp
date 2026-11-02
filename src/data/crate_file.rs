@@ -20,6 +20,7 @@ use super::{
     crate_name::CrateName,
     feature_tree::{FeatureTree, is_name},
     http::{self, BodyError, Network},
+    readme::{self, Declared},
 };
 
 /// static.crates.io itself.
@@ -353,6 +354,16 @@ pub fn member_docs_rs(manifest: &Path) -> io::Result<DocsRsBuild> {
 /// Returns an error when the manifest cannot be read or is not TOML.
 pub fn manifest_features(manifest: &Path) -> io::Result<FeatureTree> {
     Ok(FeatureTree::from_manifest(&manifest_table(manifest)?))
+}
+
+/// What the manifest at `manifest` tells of the package's readme (decided in M3e): of one that
+/// Cargo wrote into a `.crate`, as [`readme::declared`] reads it.
+///
+/// # Errors
+///
+/// Returns an error when the manifest cannot be read, is too large or is not TOML.
+pub fn manifest_readme(manifest: &Path) -> io::Result<Declared> {
+    Ok(readme::declared(&manifest_table(manifest)?))
 }
 
 /// The manifest at `manifest`, which one larger than [`MAX_MANIFEST_BYTES`] is not, rather than
@@ -759,8 +770,8 @@ features = ["serde/derive"]
         assert_eq!(&*build.declared, [Box::from("default"), "serde".into()]);
     }
 
-    /// The features of a manifest on disk, as of a crate of git; one that is not TOML is an
-    /// error (decided in M3d, D2).
+    /// The features of a manifest on disk, as of a crate of git, and its readme, as of an
+    /// unpacked `.crate`; one that is not TOML is an error (decided in M3d, D2, and M3e).
     #[test]
     fn a_manifest_on_disk_tells_its_features() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -774,9 +785,16 @@ features = ["serde/derive"]
         .expect("written");
         let tree = manifest_features(&manifest).expect("read");
         assert_eq!(tree.names().collect::<Vec<_>>(), ["full", "y"]);
+        // Its readme, not named: the default names are looked for (decided in M3e).
+        assert_eq!(manifest_readme(&manifest).expect("read"), Declared::Default);
         fs::write(&manifest, "[package").expect("written");
         let error = manifest_features(&manifest).expect_err("not TOML");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        fs::write(&manifest, "[package]\nreadme = \"docs/intro.md\"\n").expect("written");
+        assert_eq!(
+            manifest_readme(&manifest).expect("read"),
+            Declared::Path("docs/intro.md".into())
+        );
         // One too large is not read in part.
         let large = format!(
             "[package]\nname = \"demo\"\n#{}\n",

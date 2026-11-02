@@ -408,6 +408,36 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - D4 のレビュー (サブエージェント、読むだけ) の対応: q11-features の 2 つ目の正規表現は文のどこかに否定があれば通り、「既定では not enabled だがこのプロジェクトでは有効」のような誤答も通したので、否定を同じ文の中の「project / プロジェクト」から 80 字以内に限った (正答の例 8 件が通り、誤答の例 4 件のうち 3 件を落とす。同じ文で別の feature を否定する誤答は落とせない)。fixture の前提の食い違い (前から): tokio の `net` は fixture では挙げないが、axum の既定の `tokio` feature が `tokio/net` を有効にする (Cargo.lock に mio と socket2 がある)。`feature-hidden` の答えも「this project already has it turned on」で、これが正しい。fixture と eval/README のコメントを「axum 経由で有効」「axum の `ws` は有効にしない」に直した (採点は `net` だけなので合否は変わらない)。README の inspect_features の行の向き (「the items that need each」)。instructions の 100 字を超える行を折り返した
 - 残したもの: `item_not_found` のエラーでは照会の warning と hint が落ちる (前から)。feature が欠けて item が見つからないときこそ R-FT-1 の warning と inspect_features の案内が役に立つので、エラーにも載せるかを M3 の終わりに決める
 
+### 6.5 M3e
+
+**下調べ (2026-11-02。サブエージェント、読むだけ。LSP は documentSymbol だけで残りは grep と Read。ネットワークなし。target/claude-notes/m3e-research.md)**: 版と取得元は `resolve_version::resolving` で決める (inspect_features と同じ)。get_source は get_item を通るので JSON が要るが、§8 は docs.rs にビルドが無いときに `readme` を案内するので、`readme` は JSON に頼らない。crates.io のリリースのソースは `crate_source::sources` と get_source の `release_sources` (private。共有の形に出す)、member・path は `manifest_path` と metadata の `Package.readme` (継承は `../README.md`)、git は checkout、std の rust-src には README も `examples/` も無い。R-SC-4 の文書の拡張子の判定 `is_document` は local だけで Package の readme にしか効かない。`.crate` の Cargo.toml の `readme`・`[[example]]`・`required-features` はまだ読んでおらず、`metadata::Target` に `required-features` が無い。`docs::split` は ATX 見出しだけで先に隠し行を除くので README には使えない。手元の 1,465 crate: `readme` は文字列 1,308・`false` 112・欄なし 45 (うち 13 に README)、`..` を含むものは 0 件、manifest の readme が `.crate` に無いのは 1 件、README の大きさは中央値 2.3KB・p99 22.6KB・最大 38KB、`.md` が 1,304/1,307。`examples/` を持つ crate は 289 (`.rs` 1,349 個、中央値 1.7KB・最大 108KB)、`required-features` 付きの example 398。tokio・axum・reqwest・serde の `.crate` には `examples/` が無く、doc の Rust のブロックは tokio 893 (35.2 万字)・axum 171・reqwest 94・serde 68。P13 の一致は tokio の `JoinSet::spawn` で名前と親の型 4・名前だけ 140、axum の `Router::route` で 128。crates.io の README は描画した HTML (記憶、未確認) で、API を通すなら F1 が要り、手元で効くのは 1 件
+
+**M3e で利用者が決めたこと (2026-11-02)**:
+
+- 決定 63 (M3e) `readme` は本文を 1 つの文字列で返し、全見出しの目次 `outline` (段・見出し・行) を添える。引数 `section` (見出し) でその節から読める。上限を超えたら見出しの境目で切り、`truncated` と cursor を付ける
+- 決定 64 (M3e) 1 回の本文の上限は 2 万字 (get_source の決定 26 と同じ)
+- 決定 65 (M3e) 見出しは Markdown の ATX と setext で判じ、コードブロックの中は見出しにしない。doctest の隠し行は消さない。`.rst`・`.adoc`・`.txt` は目次を作らず行の境目で切る
+- 決定 66 (M3e) README の本文の見えない文字はソースと同じく見える印にし (`hidden::mark`)、warning を付ける。get_source で読んだときとそろえる。要件 R-SEC-7 が README を「第三者の文字列」(出口で除く) に入れているのは M3 の終わりに改める
+- 決定 67 (M3e) `.crate` に README が無いときの crates.io への切り替えは E1 に入れない。M3f の F1 の後に、エンドポイントの形を実測して (そのとき通信の許可を得る) 入れるかを決める
+- 決定 68 (M3e) README が無いとき (`readme = false`、`.mkd` だけ、決定 67 までの crates.io) は `docs_unavailable` に新しい reason `no_readme` (再試行不可) を付け、`crate_overview` を案内する。std は `invalid_argument` で `crate_overview`・`get_item` を案内する
+- 決定 69 (M3e) `find_examples` は `examples/` のファイルと、crate の公開の item すべての doc の Rust のコードブロックから探す (tests・benches は見ない)
+- 決定 70 (M3e) `examples/` の例は名前・絶対パス・相対の `file`・`required-features`・一致した行番号を返し、本文は `content: true` のときだけ (ファイルごとに 2 万字まで)。doc のブロックは本文 (隠し行を除き、`no_run` などの属性を付ける)・item のパス・その item の `source_location` を常に返す
+- 決定 71 (M3e) item を指したときの並びは、その item 自身の doc のブロック → 名前と親の型の両方に一致 (`examples/` → 他の doc) → 名前だけ一致 → 一致なし。同じ段の中はパスの深さ、次に文字列の順。item を指さないときは `examples/` (名前の順) → ルートの doc → 他の doc
+- 決定 72 (M3e) 件数は既定 10・上限 50、cursor 付き。応答の上限を超えるときは件数を減らす
+- 決定 73 (M3e) JSON がまだ無いときは `examples/` をすぐ返し、doc のブロックだけを省いて取得中の印と `retry_after_secs` を付ける (決定 42 の形)。docs.rs に JSON が無いときは `examples/` だけを warning 付きで返す
+- 決定 74 (M3e) doc のブロックは呼び出しごとに走査し、testdata (tokio・axum) と std で時間を測る。200 ms を超えたらメモリの中のキャッシュを足す (決定 59 と同じ)
+- 決定 75 (M3e) std は JSON の doc のブロックだけを使い、rust-src は取らない
+- 決定 76 (M3e、E1a のレビューから) manifest がドット付きのディレクトリの下の readme (pretty-xmlish 0.1.13 の `.github/README.md`) を名指しても読まない (R-SC-4 のまま)。`no_readme` の文に「ドットで始まるディレクトリの下なので読まない」と書く
+
+聞かずに決めたこと (前例のまま): `readme` の版の決め方は他のツールと同じ (`target` は版の決め方にだけ効く)。annotations は今の `annotations()` のまま。`required-features` は `.crate` の `[[example]]` から、member は cargo metadata から読む (`metadata::Target` に足す)。example の判定は Cargo の自動検出と同じにし、`examples/` の下の補助のモジュールは例として数えない。no_json の suggestions に `readme` を足すのは E3
+
+**コミットの順の案**: E1a (データ層: `.crate` の Cargo.toml の `readme` (文字列・`true`・`false`・欄なしの既定名)、`is_document` を構成によらず使える形に、Markdown の見出しで分ける部品) → E1b (`readme` ツール: crates.io のリリース、見える印、見出しの境目のページング、schema・説明文・README、偽の static.crates.io の stdio のテスト) → E1c (member・path・git・外の記録・std) → E2a (照会の層: doc の Rust のブロック、P13 の一致と決定 71 の並び、testdata の計時) → E2b (データ層: `examples/` の発見と `[[example]]`・`required-features`) → E2c (`find_examples` ツール: `What::Examples`、絶対パス、`content`、ページング、JSON の無い応答) → E2d (local・git・std、絶対パスを Claude Code の Read が開けるかを headless で確かめる) → E3 (案内と eval の Q12・Q13)。合計 3,500〜4,500 行 (見積り)
+
+**E1a の実装 (2026-11-02)**: 新しい `data::readme`: manifest の `readme` の読み (`Declared`: 文字列はパス、`true` は `README.md`、`false` は無し、欄なしや別の型は既定名を探す)、パッケージのファイルからの選び方 (`chosen`: 名指したファイルは `./`・`\`・空の区切りを直し、`..` や絶対パスはパッケージに無いものとし、文書でなければ読まない。既定名は `README.md`・`README.txt`・`README` の順)、読めない理由 (`NoReadme`: `Disabled`・`NoDefault`・`Missing`・`NotADocument`。決定 68 の `no_readme` の文に使う)。`source_root` の `is_document` をここへ移し、構成によらず使える形にした (ローカル機能の無い構成でも `.crate` の readme に掛けるため)。`crate_file::manifest_readme` (ディスクの Cargo.toml から。大きさの上限は feature と同じ)。新しい `query::markdown`: 目次 (`outline`: ATX と setext、fence (backtick と tilde、長さ、backtick の info に backtick が無いこと) と字下げのコードの中は除く。setext は段落の初めの行を見出しの行とし、リスト・引用・表・HTML・区切り線の後の下線は見出しにしない。doctest の隠し行は消さない) と、見出しの境目で切る計算 (`page_end`: 入る最後の節の初めか終わり。1 つの節が上限より長ければ入る行まで、1 行は必ず)。cargo の既定名が 3 つであることは cargo 0.99 の `DEFAULT_README_FILES: [&str; 3]` で確かめた (名前と順は記憶)。テスト: manifest の値の型ごと、選び方と理由、文書の拡張子、見出しのコードの中・リスト・引用・表・区切り線・閉じの `#`・空の見出し、ページの終わり
+
+- E1a のレビュー (サブエージェント、読むだけ。手元の `.crate` 3,439 個の manifest と README 3,054 本で実測) の対応: 決定 76 (`NoReadme::Hidden`)。`chosen` は cargo が `.crate` に書いた manifest (継承を解いて写し、パスを直したもの) を前提にすることを doc に書いた (checkout や member の素の manifest の `readme.workspace = true`・`../README.md` は E1c で `cargo metadata` から)。ドライブ文字 (`C:`) を含むパスは相対でないものとする。エラーの文のパスを backtick で囲む (`readme = ""` で崩れないように)。目次: 複数行の HTML コメントの中を除く (futures-async-stream 0.2.13)、リスト・引用・HTML・表の行の後に空行なしで続く行は継続とし、その後の下線を見出しにしない (pretty-xmlish の front matter)、先頭の BOM を除く、空行は space と tab だけ (U+3000 の行は空行でない)。`page_end` は `from` が終わりを越えたら終わりを返し、行の分け方 (`str::lines`) と行番号の 0 始まり・1 始まりの対応を doc に書いた。テスト: 名指しの `true`・ドットの下・文書でないことを先に・`""`・`.`・ドライブ文字、字下げした fence と閉じない fence、`#5`・`\#`、BOM・CRLF・HTML コメント・継続行・U+3000、`page_end` の終わりの先と長い 1 行
+- E1a のレビューで変えなかったもの: 既定名は大文字小文字を区別する (Linux の cargo と同じ。futures-intrusive 0.5.0 の `readme.md` は `NoDefault`)。空行の無い HTML ブロック (種類 6) の直後の `# T` を見出しとすること (実測 0 件)。見出しの `text` は Markdown の生の文字列 (1 割にリンクやバッジ) なので、E1b の `section` の照合は正規化か緩い一致にする
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

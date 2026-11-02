@@ -54,6 +54,7 @@ pub mod process_id;
 pub mod process_lock;
 #[cfg(feature = "local")]
 pub mod project;
+pub mod readme;
 pub mod rustdoc_json;
 pub mod source_root;
 pub mod sparse_index;

@@ -11,6 +11,7 @@ pub mod list_module;
 pub mod load;
 #[cfg(feature = "local")]
 pub mod local;
+pub mod markdown;
 pub mod methods;
 pub mod overview;
 pub mod path_index;

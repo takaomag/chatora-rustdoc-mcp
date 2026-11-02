@@ -15,7 +15,7 @@ use std::{
 
 use super::crate_source::{Origin, Sources};
 #[cfg(feature = "local")]
-use super::{cache::Cache, crate_source};
+use super::{cache::Cache, crate_source, readme::is_document};
 
 /// A root of sources, and which files under it are the package's.
 #[derive(Debug, Clone, Copy)]
@@ -276,23 +276,6 @@ impl Dependencies {
             None
         }
     }
-}
-
-/// Whether the readme at `path` is a document (requirement R-SC-4, decided in M3, P8): of the
-/// extensions of one, or named `README` without one, in any case.
-#[cfg(feature = "local")]
-fn is_document(path: &Path) -> bool {
-    path.extension().map_or_else(
-        || {
-            path.file_name()
-                .is_some_and(|name| name.eq_ignore_ascii_case("README"))
-        },
-        |extension| {
-            ["md", "markdown", "txt", "rst", "adoc"]
-                .iter()
-                .any(|document| extension.eq_ignore_ascii_case(document))
-        },
-    )
 }
 
 /// The file at `asked` under `root`, if it may be read: `asked` is relative to the root, or
