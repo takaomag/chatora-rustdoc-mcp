@@ -145,6 +145,31 @@ impl Cfg {
         }
     }
 
+    /// The features that it mentions, each with whether it is under `not` (decided in M3d,
+    /// decision 43), in the order written, once each.
+    #[must_use]
+    pub fn features(&self) -> Vec<(&str, bool)> {
+        fn walk<'c>(cfg: &'c Cfg, negated: bool, found: &mut Vec<(&'c str, bool)>) {
+            match cfg {
+                Cfg::NameValue(name, value) if &**name == "feature" => {
+                    if !found.contains(&(&**value, negated)) {
+                        found.push((value, negated));
+                    }
+                },
+                Cfg::Bool(_) | Cfg::Name(_) | Cfg::NameValue(..) => {},
+                Cfg::All(cfgs) | Cfg::Any(cfgs) => {
+                    for cfg in cfgs {
+                        walk(cfg, negated, found);
+                    }
+                },
+                Cfg::Not(cfg) => walk(cfg, !negated, found),
+            }
+        }
+        let mut found = Vec::new();
+        walk(self, false, &mut found);
+        found
+    }
+
     /// The condition in a normal build, where `doc` and `docsrs` are false (docs.rs sets them
     /// only to document). If it is then false, the condition is kept as it is, so that it shows
     /// that the item is only in documentation.
@@ -647,6 +672,25 @@ mod tests {
         );
         assert_eq!(read(r#"#[doc(alias = "lock")]"#), None);
         assert_eq!(read("#[must_use]"), None);
+    }
+
+    /// The features that a condition mentions, under `not` or not, once each (decided in M3d,
+    /// decision 43).
+    #[test]
+    fn the_features_of_a_condition_are_told_with_their_negation() {
+        let Some(CfgAttribute::Cfg(_, cfg)) = Cfg::of_attribute(
+            r#"#[doc(cfg(all(feature = "net", any(unix, feature = "rt"), not(any(feature = "x", not(feature = "net"))))))]"#,
+        ) else {
+            panic!("a condition");
+        };
+        assert_eq!(
+            cfg.features(),
+            [("net", false), ("rt", false), ("x", true),]
+        );
+        assert_eq!(
+            Cfg::Name("unix".into()).features(),
+            Vec::<(&str, bool)>::new()
+        );
     }
 
     #[test]

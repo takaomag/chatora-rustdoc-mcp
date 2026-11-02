@@ -510,6 +510,112 @@ pub struct Made<'a> {
     pub derived: bool,
 }
 
+/// The conditions of compilation of an item, on its canonical path (requirement R-FT-2).
+#[derive(Debug, Default)]
+pub(super) struct CarriedCfg {
+    /// Those of every carrier, once each: the modules and the re-export that the path goes
+    /// through, the parent and its `impl` for a member, and the item.
+    pub(super) conjuncts: Vec<Cfg>,
+    /// Those of the item itself, or of the re-export that names it last on the path, or, of a
+    /// member, those of its `impl` with features that its parent does not have: what makes it an
+    /// entry of a feature (decided in M3d, decisions 55 and 60).
+    pub(super) entry: Vec<Cfg>,
+    /// Where the item's own came from, if it has any.
+    pub(super) own: Option<CfgSource>,
+    /// Some attribute about them could not be read.
+    pub(super) unreadable: bool,
+}
+
+/// The conditions of `id` of the crate of `view`, a member of `parent` if any, on its canonical
+/// path, as `index` has it: of each carrier, its `#[doc(cfg(...))]`, or else the traces of its
+/// `#[cfg]` (requirement R-FT-2).
+pub(super) fn conditions(
+    view: &CrateView<'_>,
+    index: &ArchivedPathIndex,
+    id: Id,
+    parent: Option<Id>,
+) -> CarriedCfg {
+    let via = index.canonical_via(parent.unwrap_or(id));
+    // The re-export that names the item, as its canonical path ends.
+    let naming = parent
+        .is_none()
+        .then(|| via.last().copied())
+        .flatten()
+        .filter(|&last| {
+            view.item(last)
+                .is_some_and(|item| matches!(item.inner, ItemEnum::Use(_)))
+        });
+    let mut carriers = via;
+    // The `impl` of the parent that a member is in.
+    let mut block = None;
+    if let Some(parent) = parent {
+        carriers.push(parent);
+        block = path_index::own_impls(view, parent)
+            .find(|(_, contents)| contents.items.contains(&id))
+            .map(|(impl_item, _)| impl_item.id);
+        carriers.extend(block);
+    }
+    carriers.push(id);
+    let mut conditions = CarriedCfg::default();
+    for &carrier in &carriers {
+        let Some(item) = view.item(carrier) else {
+            continue;
+        };
+        let (mut doc_cfg, mut traces) = (Vec::new(), Vec::new());
+        for attribute in &item.attrs {
+            let Attribute::Other(text) = attribute else {
+                continue;
+            };
+            match Cfg::of_attribute(text) {
+                Some(CfgAttribute::Cfg(CfgSource::DocCfg, cfg)) => doc_cfg.push(cfg),
+                Some(CfgAttribute::Cfg(CfgSource::CfgTrace, cfg)) => traces.push(cfg),
+                Some(CfgAttribute::Unreadable) => conditions.unreadable = true,
+                None => {},
+            }
+        }
+        // What the crate writes for its documentation comes first (requirement R-FT-2).
+        let (source, cfgs) = if doc_cfg.is_empty() {
+            (CfgSource::CfgTrace, traces)
+        } else {
+            (CfgSource::DocCfg, doc_cfg)
+        };
+        if cfgs.is_empty() {
+            continue;
+        }
+        if carrier == id {
+            conditions.own = Some(source);
+        }
+        let entry = carrier == id || Some(carrier) == naming;
+        // The features of the parent and of the path to it, which the `impl` does not add.
+        let inherited: Vec<Box<str>> = if Some(carrier) == block {
+            conditions
+                .conjuncts
+                .iter()
+                .flat_map(Cfg::features)
+                .map(|(feature, _)| feature.into())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for conjunct in Cfg::all(cfgs).for_build().conjuncts() {
+            // An `impl` makes its members entries of the features that the parent does not have
+            // (decided in M3d, decision 60).
+            let added = Some(carrier) == block
+                && conjunct
+                    .features()
+                    .iter()
+                    .any(|(feature, _)| !inherited.iter().any(|known| **known == **feature));
+            if (entry || added) && !conditions.entry.contains(&conjunct) {
+                conditions.entry.push(conjunct.clone());
+            }
+            if !conditions.conjuncts.contains(&conjunct) {
+                conditions.conjuncts.push(conjunct);
+            }
+        }
+    }
+    conditions
+}
+
 /// The path of the item `id` of the crate of `view` in it, `crate::a::Item`, from its definition
 /// path (requirement R-PR-2, decided in M2's D6). `None` for an item of another crate.
 pub(super) fn crate_path(view: &CrateView<'_>, id: Id) -> Option<Box<str>> {
@@ -1227,57 +1333,12 @@ impl<'a> Query<'a> {
     /// the `impl`, trait or type it belongs to, and those of the modules and re-exports on the
     /// canonical path to it. rustdoc gives a child item none of its parent's.
     fn cfg_note(&self, id: Id, parent: Option<Id>, data: &mut ItemData<'a>) {
-        let mut carriers = parent.map_or_else(
-            || self.index.canonical_via(id),
-            |parent| {
-                let mut carriers = self.index.canonical_via(parent);
-                carriers.push(parent);
-                carriers.extend(
-                    path_index::own_impls(self.view, parent)
-                        .find(|(_, contents)| contents.items.contains(&id))
-                        .map(|(impl_item, _)| impl_item.id),
-                );
-                carriers
-            },
-        );
-        carriers.push(id);
-        let mut conjuncts: Vec<Cfg> = Vec::new();
-        let mut own = None;
-        let mut unreadable = false;
-        for &carrier in &carriers {
-            let Some(item) = self.view.item(carrier) else {
-                continue;
-            };
-            let (mut doc_cfg, mut traces) = (Vec::new(), Vec::new());
-            for attribute in &item.attrs {
-                let Attribute::Other(text) = attribute else {
-                    continue;
-                };
-                match Cfg::of_attribute(text) {
-                    Some(CfgAttribute::Cfg(CfgSource::DocCfg, cfg)) => doc_cfg.push(cfg),
-                    Some(CfgAttribute::Cfg(CfgSource::CfgTrace, cfg)) => traces.push(cfg),
-                    Some(CfgAttribute::Unreadable) => unreadable = true,
-                    None => {},
-                }
-            }
-            // What the crate writes for its documentation comes first (requirement R-FT-2).
-            let (source, cfgs) = if doc_cfg.is_empty() {
-                (CfgSource::CfgTrace, traces)
-            } else {
-                (CfgSource::DocCfg, doc_cfg)
-            };
-            if cfgs.is_empty() {
-                continue;
-            }
-            if carrier == id {
-                own = Some(source);
-            }
-            for conjunct in Cfg::all(cfgs).for_build().conjuncts() {
-                if !conjuncts.contains(&conjunct) {
-                    conjuncts.push(conjunct);
-                }
-            }
-        }
+        let CarriedCfg {
+            conjuncts,
+            own,
+            unreadable,
+            ..
+        } = conditions(self.view, self.index, id, parent);
         if let Some(project) = self.request.project_features {
             let in_build = |features| self.in_build(&conjuncts, features);
             let normal = in_build(project.normal);

@@ -24,6 +24,7 @@ use chatora_rustdoc_mcp::{
     query::{
         across::Indexed,
         cfg::{Cfg, CfgAttribute},
+        feature_items::feature_items,
         get_item::{Detail, ItemRequest, Origin, ResolvedFrom, get_item},
         path_index::Resolution,
         view::CrateView,
@@ -307,6 +308,49 @@ fn representative_items_are_found_by_their_public_paths() {
         let found = describe(&view, path);
         eprintln!("{path}: {found} (index built and archived in {build_time:?})");
         assert_eq!(found, expected, "{path}");
+    }
+}
+
+/// The items of each feature of large crates are found in a short time: once for each call of
+/// `inspect_features` (decided in M3d, decision 59, which keeps a memory cache for over 200 ms),
+/// with the entries of `tokio`'s `net` and `axum`'s `ws` first.
+#[test]
+#[ignore = "needs the JSON of testdata/docs-rs-json.txt in the cache"]
+fn the_items_of_each_feature_are_found_in_a_short_time() {
+    let cache = Cache::open_default().expect("the cache directory is known");
+    for (crate_name, version, feature, entry_path) in [
+        // Re-exported under the condition, which makes it an entry.
+        ("tokio", "1.53.3", "net", "tokio::net::TcpListener"),
+        ("axum", "0.8.9", "ws", "axum::extract::ws"),
+    ] {
+        let json = cached_json(&cache, &entry(crate_name, version));
+        let parsed = rustdoc_json::parse(&json).expect("parses");
+        let mapped = Mapped::in_memory(&Indexed::new(parsed)).expect("archived");
+        let view = CrateView::new(mapped.get());
+        let started = Instant::now();
+        let by_feature = feature_items(&view);
+        let took = started.elapsed();
+        let items = by_feature.get(feature).map_or(&[][..], Vec::as_slice);
+        let entries = items.iter().filter(|item| item.entry).count();
+        eprintln!(
+            "{crate_name}: {} features, {feature}: {} items, {entries} entries, in {took:?}",
+            by_feature.len(),
+            items.len()
+        );
+        assert!(!items.is_empty(), "no item of {crate_name} needs {feature}");
+        assert!(
+            items
+                .iter()
+                .take(entries)
+                .any(|item| &*item.path == entry_path),
+            "{entry_path} is not an entry of {feature}"
+        );
+        assert!(items.first().is_some_and(|item| item.entry));
+        // Over 200 ms, decision 59 keeps them in memory.
+        assert!(
+            took.as_millis() < 200,
+            "{crate_name}: {took:?} for the items of each feature"
+        );
     }
 }
 

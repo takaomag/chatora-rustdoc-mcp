@@ -373,6 +373,24 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - D2b のレビュー (サブエージェント、読むだけ) の対応: 期限を呼び出しの初めに 1 つだけ取り、resolve_version (`resolving` に引数で渡す)・cargo metadata・cargo tree・`.crate` の取得のすべてに使う (段ごとに取り直すと 30 秒を大きく超えうるため)。版を渡したときのプロジェクトの照合は `crates_io_in_project` を 1 回だけ呼ぶ形にし (新しい `crates_io_in_project_or_doing` で、期限を過ぎて解決中なら「読んでいる」warning)、別の版を使うときも、中身が違う写しのときも warning (get_item 向けの文言を使わない)。git の crate の作り直し中の `retry_after_secs` を写す。resolve_version の provenance の schema の `stale_reason` に `rebuilding` が無かった (前からの漏れ。resolve_version 自身の応答も合わなかった) ので足した。余計な clone を除き、型の名前を `ProjectBuild` に。説明文のローカル機能の無い構成の「and」、git の crate の読み方、`in_docs` の言い方を直した。テスト: git の crate の作り直し中の `retry_after_secs`
 - 残したもの: プロジェクトの feature の組は package を名前と版だけで引く (同じ名前と版の crates.io と git のフォークの組が混ざる。get_item と同じ限界)。プロジェクトの package の木は、版の解決で読んだ metadata を受け取らず読み直す (その間に Cargo.toml が変わると見つからないことがある)。外の workspace の記録の member の `in_docs` (決定 49 の「記録の `features_effective` から」) は付けていない (記録の LocalBuilt を引く道が要る)。crates.io の依存の `enabled_in_project` と決定 52 の warning は単体テストだけで、偽の registry を使う通しのテストは無い
 
+**D3 の下調べ (2026-11-02。サブエージェント、読むだけ。LSP は使わず grep と Read。ネットワークなし)**: archive を返す下位の入口は無く、get_item の照会に `What` を 1 つ足す (crate のルートを引き、`respond_in` で数える) のが最小。get_item の `execute` は期限を中で取り直すので、期限を渡す入口が要る。条件は `Query::cfg_note` (carrier ごとに doc(cfg) か cfg の痕跡を読み、`for_build().conjuncts()`) から carrier ごとの部分を切り出し、`Cfg` に feature の名前と否定かを返す関数を足す。数える範囲は検索索引の entries (公開パスを持つ id と、trait・variant・固有 impl の item、正準パスで id ごとに 1 回) から他の crate の再公開と private・hidden を除いたもの。testdata の JSON を python で数えると、tokio 1.53.3 は約 1,460 件のうち feature の条件を持つもの 1,420 (`net` 474、入口 24)、axum は約 450 件のうち 191、reqwest は約 464 件のうち 291。否定の言及はまれ (reqwest で 6)。1 回の計算は 10〜50 ms の見込み (推測)
+
+**D3 で利用者が決めたこと**:
+
+- 決定 55 (D3) 入口 (決定 44) は、item 自身の属性に加え、正準パスの最後の `pub use` (その item を名指す再公開) に付いた条件も含める (tokio の入口 181 件のうち 43 件が再公開にだけ条件を持つ)
+- 決定 56 (D3) `feature` を渡したときは、今の `limit`・`cursor`・`page` を item の一覧に使い、既定 50 件と字数の上限で切る
+- 決定 57 (D3) ローカルビルドの crate で、そのビルドで有効でなかった feature (`features_effective` に無いもの) は件数を出さず、その文書に無い旨を書く (docs.rs の `in_docs: false` と同じ考え)
+- 決定 58 (D3) `full` のようなまとめの feature も直接の言及だけを数え (決定 43)、0 件で closure があるものには「closure の feature を見よ」と添える
+- 決定 59 (D3) 条件の計算は呼び出しごとに行い、testdata の tokio と axum で時間を測るテストを足す。200 ms を超えたらメモリ内のキャッシュを入れる
+- 決定 60 (D3a のレビューから) member が入る impl ブロックの条件のうち、親の型 (とその経路) に無い feature は、その member をその feature の入口にする (決定 55 を少し広げる。tokio の `Builder::start_paused`・`Builder::enable_time`・`Handle::dump` など 8 件が、型に無い feature の impl にだけある)
+
+**D3 の分け方**: D3a (照会の層: `cfg_note` の carrier ごとの部分の切り出し、`Cfg` の feature と否定、検索索引の entries を回して feature ごとに数え入口と並びを決める関数、testdata の計時) → D3b (ツール: get_item に `What` と期限を渡す入口、inspect_features で件数・一覧・取得中の印・再ビルド中・版の食い違い、schema と説明文、stdio と実データ)
+
+**D3a の実装 (2026-11-02)**: 照会の層。`Query::cfg_note` から、正準パスの carrier (経由するモジュールと再公開、member なら親とその impl、item 自身) の条件を集める部分を `get_item::conditions` (`CarriedCfg`) に切り出し、item 自身か、正準パスの最後でその item を名指す `use` の条件を入口の条件として別に持つ (決定 55)。`cfg_note` の出力は変えていない。`Cfg::features` (条件が言及する feature と、`not` の下か)。検索索引の entries から他の crate の再公開と private・hidden を除いた item を回す `search::public_items`。新しい `query::feature_items` で、feature ごとに、条件がそれに言及する item (`required_features`・`other_cfg`・入口か・`not` の下だけか) を入口・パスの深さ・パスの順に並べる (決定 43・44)。手元の JSON で測ると、tokio 1.53.3 は 16 feature、`net` 474 件・入口 24 件 (`tokio::net::TcpListener` などの再公開を含む) で 5〜7 ms、axum 0.8.9 は 11 feature、`ws` 87 件・入口 2 件で 1 ms 前後 (release)。決定 59 のキャッシュは要らない。テスト: 単体で `Cfg::features` の否定と重複、`feature_items` (再公開の入口、member が親から受け継ぐ、`any` の両方、`not` の下だけ、条件の文)。testdata に tokio と axum の時間と入口のテストを足した (手元のキャッシュは target 付きの置き場で、このテストの置き場に無いので、手元では使い捨ての計測で確かめた)
+
+- D3a のレビュー (サブエージェント、読むだけ) の対応: 決定 60 を入れた。単体テストの空でも通る確かめを完全一致にし、impl ブロックだけの feature・肯定と否定の両方で言及するもの (`not` の下だけではない)・`doc(cfg)` を trace より先に読むことを足した。search.rs の doc コメントの位置を戻した。testdata の閾値を 200 ms (決定 59 の基準) にした
+- 残したもの: 数える範囲は検索索引のもの (決定 43) なので、trait impl と struct の field は数えない (reqwest の `stream` の `impl From<…> for Body` のように、feature の効果が trait impl だけのものは 0 件になる)。D3b の説明文で断る
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

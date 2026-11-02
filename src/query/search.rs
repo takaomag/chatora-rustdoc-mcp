@@ -1176,6 +1176,26 @@ fn rank(index: &ArchivedSearchIndex, options: SearchOptions<'_>, stats: &Stats) 
     hits
 }
 
+/// The items of the crate that a user of it can name: of this crate, not a re-export of another's,
+/// and public and not hidden; each once, with the type, trait or enum that it is a member of, and
+/// its canonical path (decided in M3d, D3).
+pub(super) fn public_items(
+    index: &ArchivedSearchIndex,
+) -> impl Iterator<Item = (Id, Option<Id>, &str)> {
+    index
+        .entries
+        .get()
+        .iter()
+        .filter(|entry| !entry.external && !entry.restricted)
+        .map(|entry| {
+            (
+                view::native(&entry.id),
+                entry.parent.as_ref().map(view::native),
+                entry.path.as_ref(),
+            )
+        })
+}
+
 /// The entry `entry` of `index`.
 fn entry_at(index: &ArchivedSearchIndex, entry: u32) -> Option<&ArchivedEntry> {
     index.entries.get().get(usize::try_from(entry).ok()?)
