@@ -158,25 +158,44 @@ pub(super) async fn crates_io_in_project(
     project: Option<&Path>,
     until: Instant,
 ) -> Option<FromCratesIo> {
-    let (workspace, project_from) = located(state, project).await.ok()??;
+    crates_io_in_project_or_doing(state, name, project, until)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`crates_io_in_project`], or what cargo does past the deadline, which the next call has: the
+/// lookup goes on without it, and tells so.
+#[cfg(feature = "local")]
+pub(super) async fn crates_io_in_project_or_doing(
+    state: &ToolState,
+    name: &CrateName,
+    project: Option<&Path>,
+    until: Instant,
+) -> Result<Option<FromCratesIo>, Doing> {
+    let Some((workspace, project_from)) = located(state, project).await.ok().flatten() else {
+        return Ok(None);
+    };
     // Past the deadline, the lookup goes on without it; the resolution goes on for later calls.
-    let Joined::Done(Ok(resolution)) = resolve_until(state, &workspace, until).await else {
-        return None;
+    let resolution = match resolve_until(state, &workspace, until).await {
+        Joined::Done(Ok(resolution)) => resolution,
+        Joined::Going(doing) => return Err(doing),
+        Joined::Done(Err(_)) | Joined::Ended => return Ok(None),
     };
     // The build's features are known only from `cargo metadata` and `cargo tree`.
     let Resolution::Metadata { .. } = &*resolution else {
-        return None;
+        return Ok(None);
     };
     let packages: Vec<ProjectPackage> = PackageGraph::new(&resolution)
         .crates_io_named(name.as_str())
         .into_iter()
         .cloned()
         .collect();
-    (!packages.is_empty()).then(|| FromCratesIo {
+    Ok((!packages.is_empty()).then(|| FromCratesIo {
         packages,
         project_from: project_from.as_str(),
         workspace,
-    })
+    }))
 }
 
 /// The project's packages from crates.io of one name.

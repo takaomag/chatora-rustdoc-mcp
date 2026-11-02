@@ -2452,6 +2452,55 @@ fn a_member_is_built_with_the_features_of_the_workspace() {
     assert!(server.finish().success());
 }
 
+/// `inspect_features` tells a member's features from `cargo metadata`, without building it, and
+/// whether the project's build enables each: `back` enables `front`'s `extra` (decided in M3d,
+/// decisions 45, 48 and 50).
+#[cfg(feature = "local")]
+#[test]
+fn inspect_features_tells_a_members_features_and_whether_the_project_enables_them() {
+    let dir = TempDir::new().expect("a temporary directory");
+    write_front_and_back(dir.path());
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = Server::start_in(Some(dir.path()));
+    // Again while cargo reads the features of the project's build past the call's deadline.
+    let mut told = Value::Null;
+    for id in 1..30 {
+        server.send(&call_tool(
+            id,
+            "inspect_features",
+            json!({ "crate": "front" }),
+        ));
+        told = server.response(id)["result"].clone();
+        if told["structuredContent"]["data"]["features"][0]
+            .get("enabled_in_project")
+            .is_some()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    assert_ne!(told["isError"], true, "{told}");
+    let content = &told["structuredContent"];
+    assert_eq!(content["provenance"]["source"], "project", "{told}");
+    assert_eq!(
+        content["data"]["features"],
+        json!([{ "name": "extra", "enables": [], "enabled_in_project": true }]),
+        "{told}"
+    );
+    // Nothing was built for it.
+    assert!(!dir.path().join("target").exists());
+    assert!(server.finish().success());
+}
+
 /// Writes the workspace of [`a_member_is_built_with_the_features_of_the_workspace`] in `dir`.
 #[cfg(feature = "local")]
 fn write_front_and_back(dir: &Path) {
@@ -4521,6 +4570,7 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
         ("list_implementors", with(json!({ "path": "Shape" }))),
         ("search_items", with(json!({ "query": "first" }))),
         ("resolve_version", with(json!({}))),
+        ("inspect_features", with(json!({}))),
     ];
     for (id, (tool, arguments)) in (100_u64..).zip(tools) {
         server.send(&call_tool(id, tool, arguments));
@@ -4542,6 +4592,11 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
             "{tool}: {result}"
         );
     }
+    // Its features, from the Cargo.toml of its checkout; its build had `extra`, as its
+    // `[package.metadata.docs.rs]` asks (decided in M3d, decision 49).
+    server.send(&call_tool(200, "inspect_features", with(json!({}))));
+    let features = server.response(200)["result"]["structuredContent"]["data"]["features"].clone();
+    assert_eq!(features, json!([{ "name": "extra", "enables": [] }]));
     reads_the_source_of_the_git_crate(&mut server, &with(json!({})));
     looked_up_by_hash_and_when_stale(&mut server, &commit);
     looked_up_while_rebuilding(&mut server, &commit);
@@ -4780,6 +4835,20 @@ fn looked_up_while_rebuilding(server: &mut Server, commit: &str) {
     );
     assert!(content["retry_after_secs"].is_number(), "{result}");
     assert_eq!(content["data"]["path"], "fixture_git::first", "{result}");
+    // `inspect_features` tells when to call again too.
+    let features = json!({
+        "crate": "fixture-git",
+        "git": "https://example.invalid/dep",
+        "branch": "main",
+    });
+    server.send(&call_tool(410, "inspect_features", features));
+    let result = server.response(410)["result"].clone();
+    let content = &result["structuredContent"];
+    assert_eq!(
+        content["provenance"]["stale_reason"], "rebuilding",
+        "{result}"
+    );
+    assert!(content["retry_after_secs"].is_number(), "{result}");
     drop(making);
     // Built again, it failed.
     server.send(&call_tool(403, "get_item", branch));

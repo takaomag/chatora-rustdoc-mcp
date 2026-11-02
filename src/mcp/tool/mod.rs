@@ -457,11 +457,7 @@ fn with_git(mut tool: Tool) -> Tool {
     let Some(Value::Object(properties)) = schema.get_mut("properties") else {
         return tool;
     };
-    // `inspect_features` reads the features of crates.io releases only, for now (M3d, D1b).
-    if !properties.contains_key("crate")
-        || tool.name == "list_crates"
-        || tool.name == inspect_features::NAME
-    {
+    if !properties.contains_key("crate") || tool.name == "list_crates" {
         return tool;
     }
     let arguments = if tool.name == "build_external_docs" {

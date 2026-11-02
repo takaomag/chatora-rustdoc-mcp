@@ -469,8 +469,7 @@ fn only_a_build_that_reads_projects_takes_project() {
 }
 
 /// With local features, every tool that takes `crate` takes `git`, `rev`, `branch` and `tag`, but
-/// `list_crates`, whose `crate` is the project's, and `inspect_features`, which reads crates.io
-/// releases only for now (M3d, D1b); without them, none does (§6.4).
+/// `list_crates`, whose `crate` is the project's; without them, none does (§6.4).
 #[test]
 fn the_tools_that_take_a_crate_take_a_git_repository() {
     for tool in tools() {
@@ -479,9 +478,7 @@ fn the_tools_that_take_a_crate_take_a_git_repository() {
             .get("properties")
             .and_then(Value::as_object);
         let takes = |name: &str| properties.is_some_and(|properties| properties.contains_key(name));
-        let expected = cfg!(feature = "local")
-            && takes("crate")
-            && !matches!(tool.name.as_ref(), "list_crates" | "inspect_features");
+        let expected = cfg!(feature = "local") && takes("crate") && tool.name != "list_crates";
         for name in ["git", "rev", "branch", "tag"] {
             assert_eq!(takes(name), expected, "{} {name}", tool.name);
         }

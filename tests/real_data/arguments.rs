@@ -326,6 +326,7 @@ fn git_cases() -> Vec<Case> {
         "crate_overview",
         "get_item",
         "get_source",
+        "inspect_features",
         "list_implementors",
         "list_impls",
         "list_methods",

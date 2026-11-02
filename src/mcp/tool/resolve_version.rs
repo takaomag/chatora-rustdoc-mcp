@@ -8,11 +8,8 @@ use std::sync::Arc;
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use semver::Version;
 use serde_json::{Value, json};
-#[cfg(feature = "local")]
 use tokio::time::Instant;
 
-#[cfg(feature = "local")]
-use super::project::Found;
 use super::{
     ErrorChain,
     InvalidArgument,
@@ -20,6 +17,8 @@ use super::{
     get_item::{self, ReleaseArguments},
     project::{self, InProject},
 };
+#[cfg(feature = "local")]
+use super::{project::Found, recorded_git::GitFound};
 #[cfg(feature = "local")]
 use crate::data::{
     packages::{DocsRsCheck, Source},
@@ -149,9 +148,12 @@ pub(super) fn provenance_schema() -> Value {
             "stale": { "type": "boolean" },
             "stale_reason": {
                 "type": "string",
-                "enum": ["ref_ttl_expired", "inputs_changed", "project_missing"],
-                "description": "ref_ttl_expired: a branch or a tag of git was resolved \
-                                more than a day ago, at resolved_at. inputs_changed: the \
+                "enum": ["rebuilding", "ref_ttl_expired", "inputs_changed", "project_missing"],
+                "description": "rebuilding: the crate of git that build_external_docs \
+                                recorded is being built again, as its branch or tag moved; \
+                                this is the commit before. ref_ttl_expired: a branch or a tag \
+                                of git was resolved more than a day ago, at resolved_at. \
+                                inputs_changed: the \
                                 workspace outside the default project that \
                                 build_external_docs recorded changed since. \
                                 project_missing: its directory is gone.",
@@ -195,18 +197,57 @@ struct Decided {
 /// Decides the version as `get_item` does (requirements R-VR-1 to R-VR-3), and tells what
 /// crates.io and docs.rs have of it.
 pub(super) async fn execute(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallToolResult {
+    let until = state.until();
+    resolving(arguments, state, until).await.0
+}
+
+/// What a release resolved is besides the response: the project's package that decided its
+/// version, or the crate of git that `build_external_docs` recorded, for `inspect_features`
+/// (decided in M3d, D2).
+#[derive(Default)]
+pub(super) struct Resolved {
+    /// The project's package, when the project decided the version or has the one given.
+    #[cfg(feature = "local")]
+    pub(super) found: Option<Box<Found>>,
+    /// The crate of git asked for, as recorded.
+    #[cfg(feature = "local")]
+    pub(super) git: Option<GitFound>,
+}
+
+/// [`execute`], with what the release resolved is, waiting for cargo until `until`, the deadline
+/// of the call (requirement R-ARCH-6).
+pub(super) async fn resolving(
+    arguments: ReleaseArguments,
+    state: Arc<ToolState>,
+    until: Instant,
+) -> (CallToolResult, Resolved) {
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(unused_mut, reason = "only a project or a record has more to tell")
+    )]
+    let mut resolved = Resolved::default();
     // Acted on once for the crate in the project, as `get_item` does (decided in M2's D5).
     #[cfg(feature = "local")]
     {
         let mut arguments = arguments;
         let scope = format!("crate {:?} {}", arguments.project, arguments.name);
         arguments.refresh = arguments.refresh && super::local::refresh_acts(&scope);
-        let result = resolve(arguments, state).await;
+        let result = resolve(arguments, state, until, &mut resolved).await;
         super::local::refresh_told(&scope, &result);
-        result
+        (result, resolved)
     }
     #[cfg(not(feature = "local"))]
-    resolve(arguments, state).await
+    (resolve(arguments, state, until).await, resolved)
+}
+
+/// What failed of the project and of the crate of `arguments` is forgotten before it is read again,
+/// with `refresh` (§6.4, decided in M2's D5).
+#[cfg(feature = "local")]
+async fn forget_failures(state: &ToolState, arguments: &ReleaseArguments) {
+    if arguments.refresh && super::local::refresh_project(state, arguments.project.as_deref()).await
+    {
+        state.index.forget(&arguments.name);
+    }
 }
 
 /// `invalid_argument` for `name`, a crate of std, which has no versions on crates.io.
@@ -220,23 +261,22 @@ fn no_versions(name: &CrateName) -> CallToolResult {
 }
 
 /// [`execute`], forgetting what failed first when it asks for `refresh`.
-async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallToolResult {
+async fn resolve(
+    arguments: ReleaseArguments,
+    state: Arc<ToolState>,
+    until: Instant,
+    #[cfg(feature = "local")] resolved: &mut Resolved,
+) -> CallToolResult {
     // In the records of `build_external_docs`, which `refresh` is not of (decided in M2e's E3b).
     #[cfg(feature = "local")]
     if let Some(git) = &arguments.git {
-        return of_git(&arguments, git, &state).await;
+        return of_git(&arguments, git, &state, &mut resolved.git).await;
     }
-    let until = state.until();
     if get_item::std_crate(&arguments.name).is_some() {
         return no_versions(&arguments.name);
     }
-    // What failed is forgotten before it is read again (§6.4, decided in M2's D5).
     #[cfg(feature = "local")]
-    if arguments.refresh
-        && super::local::refresh_project(&state, arguments.project.as_deref()).await
-    {
-        state.index.forget(&arguments.name);
-    }
+    forget_failures(&state, &arguments).await;
     let (lookup, mut warnings) = project::lookup_target(
         &state,
         arguments.target.as_ref(),
@@ -310,6 +350,8 @@ async fn resolve(arguments: ReleaseArguments, state: Arc<ToolState>) -> CallTool
             },
         },
     };
+    #[cfg(feature = "local")]
+    resolved.found.clone_from(&decided.found);
     answered(
         &state,
         name,
@@ -653,6 +695,7 @@ async fn of_git(
     arguments: &ReleaseArguments,
     git: &get_item::GitSpec,
     state: &ToolState,
+    recorded: &mut Option<GitFound>,
 ) -> CallToolResult {
     let target = match &arguments.target {
         Some(target) => target.clone(),
@@ -690,6 +733,7 @@ async fn of_git(
         &warnings,
     );
     found.origin.mark(&mut response);
+    *recorded = Some(found);
     CallToolResult::structured(response)
 }
 
