@@ -397,6 +397,17 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - D3b のレビューで見送ったもの: docs.rs に JSON が無い crates.io の版をプロジェクトが使っていないとき get_item を呼ばずに済ませる案。get_item は先に `build_external_docs` の記録を探し、無い JSON を覚えるので、記録があれば数えられ、無ければ 1 回の問い合わせで「build_external_docs で」の案内とともに返る
 - 残したもの: member の文書と、docs.rs に JSON が無い crates.io の依存の文書を、このツールのためにここでビルドする (get_item と同じく R-MCP-3 の範囲の判定を通る)。外の workspace の記録の member の件数は、その記録の文書から数える (get_item と同じ)
 
+**D4 の判断 (2026-11-02)**:
+
+- 決定 61 `inspect_features` への案内は 4 か所に置く: instructions の呼ぶ順 (「for a crate's features, `inspect_features`」)、get_item.md (`required_features` の欄)、crate_overview.md (`features` の欄の後)、docs.rs のビルドに無い feature の warning (R-FT-1) に添える hint。get_item.md (残り 2 字) と instructions (残り 35 字) は既存の言い回しを縮めて字数を作る
+- 決定 62 eval に Q11 のケース `q11-features` (axum で websocket を使うにはどの feature を有効にし、このプロジェクトで有効か。答えに `ws` と「有効でない」) を足し、`feature-hidden` の `tools` に `inspect_features` を足す。この 2 問を手で 1 回ずつ回す
+
+**D4 の実装 (2026-11-02)**: instructions は呼ぶ順に `inspect_features` を足し、「`resolve_version` is not needed first.」を外した (直前の「None needs an earlier call」と同じことを言う)。ローカル機能ありで 2,018 字。get_item.md は `data` の並びに「its `required_features` (see `inspect_features`)」を足し、provenance の括弧書きとプロジェクトの Cargo.lock の括弧書き (instructions にある) を縮めた (2,034 字)。crate_overview.md は「For what each feature enables and the items that need it, call `inspect_features`」(1,425 字)。R-FT-1 の warning に hint「inspect_features tells what each feature of {crate} enables and what enables it」。README の表の inspect_features の行に、プロジェクトで有効かと各 feature の item を足し、Planned から済んだ feature の項を外した。R-FT-1 の warning と hint の単体テストを足した (この warning のテストは前から無かった)
+
+- eval (2026-11-02、既定のモデル、各 1 回): `feature-hidden` は合格 (get_item → list_crates → inspect_features の 3 回、0.14 USD)。`q11-features` は inspect_features (`feature: ws`) を 1 回呼んで `ws`・既定に無いこと・`enabled_in_project: false`・有効にする書き方まで正しく答えた (0.22 USD) が、「doesn't enable it yet」「turned off」を採点の正規表現が拾わず不合格。正規表現を広げ (日本語の「ません」形も)、保存した答えに当てて合格を確かめた。回し直してはいない
+- D4 のレビュー (サブエージェント、読むだけ) の対応: q11-features の 2 つ目の正規表現は文のどこかに否定があれば通り、「既定では not enabled だがこのプロジェクトでは有効」のような誤答も通したので、否定を同じ文の中の「project / プロジェクト」から 80 字以内に限った (正答の例 8 件が通り、誤答の例 4 件のうち 3 件を落とす。同じ文で別の feature を否定する誤答は落とせない)。fixture の前提の食い違い (前から): tokio の `net` は fixture では挙げないが、axum の既定の `tokio` feature が `tokio/net` を有効にする (Cargo.lock に mio と socket2 がある)。`feature-hidden` の答えも「this project already has it turned on」で、これが正しい。fixture と eval/README のコメントを「axum 経由で有効」「axum の `ws` は有効にしない」に直した (採点は `net` だけなので合否は変わらない)。README の inspect_features の行の向き (「the items that need each」)。instructions の 100 字を超える行を折り返した
+- 残したもの: `item_not_found` のエラーでは照会の warning と hint が落ちる (前から)。feature が欠けて item が見つからないときこそ R-FT-1 の warning と inspect_features の案内が役に立つので、エラーにも載せるかを M3 の終わりに決める
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

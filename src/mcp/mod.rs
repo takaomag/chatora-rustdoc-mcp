@@ -66,8 +66,9 @@ pub(crate) const INSTRUCTIONS: &str = const_format::concatcp!(
     "- Order of calls: to find an item, ",
     FIND,
     "`crate_overview`, `list_module` or `search_items`; for the item itself, `get_item`; for \
-     what a type or trait has, `list_methods`, `list_impls` or `list_implementors`. None needs an \
-     earlier call (but see below): give the path, such as `tokio::sync::Mutex`, directly.",
+     what a type or trait has, `list_methods`, `list_impls` or `list_implementors`; for a crate's \
+     features, `inspect_features`. None needs an earlier call (but see below): give the path, \
+     such as `tokio::sync::Mutex`, directly.",
     EXTERNAL,
     "\n",
     VERSIONS,
@@ -107,10 +108,10 @@ const EXTERNAL: &str = "";
 #[cfg(feature = "local")]
 const VERSIONS: &str = "- Versions: without a version, a tool uses the one in the project's \
                         Cargo.lock (the project Claude Code was opened in, or `project`), or else \
-                        the latest release; `provenance` tells which and why. `resolve_version` \
-                        is not needed first. Working in another git worktree of the project, as a \
-                        subagent may, pass the worktree's directory as `project`: the server sees \
-                        only the directory Claude Code was opened in.\n";
+                        the latest release; `provenance` tells which and why. Working in another \
+                        git worktree of the project, as a subagent may, pass the worktree's \
+                        directory as `project`: the server sees only the directory Claude Code \
+                        was opened in.\n";
 #[cfg(not(feature = "local"))]
 const VERSIONS: &str = "- Versions: without a version, a tool uses the latest release, as this \
                         server is built without reading projects: give the version that the \
@@ -120,8 +121,8 @@ const VERSIONS: &str = "- Versions: without a version, a tool uses the latest re
 #[cfg(feature = "local")]
 const TARGETS: &str = "- Targets: the data is for the project's `build.target` for the crates it \
                        uses, else the host's, unless `target` names another, so items for other \
-                       platforms may be missing. std, core and alloc are those of a nightly toolchain: check an \
-                       item's `stability` before relying on it.\n";
+                       platforms may be missing. std, core and alloc are those of a nightly \
+                       toolchain: check an item's `stability` before relying on it.\n";
 #[cfg(not(feature = "local"))]
 const TARGETS: &str = "- Targets: the data is that of the host's target unless `target` names \
                        another, so items for other platforms may be missing. std, core and alloc \

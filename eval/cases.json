@@ -108,8 +108,15 @@
     "id": "feature-hidden",
     "question": "R-QA-6",
     "prompt": "Which feature of tokio do I need for `tokio::net::TcpStream`, and does this project enable it?",
-    "tools": ["get_item"],
+    "tools": ["get_item", "inspect_features"],
     "answer": ["\\bnet\\b"]
+  },
+  {
+    "id": "q11-features",
+    "question": "Q11",
+    "prompt": "Which feature of axum do I enable to use websockets, and does this project enable it now?",
+    "tools": ["inspect_features", "get_item"],
+    "answer": ["\\bws\\b", "(project|プロジェクト)[^.。\\n]{0,80}(n't|\\bnot\\b|\\boff\\b|無効|でない|ではない|ではありません|ていない|ていません)|(n't|\\bnot\\b|\\boff\\b|無効|でない|ではない|ではありません|ていない|ていません)[^.。\\n]{0,80}(project|プロジェクト)"]
   },
   {
     "id": "shape-result",

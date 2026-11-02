@@ -1,5 +1,6 @@
 # eval の問題が「このプロジェクト」と呼ぶ workspace。版は testdata/docs-rs-json.txt に合わせて固定する。
-# tokio の `net` はわざと有効にしない (feature で隠れた item の問題のため)。
+# tokio の `net` はここでは挙げないが、axum の既定の `tokio` feature が有効にする (feature-hidden の正答は「net、axum 経由で有効」)。
+# axum の `ws` は有効にしない (q11-features のため)。
 [package]
 name = "eval-fixture"
 version = "0.1.0"

@@ -1043,6 +1043,10 @@ impl<'a> Query<'a> {
                 self.request.version,
                 build.missing.join(", ")
             )));
+            self.hint(format!(
+                "inspect_features tells what each feature of {} enables and what enables it",
+                self.request.name
+            ));
         }
         let requested = self.request.version;
         let version = if let Origin::Std { .. } = self.request.origin {
@@ -3158,6 +3162,50 @@ pub(super) mod tests {
         let data = at_detail("my_crate::Mutex", Detail::Normal, |_| {})["data"].clone();
         assert!(data.get("cfg_source").is_none(), "{data}");
         assert!(data.get("required_features").is_none(), "{data}");
+    }
+
+    /// A feature that docs.rs's build left out is warned of, with where to read what enables it
+    /// (requirement R-FT-1, decided in M3d, decision 61).
+    #[test]
+    fn a_feature_that_docs_rs_left_out_is_warned_of() {
+        let bytes = archive(parsed().krate);
+        let view = CrateView::new(archived(&bytes));
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::new(1, 2, 3);
+        let build = DocsRsBuild {
+            missing: Box::from([Box::from("net")]),
+            ..DocsRsBuild::default()
+        };
+        let response = get_item(&view, ItemRequest {
+            name: &name,
+            version: &version,
+            path: "my_crate::Mutex",
+            origin: Origin::DocsRs {
+                resolved_from: ResolvedFrom::CargoLock,
+                project_from: Some("cwd"),
+                build: Some(&build),
+            },
+            detail: Detail::Brief,
+            project_features: None,
+            follow: false,
+            target: None,
+        })
+        .expect("found");
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("without the features [net]")),
+            "{:?}",
+            response.warnings
+        );
+        assert!(
+            response.hints.iter().any(
+                |hint| hint.starts_with("inspect_features tells what each feature of my-crate")
+            ),
+            "{:?}",
+            response.hints
+        );
     }
 
     /// `enabled_in_project` and `enabled_in_dev_only` of `path` in [`parsed`] with

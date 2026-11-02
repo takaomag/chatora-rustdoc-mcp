@@ -58,7 +58,7 @@ The tools take a `project` argument to choose a workspace of the project, or one
 | `list_module` | What a module has and re-exports, or a crate's whole public API |
 | `list_methods` | The methods that can be called on a type, and which need a `use` |
 | `get_source` | The source code of an item, or lines of a file of its crate, from the crate's own sources |
-| `inspect_features` | A crate's features: what each enables, what enables it, which `default` enables, and which docs.rs's documentation lacks |
+| `inspect_features` | A crate's features: what each enables, what enables it, which `default` enables, which docs.rs's documentation lacks, whether the project enables each, and the items that need each |
 | `list_impls` | The traits a type implements, and the conditions of its auto traits |
 | `list_implementors` | The types that implement a trait in its crate, and what an implementation must write |
 | `build_external_docs` | Builds code that the other tools do not build themselves, for them to look up: another workspace, a crate of a git repository, a crate or version the project does not use, or the project's crates for another target or with the features of their `[package.metadata.docs.rs]`. See [Security](#security) |
@@ -203,7 +203,7 @@ The server always starts: a file that cannot be read or is not TOML is ignored, 
 
 ## Planned
 
-- The features of crates built here and the items that each feature enables, examples, and changelogs.
+- Examples and changelogs.
 - The methods of the type a type dereferences to and of primitive types, the implementors of a trait across your dependency graph, and API diffs between versions.
 - Crate metadata and advisories.
 - A Claude Code plugin with a skill, and prebuilt binaries.
