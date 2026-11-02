@@ -241,9 +241,35 @@ fn feature_questions() -> Vec<Question> {
     ]
 }
 
+/// The questions about crates' readmes (decided in M3e).
+fn readme_questions() -> Vec<Question> {
+    vec![
+        question(
+            "get_readme",
+            "how do I start with axum?",
+            json!({ "crate": "axum@0.8.9" }),
+            |result| {
+                result["data"]["file"] == "README.md"
+                    && has(&result["data"]["outline"], "Usage example")
+                    && has(&result["data"]["text"], "Router::new()")
+            },
+        ),
+        question(
+            "get_readme",
+            "what does this crate's README say about its setup?",
+            json!({ "crate": "tokio@1.53.3", "section": "example" }),
+            |result| {
+                result["page"]["first_line"] == 55
+                    && has(&result["data"]["text"], r#"features = [\"full\"]"#)
+            },
+        ),
+    ]
+}
+
 fn questions() -> Vec<Question> {
     let mut questions = item_questions();
     questions.extend(feature_questions());
+    questions.extend(readme_questions());
     questions.extend(other_questions());
     questions.extend(
         [

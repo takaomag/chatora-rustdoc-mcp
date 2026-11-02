@@ -21,7 +21,7 @@ use super::{
     ToolState,
     get_item::{self, Paging, ReleaseArguments},
     list_module::{self, CURSOR_EXAMPLE, CURSOR_FORM},
-    resolve_version,
+    resolve_version::{self, Release},
 };
 #[cfg(feature = "local")]
 use super::{project, recorded_git::GitFound};
@@ -31,7 +31,6 @@ use crate::data::{
     metadata::Resolution,
     packages::DocsRsCheck,
     project::Workspace,
-    target::TargetTriple,
 };
 use crate::{
     data::{
@@ -327,70 +326,6 @@ pub(super) fn parse_arguments(arguments: Option<&JsonObject>) -> Result<Inspect,
             },
         },
     })
-}
-
-/// The release that `resolve_version` resolved, as it tells it.
-struct Release {
-    provenance: Map<String, Value>,
-    warnings: Vec<Box<str>>,
-    hints: Vec<Value>,
-    name: CrateName,
-    version: Version,
-    /// `crates.io`, `path`, `git` or `registry`.
-    source: Box<str>,
-    /// Whether it is the release on crates.io, as docs.rs has it: of crates.io, and not a copy of
-    /// the project that differs or that the index does not have.
-    on_crates_io: bool,
-    /// Whether docs.rs has its documentation.
-    docs_rs_json: Box<str>,
-    /// When to call again, as for a build of git being made again.
-    retry_after: Option<Value>,
-}
-
-impl Release {
-    /// The release that the response `content` of `resolve_version` tells, if it tells one.
-    fn of(content: &Value) -> Option<Self> {
-        fn text(value: Option<&Value>) -> &str {
-            value.and_then(Value::as_str).unwrap_or_default()
-        }
-        let provenance = content.get("provenance")?.as_object()?.clone();
-        let data = content.get("data")?;
-        let source = text(data.get("source"));
-        let docs_rs_json = text(data.get("docs_rs_json"));
-        Some(Self {
-            name: text(provenance.get("crate")).parse().ok()?,
-            version: Version::parse(text(data.get("version"))).ok()?,
-            on_crates_io: source == "crates.io"
-                && text(provenance.get("source")) == "crates.io"
-                && docs_rs_json != "not_on_docs_rs",
-            source: source.into(),
-            docs_rs_json: docs_rs_json.into(),
-            retry_after: content.get("retry_after_secs").cloned(),
-            warnings: content
-                .get("warnings")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(Box::from)
-                .collect(),
-            hints: content
-                .get("hints")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-            provenance,
-        })
-    }
-
-    /// The target, as the provenance tells it.
-    #[cfg(feature = "local")]
-    fn target(&self) -> Option<TargetTriple> {
-        self.provenance
-            .get("target")
-            .and_then(Value::as_str)
-            .and_then(|target| target.parse().ok())
-    }
 }
 
 /// What is known of the features of a release.

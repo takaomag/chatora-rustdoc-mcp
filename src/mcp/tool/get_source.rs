@@ -646,7 +646,7 @@ async fn local_package(
         // whose files may differ, nor vendored (decided in M3c, decision 31).
         "crates.io" => {
             return if cargo_home.is_some_and(|home| unpacked_from_crates_io(dir, home)) {
-                release_sources(state, found, provenance, warnings)
+                release_sources(state, &SourcesOf::of(found), provenance, warnings)
                     .await
                     .map(Readable::Release)
             } else {
@@ -809,19 +809,15 @@ async fn docs_rs_sources(
         None
     };
     let Some((name, version, path)) = &dependency else {
-        let sources = release_sources(state, found, provenance.clone(), warnings).await?;
+        let sources =
+            release_sources(state, &SourcesOf::of(found), provenance.clone(), warnings).await?;
         return Ok((sources, None));
     };
-    let of = Found {
+    let of = SourcesOf {
         name,
         version,
         checksum: None,
-        docs: Source::DocsRs,
         until: found.until,
-        #[cfg(feature = "local")]
-        built: None,
-        #[cfg(feature = "local")]
-        workspace: None,
     };
     asked.file = path.as_str().into();
     let sources = release_sources(state, &of, provenance.clone(), warnings).await?;
@@ -1426,12 +1422,35 @@ fn rust_src_error(what: &str, error: &DistError, rustup: bool) -> CallToolResult
     super::error_result(&get_item::dist_error_body(error, &message, &suggestions))
 }
 
-/// The sources of the release of `found`, a crates.io release documented on docs.rs: where cargo
-/// unpacked them, or else unpacked in the cache from its `.crate`, fetched if need be, while the
-/// call waits; else the answer to give, while they are fetched or when they cannot be had.
-async fn release_sources(
+/// A crates.io release whose sources are read, until when the call waits for them.
+pub(super) struct SourcesOf<'a> {
+    /// The crate, as crates.io spells it.
+    pub(super) name: &'a CrateName,
+    pub(super) version: &'a Version,
+    /// The sha256 of its `.crate` in the crates.io index, when the index was read.
+    pub(super) checksum: Option<&'a str>,
+    /// The deadline of the call (requirement R-ARCH-6).
+    pub(super) until: Instant,
+}
+
+impl<'a> SourcesOf<'a> {
+    /// The release of `found`.
+    const fn of(found: &Found<'a>) -> Self {
+        Self {
+            name: found.name,
+            version: found.version,
+            checksum: found.checksum,
+            until: found.until,
+        }
+    }
+}
+
+/// The sources of the release `found`, a crates.io release: where cargo unpacked them, or else
+/// unpacked in the cache from its `.crate`, fetched if need be, while the call waits; else the
+/// answer to give, while they are fetched or when they cannot be had.
+pub(super) async fn release_sources(
     state: &Arc<ToolState>,
-    found: &Found<'_>,
+    found: &SourcesOf<'_>,
     provenance: Map<String, Value>,
     warnings: &[Box<str>],
 ) -> Result<Sources, Box<CallToolResult>> {
@@ -1731,7 +1750,7 @@ fn excerpt(
 }
 
 /// `line` cut to at most `max` characters, but not within a mark such as `<U+202E>`.
-fn cut(line: &str, max: usize) -> &str {
+pub(super) fn cut(line: &str, max: usize) -> &str {
     let end = line
         .char_indices()
         .nth(max)

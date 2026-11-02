@@ -58,6 +58,7 @@ The tools take a `project` argument to choose a workspace of the project, or one
 | `list_module` | What a module has and re-exports, or a crate's whole public API |
 | `list_methods` | The methods that can be called on a type, and which need a `use` |
 | `get_source` | The source code of an item, or lines of a file of its crate, from the crate's own sources |
+| `get_readme` | A crate's README on crates.io, with the outline of its headings, a page at a time |
 | `inspect_features` | A crate's features: what each enables, what enables it, which `default` enables, which docs.rs's documentation lacks, whether the project enables each, and the items that need each |
 | `list_impls` | The traits a type implements, and the conditions of its auto traits |
 | `list_implementors` | The types that implement a trait in its crate, and what an implementation must write |
@@ -93,7 +94,7 @@ The server needs no confirmation for anything it does. Builds run `cargo`, and w
 - The lookup tools build only the crates of the project Claude Code is opened in, and the dependencies that `cargo check --all-targets` builds for the project's build targets (`build.target`, or the host's): the same set rust-analyzer builds when it opens the project. Given another `target`, they build nothing but the project's procedural macros, which are built for the host: they use docs.rs, or what `build_external_docs` built for that target.
 - `build_external_docs` builds code from anywhere else the agent points it at: another workspace, a git repository, a crate that is not a dependency, or a version that is not in `Cargo.lock`, as well as the dependencies of this project from crates.io that the lookup tools cannot build. It can also build the project's crates for another target, or with the features of their `[package.metadata.docs.rs]`.
 - Even when nothing is built, lookups in the project run `cargo metadata`, `cargo tree`, `rustc -vV`, `rustdoc -vV` and `git ls-files` there, and for the standard library `rustup run nightly rustc` in the cache directory, where the server also runs `rustc -vV` when it starts, to know the host's target. `[toolchain] path` in the project's `rust-toolchain.toml` can make them run any executable, and `build.rustc` and `build.rustc-wrapper` in its `.cargo/config.toml` can do the same for cargo; `cargo metadata` also fetches the git dependencies in `Cargo.toml` from whatever hosts they name, and when `rust-toolchain.toml` names a toolchain that is not installed, rustup may install it (hundreds of MB), as it would for your own `cargo`. rust-analyzer does the same when it opens the project. Do not open untrusted repositories in Claude Code with this server enabled.
-- `get_source` reads files that Claude Code's own `Read` permission rules and sandbox do not see. It reads only the files of the crate it is asked about: those of its published `.crate` (or of a git checkout, or of the standard library's `rust-src`), and of a crate built here its targets' sources, the files `rustdoc` read, its `Cargo.toml`, readme and examples; never dotfiles, nor files that symlinks lead to outside the crate's root.
+- `get_source` and `get_readme` read files that Claude Code's own `Read` permission rules and sandbox do not see. They read only the files of the crate they are asked about: those of its published `.crate` (or of a git checkout, or of the standard library's `rust-src`), and of a crate built here its targets' sources, the files `rustdoc` read, its `Cargo.toml`, readme and examples; never dotfiles, nor files that symlinks lead to outside the crate's root.
 
 To allow the lookup tools but still be asked before code from elsewhere is built, use these Claude Code permission rules (for a plugin install, the tool names start with `mcp__plugin_<plugin>_<server>__` instead):
 
@@ -203,7 +204,7 @@ The server always starts: a file that cannot be read or is not TOML is ignored, 
 
 ## Planned
 
-- Examples and changelogs.
+- Examples, changelogs, and the README of a crate built here or of git.
 - The methods of the type a type dereferences to and of primitive types, the implementors of a trait across your dependency graph, and API diffs between versions.
 - Crate metadata and advisories.
 - A Claude Code plugin with a skill, and prebuilt binaries.

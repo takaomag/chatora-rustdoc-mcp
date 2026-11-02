@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use semver::Version;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
 use super::{
@@ -192,6 +192,70 @@ struct Decided {
     /// The project's package, when the project decided the version.
     #[cfg(feature = "local")]
     found: Option<Box<Found>>,
+}
+
+/// The release that `resolve_version` resolved, as it tells it.
+pub(super) struct Release {
+    pub(super) provenance: Map<String, Value>,
+    pub(super) warnings: Vec<Box<str>>,
+    pub(super) hints: Vec<Value>,
+    pub(super) name: CrateName,
+    pub(super) version: Version,
+    /// `crates.io`, `path`, `git` or `registry`.
+    pub(super) source: Box<str>,
+    /// Whether it is the release on crates.io, as docs.rs has it: of crates.io, and not a copy of
+    /// the project that differs or that the index does not have.
+    pub(super) on_crates_io: bool,
+    /// Whether docs.rs has its documentation.
+    pub(super) docs_rs_json: Box<str>,
+    /// When to call again, as for a build of git being made again.
+    pub(super) retry_after: Option<Value>,
+}
+
+impl Release {
+    /// The release that the response `content` of `resolve_version` tells, if it tells one.
+    pub(super) fn of(content: &Value) -> Option<Self> {
+        fn text(value: Option<&Value>) -> &str {
+            value.and_then(Value::as_str).unwrap_or_default()
+        }
+        let provenance = content.get("provenance")?.as_object()?.clone();
+        let data = content.get("data")?;
+        let source = text(data.get("source"));
+        let docs_rs_json = text(data.get("docs_rs_json"));
+        Some(Self {
+            name: text(provenance.get("crate")).parse().ok()?,
+            version: Version::parse(text(data.get("version"))).ok()?,
+            on_crates_io: source == "crates.io"
+                && text(provenance.get("source")) == "crates.io"
+                && docs_rs_json != "not_on_docs_rs",
+            source: source.into(),
+            docs_rs_json: docs_rs_json.into(),
+            retry_after: content.get("retry_after_secs").cloned(),
+            warnings: content
+                .get("warnings")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(Box::from)
+                .collect(),
+            hints: content
+                .get("hints")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            provenance,
+        })
+    }
+
+    /// The target, as the provenance tells it.
+    #[cfg(feature = "local")]
+    pub(super) fn target(&self) -> Option<TargetTriple> {
+        self.provenance
+            .get("target")
+            .and_then(Value::as_str)
+            .and_then(|target| target.parse().ok())
+    }
 }
 
 /// Decides the version as `get_item` does (requirements R-VR-1 to R-VR-3), and tells what

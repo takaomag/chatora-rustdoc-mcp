@@ -1486,6 +1486,7 @@ fn tools_list_is_cacheable_and_not_paginated() {
     expected.extend([
         "crate_overview",
         "get_item",
+        "get_readme",
         "get_source",
         "inspect_features",
     ]);
@@ -7247,18 +7248,28 @@ fn a_crate_that_takes_long_to_fetch_is_building_and_then_answered() {
 fn features_cache() -> TempDir {
     let cache = test_cache();
     // Its `.crate`.
-    let manifest = "[package]\nname = \"demo\"\nversion = \"0.2.0\"\n[features]\n\
+    let manifest = "[package]\nname = \"demo\"\nversion = \"0.2.0\"\nreadme = \"docs/README.md\"\n\
+                    [features]\n\
                     default = [\"extra\"]\nextra = []\nfull = [\"extra\", \"dep:serde\"]\n\
                     [dependencies]\nserde = { version = \"1\", optional = true }\n\
                     [target.'cfg(unix)'.dependencies]\nlog = { version = \"0.4\", optional = true }\n";
+    // Its readme, which its manifest names, with a hidden character (decided in M3e).
+    let readme = "# Demo [![Build](https://example.invalid/b.svg)](https://example.invalid)\n\n\
+                  Say hello.\n\n## Getting started\n\n```sh\n# not a heading\ncargo add demo\n```\n\n\
+                  ## Safety \u{202e}\n\nNone.\n";
     let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
-    let mut header = tar::Header::new_gnu();
-    header.set_size(manifest.len().try_into().expect("small"));
-    header.set_mode(0o644);
-    header.set_cksum();
-    builder
-        .append_data(&mut header, "demo-0.2.0/Cargo.toml", manifest.as_bytes())
-        .expect("appended");
+    for (path, contents) in [
+        ("demo-0.2.0/Cargo.toml", manifest),
+        ("demo-0.2.0/docs/README.md", readme),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len().try_into().expect("small"));
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, contents.as_bytes())
+            .expect("appended");
+    }
     let crate_file = builder
         .into_inner()
         .and_then(GzEncoder::finish)
@@ -7390,6 +7401,83 @@ fn inspect_features_tells_the_features_from_the_index_and_the_crate_file() {
     let body = text_json(&none);
     assert_eq!(body["code"], "invalid_argument", "{none}");
     assert!(body["suggestions"].to_string().contains("full"), "{none}");
+    assert!(server.finish().success());
+}
+
+/// `get_readme` reads the readme that a release's manifest names from its `.crate`, offline: its
+/// outline without the badges nor what is in a code block, a page marked, and from a section;
+/// one that it lacks is told with its headings (decided in M3e, decisions 63 to 66).
+#[test]
+fn get_readme_reads_the_readme_of_a_release() {
+    let cache = features_cache();
+    let mut server = Server::start_with_cache(cache, None, &[(
+        "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE",
+        "true",
+    )]);
+    let call = |server: &mut Server, id, arguments: Value| {
+        server.send(&call_tool(id, "get_readme", arguments));
+        server.response(id)["result"].clone()
+    };
+    let all = call(
+        &mut server,
+        1,
+        json!({ "crate": "demo@0.2.0", "target": TARGET }),
+    );
+    assert_eq!(all["isError"], false, "{all}");
+    let content = &all["structuredContent"];
+    assert_eq!(content["provenance"]["version"], "0.2.0", "{all}");
+    let data = &content["data"];
+    assert_eq!(data["file"], "docs/README.md", "{all}");
+    assert_eq!(data["format"], "markdown", "{all}");
+    assert_eq!(
+        data["outline"],
+        json!([
+            { "level": 1, "heading": "Demo", "line": 1 },
+            { "level": 2, "heading": "Getting started", "line": 5 },
+            { "level": 2, "heading": "Safety <U+202E>", "line": 12 },
+        ]),
+        "{all}"
+    );
+    assert!(
+        data["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("## Safety <U+202E>\n")),
+        "{all}"
+    );
+    assert_eq!(data["truncated"], false, "{all}");
+    assert_eq!(content["page"]["total_lines"], 14, "{all}");
+    assert!(
+        content["warnings"].to_string().contains("2 invisible"),
+        "{all}"
+    );
+    let section = call(
+        &mut server,
+        2,
+        json!({ "crate": "demo@0.2.0", "target": TARGET, "section": "getting" }),
+    );
+    let text = &section["structuredContent"]["data"]["text"];
+    assert!(
+        text.as_str()
+            .is_some_and(|text| text.starts_with("## Getting started\n")),
+        "{section}"
+    );
+    assert_eq!(
+        section["structuredContent"]["page"]["first_line"], 5,
+        "{section}"
+    );
+    let none = call(
+        &mut server,
+        3,
+        json!({ "crate": "demo@0.2.0", "target": TARGET, "section": "License" }),
+    );
+    let body = text_json(&none);
+    assert_eq!(body["code"], "invalid_argument", "{none}");
+    assert!(
+        body["suggestions"].to_string().contains("Getting started"),
+        "{none}"
+    );
+    let std = call(&mut server, 4, json!({ "crate": "std" }));
+    assert_eq!(text_json(&std)["code"], "invalid_argument", "{std}");
     assert!(server.finish().success());
 }
 

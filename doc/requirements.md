@@ -810,8 +810,8 @@ MCP 2026-07-28 を話すクライアント (主に Claude Code) が Rust のコ�
 | `search_source` | 依存・std・workspace のソースを文字列や正規表現で探す (R-SC-6。M4、任意) | item の名前や説明で探す → `search_items` |
 | `inspect_features` | feature の一覧、依存関係、default、プロジェクトで有効か、その feature で有効になる item | 依存一覧 → `crate_metadata` |
 | `find_examples` | item や crate の使用例 (既定はファイルの絶対パス) | 導入手順 → `readme` |
-| `readme` | README (見出し単位でページング) | API の詳細 → `get_item` |
-| `changelog` | バージョン範囲の変更履歴 (既定は新しい順に応答の上限まで、最大 N リリース。§5.9) | 変更履歴が取れない、または API の差分が欲しい → `api_diff` |
+| `get_readme` | README (見出し単位でページング。M3e の決定 77 で `readme` から改めた) | API の詳細 → `get_item` |
+| `get_changelog` | バージョン範囲の変更履歴 (M3e の決定 77 で `changelog` から改めた) (既定は新しい順に応答の上限まで、最大 N リリース。§5.9) | 変更履歴が取れない、または API の差分が欲しい → `api_diff` |
 | `api_diff` | 2 つのバージョン間の公開 API の差分と semver 上の重さ | 文章での経緯が欲しい → `changelog` |
 | `crate_metadata` | **宣言された**情報 (MSRV、ライセンス、リポジトリ、依存、docs.rs の target)、選定の材料、バージョン履歴 | feature の詳細 → `inspect_features` |
 | `search_crates` | crates.io で crate を探す (選定の材料つき。被依存数は除く) | **crate が既に分かっているときは使わない** → `search_items` |

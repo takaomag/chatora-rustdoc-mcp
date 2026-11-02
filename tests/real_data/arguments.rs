@@ -136,6 +136,19 @@ fn item_cases() -> Vec<Case> {
         &json!({ "crate": TOKIO, "limit": 2 }),
         vec![("cursor", Change::NextCursor)],
     ));
+    cases.extend(shared("get_readme", &json!({})));
+    cases.extend(each("get_readme", &json!({ "crate": TOKIO }), vec![(
+        "section",
+        Change::Set(json!("Example")),
+    )]));
+    // tokio's readme fits one page: the unit test the_readme_is_answered_a_page_at_a_time checks
+    // the cursor.
+    cases.push(case(
+        "get_readme",
+        "cursor",
+        json!({ "crate": TOKIO }),
+        Change::CheckedElsewhere,
+    ));
     cases.extend(shared("crate_overview", &json!({})));
     cases.extend(each("crate_overview", &json!({ "crate": TOKIO }), vec![(
         "detail",
@@ -269,6 +282,7 @@ fn refresh_cases() -> Vec<Case> {
     [
         "crate_overview",
         "get_item",
+        "get_readme",
         "get_source",
         "inspect_features",
         "list_crates",
@@ -325,6 +339,7 @@ fn git_cases() -> Vec<Case> {
         "build_external_docs",
         "crate_overview",
         "get_item",
+        "get_readme",
         "get_source",
         "inspect_features",
         "list_implementors",

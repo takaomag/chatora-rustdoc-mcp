@@ -18,6 +18,7 @@ mod external_target;
 #[cfg(feature = "local")]
 mod external_workspace;
 mod get_item;
+mod get_readme;
 mod get_source;
 mod inspect_features;
 #[cfg(feature = "local")]
@@ -394,6 +395,7 @@ pub(super) fn definitions() -> Vec<Tool> {
         build_external_docs::definition(),
         crate_overview::definition(),
         get_item::definition(),
+        get_readme::definition(),
         get_source::definition(),
         inspect_features::definition(),
         // A project is needed, which only local features read (requirement R-ARCH-4).
@@ -827,6 +829,10 @@ async fn dispatch(
                 },
                 Err(error) => Ok(error.into_result()),
             }
+        },
+        get_readme::NAME => match get_readme::parse_arguments(request.arguments.as_ref()) {
+            Ok(readme) => Ok(run_tool(get_readme::execute(readme, Arc::clone(state))).await),
+            Err(error) => Ok(error.into_result()),
         },
         list_impls::NAME => match list_impls::parse_arguments(request.arguments.as_ref()) {
             Ok(arguments) => Ok(run_tool(list_impls::execute(arguments, Arc::clone(state))).await),
@@ -1279,7 +1285,11 @@ mod tests {
         let name = "serde".parse().expect("a crate name");
         let going = (Doing::WaitingForLock, "claude_project_dir");
         let mut tools = ONE_CRATE.to_vec();
-        tools.extend([resolve_version::NAME, inspect_features::NAME]);
+        tools.extend([
+            resolve_version::NAME,
+            inspect_features::NAME,
+            get_readme::NAME,
+        ]);
         fits_the_schemas(project::resolving_crate(&name, &target, going, &[]), &tools);
         let mut provenance = serde_json::Map::new();
         provenance.insert("source".to_owned(), json!("project"));
