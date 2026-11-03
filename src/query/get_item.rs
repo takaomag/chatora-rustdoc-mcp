@@ -848,6 +848,94 @@ pub fn get_item<'a>(
     Ok(response)
 }
 
+/// The item that `find_examples` is asked for, as `get_item` resolves it (decided in M3e, decision
+/// 71).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExamplesOf {
+    /// Its id, whose docs are its own examples.
+    pub id: Id,
+    /// Its canonical path.
+    pub path: Box<str>,
+    /// Its name.
+    pub name: Box<str>,
+    /// The name of the type, trait or enum that it is a member of, if it is one.
+    pub parent: Option<Box<str>>,
+}
+
+/// The item that `request` names, whose examples come first, as [`get_item`] resolves it; `None`
+/// for the crate's root, whose examples are all (decided in M3e, decision 71).
+///
+/// Its name is the last part of its canonical path, and its parent's of its parent's, as a renamed
+/// re-export names it (P13). The caller asks with `follow`, so that a re-export of another crate's
+/// item goes on there, and with [`Detail::Brief`], as only the paths are used.
+///
+/// # Errors
+///
+/// Returns the error of [`get_item`]: none or more than one has the path, or it goes on in another
+/// crate.
+pub fn examples_of(
+    view: &CrateView<'_>,
+    request: ItemRequest<'_>,
+) -> Result<Option<ExamplesOf>, GetItemError> {
+    let data = get_item(view, request)?.data;
+    let query = Query::new(view, request);
+    let with_root = with_root_name(view, request.name, request.path);
+    let asked = with_root.as_deref().unwrap_or(request.path);
+    let id = match query.resolve(asked) {
+        Resolution::Item(id) => id,
+        Resolution::Member { member, .. } => member,
+        Resolution::ExternalReexport(_)
+        | Resolution::Ambiguous(_)
+        | Resolution::AmbiguousMembers { .. }
+        | Resolution::NotFound => return Err(GetItemError::NotFound),
+    };
+    if id == view.root() {
+        return Ok(None);
+    }
+    // The last part, without any generics (`Mutex<T>`).
+    let last = |path: &str| {
+        let path = path.split('<').next().unwrap_or(path);
+        path.rsplit("::").next().map(Box::from).unwrap_or_default()
+    };
+    Ok(Some(ExamplesOf {
+        id,
+        name: last(&data.path),
+        parent: data.parent.as_deref().map(last),
+        path: data.path,
+    }))
+}
+
+/// Where the items `ids` are defined, as [`get_item`] tells it, and what it warns of them, each once.
+///
+/// They are for the blocks of their docs that `find_examples` shows (decided in M3e, decision 70);
+/// a warning is of a file outside the package, as one made in a build's `OUT_DIR` (requirement
+/// R-OUT-8).
+#[must_use]
+pub fn source_locations(
+    view: &CrateView<'_>,
+    request: ItemRequest<'_>,
+    ids: &[Id],
+) -> (Vec<Option<serde_json::Value>>, Box<[Box<str>]>) {
+    let mut query = Query::new(view, request);
+    let locations = ids
+        .iter()
+        .map(|&id| {
+            let item = view.item(id)?;
+            let location = query.source_location(item)?;
+            serde_json::to_value(location).ok()
+        })
+        .collect();
+    let Notes { warnings, .. } = query.finish();
+    let mut told: Vec<Box<str>> = Vec::new();
+    for warning in &warnings {
+        let warning: Box<str> = warning.as_ref().into();
+        if !told.contains(&warning) {
+            told.push(warning);
+        }
+    }
+    (locations, told.into())
+}
+
 /// `path` with its head written as the crate's lib name, the name of its root module, when it is
 /// written as the package `name` and the two differ (`md-5::Md5` is `md5::Md5`). When the lib name
 /// follows the package name (`md_5::md5::Md5`, as a path given without the crate name gets it),
@@ -1602,7 +1690,7 @@ impl<'a> Query<'a> {
     /// Where `item` is defined, with a docs.rs URL when the file is in the package, or a local
     /// build's real path to open ([`Self::readable`]). A file outside it (generated in `OUT_DIR`,
     /// or a path on the build host) gets no URL and a warning (requirement R-OUT-8).
-    fn source_location(&mut self, item: &'a Item) -> Option<SourceLocation<'a>> {
+    pub(super) fn source_location(&mut self, item: &'a Item) -> Option<SourceLocation<'a>> {
         let span = item.span.as_ref()?;
         let file = span.filename.to_str()?;
         let in_package = span
@@ -3162,6 +3250,68 @@ pub(super) mod tests {
         let data = at_detail("my_crate::Mutex", Detail::Normal, |_| {})["data"].clone();
         assert!(data.get("cfg_source").is_none(), "{data}");
         assert!(data.get("required_features").is_none(), "{data}");
+    }
+
+    /// The item asked examples of, as `get_item` resolves it: a method with its type, a type
+    /// alone; where the items are defined (decided in M3e, decisions 70 and 71).
+    #[test]
+    fn the_item_asked_examples_of_is_resolved() {
+        let bytes = archive(parsed().krate);
+        let view = CrateView::new(archived(&bytes));
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::new(1, 2, 3);
+        let request = |path| ItemRequest {
+            name: &name,
+            version: &version,
+            path,
+            origin: Origin::DocsRs {
+                resolved_from: ResolvedFrom::CargoLock,
+                project_from: Some("cwd"),
+                build: None,
+            },
+            detail: Detail::Brief,
+            project_features: None,
+            follow: false,
+            target: None,
+        };
+        let of = |path| {
+            examples_of(&view, request(path))
+                .expect("found")
+                .expect("not the root")
+        };
+        let lock = of("my_crate::Mutex::lock");
+        assert_eq!(&*lock.path, "my_crate::Mutex::lock");
+        assert_eq!(&*lock.name, "lock");
+        assert_eq!(lock.parent.as_deref(), Some("Mutex"));
+        let mutex = of("my_crate::Mutex");
+        assert_eq!((&*mutex.name, mutex.parent.as_deref()), ("Mutex", None));
+        // A variant, with its enum; the crate's root is none, whose examples are all.
+        let variant = of("my_crate::E::A");
+        assert_eq!(
+            (&*variant.name, variant.parent.as_deref()),
+            ("A", Some("E"))
+        );
+        assert_eq!(examples_of(&view, request("my_crate")).ok(), Some(None));
+        assert!(matches!(
+            examples_of(&view, request("my_crate::Nothing")),
+            Err(GetItemError::NotFound)
+        ));
+        // The test crate's method has no span; its type has one.
+        let (locations, warnings) =
+            source_locations(&view, request("my_crate"), &[lock.id, mutex.id]);
+        assert_eq!(locations.len(), 2);
+        assert!(
+            locations.first().is_some_and(Option::is_none),
+            "{locations:?}"
+        );
+        assert_eq!(
+            locations
+                .get(1)
+                .and_then(|location| location.as_ref())
+                .map(|location| location["file"].clone()),
+            Some(serde_json::json!("src/sync/mutex.rs"))
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// A feature that docs.rs's build left out is warned of, with where to read what enables it

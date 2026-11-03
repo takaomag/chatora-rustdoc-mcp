@@ -462,6 +462,13 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - E2b のレビュー (サブエージェント、読むだけ。手元の 1,465 crate の `.crate` で Cargo の規則と比べ、例を持つ 290 件で食い違い 0 件) の対応: ファイルの一覧を集合で引く (10 万ファイルと数万の `[[example]]` で二乗になった)。`[[example]]` が取る名前とファイルは、読めなくても自動の検出から除く (同じファイルが別の名前で二度出た。範囲の外の `path` で落ちた例の名前に別のファイルを返した)。edition 2015 (欄なし) で例を明示し `autoexamples` を書かなければ自動の検出をしない (Cargo と同じ)。`of_targets` はパスを `source_root::lexically` で直して比べる。テスト: 同じファイルの別の名前、範囲の外の明示、edition 2015、絶対・バックスラッシュ・ドライブ・`.rs` でない path、緩く直すと一覧に当たる `..`、`..` を含む src_path と `.rs` でない target、`Target` の `required-features` を JSON から
 - E2b のレビューで残したもの: `.rs` でない明示の path は Cargo ならビルドするが例にしない (R-SC-4 で意図して絞る)。`[project]` の古い表は読まない。`find_examples` が絶対パスを返す前に `source_root` で実パス (symlink の行き先) を判じるのは E2c で
 
+**E2c の分け方**: E2c-1 (照会の層: `examples/` のファイルと doc のブロックを並べる、指した item の解決、doc のブロックの item の場所) → E2c-2 (ツール `find_examples`)
+
+**E2c-1 の実装 (2026-11-02)**: `query::examples` に `ExampleFile` (`examples/` のファイルの名前・相対の `file`・`required-features`・本文)、`Entry` (ファイルかブロックと、その段)、`arranged` (決定 71: 段の順、同じ段ではファイルがブロックの先、それぞれの順で。item を指さなければファイル、次にブロック (根が先))、`lines_naming` (名前を含む行、20 行まで)。E2a の `ranked` は `arranged` にまとめた。`query::get_item` に `examples_of` (get_item と同じ解決で、指した item の id・正準パス・名前・属する型・trait・enum の名前。他の crate への再公開は get_item の `follow` でその crate を引くので、ここに来るのはこの crate の item か member) と `source_locations` (doc のブロックの item の `source_location` を get_item と同じ形で。`Query::source_location` を共有)。テスト: 段の順とファイルの位置、名前を含む行、メソッドと型の解決、無い path、場所
+
+- E2c-1 のレビュー (サブエージェント、読むだけ) の対応 (2026-11-04): 指した item の名前は正準パスの最後の区切り、属する型は get_item の `parent` の最後の区切り (型引数を除く) から取る (`item.name` からだと改名した再公開 `pub use imp::Foo as Bar` で `Foo` になり、P13 の「名前」と食い違った)。crate の根を指したら `None` (item を指さないのと同じ。根の名前で全部が `Both` になった)。`source_locations` は package の外のファイルなどの warning も重複なしで返す (R-OUT-8。捨てていた)。`arranged` はファイルを中で名前の順に並べる (渡された順に頼っていた)。`lines_naming` は名前を含む行の数も返す (20 行で切ったことが分からなかった)。呼び出し側は `follow` と `Detail::Brief` で呼ぶことを doc に。testdata の計時テストは、id をブロックから探さず `examples_of` で解決し (tokio は定義が `tokio::sync::mutex`、公開が `tokio::sync::Mutex`)、`source_locations` (上位 50 件) も計る。テスト: variant と enum、根、件数と warning、CRLF と上限と境、item を指さないときの全体の順
+- E2c-1 のレビューで残したもの: `examples_of` は検証のために get_item を一度呼ぶ (解決が 2 回。`Detail::Brief` なら数 ms と見込み、計時テストで見る)。member の private の item を指すと、`doc_blocks` は公開の item だけなので自身の例が出ない (E2a の範囲と同じ)。改名した再公開の単体テストは fixture に無い
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

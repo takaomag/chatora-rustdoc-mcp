@@ -203,22 +203,98 @@ pub fn has_word(text: &str, word: &str) -> bool {
     })
 }
 
-/// The blocks of `blocks` ordered for `asked`: by their rank, then as [`doc_blocks`] orders them
-/// (decided in M3e, decision 71); as they are when nothing is asked, the root's first.
+/// A file of a package's `examples/`, read, to be ranked with the blocks of its docs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExampleFile {
+    /// Its name, as `cargo run --example` takes it.
+    pub name: Box<str>,
+    /// Its file, relative to the package's root with `/`.
+    pub file: Box<str>,
+    /// The features that it needs.
+    pub required_features: Box<[Box<str>]>,
+    /// Its text.
+    pub text: String,
+}
+
+/// An example as it is shown: a file of `examples/`, or a block of the docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry<'e> {
+    /// A file of `examples/`.
+    File {
+        /// The file.
+        file: &'e ExampleFile,
+        /// How well it matches the item asked for.
+        rank: Rank,
+    },
+    /// A block of the docs.
+    Block {
+        /// The block.
+        block: &'e DocBlock,
+        /// How well it matches the item asked for.
+        rank: Rank,
+    },
+}
+
+impl Entry<'_> {
+    /// How well it matches the item asked for.
+    #[must_use]
+    pub const fn rank(&self) -> Rank {
+        match self {
+            Self::File { rank, .. } | Self::Block { rank, .. } => *rank,
+        }
+    }
+}
+
+/// The most lines of a file that are told as naming the item asked for.
+pub const MAX_LINES_TOLD: usize = 20;
+
+/// The lines of `text`, from 1, that name `asked`'s name, at most [`MAX_LINES_TOLD`], and how many
+/// do.
 #[must_use]
-pub fn ranked<'b>(blocks: &'b [DocBlock], asked: Option<&Asked<'_>>) -> Vec<(Rank, &'b DocBlock)> {
-    let mut ranked: Vec<(Rank, &DocBlock)> = blocks
-        .iter()
-        .map(|block| {
-            let rank = asked.map_or(Rank::Other, |asked| {
-                rank(asked, Some(block.id), &block.code)
-            });
-            (rank, block)
+pub fn lines_naming(text: &str, asked: &Asked<'_>) -> (Vec<usize>, usize) {
+    let mut lines = Vec::new();
+    let mut total = 0_usize;
+    for (at, line) in text.lines().enumerate() {
+        if has_word(line, asked.name) {
+            total = total.saturating_add(1);
+            if lines.len() < MAX_LINES_TOLD {
+                lines.push(at.saturating_add(1));
+            }
+        }
+    }
+    (lines, total)
+}
+
+/// The files of `examples/` and the blocks of the docs, in the order that they are shown.
+///
+/// That is by their rank for `asked`, the files before the blocks within one, each in its own
+/// order; without `asked`, the files, then the blocks, the root's first (decided in M3e, decision
+/// 71).
+#[must_use]
+pub fn arranged<'e>(
+    files: &'e [ExampleFile],
+    blocks: &'e [DocBlock],
+    asked: Option<&Asked<'_>>,
+) -> Vec<Entry<'e>> {
+    let rank_of =
+        |of: Option<Id>, text: &str| asked.map_or(Rank::Other, |asked| rank(asked, of, text));
+    // The files by name (decided in M3e, decision 71), whatever order they are given in.
+    let mut by_name: Vec<&'e ExampleFile> = files.iter().collect();
+    by_name.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut entries: Vec<Entry<'e>> = by_name
+        .into_iter()
+        .map(|file| Entry::File {
+            file,
+            rank: rank_of(None, &file.text),
         })
+        .chain(blocks.iter().map(|block| Entry::Block {
+            block,
+            rank: rank_of(Some(block.id), &block.code),
+        }))
         .collect();
-    // Stable: the order of `doc_blocks` within a rank.
-    ranked.sort_by_key(|(rank, _)| *rank);
-    ranked
+    // Stable: the files before the blocks within a rank, each in its own order.
+    entries.sort_by_key(Entry::rank);
+    entries
 }
 
 #[cfg(test)]
@@ -336,9 +412,12 @@ mod tests {
             name: "lock",
             parent: Some("Mutex"),
         };
-        let order: Vec<(Rank, &str)> = ranked(&blocks, Some(&lock))
+        let order: Vec<(Rank, &str)> = arranged(&[], &blocks, Some(&lock))
             .into_iter()
-            .map(|(rank, block)| (rank, &*block.item))
+            .map(|entry| match entry {
+                Entry::Block { block, rank } => (rank, &*block.item),
+                Entry::File { file, rank } => (rank, &*file.file),
+            })
             .collect();
         assert_eq!(order, [
             (Rank::Own, "demo::Mutex::lock"),
@@ -346,6 +425,55 @@ mod tests {
             (Rank::Name, "demo::a"),
             (Rank::Other, "demo"),
         ]);
+        // Files of `examples/` before the blocks of the same rank; without an item, all first.
+        let file = |name: &str, text: &str| ExampleFile {
+            name: name.into(),
+            file: format!("examples/{name}.rs").into(),
+            required_features: Box::default(),
+            text: text.into(),
+        };
+        let files = [
+            file("plain", "fn main() {}"),
+            file("locking", "m.lock(); // Mutex"),
+        ];
+        let order: Vec<(Rank, &str)> = arranged(&files, &blocks, Some(&lock))
+            .into_iter()
+            .map(|entry| match entry {
+                Entry::Block { block, rank } => (rank, &*block.item),
+                Entry::File { file, rank } => (rank, &*file.file),
+            })
+            .collect();
+        assert_eq!(order, [
+            (Rank::Own, "demo::Mutex::lock"),
+            (Rank::Both, "examples/locking.rs"),
+            (Rank::Both, "demo::Mutex"),
+            (Rank::Name, "demo::a"),
+            (Rank::Other, "examples/plain.rs"),
+            (Rank::Other, "demo"),
+        ]);
+        // Without an item: the files by name, then the blocks, the root's first.
+        let shown: Vec<&str> = arranged(&files, &blocks, None)
+            .into_iter()
+            .map(|entry| match entry {
+                Entry::Block { block, .. } => &*block.item,
+                Entry::File { file, .. } => &*file.file,
+            })
+            .collect();
+        assert_eq!(shown, [
+            "examples/locking.rs",
+            "examples/plain.rs",
+            "demo",
+            "demo::a",
+            "demo::Mutex",
+            "demo::Mutex::lock",
+        ]);
+        assert_eq!(
+            lines_naming("a\r\nm.lock()\r\nlocked\nlock\nMutex::lock\n", &lock),
+            (vec![2, 4, 5], 3)
+        );
+        let many = "lock\n".repeat(MAX_LINES_TOLD + 5);
+        let (lines, total) = lines_naming(&many, &lock);
+        assert_eq!((lines.len(), total), (MAX_LINES_TOLD, MAX_LINES_TOLD + 5));
         let mut paths = ["demo::b::c", "demo::z", "demo", "demo::a"];
         paths.sort_by(|a, b| by_path(a, b));
         assert_eq!(paths, ["demo", "demo::a", "demo::z", "demo::b::c"]);

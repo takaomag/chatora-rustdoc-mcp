@@ -360,34 +360,64 @@ fn the_items_of_each_feature_are_found_in_a_short_time() {
 #[test]
 #[ignore = "needs the JSON of testdata/docs-rs-json.txt in the cache"]
 fn the_examples_in_the_docs_are_found_in_a_short_time() {
-    use chatora_rustdoc_mcp::query::examples::{Asked, Rank, doc_blocks, ranked};
+    use chatora_rustdoc_mcp::query::{
+        examples::{Asked, Entry, Rank, arranged, doc_blocks},
+        get_item::{examples_of, source_locations},
+    };
 
     let cache = Cache::open_default().expect("the cache directory is known");
     for (crate_name, version, asked, parent) in [
-        ("tokio", "1.53.3", "tokio::sync::Mutex::lock", Some("Mutex")),
-        ("axum", "0.8.9", "axum::Router::route", Some("Router")),
+        // Defined in `tokio::sync::mutex`, public at `tokio::sync::Mutex`.
+        ("tokio", "1.53.3", "tokio::sync::Mutex::lock", "Mutex"),
+        ("axum", "0.8.9", "axum::Router::route", "Router"),
     ] {
-        let json = cached_json(&cache, &entry(crate_name, version));
+        let entry = entry(crate_name, version);
+        let json = cached_json(&cache, &entry);
         let parsed = rustdoc_json::parse(&json).expect("parses");
         let mapped = Mapped::in_memory(&Indexed::new(parsed)).expect("archived");
         let view = CrateView::new(mapped.get());
+        let request = ItemRequest {
+            name: &entry.name,
+            version: &entry.version,
+            path: asked,
+            origin: Origin::DocsRs {
+                resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
+                build: None,
+            },
+            detail: Detail::Brief,
+            project_features: None,
+            follow: false,
+            target: None,
+        };
         let started = Instant::now();
         let blocks = doc_blocks(&view);
-        let name = asked.rsplit("::").next().unwrap_or(asked);
-        let id = blocks
-            .iter()
-            .find(|block| &*block.item == asked)
-            .map(|block| block.id)
-            .expect("the item has examples of its own");
+        let of = examples_of(&view, request)
+            .expect("found")
+            .expect("not the root");
+        assert_eq!(&*of.path, asked);
+        assert_eq!(of.parent.as_deref(), Some(parent));
+        let name = &*of.name;
         let asked = Asked {
-            id,
-            path: asked,
+            id: of.id,
+            path: &of.path,
             name,
-            parent,
+            parent: of.parent.as_deref(),
         };
-        let order = ranked(&blocks, Some(&asked));
+        let order = arranged(&[], &blocks, Some(&asked));
+        // Where the items of a page's blocks are defined.
+        let ids: Vec<_> = order
+            .iter()
+            .take(50)
+            .filter_map(|entry| match entry {
+                Entry::Block { block, .. } => Some(block.id),
+                Entry::File { .. } => None,
+            })
+            .collect();
+        let (locations, _) = source_locations(&view, request, &ids);
         let took = started.elapsed();
-        let count = |wanted: Rank| order.iter().filter(|(rank, _)| *rank == wanted).count();
+        assert!(locations.iter().any(Option::is_some));
+        let count = |wanted: Rank| order.iter().filter(|entry| entry.rank() == wanted).count();
         eprintln!(
             "{crate_name}: {} blocks, {}: own {}, both {}, name {}, in {took:?}",
             blocks.len(),
@@ -397,13 +427,13 @@ fn the_examples_in_the_docs_are_found_in_a_short_time() {
             count(Rank::Name)
         );
         assert!(blocks.len() > 100, "{crate_name}: {} blocks", blocks.len());
-        assert_eq!(order.first().map(|(rank, _)| *rank), Some(Rank::Own));
+        assert_eq!(order.first().map(Entry::rank), Some(Rank::Own));
         assert!(count(Rank::Both) > 0);
         // Its own example names it.
         assert!(
-            order
-                .first()
-                .is_some_and(|(_, block)| block.code.contains(name)),
+            order.first().is_some_and(
+                |entry| matches!(entry, Entry::Block { block, .. } if block.code.contains(name))
+            ),
             "{crate_name}: its own example does not name {name}"
         );
         // Over 200 ms, decision 74 keeps them in memory.
