@@ -72,6 +72,7 @@ use crate::{
             ProjectFeatures,
             ResolvedFrom,
             get_item,
+            missing_features,
         },
         implementors::{ImplementorOptions, list_implementors},
         impls::{ImplOptions, list_impls},
@@ -5279,7 +5280,7 @@ fn finish(
             CallToolResult::structured(response)
         },
         Err(Failure::Parse(error)) => parse_error(&release(arguments), &error),
-        Err(Failure::Item(error)) => item_error(arguments, &error),
+        Err(Failure::Item(error)) => item_error(arguments, &error, warnings),
         Err(Failure::Archive(error)) => kept_in_memory_error(&error),
         Err(Failure::Serialize(error)) => {
             tracing::error!(%error, "the get_item response could not be serialized");
@@ -5671,35 +5672,78 @@ fn parse_error(release: &str, error: &ParseError) -> CallToolResult {
     }
 }
 
+/// The tool error for a path that the release does not have (§8), with the `warnings` of the
+/// lookup and, when docs.rs built it without some features, the warning of them and where to see
+/// what they enable: the item may need one of them (requirement R-FT-1, decided in M3h,
+/// decision 128).
+fn not_found(arguments: &Request, warnings: &[Box<str>]) -> CallToolResult {
+    let release = release(arguments);
+    let mut suggestions = vec![
+        Value::from("check the spelling and the case of each segment"),
+        Value::from(
+            "a method, associated item or variant is found through its type, trait or enum \
+             (tokio::sync::Mutex::lock)",
+        ),
+    ];
+    let missing = arguments
+        .build
+        .as_deref()
+        .and_then(|build| missing_features(&arguments.name, &arguments.version, build));
+    let missing_warning = missing.map(|(warning, hint)| {
+        suggestions.push(Value::from(hint));
+        warning.into_boxed_str()
+    });
+    let mut body = json!({
+        "code": "item_not_found",
+        "message": format!(
+            "{release} has no item at {}: it was looked up as a public path, a re-export from \
+             another crate, a definition path, and a member of the item at its parent path",
+            arguments.path
+        ),
+        "retryable": false,
+        "suggestions": suggestions,
+    });
+    insert_warnings(&mut body, warnings.iter().chain(&missing_warning));
+    error_result(&body)
+}
+
+/// Puts `warnings`, each once, as the `warnings` of the error `body`, when there are any (decided
+/// in M3h, decision 128).
+fn insert_warnings<'w>(body: &mut Value, warnings: impl Iterator<Item = &'w Box<str>>) {
+    let mut told: Vec<Value> = Vec::new();
+    for warning in warnings {
+        let warning = json!(warning);
+        if !told.contains(&warning) {
+            told.push(warning);
+        }
+    }
+    if !told.is_empty()
+        && let Some(fields) = body.as_object_mut()
+    {
+        fields.insert("warnings".to_owned(), Value::Array(told));
+    }
+}
+
 /// The tool error for a path that does not name one item (§8).
-fn item_error(arguments: &Request, error: &GetItemError) -> CallToolResult {
+fn item_error(arguments: &Request, error: &GetItemError, warnings: &[Box<str>]) -> CallToolResult {
     let release = release(arguments);
     match error {
-        GetItemError::NotFound => error_result(&json!({
-            "code": "item_not_found",
-            "message": format!(
-                "{release} has no item at {}: it was looked up as a public path, a re-export \
-                 from another crate, a definition path, and a member of the item at its parent \
-                 path",
-                arguments.path
-            ),
-            "retryable": false,
-            "suggestions": [
-                "check the spelling and the case of each segment",
-                "a method, associated item or variant is found through its type, trait or enum \
-                 (tokio::sync::Mutex::lock)",
-            ],
-        })),
-        // Followed before the error is made; reached only if following is turned off.
-        GetItemError::Elsewhere(destination) => error_result(&json!({
-            "code": "item_not_found",
-            "message": format!(
-                "{release} has no item at {}; it goes on as {} in another crate",
-                arguments.path, destination.path
-            ),
-            "retryable": false,
-            "suggestions": [format!("call get_item with the path {}", destination.path)],
-        })),
+        GetItemError::NotFound => not_found(arguments, warnings),
+        // Followed before the error is made; reached when following is turned off, as when no hops
+        // are left.
+        GetItemError::Elsewhere(destination) => {
+            let mut body = json!({
+                "code": "item_not_found",
+                "message": format!(
+                    "{release} has no item at {}; it goes on as {} in another crate",
+                    arguments.path, destination.path
+                ),
+                "retryable": false,
+                "suggestions": [format!("call get_item with the path {}", destination.path)],
+            });
+            insert_warnings(&mut body, warnings.iter());
+            error_result(&body)
+        },
         GetItemError::NotAModule { kind } => error_result(&json!({
             "code": "invalid_argument",
             "message": format!("{release} has a {kind}, not a module, at {}", arguments.path),
@@ -5912,7 +5956,7 @@ mod tests {
             here: Here::default(),
         };
         let candidates = (0..25).map(|n| format!("item {n}").into()).collect();
-        let result = item_error(&request, &GetItemError::Ambiguous { candidates });
+        let result = item_error(&request, &GetItemError::Ambiguous { candidates }, &[]);
         let text = result.content[0].as_text().map(|text| text.text.clone());
         let body: Value = serde_json::from_str(&text.unwrap_or_default()).expect("JSON");
         assert_eq!(body["code"], "ambiguous_path");

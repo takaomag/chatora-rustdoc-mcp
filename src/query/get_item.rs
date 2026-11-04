@@ -785,6 +785,27 @@ pub struct Destination {
     pub others: Vec<Self>,
 }
 
+/// The warning and the hint when docs.rs built `name` `version` without some of its features,
+/// whose items are not in its documentation (requirement R-FT-1).
+#[must_use]
+pub fn missing_features(
+    name: &CrateName,
+    version: &Version,
+    build: &DocsRsBuild,
+) -> Option<(String, String)> {
+    if build.missing.is_empty() {
+        return None;
+    }
+    Some((
+        format!(
+            "docs.rs built {name} {version} without the features [{}]; items that need them are \
+             not in this documentation",
+            build.missing.join(", ")
+        ),
+        format!("inspect_features tells what each feature of {name} enables and what enables it"),
+    ))
+}
+
 /// Looks up the item at `request.path` in the crate of `view`.
 ///
 /// # Errors
@@ -1120,21 +1141,11 @@ impl<'a> Query<'a> {
             Origin::DocsRs { build, .. } => build,
             Origin::Local { .. } | Origin::Std { .. } => None,
         };
-        if let Some(build) = build
-            && !build.missing.is_empty()
+        if let Some((warning, hint)) =
+            build.and_then(|build| missing_features(self.request.name, self.request.version, build))
         {
-            // Items behind a feature that docs.rs did not enable are not in the JSON (R-FT-1).
-            self.warnings.push(Cow::Owned(format!(
-                "docs.rs built {} {} without the features [{}]; items that need them are not in \
-                 this documentation",
-                self.request.name,
-                self.request.version,
-                build.missing.join(", ")
-            )));
-            self.hint(format!(
-                "inspect_features tells what each feature of {} enables and what enables it",
-                self.request.name
-            ));
+            self.warnings.push(Cow::Owned(warning));
+            self.hint(hint);
         }
         let requested = self.request.version;
         let version = if let Origin::Std { .. } = self.request.origin {

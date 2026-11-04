@@ -641,6 +641,15 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - H1 のレビュー (サブエージェント、読むだけ。両方の構成の文と字数を Python で展開して数えた) の対応: `get_changelog` の `from` の引数の説明が無い構成でも「プロジェクトの版から」と言っていた (構成で分けた)。search_across の失敗の hint が無い構成でも `refresh` を案内しうる (std の検索。構成で分けた)。`get_source` の offline の案内「build the project once online」も無い構成では「read the crate once online」に。検査を引数の説明にも広げた (無い構成で `refresh` と「the project uses」が無いこと。直す前の `get_changelog` で落ちることを確かめた)。crate_metadata.md は「`crate`⟨, `project`⟩ and `version` are as for」(ありの構成で 2,043 字)、無い構成の instructions は「(to `get_changelog`, as `from`)」に。決定 129 の「`find_examples` も」は利用者に聞いた問いのとおり
 - H1 のレビューで残したもの: 無い構成の版の規則は `search_crates` (crate を取らない) に触れない。「None needs an earlier call」の直後の例外は G1d のまま
 
+**積み残しのコードの実装 (2026-11-05)**:
+
+- 決定 128: `get_item` の `item_not_found` (パスの無い item、`GetItemError::NotFound`) のエラーの本文に、照会の warning (読み込みの warning と、docs.rs が有効にしなかった feature の R-FT-1 の warning) を `warnings` として載せ、suggestions に `inspect_features` の案内を足す。R-FT-1 の文は `query::get_item::missing_features` にまとめ、成功の応答と共有する。ほかの経路の `item_not_found` (glob の先・追いかけの止まり) はそのまま。stdio のテスト (`full`・`log` が無い demo 0.2.0 で無い item)
+- 決定 129: 確かめると、`get_readme` と `find_examples` は `resolve_version` と同じく `version::resolve` の warning を持っていた (完全一致と Cargo.lock の版 (ローカル機能ありの構成) は「X is yanked」、semver 要件と latest が yanked にしか当たらないときは「every version that matches … is yanked; resolved to X」)。E1b のレビューの「付けない」は誤りで、コードは直さずに stdio のテスト (index の yanked を真にした demo 0.2.0 を 2 つのツールで) を足した。`get_item` は R-VR-6 の近道 (完全一致でキャッシュに JSON があれば index を読まない) で付かない (要件どおり)。docs.rs の JSON の問い合わせと印の二重の数えを要件に書くのは §7 の v0.21 で
+- 決定 131: 手元に cargo のソースが無かったので、cargo 1.99.1 で `cargo metadata --offline` を実測した (target/claude-notes/readme-true)。`[workspace.package] readme = true` を継ぐ member の `readme` は、member 自身に README.md があっても workspace のルートの `README.md` (`../../README.md`) で、ルートに無くても同じパスを返す。member 自身の `readme = true` はその dir の `README.md`。`cargo package` も workspace のルートの README.md を入れる。決定 80 の解き方と同じなので `get_readme` は直さない
+
+- 積み残しのレビュー (サブエージェント、読むだけ) の対応: 追いかけの止まり (`Elsewhere`、たどれる回数を使い切ったとき) の `item_not_found` にも照会の warnings を載せた (`item_error` が warnings を受け、`insert_warnings` で重ねずに)。決定 129 の記録の文を版の決め方ごとに書き分け、Cargo.lock の版はローカル機能ありの構成だけと添えた。テストを足した (warning が 1 度ずつ、semver 要件 `^0.2` が yanked の版だけに当たるときの warning)
+- 積み残しのレビューで残したもの: エラーの本文の `warnings` は R-ERR-2 の「該当するときだけ足すキー」に無いので、§7 の v0.21 で足す。再エクスポートをたどった先で item が無いとき、元の応答の warning は`… could not be looked up: item_not_found: <message>`だけで、行き先の R-FT-1 の warning と案内は落ちる (決定 128 の範囲外)。docs.rs が feature を欠かない release で `warnings` が出ないことの stdio のテストは無い (fixture が無い。単体の `missing_features` の空の場合は成功の応答のテストが押さえる)
+
 聞かずに決めたこと: crate_metadata.md の無い構成の文と `refresh`、無い構成の instructions の版の規則は H1 で直す (説明と動きの食い違い)。段の順は H1 (説明文と instructions) → 積み残しのコード (決定 128・129・131) → H4 (決定 134) → H5 (決定 133) → H3 (README) → H2 (eval の全件、決定 124・126) → §7
 
 ## 7. M3 の終わり方

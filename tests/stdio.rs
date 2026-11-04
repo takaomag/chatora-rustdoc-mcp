@@ -8937,3 +8937,85 @@ fn servers_of_different_formats_share_a_cache() {
         }
     }
 }
+
+/// `item_not_found` tells the features that docs.rs built the release without, which the item
+/// may need, and points to `inspect_features` (requirement R-FT-1, decided in M3h, decision 128).
+#[test]
+fn an_item_not_found_tells_the_features_that_docs_rs_left_out() {
+    let cache = features_cache();
+    let mut server = Server::start_with_cache(cache, None, &[(
+        "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE",
+        "true",
+    )]);
+    server.send(&call_tool(
+        1,
+        "get_item",
+        json!({ "crate": "demo@0.2.0", "path": "demo::from_serde", "target": TARGET }),
+    ));
+    let result = server.response(1)["result"].clone();
+    let body = text_json(&result);
+    assert_eq!(body["code"], "item_not_found", "{result}");
+    assert!(
+        body["warnings"]
+            .to_string()
+            .contains("docs.rs built demo 0.2.0 without the features [full, log]"),
+        "{result}"
+    );
+    assert!(
+        body["suggestions"]
+            .to_string()
+            .contains("inspect_features tells what each feature of demo enables"),
+        "{result}"
+    );
+    let warnings = body["warnings"].as_array().expect("warnings");
+    for (n, warning) in warnings.iter().enumerate() {
+        assert!(!warnings[..n].contains(warning), "told twice: {result}");
+    }
+    assert!(server.finish().success());
+}
+
+/// `get_readme` and `find_examples` warn of a yanked release asked for, as `resolve_version` does,
+/// since they decide the version as it does (decided in M3h, decision 129).
+#[test]
+fn a_yanked_release_is_warned_of_by_get_readme_and_find_examples() {
+    let cache = features_cache();
+    let index = cache.path().join("index.crates.io/de/mo/demo");
+    let line = std::fs::read_to_string(&index).expect("the index line");
+    assert!(line.contains("\"yanked\":false"), "{line}");
+    std::fs::write(&index, line.replace("\"yanked\":false", "\"yanked\":true")).expect("written");
+    let mut server = Server::start_with_cache(cache, None, &[(
+        "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE",
+        "true",
+    )]);
+    for (id, tool) in [(1, "get_readme"), (2, "find_examples")] {
+        server.send(&call_tool(
+            id,
+            tool,
+            json!({ "crate": "demo@0.2.0", "target": TARGET }),
+        ));
+        let result = server.response(id)["result"].clone();
+        assert_eq!(result["isError"], false, "{tool}: {result}");
+        let warnings = &result["structuredContent"]["warnings"];
+        assert!(
+            warnings.as_array().is_some_and(|warnings| warnings
+                .iter()
+                .any(|warning| warning == "0.2.0 is yanked")),
+            "{tool}: {result}"
+        );
+    }
+    // A requirement that only the yanked version matches resolves to it, and says so.
+    server.send(&call_tool(
+        3,
+        "get_readme",
+        json!({ "crate": "demo", "version": "^0.2", "target": TARGET }),
+    ));
+    let result = server.response(3)["result"].clone();
+    assert_eq!(result["isError"], false, "{result}");
+    assert!(
+        result["structuredContent"]["warnings"]
+            .to_string()
+            .contains("every version that matches ^0.2 is yanked; resolved to 0.2.0"),
+        "{result}"
+    );
+    assert!(server.finish().success());
+}
