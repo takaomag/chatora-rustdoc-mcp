@@ -537,6 +537,11 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - F1b のレビュー (サブエージェント、読むだけ) の対応: ロックの単位を在庫の単位 (crate のディレクトリ、検索のファイル) にそろえ、GC・clear と排他する。ロックは `until` までしか待たず、間に合わなければ残っている応答を `stale` で返し、無ければ `NoTurn`。`crates.io` は引き取りの判定の名前 (DISTINCTIVE) から外す (印を書く版しか作らず、crates.io のリポジトリの clone も同じ名前)。offline の `stale` の文を分けた。テストを足した (在庫、壊れたファイルの取り直し、続きの頁、同時の頼み、ロックの期限、`forget` の前の記憶)
 - F1b のレビューで残したもの: 404 は覚えない (F2 は index で先に絞るので、無い crate を API に聞かない)。`fresh` は回数で絞らない (`refresh` のときだけ)。検索のファイル名は塩なしのハッシュで、短い語なら推測でき、結果の `exact_match` からも分かる (README に書く。F3b)。symlink を通した書き込みと読めないキャッシュの扱いは sparse index と同じ既存の型
 
+**F2a の実装 (2026-11-04)**: データ層。sparse index の版に公開日 `published` (`pubtime`)、`IndexEntry::dependencies` (名前・改名の元・要求・features・default_features・kind・optional・target)。`.crate` の Cargo.toml の宣言 `crate_file::declaration` (description・license・license-file・repository・homepage・documentation・rust-version・edition と docs.rs の targets・default-target)。`query::crate_metadata` に版の履歴の差分 `changes` (決定 96)、保守の区分 `recency` (決定 97)、index と API の時刻を読む `parse_time`
+
+- F2a のレビュー (サブエージェント、読むだけ。手元の index の 1,564 行・依存 24,350 件で形を確かめた) の対応: 頁の最後の版は次の頁の先頭と比べる (`After::Version`。前は境目の変化がどの頁にも出なかった)。index の依存は 1 件ずつ読み、読めない 1 件だけを除く。未知の `kind` は `other`、null は normal。依存に `features`・`default_features` を足した。docs.rs の target は `TargetTriple` で検証し (`..` や先頭の記号を除く)、`targets` が無いのと `[]` を分け、除いた数を数える。空白だけの値は無いものとする。テストを足した
+- F2a のレビューで残したもの: 長い description などは出力の段 (F2b) で切る。semver の順で隣と比べるので、系列の境目のバックポートは向きが逆の変化に見えうる (doc に書いた。説明文にも F2b で)。API の `license` の null は `license-file` だけの版でもなる (説明文で補う)
+
 聞かずに決めたこと: index に版があり API が 404 を返すとき (公開の直後など) は決定 93 と同じく API の項目を省いて warning にする。API の要求の数と待ちはログだけに出し、応答には入れない (R13)。
 
 ## 7. M3 の終わり方

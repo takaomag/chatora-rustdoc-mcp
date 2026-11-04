@@ -125,6 +125,24 @@ impl IndexEntry {
         Some(FeatureTree::new(declared, optional))
     }
 
+    /// The dependencies that `version` declares, from its line of the index, in its order, but one
+    /// that cannot be read. `None` if the index does not list it or its line cannot be read.
+    #[must_use]
+    pub fn dependencies(&self, version: &Version) -> Option<Vec<IndexDependency>> {
+        let listed = self
+            .versions
+            .iter()
+            .find(|listed| listed.version == *version)?;
+        let line: DependenciesLine =
+            serde_json::from_slice(self.body.get(listed.line.clone())?).ok()?;
+        Some(
+            line.deps
+                .into_iter()
+                .filter_map(|dependency| serde_json::from_value(dependency).ok())
+                .collect(),
+        )
+    }
+
     /// When the index file was fetched, in RFC 3339, if it is [`Self::stale`]: for the provenance
     /// (requirement R-CA-7).
     #[must_use]
@@ -146,6 +164,9 @@ pub struct IndexVersion {
     pub yanked: bool,
     /// The MSRV it declares, if any.
     pub rust_version: Option<Box<str>>,
+    /// When it was published (`pubtime`, RFC 3339), if the index tells (decided in M3f, decision
+    /// 97). The index of crates.io has it for every version, old ones too; another may not.
+    pub published: Option<Box<str>>,
     /// Where its line is in [`IndexEntry::body`].
     pub line: Range<usize>,
 }
@@ -231,6 +252,8 @@ struct Line {
     yanked: bool,
     #[serde(default)]
     rust_version: Option<String>,
+    #[serde(default)]
+    pubtime: Option<String>,
 }
 
 /// The fields of an index line that tell its features: `features2` has those that older Cargo
@@ -243,6 +266,70 @@ struct FeatureLine {
     features2: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     deps: Vec<DependencyLine>,
+}
+
+/// The dependencies of an index line, each read on its own, so that one that cannot be read does
+/// not hide the others.
+#[derive(Debug, Deserialize)]
+struct DependenciesLine {
+    #[serde(default)]
+    deps: Vec<serde_json::Value>,
+}
+
+/// A dependency that a version declares, as its line of the index has it (decided in M3f,
+/// decision 98: what is declared, not what a project resolves).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDependency {
+    /// The name that the crate gives it, which is the crate's unless renamed.
+    pub name: Box<str>,
+    /// The crate on crates.io, when the dependency is renamed (`package = "…"`).
+    #[serde(default)]
+    pub package: Option<Box<str>>,
+    /// The version requirement.
+    pub req: Box<str>,
+    /// The features of it that are enabled.
+    #[serde(default)]
+    pub features: Box<[Box<str>]>,
+    /// Whether its default features are enabled.
+    #[serde(default = "enabled")]
+    pub default_features: bool,
+    /// What it is a dependency for; a normal one when the index does not say.
+    #[serde(default, deserialize_with = "kind_or_normal")]
+    pub kind: DependencyKind,
+    /// Whether a feature has to enable it.
+    #[serde(default)]
+    pub optional: bool,
+    /// The platform it is for (`cfg(unix)` or a target), if only one.
+    #[serde(default)]
+    pub target: Option<Box<str>>,
+}
+
+/// What a dependency is for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DependencyKind {
+    /// The crate's code.
+    #[default]
+    Normal,
+    /// Its tests, examples and benchmarks.
+    Dev,
+    /// Its build script.
+    Build,
+    /// A kind this server does not know.
+    #[serde(other)]
+    Other,
+}
+
+/// `true`, the default of `default_features`.
+const fn enabled() -> bool {
+    true
+}
+
+/// The kind of a dependency, a normal one for `null` too.
+fn kind_or_normal<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<DependencyKind, D::Error> {
+    Option::<DependencyKind>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// A dependency of an index line, by the name that the crate gives it.
@@ -600,6 +687,7 @@ fn parse(body: Arc<[u8]>, fetched_at: SystemTime) -> Result<IndexEntry, Malforme
             checksum: line.cksum.into(),
             yanked: line.yanked,
             rust_version: line.rust_version.map(String::into_boxed_str),
+            published: line.pubtime.map(String::into_boxed_str),
             line: at,
         });
     }
@@ -757,6 +845,41 @@ mod tests {
             ["fs"]
         );
         assert_eq!(entry.features(&Version::new(2, 0, 0)), None);
+    }
+
+    #[test]
+    fn a_versions_publication_and_dependencies_are_read_from_its_line() {
+        let body: &[u8] = b"{\"name\":\"demo\",\"vers\":\"0.1.0\",\"cksum\":\"aa\",\"deps\":[]}\n\
+            {\"name\":\"demo\",\"vers\":\"0.2.0\",\"cksum\":\"bb\",\"pubtime\":\"2026-01-02T03:04:05Z\",\
+            \"deps\":[\
+            {\"name\":\"serde\",\"req\":\"^1\",\"features\":[\"derive\"],\"optional\":true,\"default_features\":true,\"target\":null,\"kind\":\"normal\"},\
+            {\"name\":\"json\",\"package\":\"serde_json\",\"req\":\"^1\",\"kind\":\"dev\"},\
+            {\"name\":\"cc\",\"req\":\"^1.2\",\"kind\":\"build\",\"target\":\"cfg(windows)\",\"default_features\":false},\
+            {\"name\":\"odd\",\"req\":\"^1\",\"kind\":\"later\"},\
+            {\"name\":\"null\",\"req\":\"^1\",\"kind\":null},\
+            {\"name\":\"broken\"}]}\n";
+        let entry = parse(Arc::from(body), SystemTime::UNIX_EPOCH).expect("parses");
+        assert_eq!(entry.versions[0].published, None);
+        assert_eq!(
+            entry.versions[1].published.as_deref(),
+            Some("2026-01-02T03:04:05Z")
+        );
+        let dependencies = entry.dependencies(&Version::new(0, 2, 0)).expect("listed");
+        // The one without `req` is left out; the others stay.
+        assert_eq!(dependencies.len(), 5);
+        assert!(dependencies[0].optional && dependencies[0].kind == DependencyKind::Normal);
+        assert_eq!(&*dependencies[0].features, ["derive".into()]);
+        assert!(dependencies[0].default_features && !dependencies[2].default_features);
+        assert_eq!(dependencies[3].kind, DependencyKind::Other);
+        assert_eq!(dependencies[4].kind, DependencyKind::Normal);
+        assert_eq!(dependencies[1].package.as_deref(), Some("serde_json"));
+        assert_eq!(dependencies[1].kind, DependencyKind::Dev);
+        assert_eq!(
+            (dependencies[2].kind, dependencies[2].target.as_deref()),
+            (DependencyKind::Build, Some("cfg(windows)"))
+        );
+        assert_eq!(entry.dependencies(&Version::new(0, 1, 0)), Some(Vec::new()));
+        assert_eq!(entry.dependencies(&Version::new(9, 0, 0)), None);
     }
 
     #[test]

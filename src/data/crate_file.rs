@@ -22,6 +22,7 @@ use super::{
     feature_tree::{FeatureTree, is_name},
     http::{self, BodyError, Network},
     readme::{self, Declared},
+    target::TargetTriple,
 };
 
 /// static.crates.io itself.
@@ -560,6 +561,94 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
     }
 }
 
+/// What a package declares of itself in `[package]` of its `Cargo.toml`, and the targets that it
+/// asks docs.rs to build for.
+///
+/// It is what is declared, not what a project resolves (decided in M3f, decision 98; requirement
+/// R-CI-1). A field of another type than expected counts as absent, as one inherited from a
+/// workspace (`license.workspace = true`) does, which a `.crate` never has.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Declaration {
+    /// `description`.
+    pub description: Option<Box<str>>,
+    /// `license`: an SPDX expression, or the old `MIT/Apache-2.0`.
+    pub license: Option<Box<str>>,
+    /// `license-file`, a path in the package.
+    pub license_file: Option<Box<str>>,
+    /// `repository`.
+    pub repository: Option<Box<str>>,
+    /// `homepage`.
+    pub homepage: Option<Box<str>>,
+    /// `documentation`.
+    pub documentation: Option<Box<str>>,
+    /// `rust-version`: the MSRV.
+    pub rust_version: Option<Box<str>>,
+    /// `edition`; Cargo takes `2015` when there is none.
+    pub edition: Option<Box<str>>,
+    /// `targets` of `[package.metadata.docs.rs]`, those that are target names; `None` when it does
+    /// not say, which docs.rs takes as its usual targets, and empty for `[]`, its default one only.
+    pub docs_rs_targets: Option<Box<[TargetTriple]>>,
+    /// How many of `targets` were left out as not target names (requirement R-SEC-4).
+    pub docs_rs_targets_left_out: usize,
+    /// `default-target` of `[package.metadata.docs.rs]`, if it is a target name.
+    pub docs_rs_default_target: Option<TargetTriple>,
+}
+
+/// What `name` at `version` declares, from the `Cargo.toml` in its `.crate` `contents`.
+///
+/// # Errors
+///
+/// Returns an error when the `.crate` has no `Cargo.toml` that can be read.
+pub fn declaration(
+    contents: &[u8],
+    name: &CrateName,
+    version: &Version,
+) -> Result<Declaration, CrateError> {
+    let manifest = manifest(contents, &format!("{name}-{version}/Cargo.toml"))?;
+    let table: toml::Table = toml::from_str(&manifest).map_err(CrateError::Manifest)?;
+    Ok(declaration_of(&table))
+}
+
+/// What the manifest `table` declares.
+fn declaration_of(table: &toml::Table) -> Declaration {
+    let package = table.get("package");
+    let field = |key: &str| -> Option<Box<str>> {
+        package?
+            .get(key)?
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into)
+    };
+    let docs_rs = package
+        .and_then(|package| package.get("metadata"))
+        .and_then(|metadata| metadata.get("docs"))
+        .and_then(|docs| docs.get("rs"));
+    let target = |value: &toml::Value| value.as_str()?.parse::<TargetTriple>().ok();
+    let targets = docs_rs
+        .and_then(|docs_rs| docs_rs.get("targets"))
+        .and_then(toml::Value::as_array);
+    Declaration {
+        description: field("description"),
+        license: field("license"),
+        license_file: field("license-file"),
+        repository: field("repository"),
+        homepage: field("homepage"),
+        documentation: field("documentation"),
+        rust_version: field("rust-version"),
+        edition: field("edition"),
+        docs_rs_targets: targets.map(|targets| targets.iter().filter_map(target).collect()),
+        docs_rs_targets_left_out: targets.map_or(0, |targets| {
+            targets
+                .iter()
+                .filter(|value| target(value).is_none())
+                .count()
+        }),
+        docs_rs_default_target: docs_rs
+            .and_then(|docs_rs| docs_rs.get("default-target"))
+            .and_then(target),
+    }
+}
+
 /// Whether `name` is a feature as Cargo takes it, or a feature of a dependency (`dep/feature`).
 pub(super) fn is_feature_name(name: &str) -> bool {
     match name.split_once('/') {
@@ -843,6 +932,68 @@ features = ["serde/derive"]
         fs::write(&manifest, large).expect("written");
         let error = manifest_features(&manifest).expect_err("too large");
         assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+    }
+
+    #[test]
+    fn a_crate_tells_what_it_declares() {
+        let manifest = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                        rust-version = \"1.70\"\nlicense = \"MIT OR Apache-2.0\"\n\
+                        repository = \"https://example.com/demo\"\ndescription = \" \"\n\
+                        homepage = { workspace = true }\n\
+                        [package.metadata.docs.rs]\n\
+                        targets = [\"x86_64-unknown-linux-gnu\", \"bad target\", \"..x\", 3]\n\
+                        default-target = \"wasm32-unknown-unknown\"\n";
+        let declared = declaration(
+            &crate_file("demo", "0.1.0", manifest),
+            &"demo".parse().expect("a name"),
+            &Version::new(0, 1, 0),
+        )
+        .expect("read");
+        assert_eq!(declared.license.as_deref(), Some("MIT OR Apache-2.0"));
+        assert_eq!(declared.rust_version.as_deref(), Some("1.70"));
+        assert_eq!(declared.edition.as_deref(), Some("2021"));
+        assert_eq!(
+            declared.repository.as_deref(),
+            Some("https://example.com/demo")
+        );
+        assert_eq!(declared.description, None, "empty");
+        assert_eq!(declared.homepage, None, "not a string");
+        let targets: Vec<String> = declared
+            .docs_rs_targets
+            .iter()
+            .flatten()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(targets, ["x86_64-unknown-linux-gnu"]);
+        assert_eq!(declared.docs_rs_targets_left_out, 3);
+        assert_eq!(
+            declared
+                .docs_rs_default_target
+                .map(|target| target.to_string()),
+            Some("wasm32-unknown-unknown".to_owned())
+        );
+        let none = declaration(
+            &crate_file(
+                "demo",
+                "0.1.0",
+                "[package]\nname = \"demo\"\n[package.metadata.docs.rs]\ntargets = []\n",
+            ),
+            &"demo".parse().expect("a name"),
+            &Version::new(0, 1, 0),
+        )
+        .expect("read");
+        assert_eq!(
+            none.docs_rs_targets.as_deref(),
+            Some(&[][..]),
+            "only the default one"
+        );
+        let bare = declaration(
+            &crate_file("demo", "0.1.0", "[package]\nname = \"demo\"\n"),
+            &"demo".parse().expect("a name"),
+            &Version::new(0, 1, 0),
+        )
+        .expect("read");
+        assert_eq!(bare, Declaration::default());
     }
 
     #[test]

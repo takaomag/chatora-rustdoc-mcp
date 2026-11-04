@@ -753,6 +753,7 @@ checksum = "ab"
                 checksum: checksum.into(),
                 yanked: false,
                 rust_version: None,
+                published: None,
                 line: 0..0,
             }]
             .into(),
