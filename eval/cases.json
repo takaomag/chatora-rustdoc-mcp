@@ -119,6 +119,20 @@
     "answer": ["\\bws\\b", "(project|プロジェクト)[^.。\\n]{0,80}(n't|\\bnot\\b|\\boff\\b|無効|でない|ではない|ではありません|ていない|ていません)|(n't|\\bnot\\b|\\boff\\b|無効|でない|ではない|ではありません|ていない|ていません)[^.。\\n]{0,80}(project|プロジェクト)"]
   },
   {
+    "id": "q12-examples",
+    "question": "Q12",
+    "prompt": "How is `tokio::sync::Mutex::lock` used? Show me an example from its documentation.",
+    "tools": ["find_examples", "get_item"],
+    "answer": ["\\.lock\\(\\)\\.await"]
+  },
+  {
+    "id": "q13-readme",
+    "question": "Q13",
+    "prompt": "How do I get started with axum? What does a minimal app look like?",
+    "tools": ["get_readme", "crate_overview"],
+    "answer": ["Router"]
+  },
+  {
     "id": "shape-result",
     "question": "R-OUT-1",
     "prompt": "Call get_item once for `tokio::sync::Mutex` in tokio 1.53.3 with detail brief, and tell me the version in its provenance.",

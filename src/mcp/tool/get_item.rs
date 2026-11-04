@@ -5581,6 +5581,7 @@ pub(super) fn load_error_of(
                 "check that the crate and the version exist on crates.io",
                 "docs.rs has rustdoc JSON only for releases it built on or after 2025-05-23, and none \
              for a release whose docs.rs build failed",
+                "call get_readme for the crate's README, which needs no rustdoc JSON",
             ])
         },
         FetchError::TooLarge { .. } => ("docs_unavailable", Some("too_large"), false, &[]),

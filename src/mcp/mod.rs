@@ -67,8 +67,8 @@ pub(crate) const INSTRUCTIONS: &str = const_format::concatcp!(
     FIND,
     "`crate_overview`, `list_module` or `search_items`; for the item itself, `get_item`; for \
      what a type or trait has, `list_methods`, `list_impls` or `list_implementors`; for a crate's \
-     features, `inspect_features`. None needs an earlier call (but see below): give the path, \
-     such as `tokio::sync::Mutex`, directly.",
+     features, README or examples, `inspect_features`, `get_readme` or `find_examples`. None \
+     needs an earlier call (but see below): give the crate or path directly.",
     EXTERNAL,
     "\n",
     VERSIONS,
@@ -139,8 +139,8 @@ const STALE: &str = "";
 /// Where the language server is the better tool.
 #[cfg(feature = "local")]
 const LANGUAGE_SERVER: &str = "- Look up this workspace's own items here too, by path or name, as \
-                               its dependencies'. Use the language server (rust-analyzer) for \
-                               what is at a position (line and column), references, diagnostics, \
+                               you do its dependencies'. Use the language server (rust-analyzer) for \
+                               what is at a position, references, diagnostics, \
                                and code edited after an answer's `built_at`.";
 #[cfg(not(feature = "local"))]
 const LANGUAGE_SERVER: &str = "- For the code of this workspace itself (its own items, the type at \

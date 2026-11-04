@@ -441,6 +441,8 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 決定 87 (M3e、E2d) プロジェクトの vendor した写し・別の registry の crate は、`examples/` を読まず warning を付けて doc のブロックだけを返す (エラーにしない)
 - 決定 88 (M3e、E2d) R11 (返した絶対パスを Claude Code の Read が開けるか) は E2d の終わりに headless の `claude -p` で、サーバーのキャッシュ・cargo の registry/src・cwd の中の 3 種を、Read を許さない・許す・`--add-dir` の 3 通りで試す。git の checkout は既にあるものを直接 Read させて代える。利用料と crates.io の index への通信はそのときに使う。Read が拒まれたときの対応は結果を見て決める
 - 決定 89 (M3e、E2d-4 の R11 の結果から) cwd の外の `path` を Read が開けないときに備え、README に `permissions.additionalDirectories` にキャッシュと `~/.cargo` を足す方法を書き、説明文に「開けなければ `content: true`」を添える。`content` の既定は false のまま
+- 決定 90 (M3e、E3) `get_readme` と `find_examples` への案内は 4 か所に置く: instructions の呼ぶ順、crate_overview.md (始め方は `get_readme`、例は `find_examples`)、get_item.md (例は `find_examples`)、docs.rs に JSON が無い (`no_json`) エラーの案内 (`get_readme` は JSON 無しで README を読める。要件 §8 のとおり)。get_item.md と instructions は既存の言い回しを縮めて字数を作る
+- 決定 91 (M3e、E3) eval に `q12-examples` (`tokio::sync::Mutex::lock` の使用例。tools は `find_examples`・`get_item`、答えに `.lock().await`) と `q13-readme` (axum の始め方。tools は `get_readme`・`crate_overview`、答えに `Router`) を足し、この 2 問を手で 1 回ずつ回す
 
 **E2d の分け方**: E2d-1 (`here.rs` への移動、`examples/` の上限付きの走査と `[[example]]` の path、例を読む部分を根と一覧で一般化) → E2d-2 (find_examples に member・path・git と記録した git の crate、決定 87、git では版を渡さない、lib の名前の違う crate の `docs_from` と根の判定) → E2d-3 (std、決定 84・85、std_dist の計時) → E2d-4 (R11、決定 88)
 
@@ -455,6 +457,11 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - E2d-3 のレビューで残したもの: std_dist の計時は `Origin::DocsRs` で呼び、本番の `Origin::Std` と `across::follow` を通らない。std の取得中の応答は `data` が無い (説明文の `data.docs: pending` と形が違う)。合わせた schema の単体テストは無い (stdio の応答の検査で見る)
 
 **E2d-4 (R11) の結果 (2026-11-04)**: release ビルドの server を `claude -p --strict-mcp-config --mcp-config <target/r11/mcp.json> --tools Read --setting-sources project` (Claude Code 2.1.318) で、`find_examples` が返した最初の例の `path` を Read で開かせた (6 回、合わせて約 0.45 USD、作業用のディレクトリは消した)。Read を許さないとき: cwd の中の member (`examples/hi.rs`) は読めた。サーバーのキャッシュ (compio 0.19.2 の `~/.cache/chatora-rustdoc-mcp/static.crates.io/…/src.v1/examples/basic.rs`) と cargo の registry/src (same-file 1.0.6。返したのは `~/.cargo` の symlink を解いた実パス `/opt/local/rust/.cargo/…`) は「許可が要る」で拒まれた。`--allowedTools …,Read` でも `--add-dir` (キャッシュ、`~/.cargo`) でも読めた。symlink の名前で足した `~/.cargo` は実パスにも効いた。git の checkout は cwd の外という点で registry/src と同じなので試していない。返す `path` はどれも開けるパスだった。決定 89 で README と説明文に案内を足した
+
+**E3 の実装 (2026-11-04)**: instructions の呼ぶ順を「for a crate's features, README or examples, `inspect_features`, `get_readme` or `find_examples`」にし、字数のため「give the path, such as `tokio::sync::Mutex`, directly」の例と「by path or name」を外した (説明文に同じことがある)。crate_overview.md に「始め方は `get_readme`、例は `find_examples`」。get_item.md に「Its examples: `find_examples`」、字数のため provenance の括弧書きと `detail` の説明を縮めた (テストの数え方で 2,044 字)。`no_json` の案内に「call get_readme for the crate's README, which needs no rustdoc JSON」。eval (2026-11-04、既定のモデル、各 1 回): `q12-examples` は合格 (最初に `find_examples`、次に `get_item`、0.24 USD)、`q13-readme` は合格 (`get_readme` を 1 回、0.08 USD)
+
+- E3 のレビュー (サブエージェント、読むだけ。字数と checks の規則は両方の構成で問題なし、no_json の案内は crates.io のリリースの docs.rs の取得にしか付かず当てはまる) の対応: instructions の「by path or name」を戻して「as you do its dependencies'」に、「give the path directly」を「give the crate or path directly」に (例を外して何を渡すかが曖昧になった。`get_readme`・`inspect_features` は crate を取る)。字数のため、言語サーバーの案内の「(line and column)」を外した。get_item.md を「For examples, `find_examples`.」に、`no_json` の案内を「call get_readme …」に (他の案内の形に合わせた)
+- E3 のレビューで残したもの: eval の `q12-examples` は `get_item` だけでも、`q13-readme` は `crate_overview` だけでも合格する (tools は「どれか 1 つ」)。決定 91 の tools のままにし、誘導は呼んだツールの記録で見る。要件の Q13 の表の `readme` は M3 の終わりに `get_readme` に改める (決定 77)
 
 聞かずに決めたこと (前例のまま): `readme` の版の決め方は他のツールと同じ (`target` は版の決め方にだけ効く)。annotations は今の `annotations()` のまま。`required-features` は `.crate` の `[[example]]` から、member は cargo metadata から読む (`metadata::Target` に足す)。example の判定は Cargo の自動検出と同じにし、`examples/` の下の補助のモジュールは例として数えない。no_json の suggestions に `readme` を足すのは E3
 
