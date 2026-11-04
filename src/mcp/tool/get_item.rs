@@ -21,6 +21,7 @@ use super::{
     InvalidArgument,
     ToolState,
     error_result,
+    find_examples::{self, DocExamplesAsk},
     get_source::{self, SourceAsk},
     inspect_features::{self, FeatureItemsAsk},
     project::{self, InProject},
@@ -176,6 +177,9 @@ pub(super) enum What {
     /// The items that each feature of the crate enables (`inspect_features`), found at its root
     /// (decided in M3d, D3).
     FeatureItems(Box<FeatureItemsAsk>),
+    /// The examples of the crate, or of the item first (`find_examples`), with the files of its
+    /// `examples/` (decided in M3e, E2c).
+    Examples(Box<DocExamplesAsk>),
 }
 
 impl What {
@@ -184,6 +188,7 @@ impl What {
     fn until(&self, state: &ToolState) -> Instant {
         match self {
             Self::FeatureItems(asked) => asked.until,
+            Self::Examples(asked) => asked.until,
             Self::Item
             | Self::List(_)
             | Self::Overview
@@ -383,6 +388,29 @@ impl Arguments {
             shape: Shape {
                 detail: Detail::Brief,
                 what: What::FeatureItems(Box::new(asked)),
+            },
+        }
+    }
+
+    /// The arguments of `find_examples` for the examples of `release`, at the item that `asked`
+    /// names or else at its root; what failed of the project was forgotten when its version was
+    /// resolved, and what failed of the release is forgotten as `asked` tells.
+    pub(super) fn for_examples(release: ReleaseArguments, asked: DocExamplesAsk) -> Self {
+        let path = asked.ask_item().map_or_else(
+            || release.name.as_str().replace('-', "_").into(),
+            |item| with_crate_name(&release.name, item),
+        );
+        Self {
+            path,
+            name: release.name,
+            version: release.version,
+            project: release.project,
+            target: release.target,
+            refresh: false,
+            git: release.git,
+            shape: Shape {
+                detail: Detail::Brief,
+                what: What::Examples(Box::new(asked)),
             },
         }
     }
@@ -3227,8 +3255,9 @@ async fn look_up(
     // What failed of the release alone, as `inspect_features` resolved the rest (decided in M3d,
     // D3).
     #[cfg(feature = "local")]
-    let refresh =
-        refresh || matches!(&arguments.shape.what, What::FeatureItems(asked) if asked.refresh);
+    let refresh = refresh
+        || matches!(&arguments.shape.what, What::FeatureItems(asked) if asked.refresh)
+        || matches!(&arguments.shape.what, What::Examples(asked) if asked.refresh);
     #[cfg(feature = "local")]
     if refresh {
         // Not what `build_external_docs` recorded, which only it makes again (requirement
@@ -5386,6 +5415,14 @@ fn respond_in(
             let response = get_item(view, request).map_err(Failure::Item)?;
             let mut value = serde_json::to_value(&response).map_err(Failure::Serialize)?;
             inspect_features::add_items(&mut value, view, asked.feature.as_deref(), lacking);
+            return Ok(value);
+        },
+        // The examples of the docs, with the files of `examples/`, in the order shown (decided in
+        // M3e, decision 71).
+        What::Examples(asked) => {
+            let response = get_item(view, request).map_err(Failure::Item)?;
+            let mut value = serde_json::to_value(&response).map_err(Failure::Serialize)?;
+            find_examples::add_answer(&mut value, (view, request), asked).map_err(Failure::Item)?;
             return Ok(value);
         },
         // The source is read after, where the item is, with what tells a macro's output.

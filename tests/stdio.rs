@@ -1485,6 +1485,7 @@ fn tools_list_is_cacheable_and_not_paginated() {
     }
     expected.extend([
         "crate_overview",
+        "find_examples",
         "get_item",
         "get_readme",
         "get_source",
@@ -7330,7 +7331,8 @@ fn features_cache() -> TempDir {
                     [features]\n\
                     default = [\"extra\"]\nextra = []\nfull = [\"extra\", \"dep:serde\"]\n\
                     [dependencies]\nserde = { version = \"1\", optional = true }\n\
-                    [target.'cfg(unix)'.dependencies]\nlog = { version = \"0.4\", optional = true }\n";
+                    [target.'cfg(unix)'.dependencies]\nlog = { version = \"0.4\", optional = true }\n\
+                    [[example]]\nname = \"greet\"\nrequired-features = [\"extra\"]\n";
     // Its readme, which its manifest names, with a hidden character (decided in M3e).
     let readme = "# Demo [![Build](https://example.invalid/b.svg)](https://example.invalid)\n\n\
                   Say hello.\n\n## Getting started\n\n```sh\n# not a heading\ncargo add demo\n```\n\n\
@@ -7339,6 +7341,10 @@ fn features_cache() -> TempDir {
     for (path, contents) in [
         ("demo-0.2.0/Cargo.toml", manifest),
         ("demo-0.2.0/docs/README.md", readme),
+        (
+            "demo-0.2.0/examples/greet.rs",
+            "fn main() {\n    demo::hello();\n}\n",
+        ),
     ] {
         let mut header = tar::Header::new_gnu();
         header.set_size(contents.len().try_into().expect("small"));
@@ -7386,6 +7392,9 @@ fn features_cache() -> TempDir {
         hello.attrs.push(rustdoc_types::Attribute::Other(
             r#"#[doc(cfg(feature = "extra"))]"#.to_owned(),
         ));
+        // An example of its own, with a hidden line (decided in M3e).
+        hello.docs =
+            Some("Says hello.\n\n```no_run\n# fn main() {\ndemo::hello();\n# }\n```\n".to_owned());
     }
     store
         .write_docs_rs_json(
@@ -7556,6 +7565,105 @@ fn get_readme_reads_the_readme_of_a_release() {
     );
     let std = call(&mut server, 4, json!({ "crate": "std" }));
     assert_eq!(text_json(&std)["code"], "invalid_argument", "{std}");
+    assert!(server.finish().success());
+}
+
+/// `find_examples` finds a release's examples offline: the files of its `examples/` by their
+/// paths, with the features they need, and the blocks of its docs, the item's own first (decided
+/// in M3e, decisions 69 to 72).
+#[test]
+fn find_examples_finds_the_examples_of_a_release() {
+    let cache = features_cache();
+    let mut server = Server::start_with_cache(cache, None, &[(
+        "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE",
+        "true",
+    )]);
+    let call = |server: &mut Server, id, arguments: Value| {
+        server.send(&call_tool(id, "find_examples", arguments));
+        server.response(id)["result"].clone()
+    };
+    let hello = call(
+        &mut server,
+        1,
+        json!({ "crate": "demo@0.2.0", "target": TARGET, "path": "hello", "content": true }),
+    );
+    assert_eq!(hello["isError"], false, "{hello}");
+    let data = &hello["structuredContent"]["data"];
+    assert_eq!(data["docs"], "read", "{hello}");
+    assert_eq!(data["item"], "demo::hello", "{hello}");
+    let examples = data["examples"].as_array().expect("examples");
+    assert_eq!(examples.len(), 2, "{hello}");
+    let own = &examples[0];
+    assert_eq!(own["kind"], "doc", "{hello}");
+    assert_eq!(own["match"], "own", "{hello}");
+    assert_eq!(own["code"], "demo::hello();\n", "{hello}");
+    assert_eq!(own["attributes"], json!(["no_run"]), "{hello}");
+    let file = &examples[1];
+    assert_eq!(file["kind"], "file", "{hello}");
+    assert_eq!(file["name"], "greet", "{hello}");
+    assert_eq!(file["file"], "examples/greet.rs", "{hello}");
+    assert_eq!(file["required_features"], json!(["extra"]), "{hello}");
+    assert_eq!(file["lines"], json!([2]), "{hello}");
+    assert!(
+        file["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("demo::hello()"))
+    );
+    let path = file["path"].as_str().expect("a path");
+    assert!(Path::new(path).is_absolute(), "{path}");
+    assert!(std::fs::read_to_string(path).is_ok_and(|text| text.contains("hello")));
+    // Without an item: the files first; a page of one, then the rest with the cursor.
+    let first = call(
+        &mut server,
+        2,
+        json!({ "crate": "demo@0.2.0", "target": TARGET, "limit": 1 }),
+    );
+    let content = &first["structuredContent"];
+    assert_eq!(content["data"]["examples"][0]["kind"], "file", "{first}");
+    assert!(content["data"]["examples"][0].get("content").is_none());
+    assert_eq!(content["page"]["total"], 2, "{first}");
+    let cursor = content["page"]["next_cursor"].as_str().expect("a cursor");
+    let rest = call(
+        &mut server,
+        3,
+        json!({ "crate": "demo@0.2.0", "target": TARGET, "limit": 1, "cursor": cursor }),
+    );
+    assert_eq!(
+        rest["structuredContent"]["data"]["examples"][0]["kind"], "doc",
+        "{rest}"
+    );
+    assert_eq!(
+        rest["structuredContent"]["page"]["has_more"], false,
+        "{rest}"
+    );
+    // Without the docs, as of another target offline: the files alone, ranked by the name given
+    // (decided in M3e, decision 73).
+    let alone = call(
+        &mut server,
+        5,
+        json!({ "crate": "demo@0.2.0", "target": "aarch64-apple-darwin", "path": "hello" }),
+    );
+    assert_ne!(alone["isError"], true, "{alone}");
+    let content = &alone["structuredContent"];
+    assert_eq!(content["data"]["docs"], "unavailable", "{alone}");
+    assert_eq!(content["data"]["examples"][0]["name"], "greet", "{alone}");
+    assert_eq!(
+        content["data"]["examples"][0]["match"], "item_and_type",
+        "{alone}"
+    );
+    assert!(
+        content["warnings"]
+            .to_string()
+            .contains("the examples of the docs are not here"),
+        "{alone}"
+    );
+    // An item that the crate does not have is the caller's to fix.
+    let none = call(
+        &mut server,
+        4,
+        json!({ "crate": "demo@0.2.0", "target": TARGET, "path": "nothing" }),
+    );
+    assert_eq!(text_json(&none)["code"], "item_not_found", "{none}");
     assert!(server.finish().success());
 }
 

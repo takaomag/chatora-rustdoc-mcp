@@ -241,6 +241,30 @@ fn feature_questions() -> Vec<Question> {
     ]
 }
 
+/// The questions about crates' examples (decided in M3e).
+fn example_questions() -> Vec<Question> {
+    vec![
+        question(
+            "find_examples",
+            "how is `tokio::sync::Mutex::lock` used?",
+            json!({ "crate": "tokio@1.53.3", "path": "sync::Mutex::lock" }),
+            |result| {
+                result["data"]["examples"][0]["match"] == "own"
+                    && has(&result["data"]["examples"][0]["code"], ".lock().await")
+            },
+        ),
+        question(
+            "find_examples",
+            "are there examples of axum's `Router`?",
+            json!({ "crate": "axum@0.8.9", "path": "Router" }),
+            |result| {
+                result["data"]["item"] == "axum::Router"
+                    && has(&result["data"]["examples"], "Router::new()")
+            },
+        ),
+    ]
+}
+
 /// The questions about crates' readmes (decided in M3e).
 fn readme_questions() -> Vec<Question> {
     vec![
@@ -270,6 +294,7 @@ fn questions() -> Vec<Question> {
     let mut questions = item_questions();
     questions.extend(feature_questions());
     questions.extend(readme_questions());
+    questions.extend(example_questions());
     questions.extend(other_questions());
     questions.extend(
         [

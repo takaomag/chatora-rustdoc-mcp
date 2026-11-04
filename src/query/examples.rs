@@ -210,6 +210,8 @@ pub struct ExampleFile {
     pub name: Box<str>,
     /// Its file, relative to the package's root with `/`.
     pub file: Box<str>,
+    /// Its real path, absolute, for the client to open (decided in M3e, decision 70).
+    pub path: Box<str>,
     /// The features that it needs.
     pub required_features: Box<[Box<str>]>,
     /// Its text.
@@ -429,6 +431,7 @@ mod tests {
         let file = |name: &str, text: &str| ExampleFile {
             name: name.into(),
             file: format!("examples/{name}.rs").into(),
+            path: format!("/p/examples/{name}.rs").into(),
             required_features: Box::default(),
             text: text.into(),
         };

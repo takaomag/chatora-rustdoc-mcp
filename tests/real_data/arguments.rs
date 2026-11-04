@@ -136,6 +136,24 @@ fn item_cases() -> Vec<Case> {
         &json!({ "crate": TOKIO, "limit": 2 }),
         vec![("cursor", Change::NextCursor)],
     ));
+    cases.extend(shared("find_examples", &json!({})));
+    cases.extend(each("find_examples", &json!({ "crate": TOKIO }), vec![
+        ("path", Change::Set(json!("sync::Mutex::lock"))),
+        ("limit", Change::Set(json!(2))),
+    ]));
+    cases.extend(each(
+        "find_examples",
+        &json!({ "crate": TOKIO, "limit": 2 }),
+        vec![("cursor", Change::NextCursor)],
+    ));
+    // tokio's `.crate` has no `examples/`: the stdio test
+    // find_examples_finds_the_examples_of_a_release checks the text of its files.
+    cases.push(case(
+        "find_examples",
+        "content",
+        json!({ "crate": TOKIO }),
+        Change::CheckedElsewhere,
+    ));
     cases.extend(shared("get_readme", &json!({})));
     cases.extend(each("get_readme", &json!({ "crate": TOKIO }), vec![(
         "section",
@@ -281,6 +299,7 @@ fn refresh_cases() -> Vec<Case> {
     // and the stdio test a_member_whose_build_fails_again_is_told_failed check.
     [
         "crate_overview",
+        "find_examples",
         "get_item",
         "get_readme",
         "get_source",
@@ -338,6 +357,7 @@ fn git_cases() -> Vec<Case> {
     let tools = [
         "build_external_docs",
         "crate_overview",
+        "find_examples",
         "get_item",
         "get_readme",
         "get_source",

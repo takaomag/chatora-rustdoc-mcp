@@ -17,6 +17,7 @@ mod external_git;
 mod external_target;
 #[cfg(feature = "local")]
 mod external_workspace;
+mod find_examples;
 mod get_item;
 mod get_readme;
 mod get_source;
@@ -394,6 +395,7 @@ pub(super) fn definitions() -> Vec<Tool> {
         #[cfg(feature = "local")]
         build_external_docs::definition(),
         crate_overview::definition(),
+        find_examples::definition(),
         get_item::definition(),
         get_readme::definition(),
         get_source::definition(),
@@ -829,6 +831,10 @@ async fn dispatch(
                 },
                 Err(error) => Ok(error.into_result()),
             }
+        },
+        find_examples::NAME => match find_examples::parse_arguments(request.arguments.as_ref()) {
+            Ok(find) => Ok(run_tool(find_examples::execute(find, Arc::clone(state))).await),
+            Err(error) => Ok(error.into_result()),
         },
         get_readme::NAME => match get_readme::parse_arguments(request.arguments.as_ref()) {
             Ok(readme) => Ok(run_tool(get_readme::execute(readme, Arc::clone(state))).await),
@@ -1289,6 +1295,7 @@ mod tests {
             resolve_version::NAME,
             inspect_features::NAME,
             get_readme::NAME,
+            find_examples::NAME,
         ]);
         fits_the_schemas(project::resolving_crate(&name, &target, going, &[]), &tools);
         let mut provenance = serde_json::Map::new();
