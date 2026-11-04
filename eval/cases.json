@@ -133,6 +133,20 @@
     "answer": ["Router"]
   },
   {
+    "id": "q15-metadata",
+    "question": "Q15",
+    "prompt": "What are serde's MSRV and license, and is it still maintained?",
+    "tools": ["crate_metadata"],
+    "answer": ["\\bMIT\\b", "\\b1\\.56\\b"]
+  },
+  {
+    "id": "q16-search",
+    "question": "Q16",
+    "prompt": "Which crate should I use to parse command-line arguments in Rust?",
+    "tools": ["search_crates"],
+    "answer": ["\\bclap\\b"]
+  },
+  {
     "id": "shape-result",
     "question": "R-OUT-1",
     "prompt": "Call get_item once for `tokio::sync::Mutex` in tokio 1.53.3 with detail brief, and tell me the version in its provenance.",

@@ -566,6 +566,12 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - F3a のレビュー (サブエージェント、読むだけ) の対応: local の構成で `refresh` を持つかの単体テストが落ちる (例外に足した)。エラーの割り振りを他のツールにそろえた (キャッシュと URL は `internal_error`、`retryable` ごとの suggestions、offline の案内、`RecentFailure` に `retry_after_secs`)。crates.io が cursor を 4xx で断れば `invalid_argument`。応答の予算を超えたら description を 200 字に詰めて warning (seek の頁は途中で切れない)。頁番号は数字だけで 2 以上。`sort`・`cursor` の null は無いものとする。最後の空の頁の案内を分けた。版は版の上限 (100 字) で切る。`crate_metadata` の案内に yanked を足した。テストを足した (別の query・limit の cursor、`p1`・`p0`・`p+3`・`p03`・長すぎる seek、null、0 件の案内)
 - F3a のレビューで残したもの: cursor の形 (`s1.<digest>.<頁>`) は要件 R-OUT-3 の `c1.` の形と違う (M3 の終わりに要件に書く)。search_crates の stdio のテストは local の構成だけ (偽のレジストリが local 限定)。決定 102 の「骨格の検査の例外」は、ツールごとの provenance の必須を検査するものが無く、登録先が無い
 
+**F3b の実装 (2026-11-04)**: instructions の呼ぶ順に「for its license, MSRV or upkeep, `crate_metadata`; to find one, `search_crates`」を足し、字数のため版の規則 (Cargo.lock の言い方、worktree の文)・stale の説明 (「its lines moved」)・language server の案内 (「by path or name」) を縮めた。eval に `q15-metadata` (serde の MSRV と license と保守。tools は `crate_metadata`、答えに MIT と 1.xx) と `q16-search` (コマンドラインの引数を解析する crate。tools は `search_crates`、答えに clap) を足した (決定 105)。eval (2026-11-04、既定のモデル、各 1 回): `q15-metadata` は合格 (`crate_metadata` を 1 回、0.23 USD)、`q16-search` は合格 (`search_crates` の後に `crate_metadata`、0.07 USD)
+
+- F3b のレビュー (サブエージェント、読むだけ) の対応: q15 の答えの正規表現を fixture の serde 1.0.228 の MSRV `1.56` に絞った (`1\.\d{2}` は昔の MSRV の誤答も通した。回した答えには 1.56 があった)。worktree の文は「the worktree's directory」と明示し、「to find one」を「to find a crate」に戻した。instructions は local の構成で上限まで残り数字 (次に足すときは縮める所を先に決める)
+- F3b のレビューで残したもの: q16 は要件の Q16 (MQTT のクライアント) と違い、記憶で答えられる clap を問う (検索が効いたかは tools の検査で見る)。q15 はリポジトリと保守の語を確かめない。stale の説明から行のずれへの注意を外した
+
+
 聞かずに決めたこと: index に版があり API が 404 を返すとき (公開の直後など) は決定 93 と同じく API の項目を省いて warning にする。API の要求の数と待ちはログだけに出し、応答には入れない (R13)。
 
 ## 7. M3 の終わり方

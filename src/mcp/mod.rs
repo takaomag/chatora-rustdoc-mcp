@@ -67,8 +67,9 @@ pub(crate) const INSTRUCTIONS: &str = const_format::concatcp!(
     FIND,
     "`crate_overview`, `list_module` or `search_items`; for the item itself, `get_item`; for \
      what a type or trait has, `list_methods`, `list_impls` or `list_implementors`; for a crate's \
-     features, README or examples, `inspect_features`, `get_readme` or `find_examples`. None \
-     needs an earlier call (but see below): give the crate or path directly.",
+     features, README or examples, `inspect_features`, `get_readme` or `find_examples`; for its \
+     license, MSRV or upkeep, `crate_metadata`; to find a crate, `search_crates`. None needs an \
+     earlier call (but see below): give the crate or path directly.",
     EXTERNAL,
     "\n",
     VERSIONS,
@@ -106,12 +107,11 @@ const EXTERNAL: &str = "";
 
 /// The rule for versions.
 #[cfg(feature = "local")]
-const VERSIONS: &str = "- Versions: without a version, a tool uses the one in the project's \
-                        Cargo.lock (the project Claude Code was opened in, or `project`), or else \
-                        the latest release; `provenance` tells which and why. Working in another \
-                        git worktree of the project, as a subagent may, pass the worktree's \
-                        directory as `project`: the server sees only the directory Claude Code \
-                        was opened in.\n";
+const VERSIONS: &str = "- Versions: without a version, a tool uses the one in the Cargo.lock of \
+                        the project Claude Code was opened in (or `project`), or else the latest \
+                        release; `provenance` tells which and why. In another git worktree, as a \
+                        subagent may be, pass the worktree's directory as `project`: the server \
+                        sees only the one Claude Code was opened in.\n";
 #[cfg(not(feature = "local"))]
 const VERSIONS: &str = "- Versions: without a version, a tool uses the latest release, as this \
                         server is built without reading projects: give the version that the \
@@ -132,14 +132,14 @@ const TARGETS: &str = "- Targets: the data is that of the host's target unless `
 /// How to read a stale answer.
 #[cfg(feature = "local")]
 const STALE: &str = " One with `stale` is of an earlier build: `stale_reason` and the hints tell \
-                     why and what to do; an item may have changed, and its lines moved.";
+                     why and what to do; it may have changed since.";
 #[cfg(not(feature = "local"))]
 const STALE: &str = "";
 
 /// Where the language server is the better tool.
 #[cfg(feature = "local")]
-const LANGUAGE_SERVER: &str = "- Look up this workspace's own items here too, by path or name, as \
-                               you do its dependencies'. Use the language server (rust-analyzer) for \
+const LANGUAGE_SERVER: &str = "- Look up this workspace's own items here too, as its dependencies'. \
+                               Use the language server (rust-analyzer) for \
                                what is at a position, references, diagnostics, \
                                and code edited after an answer's `built_at`.";
 #[cfg(not(feature = "local"))]
