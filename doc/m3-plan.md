@@ -571,8 +571,27 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - F3b のレビュー (サブエージェント、読むだけ) の対応: q15 の答えの正規表現を fixture の serde 1.0.228 の MSRV `1.56` に絞った (`1\.\d{2}` は昔の MSRV の誤答も通した。回した答えには 1.56 があった)。worktree の文は「the worktree's directory」と明示し、「to find one」を「to find a crate」に戻した。instructions は local の構成で上限まで残り数字 (次に足すときは縮める所を先に決める)
 - F3b のレビューで残したもの: q16 は要件の Q16 (MQTT のクライアント) と違い、記憶で答えられる clap を問う (検索が効いたかは tools の検査で見る)。q15 はリポジトリと保守の語を確かめない。stale の説明から行のずれへの注意を外した
 
-
 聞かずに決めたこと: index に版があり API が 404 を返すとき (公開の直後など) は決定 93 と同じく API の項目を省いて warning にする。API の要求の数と待ちはログだけに出し、応答には入れない (R13)。
+
+### 6.7 M3g
+
+**下調べ (2026-11-04。サブエージェント、読むだけ、ネットワークなし。target/claude-notes/m3g-research.md)**: 手元の registry の 1,025 crate (最新版) のうち changelog があるのは 403 (39%) で、どれもパッケージのルート直下。名前は `CHANGELOG.md` 358・`RELEASES.md` 18・`CHANGES.md` 9・拡張子なしの `CHANGELOG`/`CHANGES` 7 など。serde・clap・reqwest・anyhow などは無い (多くは GitHub の releases)。Cargo.toml に changelog の欄は無い。版の見出しは 400 crate・10,605 見出しで、段が混ざる crate が 27、形は Keep a Changelog 99・`1.2.3 (日付)` 79・`1.2.3` 64・`Version`/`Release` 47 など。Unreleased 類は 110 (中身ありは 10)、版の見出しが無いのは 3、求める版が無い古い changelog は 35。大きさは中央値 4,717 字・最大 394,697 字で、新しい 10 リリースが 2 万字を超えるのは 16。rust-src に RELEASES.md は無い (rust-docs の `releases.md` はある)。`get_readme` の版の決め方・`here`・`outline`・`page_end`・予算の削り方が写せ、直すのは `readme::is_document` (拡張子なし)・`source_root::Package` (changelog の欄)・頁の単位 (リリース)
+
+**M3g で利用者が決めたこと (2026-11-04)**:
+
+- 決定 112 (M3g) 読むのは範囲の上端の版 (`to`、無ければ最新の安定版) の `.crate` の changelog。プロジェクトが古い版をロックしていても新しい版の変更が読める
+- 決定 113 (M3g) 引数は `crate`・`from`・`to`・`project`・`limit`・`cursor` (と他のツールにそろえた `refresh`・`git`・`rev`・`branch`・`tag`)。`version` と `target` は取らない。`section` は持たない
+- 決定 114 (M3g) 範囲は `from` を含まず `to` を含む。部分の版 (`0.8`) は `to` なら 0.8.x の最新まで、`from` なら 0.8.x の全部より後。`from` を省けばプロジェクトの版より後 (使わなければ先頭から)、`to` を省けば最新の安定版まで
+- 決定 115 (M3g) 新しい順に `limit` (既定 10、上限 50) と本文 2 万字の小さいほうまで。`page` に `shown`・`total`・`has_more`・`next_cursor`。少なくとも 1 リリースは載せ、1 リリースが 2 万字を超えれば行の境目で切って続きを cursor で
+- 決定 116 (M3g) 版の見出しは段を問わず、整えた見出し (リンク・強調・取り消し線を外す) の先頭 (`[`・`v`・`Version`/`Release`/crate 名の後) に版があるもの。版が先頭に無いもの (「Migration notes for 2.22.0」) は除く。semver で読み、2 つ組は `.0` を補う。日付と yanked の印も取る。parse-changelog crate は採らず自前 (要件 §10 の表は M3 の終わりに改める)
+- 決定 117 (M3g) Unreleased 類はリリースに数えず、`to` を省いたときだけ中身があれば `unreleased` で添える。版の見出しが 1 つも無ければ行で切った本文と warning。求める版が changelog に無ければ (古い changelog) warning
+- 決定 118 (M3g) パッケージのルート直下を、大文字小文字を問わず `CHANGELOG` → `CHANGES` → `RELEASES`・`RELEASE-NOTES`・`RELEASE_NOTES` → `HISTORY` → `NEWS` の順で探す。拡張子は `.md`・`.markdown`・`.txt`・`.rst`・`.adoc`・なし、同じ順位なら `.md` を先に。ディレクトリは読まない
+- 決定 119 (M3g) member・path・git でパッケージのディレクトリに無ければ、決定 78・80 と同じ根の中で workspace のルートも見て、そこから読んだことを warning で言う (他の crate の節が混ざりうる)
+- 決定 120 (M3g) changelog が無ければ `docs_unavailable` に reason `no_changelog` (再試行不可)。`crate_metadata` と、宣言された repository の URL (GitHub なら releases の頁。示すだけで取得しない) を案内する
+- 決定 121 (M3g) std・core・alloc は `invalid_argument` で断り、Rust のリリースノートはまだ引けないことと、`get_item` の `stability` (since の版) を案内する
+- 決定 122 (M3g) eval に `q14-changelog` を足し、最後の段で手で 1 回回す
+
+聞かずに決めたこと: 本文の見えない文字は決定 66 と同じく印を付けて warning。GitHub releases と token (P9 の G2) は G2 に入るときに決める。段の分け方は G1a (データ層: ファイルの選び方・版の見出し・範囲) → G1b (ツール、crates.io) → G1c (ローカル) → G1d (案内と eval)
 
 ## 7. M3 の終わり方
 
