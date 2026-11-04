@@ -336,8 +336,27 @@ fn search_questions() -> Vec<Question> {
     ]
 }
 
+/// The questions about crates' changelogs (decided in M3g).
+fn changelog_questions() -> Vec<Question> {
+    vec![
+        question(
+            "get_changelog",
+            "what changed in tokio since the version we use?",
+            json!({ "crate": "tokio", "from": "1.52", "to": "1.53.3" }),
+            |result| has(&result["data"]["releases"], "1.53"),
+        ),
+        question(
+            "get_changelog",
+            "what is new in axum 0.8?",
+            json!({ "crate": "axum", "from": "0.7", "to": "0.8.9" }),
+            |result| has(&result["data"]["releases"], "0.8.0"),
+        ),
+    ]
+}
+
 fn questions() -> Vec<Question> {
     let mut questions = item_questions();
+    questions.extend(changelog_questions());
     questions.extend(metadata_questions());
     questions.extend(search_questions());
     questions.extend(feature_questions());

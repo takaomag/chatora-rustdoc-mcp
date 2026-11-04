@@ -603,7 +603,6 @@ pub struct Declaration {
 /// # Errors
 ///
 /// Returns an error when the manifest cannot be read or is not TOML.
-#[cfg(feature = "local")]
 pub fn manifest_declaration(manifest: &Path) -> io::Result<(Declaration, Vec<Box<str>>)> {
     let table = manifest_table(manifest)?;
     let inherited = table
@@ -627,7 +626,6 @@ pub fn manifest_declaration(manifest: &Path) -> io::Result<(Declaration, Vec<Box
 }
 
 /// The fields of `[package]` that [`Declaration`] tells.
-#[cfg(feature = "local")]
 const DECLARED_FIELDS: [&str; 8] = [
     "description",
     "license",

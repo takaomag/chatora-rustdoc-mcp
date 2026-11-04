@@ -136,36 +136,6 @@ fn item_cases() -> Vec<Case> {
         &json!({ "crate": TOKIO, "limit": 2 }),
         vec![("cursor", Change::NextCursor)],
     ));
-    cases.extend(each(
-        "search_crates",
-        &json!({ "query": "json", "limit": 2 }),
-        vec![
-            ("query", Change::Set(json!("yaml"))),
-            ("sort", Change::Set(json!("downloads"))),
-            ("limit", Change::Set(json!(3))),
-            ("cursor", Change::NextCursor),
-        ],
-    ));
-    // No target: what a crate declares is of every target.
-    cases.extend(each("crate_metadata", &json!({ "crate": TOKIO }), vec![
-        ("crate", Change::Set(json!(AXUM))),
-        ("limit", Change::Set(json!(1))),
-    ]));
-    cases.extend(each(
-        "crate_metadata",
-        &json!({ "crate": "tokio", "version": "1.53.3" }),
-        vec![("version", Change::Set(json!("1.45.1")))],
-    ));
-    cases.extend(each(
-        "crate_metadata",
-        &json!({ "crate": TOKIO, "limit": 1 }),
-        vec![("cursor", Change::NextCursor)],
-    ));
-    if cfg!(feature = "local") {
-        cases.extend(each("crate_metadata", &json!({ "crate": "tokio" }), vec![
-            ("project", Change::Set(json!(OTHER_PROJECT))),
-        ]));
-    }
     cases.extend(shared("find_examples", &json!({})));
     cases.extend(each("find_examples", &json!({ "crate": TOKIO }), vec![
         ("path", Change::Set(json!("sync::Mutex::lock"))),
@@ -202,6 +172,68 @@ fn item_cases() -> Vec<Case> {
         "detail",
         Change::Set(json!("full")),
     )]));
+    cases
+}
+
+/// Cases of the tools that read crates.io's index and API, and a `.crate`'s changelog (decided in
+/// M3f and M3g).
+fn crates_io_cases() -> Vec<Case> {
+    let mut cases = Vec::new();
+    cases.extend(each(
+        "get_changelog",
+        &json!({ "crate": "tokio", "limit": 1 }),
+        vec![("crate", Change::Set(json!("axum")))],
+    ));
+    cases.extend(each(
+        "get_changelog",
+        &json!({ "crate": "tokio", "from": "1.50", "to": "1.53.3", "limit": 1 }),
+        vec![
+            ("from", Change::Set(json!("1.51"))),
+            ("to", Change::Set(json!("1.52"))),
+            ("limit", Change::Set(json!(2))),
+            ("cursor", Change::NextCursor),
+        ],
+    ));
+    // Both projects use tokio 1.53.3: the stdio test
+    // get_changelog_starts_after_the_version_that_the_project_uses checks it instead.
+    if cfg!(feature = "local") {
+        cases.push(case(
+            "get_changelog",
+            "project",
+            json!({}),
+            Change::CheckedElsewhere,
+        ));
+    }
+    cases.extend(each(
+        "search_crates",
+        &json!({ "query": "json", "limit": 2 }),
+        vec![
+            ("query", Change::Set(json!("yaml"))),
+            ("sort", Change::Set(json!("downloads"))),
+            ("limit", Change::Set(json!(3))),
+            ("cursor", Change::NextCursor),
+        ],
+    ));
+    // No target: what a crate declares is of every target.
+    cases.extend(each("crate_metadata", &json!({ "crate": TOKIO }), vec![
+        ("crate", Change::Set(json!(AXUM))),
+        ("limit", Change::Set(json!(1))),
+    ]));
+    cases.extend(each(
+        "crate_metadata",
+        &json!({ "crate": "tokio", "version": "1.53.3" }),
+        vec![("version", Change::Set(json!("1.45.1")))],
+    ));
+    cases.extend(each(
+        "crate_metadata",
+        &json!({ "crate": TOKIO, "limit": 1 }),
+        vec![("cursor", Change::NextCursor)],
+    ));
+    if cfg!(feature = "local") {
+        cases.extend(each("crate_metadata", &json!({ "crate": "tokio" }), vec![
+            ("project", Change::Set(json!(OTHER_PROJECT))),
+        ]));
+    }
     cases
 }
 
@@ -331,6 +363,7 @@ fn refresh_cases() -> Vec<Case> {
         "crate_metadata",
         "crate_overview",
         "find_examples",
+        "get_changelog",
         "get_item",
         "get_readme",
         "get_source",
@@ -390,6 +423,7 @@ fn git_cases() -> Vec<Case> {
         "crate_metadata",
         "crate_overview",
         "find_examples",
+        "get_changelog",
         "get_item",
         "get_readme",
         "get_source",
@@ -412,6 +446,7 @@ fn git_cases() -> Vec<Case> {
 
 fn cases() -> Vec<Case> {
     let mut cases = item_cases();
+    cases.extend(crates_io_cases());
     cases.extend(list_cases());
     cases.extend(type_cases());
     cases.extend(project_cases());

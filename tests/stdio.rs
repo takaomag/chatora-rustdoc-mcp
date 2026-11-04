@@ -1521,6 +1521,7 @@ fn tools_list_is_cacheable_and_not_paginated() {
         "crate_metadata",
         "crate_overview",
         "find_examples",
+        "get_changelog",
         "get_item",
         "get_readme",
         "get_source",
@@ -4430,6 +4431,74 @@ fn failures_in(cache: &Path) -> Vec<(PathBuf, String)> {
     }
     found.sort();
     found
+}
+
+/// `get_changelog` without `from` tells the releases after the version that the project uses, from
+/// the changelog of the newest release's `.crate` (decided in M3g, decisions 112 and 114).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn get_changelog_starts_after_the_version_that_the_project_uses() {
+    use registry::{FakeCrate, FakeRegistry};
+    let registry = FakeRegistry::start();
+    let changelog = |versions: &[&str]| {
+        versions
+            .iter()
+            .map(|version| format!("## {version}\n\n- In {version}.\n\n"))
+            .collect::<Vec<_>>()
+            .concat()
+    };
+    for versions in [&["0.1.0"][..], &["0.2.0", "0.1.0"][..]] {
+        registry.publish(
+            &FakeCrate::new("fixture-changes", versions[0])
+                .file("CHANGELOG.md", &changelog(versions))
+                .file("src/lib.rs", ""),
+        );
+    }
+    let dir = TempDir::new().expect("a temporary directory");
+    let project = dir.path().join("user");
+    std::fs::create_dir_all(project.join("src")).expect("made");
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"user\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nfixture-changes = \"=0.1.0\"\n",
+    )
+    .expect("written");
+    std::fs::write(project.join("src/lib.rs"), "").expect("written");
+    let cargo_home = dir.path().join("cargo-home");
+    std::fs::create_dir_all(&cargo_home).expect("made");
+    std::fs::write(cargo_home.join("config.toml"), registry.cargo_config()).expect("written");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile"])
+        .current_dir(&project)
+        .env("CARGO_HOME", &cargo_home)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = server_in_on(Some(&project), &registry, dir.path());
+    let told = called_until_done(
+        &mut server,
+        1,
+        "get_changelog",
+        &json!({ "crate": "fixture-changes" }),
+    );
+    let content = &told["structuredContent"];
+    assert_eq!(content["provenance"]["version"], "0.2.0", "{told}");
+    assert_eq!(content["provenance"]["from_project"], "0.1.0", "{told}");
+    assert_eq!(content["data"]["from"], "0.1.0", "{told}");
+    let versions: Vec<&str> = content["data"]["releases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|release| release["version"].as_str())
+        .collect();
+    assert_eq!(versions, ["0.2.0"], "{told}");
+    assert!(server.finish().success());
 }
 
 /// A dependency of the project that `cargo rustdoc -p` cannot name, as only its tests use it, is
@@ -7575,6 +7644,11 @@ fn features_cache() -> TempDir {
             "demo-0.2.0/examples/greet.rs",
             "fn main() {\n    demo::hello();\n}\n",
         ),
+        (
+            "demo-0.2.0/CHANGELOG.md",
+            "# Changelog\n\n## [Unreleased]\n\n- Soon.\n\n## [0.2.0] - 2026-01-02\n\n\
+             - Added `hello`.\n\n## [0.1.0]\n\n- First.\n\n[0.1.0]: https://example.invalid\n",
+        ),
     ] {
         let mut header = tar::Header::new_gnu();
         header.set_size(contents.len().try_into().expect("small"));
@@ -7851,6 +7925,57 @@ fn crate_metadata_tells_what_a_release_declares_and_how_it_is_kept() {
         rest["structuredContent"]["data"]["history"][0]["version"], "0.1.0",
         "{rest}"
     );
+    assert!(server.finish().success());
+}
+
+/// `get_changelog` reads the changelog of a release's `.crate`, offline: its releases newest first,
+/// what is not released yet, and a range (decided in M3g, decisions 112 to 117).
+#[test]
+fn get_changelog_reads_the_releases_of_a_releases_changelog() {
+    let cache = features_cache();
+    let mut server = Server::start_with_cache(cache, None, &[(
+        "CHATORA_RUSTDOC_MCP_NETWORK__OFFLINE",
+        "true",
+    )]);
+    let mut call = |id, arguments: Value| {
+        server.send(&call_tool(id, "get_changelog", arguments));
+        server.response(id)["result"].clone()
+    };
+    let all = call(1, json!({ "crate": "demo" }));
+    assert_eq!(all["isError"], false, "{all}");
+    let content = &all["structuredContent"];
+    assert_eq!(content["provenance"]["version"], "0.2.0", "{all}");
+    let data = &content["data"];
+    assert_eq!(data["file"], "CHANGELOG.md", "{all}");
+    assert_eq!(
+        data["unreleased"], "## [Unreleased]\n\n- Soon.\n\n",
+        "{all}"
+    );
+    assert_eq!(
+        data["releases"],
+        json!([
+            {
+                "version": "0.2.0",
+                "heading": "[0.2.0] - 2026-01-02",
+                "date": "2026-01-02",
+                "text": "## [0.2.0] - 2026-01-02\n\n- Added `hello`.\n\n",
+            },
+            { "version": "0.1.0", "heading": "[0.1.0]", "text": "## [0.1.0]\n\n- First.\n\n" },
+        ]),
+        "{all}"
+    );
+    assert_eq!(
+        content["page"],
+        json!({ "shown": 2, "total": 2, "has_more": false }),
+        "{all}"
+    );
+    let range = call(2, json!({ "crate": "demo", "from": "0.1" }));
+    let versions = &range["structuredContent"]["data"]["releases"];
+    assert_eq!(versions.as_array().map(Vec::len), Some(1), "{range}");
+    assert_eq!(versions[0]["version"], "0.2.0", "{range}");
+    let refused = call(3, json!({ "crate": "demo@0.2.0" }));
+    assert_eq!(refused["isError"], true, "{refused}");
+    drop(call);
     assert!(server.finish().success());
 }
 

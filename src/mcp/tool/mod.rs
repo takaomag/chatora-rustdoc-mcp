@@ -19,6 +19,7 @@ mod external_target;
 #[cfg(feature = "local")]
 mod external_workspace;
 mod find_examples;
+mod get_changelog;
 mod get_item;
 mod get_readme;
 mod get_source;
@@ -425,6 +426,7 @@ pub(super) fn definitions() -> Vec<Tool> {
         crate_metadata::definition(),
         crate_overview::definition(),
         find_examples::definition(),
+        get_changelog::definition(),
         get_item::definition(),
         get_readme::definition(),
         get_source::definition(),
@@ -862,6 +864,10 @@ async fn dispatch(
         },
         find_examples::NAME => match find_examples::parse_arguments(arguments) {
             Ok(find) => Ok(Box::pin(run_tool(find_examples::execute(find, shared))).await),
+            Err(error) => Ok(error.into_result()),
+        },
+        get_changelog::NAME => match get_changelog::parse_arguments(arguments) {
+            Ok(changelog) => Ok(run_tool(get_changelog::execute(changelog, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         get_readme::NAME => match get_readme::parse_arguments(arguments) {
@@ -1321,6 +1327,7 @@ mod tests {
             resolve_version::NAME,
             inspect_features::NAME,
             get_readme::NAME,
+            get_changelog::NAME,
             find_examples::NAME,
         ]);
         fits_the_schemas(project::resolving_crate(&name, &target, going, &[]), &tools);
