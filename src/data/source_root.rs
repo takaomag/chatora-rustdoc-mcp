@@ -68,6 +68,9 @@ pub struct Package {
     pub readme: Option<PathBuf>,
     /// Its examples' files.
     pub examples: Vec<PathBuf>,
+    /// Its changelog, found by its name, in its directory or its workspace's root (decided in
+    /// M3g, decisions 118 and 119).
+    pub changelog: Option<PathBuf>,
 }
 
 /// A file that may be read.
@@ -205,6 +208,10 @@ impl Package {
                 .readme
                 .as_deref()
                 .is_some_and(|readme| is(readme) && is_document(readme))
+            || self
+                .changelog
+                .as_deref()
+                .is_some_and(|changelog| is(changelog) && super::changelog::is_changelog(changelog))
     }
 }
 
@@ -647,6 +654,7 @@ mod tests {
             source_files: vec![one.join("src/lib.rs"), workspace.join("notes.md")],
             readme: Some(one.join("../README.md")),
             examples: vec![one.join("examples/hi.rs")],
+            changelog: None,
         };
         let read = |package: &Package, asked: &str| {
             resolve(Root::Package(package), Path::new(asked)).map(|resolved| resolved.relative)

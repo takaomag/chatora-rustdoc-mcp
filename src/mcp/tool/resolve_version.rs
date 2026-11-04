@@ -195,6 +195,7 @@ struct Decided {
 }
 
 /// The release that `resolve_version` resolved, as it tells it.
+#[derive(Clone)]
 pub(super) struct Release {
     pub(super) provenance: Map<String, Value>,
     pub(super) warnings: Vec<Box<str>>,

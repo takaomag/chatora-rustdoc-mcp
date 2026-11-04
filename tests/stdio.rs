@@ -2617,6 +2617,69 @@ fn search_crates_searches_crates_io_a_page_at_a_time() {
     assert!(server.finish().success());
 }
 
+/// `get_changelog` reads a member's changelog where it is: `back`'s own, and `front`'s workspace's,
+/// as it has none, with a warning (decided in M3g, decisions 118 and 119).
+#[cfg(feature = "local")]
+#[test]
+fn get_changelog_reads_a_members_changelog_where_it_is() {
+    let dir = TempDir::new().expect("a temporary directory");
+    write_front_and_back(dir.path());
+    std::fs::write(
+        dir.path().join("CHANGELOG.md"),
+        "# Changelog\n\n## 0.1.0\n\n- The workspace's.\n",
+    )
+    .expect("written");
+    std::fs::write(
+        dir.path().join("back/CHANGES.md"),
+        "## 0.1.0\n\n- Back's own.\n",
+    )
+    .expect("written");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = Server::start_in(Some(dir.path()));
+    let back = called_until_done(&mut server, 1, "get_changelog", &json!({ "crate": "back" }));
+    let data = &back["structuredContent"]["data"];
+    assert_eq!(data["file"], "CHANGES.md", "{back}");
+    assert!(
+        data["releases"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Back's own")),
+        "{back}"
+    );
+    // With `to`, the member of that version, where it is.
+    let back_to = called_until_done(
+        &mut server,
+        50,
+        "get_changelog",
+        &json!({ "crate": "back", "to": "0.1.0" }),
+    );
+    assert_eq!(
+        back_to["structuredContent"]["data"]["file"], "CHANGES.md",
+        "{back_to}"
+    );
+    let front = called_until_done(
+        &mut server,
+        100,
+        "get_changelog",
+        &json!({ "crate": "front" }),
+    );
+    let content = &front["structuredContent"];
+    assert_eq!(content["data"]["file"], "../CHANGELOG.md", "{front}");
+    assert!(
+        content["warnings"].to_string().contains("its workspace's"),
+        "{front}"
+    );
+    assert!(server.finish().success());
+}
+
 /// `crate_metadata` tells what the project's packages declare, with what they inherit from their
 /// workspace, and their dependencies, from `cargo metadata`, without crates.io (decided in M3f,
 /// decision 98).
@@ -4498,6 +4561,17 @@ fn get_changelog_starts_after_the_version_that_the_project_uses() {
         .filter_map(|release| release["version"].as_str())
         .collect();
     assert_eq!(versions, ["0.2.0"], "{told}");
+    // With `to` too.
+    let up_to = called_until_done(
+        &mut server,
+        100,
+        "get_changelog",
+        &json!({ "crate": "fixture-changes", "to": "0.2" }),
+    );
+    assert_eq!(
+        up_to["structuredContent"]["provenance"]["from_project"], "0.1.0",
+        "{up_to}"
+    );
     assert!(server.finish().success());
 }
 
@@ -4963,6 +5037,14 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
     server.send(&call_tool(202, "find_examples", with(json!({}))));
     let found = server.response(202)["result"]["structuredContent"]["data"].clone();
     assert_eq!(found["examples"][0]["file"], "examples/try.rs", "{found}");
+    // Its changelog, where it is: it has none (decided in M3g, decisions 119 and 120).
+    server.send(&call_tool(204, "get_changelog", with(json!({}))));
+    let changelog = server.response(204)["result"].clone();
+    assert_eq!(
+        text_json(&changelog)["reason"],
+        "no_changelog",
+        "{changelog}"
+    );
     // What it declares, from its checkout, without crates.io (decided in M3f, decision 98).
     server.send(&call_tool(203, "crate_metadata", with(json!({}))));
     let metadata = server.response(203)["result"]["structuredContent"].clone();

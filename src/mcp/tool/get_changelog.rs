@@ -5,6 +5,8 @@
 //! `get_source` reads its files, and cut into releases at the headings that start with a version
 //! (`query::changelog`).
 
+#[cfg(feature = "local")]
+use std::path::PathBuf;
 use std::{io::Read as _, path::Path, sync::Arc};
 
 use rmcp::model::{CallToolResult, JsonObject, Tool};
@@ -12,6 +14,8 @@ use rmcp::model::{CallToolResult, JsonObject, Tool};
 use semver::Version;
 use serde_json::{Map, Value, json};
 
+#[cfg(feature = "local")]
+use super::here::{self, Here, HereRoot, NotHere};
 use super::{
     InvalidArgument,
     ToolState,
@@ -20,6 +24,8 @@ use super::{
     list_module::{self, CURSOR_EXAMPLE, CURSOR_FORM},
     resolve_version::{self, Release},
 };
+#[cfg(feature = "local")]
+use crate::data::project as workspaces;
 use crate::{
     data::{
         cache::sha256_hex,
@@ -246,9 +252,10 @@ pub(super) fn parse_arguments(
         ));
     }
     // The range says which versions (decision 113).
-    if release.version.is_some() || release.target.is_some() {
+    // A target is let be, as for `crate_metadata`: a changelog is of every target.
+    if release.version.is_some() {
         return Err(InvalidArgument::new(
-            "get_changelog takes no version nor target: the range of versions is from and to",
+            "get_changelog takes no version: the range of versions is from and to",
             RANGE_EXAMPLE,
         ));
     }
@@ -351,9 +358,31 @@ fn spec_of(to: Option<&Bound>) -> VersionSpec {
 pub(super) async fn execute(changelog: Changelog, state: Arc<ToolState>) -> CallToolResult {
     let Changelog { release, ask } = changelog;
     let until = state.until();
-    let mut newest = release.clone();
+    // Where the project or a record has the crate, its changelog is read there (decided in M3g,
+    // decision 119); else what the project uses is the start of the range (decision 114).
+    #[cfg(feature = "local")]
+    let used = if ask.from.is_none() || ask.to.is_none() || release.git.is_some() {
+        match first_look(&state, release.clone(), until).await {
+            First::Here(here) => {
+                let (here, found) = *here;
+                return read_here(found, here, ask).await;
+            },
+            First::Answer(answer) => return *answer,
+            First::Used(used) => used,
+        }
+    } else {
+        Used::None
+    };
+    let mut newest = release;
     newest.version = Some(spec_of(ask.to.as_ref()));
-    let (resolved, _taken) = resolve_version::resolving(newest, Arc::clone(&state), until).await;
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(
+            unused_variables,
+            reason = "only a project or a record has more to tell"
+        )
+    )]
+    let (resolved, taken) = resolve_version::resolving(newest, Arc::clone(&state), until).await;
     let Some(newest) = resolved
         .structured_content
         .as_ref()
@@ -362,16 +391,21 @@ pub(super) async fn execute(changelog: Changelog, state: Arc<ToolState>) -> Call
     else {
         return resolved;
     };
+    // The project's package of that version, as `to` names it: where it is.
+    #[cfg(feature = "local")]
+    match here_of(&state, &taken, &newest, until).await {
+        First::Here(here) => {
+            let (here, found) = *here;
+            return read_here(found, here, ask).await;
+        },
+        First::Answer(answer) => return *answer,
+        First::Used(_) => {},
+    }
     if !newest.on_crates_io {
         return not_a_release(&newest);
     }
     #[cfg(feature = "local")]
-    let (ask, newest) = match from_project(&state, release, until, (ask, newest)).await {
-        Ok(asked) => asked,
-        Err(answer) => return *answer,
-    };
-    #[cfg(not(feature = "local"))]
-    drop(release);
+    let (ask, newest) = from_project(used, (ask, newest));
     let of = SourcesOf {
         name: &newest.name,
         version: &newest.version,
@@ -405,46 +439,44 @@ pub(super) async fn execute(changelog: Changelog, state: Arc<ToolState>) -> Call
     }
 }
 
-/// `ask` with `from` the version that the project uses when it is not given (decision 114), and
-/// `newest` with what tells of it; the answer to give meanwhile while the project is read.
+/// `ask` with `from` the version that the project uses, `used`, when it is not given (decision
+/// 114), and `newest` with what tells of it.
 #[cfg(feature = "local")]
-async fn from_project(
-    state: &Arc<ToolState>,
-    release: ReleaseArguments,
-    until: tokio::time::Instant,
+fn from_project(
+    used: Used,
     (mut ask, mut newest): (ChangelogAsk, Release),
-) -> Result<(ChangelogAsk, Release), Box<CallToolResult>> {
-    if ask.from.is_none() {
-        match used_version(state, release, until).await {
-            Used::Version(used) => {
-                // Already at the newest of the range or past it: nothing after it to tell.
-                if used.cmp_precedence(&newest.version).is_ge() {
-                    newest.warnings.push(
-                        format!(
-                            "the project already uses {} {used}, which is not older than {}: no \
-                             release comes after it; pass from for older ones",
-                            newest.name, newest.version
-                        )
-                        .into(),
-                    );
-                }
-                newest
-                    .provenance
-                    .insert("from_project".to_owned(), json!(used.to_string()));
-                ask.from = Some(Bound::Exact(used));
-            },
-            Used::None => {},
-            Used::Unknown(why) => newest.warnings.push(
-                format!(
-                    "the version that the project uses is not known ({why}): the releases start \
-                     at the first; pass from"
-                )
-                .into(),
-            ),
-            Used::Resolving(answer) => return Err(answer),
-        }
+) -> (ChangelogAsk, Release) {
+    if ask.from.is_some() {
+        return (ask, newest);
     }
-    Ok((ask, newest))
+    match used {
+        Used::Version(used) => {
+            // Already at the newest of the range or past it: nothing after it to tell.
+            if used.cmp_precedence(&newest.version).is_ge() {
+                newest.warnings.push(
+                    format!(
+                        "the project already uses {} {used}, which is not older than {}: no \
+                         release comes after it; pass from for older ones",
+                        newest.name, newest.version
+                    )
+                    .into(),
+                );
+            }
+            newest
+                .provenance
+                .insert("from_project".to_owned(), json!(used.to_string()));
+            ask.from = Some(Bound::Exact(used));
+        },
+        Used::None => {},
+        Used::Unknown(why) => newest.warnings.push(
+            format!(
+                "the version that the project uses is not known ({why}): the releases start at \
+                 the first; pass from"
+            )
+            .into(),
+        ),
+    }
+    (ask, newest)
 }
 
 /// What is known of the version of the crate that the project uses.
@@ -456,23 +488,37 @@ enum Used {
     None,
     /// It could not be told, and why.
     Unknown(String),
-    /// The project is being read: the answer to give meanwhile.
-    Resolving(Box<CallToolResult>),
 }
 
-/// The version of the crate that the project uses, from its Cargo.lock, as the start of the range
-/// (decision 114).
+/// What resolving the crate without a version tells.
 #[cfg(feature = "local")]
-async fn used_version(
+enum First {
+    /// A package of the project or a crate of git that a record has, which is where it is, of
+    /// this release.
+    Here(Box<(Here, Release)>),
+    /// The answer to give: while the project is read, or an error.
+    Answer(Box<CallToolResult>),
+    /// A crate of crates.io, and the version that the project uses of it.
+    Used(Used),
+}
+
+/// The crate resolved without a version, as the project uses it: where it is, for a package of the
+/// project or a crate of git that a record has; else the version that the project's Cargo.lock
+/// has, as the start of the range (decision 114).
+#[cfg(feature = "local")]
+async fn first_look(
     state: &Arc<ToolState>,
     mut release: ReleaseArguments,
     until: tokio::time::Instant,
-) -> Used {
+) -> First {
+    let git = release.git.is_some();
     release.version = None;
-    let (resolved, _taken) = resolve_version::resolving(release, Arc::clone(state), until).await;
+    let (resolved, taken) = resolve_version::resolving(release, Arc::clone(state), until).await;
     let content = resolved.structured_content.as_ref();
-    if content.is_some_and(|content| content.get("status").is_some()) {
-        return Used::Resolving(Box::new(resolved));
+    if content.is_some_and(|content| content.get("status").is_some())
+        || (git && resolved.is_error == Some(true))
+    {
+        return First::Answer(Box::new(resolved));
     }
     if resolved.is_error == Some(true) {
         let why = resolved
@@ -482,24 +528,168 @@ async fn used_version(
             .and_then(|text| serde_json::from_str::<Value>(&text.text).ok())
             .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
             .unwrap_or_else(|| "an error".to_owned());
-        return Used::Unknown(why);
+        return First::Used(Used::Unknown(why));
     }
     let Some(used) = content.and_then(Release::of) else {
-        return Used::Unknown("the answer could not be read".to_owned());
+        return First::Used(Used::Unknown("the answer could not be read".to_owned()));
     };
+    here_of(state, &taken, &used, until).await
+}
+
+/// Where the release `used` that resolving took as `taken` is, when it is a crate of git that a
+/// record has or a package of the project that is not a release of crates.io (decision 119);
+/// else, for a crate of crates.io, the version that the project's Cargo.lock has of it, if it is
+/// the one resolved.
+#[cfg(feature = "local")]
+async fn here_of(
+    state: &Arc<ToolState>,
+    taken: &resolve_version::Resolved,
+    used: &Release,
+    until: tokio::time::Instant,
+) -> First {
+    if let Some(git) = &taken.git {
+        return match here::of_git(state, git) {
+            Ok(here) => First::Here(Box::new((here, used.clone()))),
+            Err(answer) => First::Answer(answer),
+        };
+    }
+    if let Some(found) = taken.found.as_deref()
+        && !used.on_crates_io
+        && !here::unpacked_from_crates_io(state, found)
+    {
+        let what = format!("{} {}", used.name, used.version);
+        return match here::of_project(state, (found, used), until, ("changelog", METADATA)).await {
+            Ok(here) => First::Here(Box::new((here, used.clone()))),
+            Err(NotHere::Answer(answer)) => First::Answer(answer),
+            Err(NotHere::Copy(of)) => First::Answer(Box::new(super::error_result(&json!({
+                "code": "docs_unavailable",
+                "reason": "outside_package",
+                "message": format!("the changelog of {what} is not read: the project uses {of}"),
+                "retryable": false,
+                "suggestions": [METADATA],
+            })))),
+        };
+    }
     let from_lock = used
         .provenance
         .get("resolved_from")
         .and_then(Value::as_str)
         .is_some_and(|from| from.starts_with("cargo_lock"));
-    if from_lock {
-        Used::Version(used.version)
+    First::Used(if from_lock {
+        Used::Version(used.version.clone())
     } else {
         Used::None
-    }
+    })
 }
 
-/// The tool error for a release that is not of crates.io, whose changelog is not read yet.
+/// The answer for the changelog of the package `here`, of `release`, read where it is: in its
+/// directory, or else its workspace's root (decision 119), judged as `get_source` judges its
+/// files.
+#[cfg(feature = "local")]
+async fn read_here(mut release: Release, here: Here, ask: ChangelogAsk) -> CallToolResult {
+    let answered = crate::task::spawn_blocking(move || {
+        let (read, from_workspace) = read_package(&here);
+        if from_workspace.is_some() {
+            release.warnings.push(
+                format!(
+                    "{} {} has no changelog of its own: this is its workspace's, which may tell of \
+                     other crates too",
+                    release.name, release.version
+                )
+                .into(),
+            );
+        }
+        respond(&release, read, &ask)
+    })
+    .await;
+    answered.unwrap_or_else(|error| {
+        let error = crate::task::resume_if_panic(error);
+        tracing::error!(%error, "the reading of a changelog did not finish");
+        super::tool_error(
+            "internal_error",
+            "the changelog could not be read (a bug)",
+            false,
+            &["report the bug to the server's maintainers, with the server's stderr log"],
+        )
+    })
+}
+
+/// The changelog of the package `here`, and the root of its workspace when it is read there.
+#[cfg(feature = "local")]
+fn read_package(here: &Here) -> (Read, Option<PathBuf>) {
+    let dir = &here.dir;
+    let workspace = || match &here.root {
+        HereRoot::Package { workspace } => listed(dir, workspace.as_deref()),
+        HereRoot::Checkout(checkout) => listed(dir, Some(checkout)),
+    };
+    let (path, from_workspace) = match file_in(dir) {
+        Some(path) => (path, None),
+        None => match workspace().filter(|root| root != dir) {
+            Some(root) => match file_in(&root) {
+                Some(path) => (path, Some(root)),
+                None => return (none_in(dir), None),
+            },
+            None => return (none_in(dir), None),
+        },
+    };
+    let file: Box<str> = get_source::relative_to(&path, dir).into();
+    let read = match &here.root {
+        HereRoot::Package { workspace } => {
+            let root = workspace
+                .clone()
+                .or_else(|| from_workspace.clone())
+                .unwrap_or_else(|| dir.clone());
+            let package = source_root::Package {
+                root,
+                dir: dir.clone(),
+                changelog: Some(path.clone()),
+                ..source_root::Package::default()
+            };
+            read_file(Root::Package(&package), &path, file, || none_in(dir))
+        },
+        HereRoot::Checkout(checkout) => {
+            read_file(Root::Checkout(checkout), &path, file, || none_in(dir))
+        },
+    };
+    (read, from_workspace)
+}
+
+/// The root of the workspace that lists the package in `dir`, no higher than `boundary`: the one
+/// that it is of, not one that it is only under (decided in M3e, decisions 78 and 80).
+#[cfg(feature = "local")]
+fn listed(dir: &Path, boundary: Option<&Path>) -> Option<PathBuf> {
+    workspaces::listing_workspace(dir, boundary)
+        .inspect_err(|error| {
+            tracing::warn!(%error, "the workspace of a package could not be read for its changelog");
+        })
+        .ok()
+        .flatten()
+}
+
+/// The changelog among the files of the directory `dir`, as [`changelog::chosen`] takes it.
+#[cfg(feature = "local")]
+fn file_in(dir: &Path) -> Option<PathBuf> {
+    let names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| std::fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_file()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    changelog::chosen(names.iter().map(String::as_str)).map(|name| dir.join(name))
+}
+
+/// No changelog in the package in `dir`, with what its manifest declares.
+#[cfg(feature = "local")]
+fn none_in(dir: &Path) -> Read {
+    Read::None(
+        crate_file::manifest_declaration(&dir.join("Cargo.toml"))
+            .ok()
+            .map(|(declaration, _)| declaration),
+    )
+}
+
+/// The tool error for a release that is not of crates.io, nor a package that the project or a record
+/// has where it is.
 fn not_a_release(release: &Release) -> CallToolResult {
     let of = if release.source.as_ref() == "crates.io" {
         "crates.io, but not the release on crates.io: a copy that differs from it, or that the \
@@ -551,7 +741,13 @@ fn read_changelog(sources: &Sources) -> Read {
     let Some(file) = changelog::chosen(names) else {
         return none();
     };
-    let resolved = match source_root::resolve(root, Path::new(file)) {
+    read_file(root, Path::new(file), file.into(), none)
+}
+
+/// The changelog at `asked` under `root`, judged as `get_source` judges its files, shown as
+/// `file`; `none` when it leads through a symlink to a file of another name.
+fn read_file(root: Root<'_>, asked: &Path, file: Box<str>, none: impl FnOnce() -> Read) -> Read {
+    let resolved = match source_root::resolve(root, asked) {
         Ok(resolved) => resolved,
         Err(refusal) => {
             let reason = match refusal {
@@ -568,7 +764,6 @@ fn read_changelog(sources: &Sources) -> Read {
             );
         },
     };
-    // One that leads through a symlink to a file of another name is none.
     if !changelog::is_changelog(&resolved.path) {
         return none();
     }
@@ -591,7 +786,7 @@ fn read_changelog(sources: &Sources) -> Read {
     }
     let text = String::from_utf8_lossy(&contents);
     let lossy = matches!(text, std::borrow::Cow::Owned(_));
-    Read::Found(file.into(), text.replace("\r\n", "\n"), lossy)
+    Read::Found(file, text.replace("\r\n", "\n"), lossy)
 }
 
 /// The page of a repository's releases on GitHub (`https://github.com/owner/repo/releases`), of

@@ -979,33 +979,33 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_crate_and_a_failing_api_are_told_apart() {
+        // A server for each, so that a retry of one cannot take another's answer.
         let missing = r#"{"errors":[{"detail":"crate `nope` does not exist"}]}"#;
-        let (base_url, _requests) = serve_sequence(vec![
-            (
-                format!(
-                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\n\r\n",
-                    missing.len()
-                ),
-                missing.as_bytes().to_vec(),
+        let (base_url, _requests) = serve_sequence(vec![(
+            format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\n\r\n",
+                missing.len()
             ),
+            missing.as_bytes().to_vec(),
+        )]);
+        let (client, _dir) = api(&base_url, Duration::ZERO);
+        let answer = client.fetch_crate_info(&name("nope"), later(10)).await;
+        assert!(matches!(answer, Err(ApiError::NotFound)), "{answer:?}");
+        let (base_url, _requests) = serve_sequence(vec![
             status("503 Service Unavailable"),
             status("503 Service Unavailable"),
             status("503 Service Unavailable"),
-            ok("{\"crate\":{}}"),
         ]);
         let (client, _dir) = api(&base_url, Duration::ZERO);
-        assert!(matches!(
-            client.fetch_crate_info(&name("nope"), later(10)).await,
-            Err(ApiError::NotFound)
-        ));
-        assert!(matches!(
-            client.fetch_crate_info(&name("serde"), later(10)).await,
-            Err(ApiError::Transient { status }) if status == StatusCode::SERVICE_UNAVAILABLE
-        ));
-        assert!(matches!(
-            client.fetch_crate_info(&name("serde"), later(10)).await,
-            Err(ApiError::Malformed(_))
-        ));
+        let answer = client.fetch_crate_info(&name("serde"), later(10)).await;
+        assert!(
+            matches!(&answer, Err(ApiError::Transient { status }) if *status == StatusCode::SERVICE_UNAVAILABLE),
+            "{answer:?}"
+        );
+        let (base_url, _requests) = serve_sequence(vec![ok("{\"crate\":{}}")]);
+        let (client, _dir) = api(&base_url, Duration::ZERO);
+        let answer = client.fetch_crate_info(&name("serde"), later(10)).await;
+        assert!(matches!(answer, Err(ApiError::Malformed(_))), "{answer:?}");
     }
 
     #[tokio::test]
