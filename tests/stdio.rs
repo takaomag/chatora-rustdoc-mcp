@@ -488,6 +488,8 @@ fn fake_dist(with_rust_src: bool) -> String {
                 begin: (3, 1),
                 end: (5, 2),
             });
+            // An example of its own (decided in M3e, decision 75).
+            hello.docs = Some(format!("Says hello.\n\n```\n{name}::hello();\n```\n"));
         }
         serde_json::to_vec(&krate).expect("serializes")
     };
@@ -689,10 +691,17 @@ fn get_source_reads_std_from_the_rust_src_of_its_nightly() {
     }
     assert!(server.finish().success());
     // A nightly that publishes no rust-src.
+    without_rust_src(&path);
+}
+
+/// Without the rust-src of its nightly, std's source is not had, but its examples are: the blocks
+/// of the docs of its JSON, with std's provenance (decided in M3e, decisions 75 and 85).
+#[cfg(debug_assertions)]
+fn without_rust_src(path: &str) {
     let dist = fake_dist(false);
     let env = [
         ("CHATORA_RUSTDOC_TEST_DIST_URL", dist.as_str()),
-        ("PATH", path.as_str()),
+        ("PATH", path),
     ];
     let mut server = Server::start_with(None, &env);
     let arguments = json!({ "crate": "std", "path": "hello", "target": TARGET });
@@ -702,6 +711,31 @@ fn get_source_reads_std_from_the_rust_src_of_its_nightly() {
         (&body["code"], &body["reason"]),
         (&json!("docs_unavailable"), &json!("no_source")),
         "{missed}"
+    );
+    // Its examples need no rust-src: the blocks of the docs of its JSON, with std's provenance
+    // (decided in M3e, decisions 75 and 85).
+    let found = called_until_done(&mut server, 200, "find_examples", &arguments);
+    assert_ne!(found["isError"], true, "{found}");
+    let content = &found["structuredContent"];
+    assert_eq!(content["provenance"]["source"], "std", "{found}");
+    assert_eq!(content["data"]["docs"], "read", "{found}");
+    assert_eq!(content["data"]["examples"][0]["match"], "own", "{found}");
+    assert_eq!(
+        content["data"]["examples"][0]["code"], "std::hello();\n",
+        "{found}"
+    );
+    // Without an item: std's own, and where those of core and alloc are.
+    let all = called_until_done(
+        &mut server,
+        300,
+        "find_examples",
+        &json!({ "crate": "std", "target": TARGET }),
+    );
+    assert!(
+        all["structuredContent"]["hints"]
+            .to_string()
+            .contains("core or alloc"),
+        "{all}"
     );
     assert!(server.finish().success());
 }

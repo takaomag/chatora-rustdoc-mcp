@@ -396,6 +396,8 @@ impl Arguments {
     /// names or else at its root; what failed of the project was forgotten when its version was
     /// resolved, and what failed of the release is forgotten as `asked` tells.
     pub(super) fn for_examples(release: ReleaseArguments, asked: DocExamplesAsk) -> Self {
+        // std's crates resolve no version first: what failed of them is forgotten here.
+        let refresh = std_crate(&release.name).is_some() && release.refresh;
         let path = asked.ask_item().map_or_else(
             || release.name.as_str().replace('-', "_").into(),
             |item| with_crate_name(&release.name, item),
@@ -406,7 +408,7 @@ impl Arguments {
             version: release.version,
             project: release.project,
             target: release.target,
-            refresh: false,
+            refresh,
             git: release.git,
             shape: Shape {
                 detail: Detail::Brief,

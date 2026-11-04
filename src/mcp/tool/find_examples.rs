@@ -177,7 +177,7 @@ fn output_schema() -> JsonObject {
     object(json!({
         "type": "object",
         "properties": {
-            "provenance": resolve_version::provenance_schema(),
+            "provenance": provenance_schema(),
             "retry_after_secs": { "type": "integer" },
             "warnings": strings,
             "data": {
@@ -189,8 +189,9 @@ fn output_schema() -> JsonObject {
                     },
                     "docs_from": {
                         "type": "string",
-                        "description": "The crate and version that the blocks of the docs are of, \
-                                        when the item is re-exported from it.",
+                        "description": "The crate that the blocks of the docs are of, with its \
+                                        version if it has one, when the item is re-exported \
+                                        from it.",
                     },
                     "docs": {
                         "type": "string",
@@ -256,6 +257,42 @@ fn output_schema() -> JsonObject {
         },
         "required": ["provenance", "data", "page"],
     }))
+}
+
+/// The schema of `provenance`: as `resolve_version` tells a release, or as `get_item` tells std's
+/// (decided in M3e, decision 85). Each property of either, the values of an `enum` of both, and
+/// what both require.
+fn provenance_schema() -> Value {
+    let mut merged = resolve_version::provenance_schema();
+    let of_std = get_item::provenance_schema();
+    if let (Some(Value::Object(properties)), Some(Value::Object(more))) =
+        (merged.get_mut("properties"), of_std.get("properties"))
+    {
+        for (name, property) in more {
+            let Some(existing) = properties.get_mut(name) else {
+                properties.insert(name.clone(), property.clone());
+                continue;
+            };
+            if let (Some(Value::Array(values)), Some(Value::Array(others))) =
+                (existing.get_mut("enum"), property.get("enum"))
+            {
+                for other in others {
+                    if !values.contains(other) {
+                        values.push(other.clone());
+                    }
+                }
+            }
+        }
+    }
+    let required_of_std: Vec<Value> = of_std
+        .get("required")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(Value::Array(required)) = merged.get_mut("required") {
+        required.retain(|name| required_of_std.contains(name));
+    }
+    merged
 }
 
 /// `value` as a JSON object, or an empty one.
@@ -340,6 +377,11 @@ pub(super) async fn execute(find: FindExamples, state: Arc<ToolState>) -> CallTo
     let FindExamples { release, ask } = find;
     // One deadline for every step (requirement R-ARCH-6).
     let until = state.until();
+    // std's crates have no version to resolve, nor files: the docs of their JSON (decided in M3e,
+    // decisions 75 and 85).
+    if get_item::std_crate(&release.name).is_some() {
+        return of_std(&state, (release, until), ask).await;
+    }
     let asked_release = release.clone();
     #[cfg_attr(
         not(feature = "local"),
@@ -712,6 +754,112 @@ fn docs_from(content: &Map<String, Value>, release: &Release) -> Option<String> 
     let same = name.replace('-', "_") == release.name.as_str().replace('-', "_")
         && version == release.version.to_string();
     (!same).then(|| format!("{name} {version}"))
+}
+
+/// The examples of a crate of std, as `release` names it, until `until`: the blocks of the docs of
+/// its JSON, which `get_item` loads, as it tells them, with its provenance; of std's own items
+/// unless an item is asked for, which goes on into core or alloc as `get_item` does (decided in
+/// M3e, decisions 75, 84 and 85).
+async fn of_std(
+    state: &Arc<ToolState>,
+    (release, until): (ReleaseArguments, Instant),
+    ask: ExamplesAsk,
+) -> CallToolResult {
+    let name = release.name.clone();
+    #[cfg(feature = "local")]
+    let refresh = release.refresh;
+    // Of std itself, whose items are mostly core's and alloc's (decided in M3e, decision 84).
+    let all = ask.item.is_none()
+        && matches!(
+            get_item::std_crate(&name),
+            Some(crate::data::dist::StdCrate::Std)
+        );
+    let mut result = get_item::execute(
+        get_item::Arguments::for_examples(release, DocExamplesAsk {
+            until,
+            #[cfg(feature = "local")]
+            refresh,
+            ask,
+            files: Arc::from([]),
+        }),
+        Arc::clone(state),
+    )
+    .await;
+    // An error, or the response while std's documentation is had, as it is.
+    let Some(Value::Object(mut content)) = result
+        .structured_content
+        .take()
+        .filter(|_| result.is_error != Some(true))
+    else {
+        return result;
+    };
+    // The response while std's documentation is had, which has no `data`, as it is.
+    if !content.contains_key("data") {
+        return CallToolResult::structured(Value::Object(content));
+    }
+    let Some(Value::Object(mut answer)) = content
+        .get_mut("data")
+        .and_then(Value::as_object_mut)
+        .and_then(|data| data.remove(ANSWER))
+    else {
+        tracing::error!("get_item answered find_examples of std without its examples");
+        return super::tool_error(
+            "internal_error",
+            "the examples of std could not be had (a bug)",
+            false,
+            &["report the bug to the server's maintainers, with the server's stderr log"],
+        );
+    };
+    if answer.contains_key(CURSOR_REFUSED) {
+        return InvalidArgument::new(CHANGED, CURSOR_EXAMPLE).into_result();
+    }
+    let crate_of_docs = content
+        .get("provenance")
+        .and_then(|provenance| provenance.get("crate"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let normal = |name: &str| name.to_ascii_lowercase().replace('-', "_");
+    if !crate_of_docs.is_empty() && normal(&crate_of_docs) != normal(name.as_str()) {
+        answer.insert("docs_from".to_owned(), json!(crate_of_docs));
+    }
+    let mut hints: Vec<Value> = match content.remove("hints") {
+        Some(Value::Array(hints)) => hints,
+        _ => Vec::new(),
+    };
+    if all {
+        hints.push(json!(format!(
+            "these are the examples of {name}'s own items: those of the items that it \
+             re-exports from core or alloc are found with crate core or alloc, or with the path \
+             of an item"
+        )));
+    }
+    let warnings: Vec<Box<str>> = match content.remove("warnings") {
+        Some(Value::Array(warnings)) => warnings
+            .iter()
+            .filter_map(Value::as_str)
+            .map(Box::from)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut response = Map::new();
+    response.insert(
+        "provenance".to_owned(),
+        content.remove("provenance").unwrap_or_default(),
+    );
+    let page = answer.remove("page").unwrap_or_default();
+    let mut all_warnings = warnings;
+    if let Some(Value::Array(more)) = answer.remove("warnings") {
+        all_warnings.extend(more.iter().filter_map(Value::as_str).map(Box::from));
+    }
+    response.insert("data".to_owned(), Value::Object(answer));
+    response.insert("page".to_owned(), page);
+    if !hints.is_empty() {
+        response.insert("hints".to_owned(), json!(hints));
+    }
+    let mut response = Value::Object(response);
+    get_item::add_warnings(&mut response, &all_warnings);
+    CallToolResult::structured(response)
 }
 
 /// The JSON body of the tool error `result`.

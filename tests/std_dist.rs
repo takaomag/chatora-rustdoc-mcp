@@ -174,3 +174,86 @@ async fn stability_of_formats_58_to_60_is_read() {
         assert_eq!(const_stable > 0, format >= 59, "{date}");
     }
 }
+
+/// The examples in the docs of std, alloc and core are found and ranked in a short time: once for
+/// each call of `find_examples` (decided in M3e, decisions 74 and 75, which keeps a memory cache
+/// for over 200 ms), the item's own first.
+#[tokio::test]
+#[ignore = "fetches about 4 MB from static.rust-lang.org"]
+async fn the_examples_in_the_docs_of_std_are_found_in_a_short_time() {
+    use chatora_rustdoc_mcp::query::{
+        examples::{Asked, Entry, Rank, arranged, doc_blocks},
+        get_item::{Detail, ItemRequest, Origin, ResolvedFrom, examples_of, source_locations},
+    };
+
+    let (cache, docs) = std_docs(None).await;
+    for (krate, path, parent) in [
+        (
+            StdCrate::Std,
+            "std::collections::HashMap::insert",
+            "HashMap",
+        ),
+        (StdCrate::Alloc, "alloc::vec::Vec::push", "Vec"),
+        (StdCrate::Core, "core::option::Option::map", "Option"),
+    ] {
+        let json = dist::read_std_json(&cache, &docs, krate).expect("the JSON of the crate");
+        let parsed = rustdoc_json::parse(&json).expect("the crate parses");
+        let mapped = Mapped::in_memory(&Indexed::new(parsed)).expect("archived");
+        let view = CrateView::new(mapped.get());
+        let name = path
+            .split("::")
+            .next()
+            .unwrap_or_default()
+            .parse()
+            .expect("a crate name");
+        let version = semver::Version::new(0, 0, 0);
+        let request = ItemRequest {
+            name: &name,
+            version: &version,
+            path,
+            origin: Origin::DocsRs {
+                resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
+                build: None,
+            },
+            detail: Detail::Brief,
+            project_features: None,
+            follow: false,
+            target: None,
+        };
+        let started = Instant::now();
+        let blocks = doc_blocks(&view);
+        let of = examples_of(&view, request)
+            .expect("found")
+            .expect("not the root");
+        assert_eq!(of.parent.as_deref(), Some(parent), "{path}");
+        let asked = Asked {
+            id: of.id,
+            path: &of.path,
+            name: &of.name,
+            parent: of.parent.as_deref(),
+        };
+        let order = arranged(&[], &blocks, Some(&asked));
+        let ids: Vec<_> = order
+            .iter()
+            .take(50)
+            .filter_map(|entry| match entry {
+                Entry::Block { block, .. } => Some(block.id),
+                Entry::File { .. } => None,
+            })
+            .collect();
+        let (locations, _) = source_locations(&view, request, &ids);
+        let took = started.elapsed();
+        assert!(locations.iter().any(Option::is_some), "{path}");
+        assert_eq!(&*of.path, path);
+        assert!(blocks.len() > 100, "{path}: {} blocks", blocks.len());
+        eprintln!("{path}: {} blocks in {took:?}", blocks.len());
+        assert_eq!(order.first().map(Entry::rank), Some(Rank::Own), "{path}");
+        // Over 200 ms, decision 74 keeps them in memory.
+        assert!(
+            took.as_millis() < 200,
+            "{path}: {took:?} for {} blocks",
+            blocks.len()
+        );
+    }
+}
