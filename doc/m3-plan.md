@@ -504,6 +504,36 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - E2c-2 のレビュー (サブエージェント、読むだけ。手元の tokio・axum の JSON で実データの問いを確かめた) の対応: 決定 81 (他の crate をたどったら `docs_from` と warning。get_item の warnings も捨てずに加える)。`examples/` を読むのは合わせて 64 MiB まで (2 MiB × 1,000 で 2 GB になりえた)。JSON の無いときのファイルだけのページも `spawn_blocking` の中で。応答の上限のループは実際に出した件数から減らし、provenance・warnings・hints の分 (2,000 字) を残す。JSON の無いときも crate の根を指せば何も指さないのと同じ。get_item の応答に答えが無ければログと warning。`not_a_release` の文を、crates.io の写しのときに合う形に。README の Security に `find_examples` を足した。テスト: 単体でファイルだけの並びと根、他の crate の docs、stdio で JSON の無い target のファイルだけの答え
 - E2c-2 のレビューで残したもの: `.crate` の取得と JSON の取得は直列で期限を共有し、JSON は期限まで待つ (決定 73 の「すぐ」は、期限を過ぎたら)。そのまま返す `item_not_found` などの案内は get_item を名指す。読めた経路での cursor の拒否と follow の stdio のテストは無い
 
+### 6.6 M3f
+
+**下調べ (2026-11-04。サブエージェント、読むだけ、ネットワークなし。target/claude-notes/m3f-research.md)**: http.rs に待ち行列は無い (1 秒 1 回は新しく作る)。`USER_AGENT` はリポジトリの URL が連絡先で、メールや名前は無い。sparse index の `Line` は `pubtime` を読んでいない (手元の 1,564 行すべてにある) し、依存は名前と `optional` だけ。`.crate` からは license・repository・rust-version を読んでいない。キャッシュの置き場と GC に新しい分類が要る。`search_crates` は `readOnlyHint: true` で、`refresh` と `project` を取らない。README の接続先 (Security) に crates.io の API を足す。eval に Q15・Q16 が無い
+
+**API の実測 (決定 92、2026-11-04、20 要求、1 秒 1 回、User-Agent はリポジトリの URL だけ。生の応答は target/claude-notes/m3f-api/)**: `/crates/serde` は 441 KB (316 版の全項目。`published_by`・`audit_actions` 込み)。`?include=default_version` なら 2.7 KB。`/crates/{n}/versions` は 1 頁 100 件まで (101 は 400)、100 件で 167 KB、続きは `meta.next_page` の seek。license は旧表記 `MIT/Apache-2.0` と SPDX が混ざり、null もある。`/reverse_dependencies?per_page=1` の `meta.total` が被依存数。検索 `/crates?q=` は 1 頁 100 件まで、0 件は `crates: []`。relevance 順の「json parser」の上位 3 件は小さな crate で、`sort=downloads` の「json」は serde・serde_derive・serde_json。無い crate は 404 (`errors[].detail`)。大文字や `-` と `_` の違いは正規の名前に寄せて 200 を返す。`/crates/{n}/{v}/readme` は static.crates.io への 302 で、中身は HTML。応答に rate limit の header は無い
+
+**M3f で利用者が決めたこと (2026-11-04)**:
+
+- 決定 92 (M3f) API の形は通信の許可を得て実測した (上)
+- 決定 93 (M3f) `crate_metadata` で API が使えないとき (待ち行列の待ちが期限を越える、5xx・接続の失敗、offline でキャッシュも無い) は、index と `.crate` から取れた項目だけを返し、API の項目を省いて warning で理由を言う。待ちすぎるときは待たない
+- 決定 94 (M3f) API の応答の TTL は、crate の情報・版の一覧・被依存数が 1 日、検索が 1 時間。置き場は文書のキャッシュの側で GC の対象。offline では古さによらず使い、provenance に `api_fetched_at` を入れる
+- 決定 95 (M3f) crate の情報は `?include=default_version` で引く (F1a のレビューで `?include=downloads` に改め、版は sparse index から取る)。版の履歴や版ごとの license が要るときだけ `/versions?per_page=100` を頁ごとに引き、頁ごとにキャッシュする
+- 決定 96 (M3f) 版の履歴は新しい版から、license・rust_version・edition が前の版から変わった版と yanked の版だけを日付付きで返す。既定 20 件、上限 100 件、続きは cursor。版の総数と最新版は別に返す
+- 決定 97 (M3f) 保守の目安は最新のリリースの公開日 (index の `pubtime`、無ければ API の `created_at`) から、`last_release_at`・経過日数・区分 (30・90・365 日以内、それより前) を返す。区分は事実の切り分けで、「放置」とは言わない
+- 決定 98 (M3f) crates.io に無いパッケージ (member、path・git の依存、ほかの registry) は、宣言の項目 (license・repository・rust-version・edition・版) を返し、DL 数・被依存数・履歴が無いことを warning で言う
+- 決定 99 (M3f) `crate_metadata` の引数は `crate`・`version`・`project`・`limit`・`cursor` (と他のツールにそろえた `refresh`)。`target` は取らない
+- 決定 100 (M3f) `search_crates` は crates.io の順 (既定は relevance) に従い、`sort` 引数 (relevance・downloads・recent-downloads・recent-updates・new) で選べる。結果に数字を付け、説明文で「定番を探すなら downloads」と案内する。要件 R-SR-6 (手元での順位付け) は M3 の終わりに改める
+- 決定 101 (M3f) `search_crates` は既定 10 件・上限 50 件で、検索の 1 要求の項目だけを返す (結果ごとに index を引かない)。続きは cursor。yanked や MSRV は `crate_metadata` を案内する
+- 決定 102 (M3f) `search_crates` の provenance は `source: "crates.io"` だけを必須にし、`fetched_at` と `sort` を添える。共通の骨格の検査ではこのツールを例外として登録する
+- 決定 103 (M3f) `published_by`・`audit_actions`・owners は応答にもキャッシュにも残さない (受け取る型にその項目を持たせない)。README の接続先に crates.io の API を足し、検索語と crate 名が送られることを書く
+- 決定 104 (M3f) 決定 67 の crates.io の README は使わない (別のホストの HTML で、.crate の README から作られたもの)。F4 は取りやめる
+- 決定 105 (M3f) eval に `q15-metadata` と `q16-search` を足し、F3b で手で 1 回ずつ回す
+
+**F1a の実装 (2026-11-04)**: 新しいモジュール `data::crates_io` (`CratesIo`)。`crate_info` (`?include=default_version`)・`versions` (100 件ずつ、`Next` の seek か頁)・`dependents` (`per_page=1` の `meta.total`)・`search` (`q`・`sort`・`per_page`) を、読む項目だけの型で受ける (`published_by` などは型に無い。決定 103)。1 秒 1 回は `http::Pacer` で、待つ順は頼んだ順 (tokio の Mutex)、順番が `until` の後になるなら送らない (`ApiError::NoTurn`)。`http::send` を `send_in_turn` に一般化し、送り直しも順番を待つ (順番が来なければ最後の結果を返す)。応答は 8 MiB まで。offline なら送らない。`next_page` は丸ごと送り返さず、`seek` と `page` だけを取り出す。キャッシュと失敗の記憶は F1b
+
+- F1a のレビュー (サブエージェント、読むだけ) の対応: 決定 95 を改めた (利用者が追加の 3 要求の実測を許した)。`?include=default_version` の応答は `max_version`・`newest_version` が `0.0.0`、`max_stable_version`・`recent_downloads` が null で、版を読み違える。`include=downloads` (957 バイト) なら `recent_downloads` と `default_version` が入るので、crate はこれで引き、最新版・最新の安定版は sparse index から取る (検索の応答の版は正しい)。テストの応答も実際の形にした。`Pacer` は予約方式にした (列の後ろでも、順番が期限の後なら待たずに断る。送り直しの待ちも順番に含め、期限を越えるなら送らない。断念した順番は空けたままにする)。プロセスに 1 つ (`static`)。crates.io のクライアントはリダイレクトを追わない (順番の外で送らないため)。`reqwest::Error` の文には URL (検索語) が入るので `without_url` で落とす。最初の順番の待ちは要求の時間 (R-OBS-1) に入れない。`next_page` を読めなければ warning
+- F1a のレビューで残したもの: 間隔は送り出しの時刻どうしで測る (応答が 1 秒より遅ければ 2 本が重なる)。カーソルは seek・page を q・sort・per_page と束ねて照合する (F3a)
+
+聞かずに決めたこと: index に版があり API が 404 を返すとき (公開の直後など) は決定 93 と同じく API の項目を省いて warning にする。API の要求の数と待ちはログだけに出し、応答には入れない (R13)。
+
 ## 7. M3 の終わり方
 
 1. §6 の結果から、要件に反映する決定の一覧を作る。判断が要るものは 1 件ずつ決める

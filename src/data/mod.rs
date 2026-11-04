@@ -20,6 +20,7 @@ pub mod clear;
 pub mod crate_file;
 pub mod crate_name;
 pub mod crate_source;
+pub mod crates_io;
 pub mod dist;
 pub mod docs_rs;
 pub mod examples;

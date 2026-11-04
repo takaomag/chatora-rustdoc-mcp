@@ -1,7 +1,7 @@
 //! The HTTP client settings and body reading that the sources share (requirements R-NW-1 to
 //! R-NW-3).
 
-use std::{error::Error, time::Duration};
+use std::{convert::Infallible, error::Error, sync::Arc, time::Duration};
 
 use reqwest::{StatusCode, header};
 
@@ -150,9 +150,31 @@ fn redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect::Actio
 pub(super) async fn send(
     request: reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, reqwest::Error> {
+    let Ok(outcome) = send_in_turn(request, async |wait| {
+        tokio::time::sleep(wait).await;
+        Ok::<(), Infallible>(())
+    })
+    .await;
+    outcome
+}
+
+/// [`send`] with each attempt sent only when `turn` gives it its turn, as a [`Pacer`] does.
+/// `turn` is given the least wait before the attempt (none for the first, and the backoff or
+/// `Retry-After` for a retry), and waits it out itself. When the first attempt gets no turn,
+/// nothing is sent and `turn`'s error is returned; when a retry gets none, the last outcome is.
+///
+/// # Errors
+///
+/// Returns `turn`'s error when nothing was sent, and else as [`send`].
+pub(super) async fn send_in_turn<E>(
+    request: reqwest::RequestBuilder,
+    mut turn: impl AsyncFnMut(Duration) -> Result<(), E>,
+) -> Result<Result<reqwest::Response, reqwest::Error>, E> {
     let mut current = request;
     let mut delay = FIRST_RETRY_DELAY;
     let mut attempt: u32 = 1;
+    turn(Duration::ZERO).await?;
+    // The wait for the first turn is not part of the request's time in the log.
     let started = std::time::Instant::now();
     loop {
         // A request without a streaming body can always be copied for the next attempt.
@@ -168,20 +190,89 @@ pub(super) async fn send(
         match (wait, next) {
             (Some(wait), Some(next)) if attempt < MAX_ATTEMPTS && wait <= MAX_RETRY_AFTER => {
                 tracing::debug!(attempt, ?wait, "retrying a request that failed transiently");
-                tokio::time::sleep(wait).await;
+                if turn(wait).await.is_err() {
+                    tracing::debug!(attempt, "no turn for a retry in time");
+                    return Ok(noted(outcome, attempt, started));
+                }
                 current = next;
                 delay = delay.saturating_mul(2);
                 attempt = attempt.saturating_add(1);
             },
-            _ => {
-                let (url, status) = match &outcome {
-                    Ok(response) => (Some(response.url()), Some(response.status().as_u16())),
-                    Err(error) => (error.url(), error.status().map(|status| status.as_u16())),
-                };
-                super::fetches::note(url, status, attempt, started.elapsed());
-                return outcome;
-            },
+            _ => return Ok(noted(outcome, attempt, started)),
         }
+    }
+}
+
+/// `outcome`, noted for the log after `attempts` attempts since `started`.
+fn noted(
+    outcome: Result<reqwest::Response, reqwest::Error>,
+    attempts: u32,
+    started: std::time::Instant,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let (url, status) = match &outcome {
+        Ok(response) => (Some(response.url()), Some(response.status().as_u16())),
+        Err(error) => (error.url(), error.status().map(|status| status.as_u16())),
+    };
+    super::fetches::note(url, status, attempts, started.elapsed());
+    outcome
+}
+
+/// Gives turns at sending requests to one server, starts at least `interval` apart, in the order
+/// asked (requirement R-NW-1: crates.io asks crawlers for one request a second). The interval is
+/// between the starts of the requests, so that a slow response does not hold up the next. Clones
+/// share the turns, so a process makes one for each server.
+///
+/// A turn is reserved when it is asked for and then waited for. A turn that is not taken, because
+/// its caller stops waiting, is left unused rather than given to the next, so that two starts are
+/// never closer than `interval`.
+#[derive(Debug, Clone)]
+pub(super) struct Pacer {
+    /// When the next turn may start.
+    next: Arc<parking_lot::Mutex<tokio::time::Instant>>,
+    interval: Duration,
+}
+
+/// No turn would come by the time given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NoTurn;
+
+impl Pacer {
+    /// Turns at least `interval` apart.
+    pub(super) fn new(interval: Duration) -> Self {
+        Self {
+            next: Arc::new(parking_lot::Mutex::new(tokio::time::Instant::now())),
+            interval,
+        }
+    }
+
+    /// Reserves the first turn at least `after` from now and waits for it, unless it would come
+    /// after `until`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NoTurn`] at once, with no turn reserved, when the turn would come after `until`.
+    pub(super) async fn turn(
+        &self,
+        after: Duration,
+        until: tokio::time::Instant,
+    ) -> Result<(), NoTurn> {
+        let now = tokio::time::Instant::now();
+        let at = {
+            let mut next = self.next.lock();
+            let at = (*next).max(now.checked_add(after).unwrap_or(now));
+            if at > until {
+                tracing::debug!(wait = ?at.duration_since(now), "no turn in time");
+                return Err(NoTurn);
+            }
+            *next = at.checked_add(self.interval).unwrap_or(at);
+            at
+        };
+        let waited = at.duration_since(now);
+        if waited > after {
+            tracing::debug!(?waited, "waiting for a turn");
+        }
+        tokio::time::sleep_until(at).await;
+        Ok(())
     }
 }
 

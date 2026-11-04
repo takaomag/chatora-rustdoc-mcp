@@ -1,7 +1,8 @@
 //! What was fetched over the network during a tool call, for its log record: which sources it
 //! needed and whether the cache had everything (requirement R-OBS-1).
 //!
-//! Every request goes through `http::send`, which notes it here when a [`Fetches`] is in scope.
+//! Every request goes through `http::send` or `http::send_in_turn`, which note it here when a
+//! [`Fetches`] is in scope.
 
 use std::{sync::Arc, time::Duration};
 
