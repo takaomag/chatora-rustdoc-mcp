@@ -613,7 +613,35 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - G1d のレビュー (サブエージェント、読むだけ。字数を Python で数えた) の対応: `history` の license_file の注は、過去の版の license が欠ける理由で `declared` の注 (今の版) と重ならないので戻した (「or a `license_file`」)。q14 の答えの正規表現は版の番号しか見ず「取得できなかった」でも通るので、1.53.0 の節の中身の語のどれかを足した (前回の答えに当たる)
 - G1d のレビューで残したもの: instructions はローカル機能ありで残り 2 字 (次に案内を足すときは縮める所を先に決める)。「None needs an earlier call」の直後に `build_external_docs` を先に呼ぶ例外が続く (合図の「(but see below)」は字数で外した)。ローカル機能の無い構成の版の規則は「version を渡せ」と言うが `get_changelog` は `version` を取らない (エラーで `from`/`to` を案内する。M3h で見直す)
 
+- 決定 123 (M3g、G1 の後に利用者が決めた) G2 (GitHub releases と token、R-NW-4) は M3 に入れず、資格情報の扱いを要件のセキュリティと合わせて決める後の段 (M4 以降) に回す。M3 の `get_changelog` は `.crate` と手元の changelog だけで、無ければ GitHub の releases の頁を案内する。要件の「M3 で」の記述は M3 の終わりに改める (判断の材料: 手元の 1,025 crate の 61% が `.crate` に changelog を持たず、その 612 は repository が github.com)
+
 聞かずに決めたこと: 本文の見えない文字は決定 66 と同じく印を付けて warning。GitHub releases と token (P9 の G2) は G2 に入るときに決める。段の分け方は G1a (データ層: ファイルの選び方・版の見出し・範囲) → G1b (ツール、crates.io) → G1c (ローカル) → G1d (案内と eval)
+
+### 6.8 M3h
+
+**下調べ (2026-11-04。サブエージェント、読むだけ、ネットワークなし。target/claude-notes/m3h-research.md)**: 字数 (ローカル機能あり、上限 2,048) は instructions 2,046・`get_item` 2,044・`crate_metadata` 2,043・`inspect_features` 2,042。crate_metadata.md はローカル機能の無い構成で文が壊れ (「`crate`, `version` and are as for」)、その構成に無い `refresh` を案内する。無い構成の instructions の版の規則が `get_changelog` (`version` を取らない) と `search_crates` (crate が無い) に合わない。find_examples の説明文の std の取得中の形が応答と違う。eval は 33 問 (35 回) で Q10 (`get_source`) が無く、全体の見込みは 4.5〜5 USD (ツールが 17 本になり最初の入力が約 1.5 倍)。README は状態の行・Installation の rust-src・Security (本文は除かず印)・Cache (`src.v1`・rust-src・`crates.io/v1`)・`limits.extract_max_size`・Planned・reason の例が古い。annotations の検査は今の決まりと合う。canary に crates.io の API と dist の rust-src の項目が無い。§6 の各段の残りを、M3h のコードの直し・要件 v0.21・M4 以降・直ったものに分けた
+
+**M3h で利用者が決めたこと (2026-11-04)**:
+
+- 決定 124 (M3h) eval に `q10-source` (`tokio::sync::Mutex::lock` の実装。tools は `get_source`。答えの正規表現は tokio 1.53.3 の実装を読んで決める) を足す
+- 決定 125 (M3h) eval の Q16 は clap のまま (MQTT の問いは足さない)
+- 決定 126 (M3h) eval の全件を 1 回回す。上限 5 USD (1 問は既定の 1 USD)。超えそうなら途中で止めて聞く
+- 決定 127 (M3h) instructions と説明文の上限は 2,048 字のまま (README が求める最低の版 v2.1.292 で切られないように)
+- 決定 128 (M3h) `get_item` の `item_not_found` のエラーにも、照会の warning (欠けた feature など) と `inspect_features` の hint を載せる (M3d の D4 の残り)
+- 決定 129 (M3h) `get_readme` と `find_examples` も yanked の版で warning を付ける。docs.rs の JSON の問い合わせと印の二重の数えはそのまま、要件に書く (E1b の残り)
+- 決定 130 (M3h) 外の path 依存の継承した readme を `get_source` は読まない (決定 78 の残り)。今のまま要件に書く
+- 決定 131 (M3h) `[workspace.package] readme = true` の cargo の解き方を手元の cargo のソースで確かめ (通信なし)、違えば `get_readme` を直して要件に書く (決定 80 の残り)
+- 決定 132 (M3h) find_examples の説明文の std の取得中の形を、実際の応答に合わせる (E2d-3 の残り)
+- 決定 133 (M3h) canary に crates.io の API (`crate_metadata` の serde で popularity と history が揃い API の warning が無いこと、`search_crates` で serde_json が出ること) と dist の rust-src (manifest の rust-src と既知の std のファイル) を足し、Issue の文も直す
+- 決定 134 (M3h) R-MCP-4 のために、`build.rustc` の罠の stdio のテストで `search_crates` を呼んでも何も起動しないことを確かめる
+- 決定 135 (M3h) 決定 102 の「骨格の検査の例外」は検査が無いので、要件 v0.21 に「provenance の必須はツールごとの outputSchema で決め、`search_crates` は `source` だけ」と書く
+
+**H1 の実装 (2026-11-04)**: crate_metadata.md の「`crate`, `version` and⟨ `project`⟩ are as for」(無い構成で「and are」に壊れていた) を「`crate` and `version`⟨, and `project`,⟩ are as for」にし、`refresh` の文を ⟨⟩ に入れた。crate_metadata.rs の index に無い版の warning の「call again with refresh」はローカル機能のある構成だけ。無い構成の instructions の版の規則に「to `get_changelog` as `from`」を足した。find_examples.md に「std の取得中は `status: building` で `data` は無い」を足した (決定 132)。検査 `descriptions_are_of_this_build` に、無い構成の説明文と instructions に `refresh` が無いことを足した (直す前の crate_metadata.md で落ちることを確かめた)
+
+- H1 のレビュー (サブエージェント、読むだけ。両方の構成の文と字数を Python で展開して数えた) の対応: `get_changelog` の `from` の引数の説明が無い構成でも「プロジェクトの版から」と言っていた (構成で分けた)。search_across の失敗の hint が無い構成でも `refresh` を案内しうる (std の検索。構成で分けた)。`get_source` の offline の案内「build the project once online」も無い構成では「read the crate once online」に。検査を引数の説明にも広げた (無い構成で `refresh` と「the project uses」が無いこと。直す前の `get_changelog` で落ちることを確かめた)。crate_metadata.md は「`crate`⟨, `project`⟩ and `version` are as for」(ありの構成で 2,043 字)、無い構成の instructions は「(to `get_changelog`, as `from`)」に。決定 129 の「`find_examples` も」は利用者に聞いた問いのとおり
+- H1 のレビューで残したもの: 無い構成の版の規則は `search_crates` (crate を取らない) に触れない。「None needs an earlier call」の直後の例外は G1d のまま
+
+聞かずに決めたこと: crate_metadata.md の無い構成の文と `refresh`、無い構成の instructions の版の規則は H1 で直す (説明と動きの食い違い)。段の順は H1 (説明文と instructions) → 積み残しのコード (決定 128・129・131) → H4 (決定 134) → H5 (決定 133) → H3 (README) → H2 (eval の全件、決定 124・126) → §7
 
 ## 7. M3 の終わり方
 

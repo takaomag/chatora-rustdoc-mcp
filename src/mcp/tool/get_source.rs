@@ -1634,10 +1634,13 @@ fn sources_error(release: &str, error: &SourcesError, offline: bool) -> CallTool
         | SourcesError::Cache(_) => ("internal_error", None, false),
     };
     let suggestions: &[&str] = match code {
-        "offline_miss" => &[
+        "offline_miss" => &[if cfg!(feature = "local") {
             "the sources are read from a .crate here: build the project once online, or turn \
-             network.offline off",
-        ],
+             network.offline off"
+        } else {
+            "the sources are read from a .crate here: read the crate once online, or turn \
+             network.offline off"
+        }],
         "network_error" => &["try again in a while"],
         "internal_error" => &["check that the cache directory can be written"],
         _ => &["read the file on docs.rs, at the url of source_location of get_item"],

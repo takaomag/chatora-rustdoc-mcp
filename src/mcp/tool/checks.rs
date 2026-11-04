@@ -131,20 +131,45 @@ fn descriptions_have_their_parts_within_the_length() {
 
 /// A description tells only of what this build has (decided in M2f's F4a, 4): without local
 /// features, which read no project, the descriptions tell nothing of a project, its workspace or
-/// its members, nor the instructions of `project`, which is not declared then. That the marks of
-/// the text for one build only are each closed, and not in another, `for_this_build` checks.
+/// its members, nor the instructions of `project`, which is not declared then, nor of `refresh`,
+/// which is not either (decided in M3h). That the marks of the text for one build only are each
+/// closed, and not in another, `for_this_build` checks.
 #[test]
 fn descriptions_are_of_this_build() {
     for tool in tools() {
         let text = description(&tool);
         if !cfg!(feature = "local") {
-            for word in ["project", "workspace", "member"] {
+            for word in ["project", "workspace", "member", "`refresh`"] {
                 assert!(!text.contains(word), "{}: {word} in {text}", tool.name);
             }
         }
     }
     if !cfg!(feature = "local") {
-        assert!(!INSTRUCTIONS.contains("`project`"), "{INSTRUCTIONS}");
+        for word in ["`project`", "`refresh`"] {
+            assert!(!INSTRUCTIONS.contains(word), "{word} in {INSTRUCTIONS}");
+        }
+        // Nor the arguments' descriptions of the project's version or of `refresh`.
+        for tool in tools() {
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten();
+            for (argument, schema) in properties {
+                let text = schema
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                for word in ["refresh", "the project uses"] {
+                    assert!(
+                        !text.contains(word),
+                        "{} {argument}: {word} in {text}",
+                        tool.name
+                    );
+                }
+            }
+        }
     }
 }
 

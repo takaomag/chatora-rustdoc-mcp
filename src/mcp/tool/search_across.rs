@@ -960,9 +960,13 @@ fn hints(
             "for a crate whose status is failed, once the cause is fixed, call build_external_docs \
              with {again} to build it again"
         ))),
-        (true, None) => hints.push(json!(
+        (true, None) if cfg!(feature = "local") => hints.push(json!(
             "for a crate whose status is failed, once the cause is fixed, call get_item with that \
              crate and \"refresh\": true to build it again"
+        )),
+        (true, None) => hints.push(json!(
+            "for a crate whose status is failed, once the cause is fixed, call get_item with that \
+             crate again"
         )),
         (false, _) => {},
     }

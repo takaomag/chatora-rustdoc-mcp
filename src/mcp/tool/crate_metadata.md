@@ -1,6 +1,6 @@
 Tell what a Rust crate declares (license, MSRV, edition, repository, dependencies), its releases, how much it is used, and where its license, MSRV or edition changed. Answers questions such as "what is serde's MSRV and license?" or "is this crate still maintained?".
 
-`crate`, `version` and⟨ `project`⟩ are as for `get_item`; `refresh` asks the crates.io API again too. What is told is declared in the release's `Cargo.toml`, not resolved.⟨ Of the project's other packages, only `declared` and `dependencies` come; of a crate of git, `declared`.⟩
+`crate`⟨, `project`⟩ and `version` are as for `get_item`⟨; `refresh` asks the crates.io API again too⟩. What is told is declared in the release's `Cargo.toml`, not resolved.⟨ Of the project's other packages, only `declared` and `dependencies` come; of a crate of git, `declared`.⟩
 
 Returns `provenance` as `resolve_version` does, with `api_fetched_at` for the crates.io API, and `data`:
 - `declared`: of the release, `description` (cut at 1,000 characters), `license` (SPDX, or old `MIT/Apache-2.0`; none with only `license_file`), `rust_version`, `edition` (none is 2015, unless a warning says inherited), `repository`, `homepage`, `documentation`, `docs_rs_targets` and `docs_rs_default_target`.

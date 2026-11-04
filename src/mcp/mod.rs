@@ -115,7 +115,8 @@ const VERSIONS: &str = "- Versions: without a version, a tool uses the one in th
 #[cfg(not(feature = "local"))]
 const VERSIONS: &str = "- Versions: without a version, a tool uses the latest release, as this \
                         server is built without reading projects: give the version that the \
-                        project's Cargo.lock has. `provenance` tells which version was used.\n";
+                        project's Cargo.lock has (to `get_changelog`, as `from`). `provenance` \
+                        tells which version was used.\n";
 
 /// The rule for targets.
 #[cfg(feature = "local")]

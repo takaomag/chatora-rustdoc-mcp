@@ -354,8 +354,14 @@ pub(super) async fn execute(metadata: Metadata, state: Arc<ToolState>) -> CallTo
         release.warnings.push(
             format!(
                 "the crates.io index as kept does not list {} {}: what it declares and its \
-                 dependencies are not known; call again with refresh to read the index again",
-                release.name, release.version
+                 dependencies are not known{}",
+                release.name,
+                release.version,
+                if cfg!(feature = "local") {
+                    "; call again with refresh to read the index again"
+                } else {
+                    ""
+                }
             )
             .into(),
         );

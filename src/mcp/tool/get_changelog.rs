@@ -71,6 +71,12 @@ const MAX_CHANGELOG_BYTES: u64 = 8 * 1024 * 1024;
 /// How a cursor's position is packed: the release, and the line in it to go on from.
 const LINES_PER_RELEASE: usize = 1 << 24;
 
+/// What `from` defaults to.
+#[cfg(feature = "local")]
+const FROM_DEFAULT: &str = " Defaults to the version the project uses, or the first.";
+#[cfg(not(feature = "local"))]
+const FROM_DEFAULT: &str = " Defaults to the first.";
+
 /// How to pass `from` and `to`, for `invalid_argument`.
 const RANGE_EXAMPLE: &[&str] = &[r#"pass versions, for example {"from": "1.40.0", "to": "1.48"}"#];
 
@@ -110,8 +116,10 @@ pub(super) fn definition() -> Tool {
             },
             "from": {
                 "type": "string",
-                "description": "The version after which to start (1.40.0, or 1.40 for after every \
-                                1.40.x). Defaults to the version the project uses, or the first.",
+                "description": const_format::concatcp!(
+                    "The version after which to start (1.40.0, or 1.40 for after every 1.40.x).",
+                    FROM_DEFAULT
+                ),
             },
             "to": {
                 "type": "string",
