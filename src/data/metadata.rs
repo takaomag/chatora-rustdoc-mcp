@@ -133,6 +133,33 @@ pub struct Package {
     /// workspace too; `None` without one (requirement R-SC-4).
     #[serde(default)]
     pub readme: Option<PathBuf>,
+    /// `description`, inherited from its workspace too, as the other fields below.
+    #[serde(default)]
+    pub description: Option<Box<str>>,
+    /// `license`.
+    #[serde(default)]
+    pub license: Option<Box<str>>,
+    /// `license-file`.
+    #[serde(default)]
+    pub license_file: Option<Box<str>>,
+    /// `repository`.
+    #[serde(default)]
+    pub repository: Option<Box<str>>,
+    /// `homepage`.
+    #[serde(default)]
+    pub homepage: Option<Box<str>>,
+    /// `documentation`.
+    #[serde(default)]
+    pub documentation: Option<Box<str>>,
+    /// `rust-version`.
+    #[serde(default)]
+    pub rust_version: Option<Box<str>>,
+    /// `edition`, which `cargo metadata` always tells.
+    #[serde(default)]
+    pub edition: Option<Box<str>>,
+    /// `[package.metadata]`, for `docs.rs`'s.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// A dependency of a package, as its manifest declares it.
@@ -146,9 +173,66 @@ pub struct Dependency {
     /// Whether it is optional, which makes a feature of its name.
     #[serde(default)]
     pub optional: bool,
+    /// The version requirement.
+    #[serde(default)]
+    pub req: Box<str>,
+    /// `dev` or `build`; `None` for a normal one.
+    #[serde(default)]
+    pub kind: Option<Box<str>>,
+    /// The platform it is for, if only one.
+    #[serde(default)]
+    pub target: Option<Box<str>>,
+    /// Whether its default features are enabled.
+    #[serde(default = "enabled")]
+    pub uses_default_features: bool,
+}
+
+/// `true`, the default of `uses_default_features`.
+const fn enabled() -> bool {
+    true
 }
 
 impl Package {
+    /// What it declares, as `cargo metadata` tells it: with what it inherits from its workspace
+    /// (decided in M3f, decision 98).
+    #[must_use]
+    pub fn declaration(&self) -> crate::data::crate_file::Declaration {
+        let docs_rs = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("docs")?.get("rs"));
+        let text = |value: &Option<Box<str>>| {
+            value
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+        };
+        let targets = docs_rs
+            .and_then(|docs_rs| docs_rs.get("targets"))
+            .and_then(serde_json::Value::as_array);
+        let target = |value: &serde_json::Value| value.as_str()?.parse::<TargetTriple>().ok();
+        crate::data::crate_file::Declaration {
+            description: text(&self.description),
+            license: text(&self.license),
+            license_file: text(&self.license_file),
+            repository: text(&self.repository),
+            homepage: text(&self.homepage),
+            documentation: text(&self.documentation),
+            rust_version: text(&self.rust_version),
+            edition: text(&self.edition),
+            docs_rs_targets: targets.map(|targets| targets.iter().filter_map(target).collect()),
+            docs_rs_targets_left_out: targets.map_or(0, |targets| {
+                targets
+                    .iter()
+                    .filter(|value| target(value).is_none())
+                    .count()
+            }),
+            docs_rs_default_target: docs_rs
+                .and_then(|docs_rs| docs_rs.get("default-target"))
+                .and_then(target),
+        }
+    }
+
     /// Its features as Cargo reads them (decided in M3d, decision 48). Those that `cargo
     /// metadata` lists for its optional dependencies, `"x": ["dep:x"]` where no other names
     /// `dep:x`, are taken for the ones that Cargo makes, which one written so means too.

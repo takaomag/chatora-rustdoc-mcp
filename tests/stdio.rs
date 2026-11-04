@@ -2535,6 +2535,78 @@ fn inspect_features_tells_a_members_features_and_whether_the_project_enables_the
     assert!(server.finish().success());
 }
 
+/// `crate_metadata` tells what the project's packages declare, with what they inherit from their
+/// workspace, and their dependencies, from `cargo metadata`, without crates.io (decided in M3f,
+/// decision 98).
+#[cfg(feature = "local")]
+#[test]
+fn crate_metadata_tells_what_a_member_declares() {
+    let dir = TempDir::new().expect("a temporary directory");
+    write_front_and_back(dir.path());
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"front\", \"back\"]\nresolver = \"3\"\n\n\
+         [workspace.package]\nreadme = \"README.md\"\nlicense = \"MIT\"\n",
+    )
+    .expect("written");
+    std::fs::write(
+        dir.path().join("front/Cargo.toml"),
+        "[package]\nname = \"front\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         readme.workspace = true\nlicense.workspace = true\nrust-version = \"1.85\"\n\n\
+         [features]\nextra = []\n",
+    )
+    .expect("written");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(dir.path())
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    let mut server = Server::start_in(Some(dir.path()));
+    // Again while cargo reads the project.
+    let mut ask = |id: u64, krate: &str| {
+        let mut told = Value::Null;
+        for attempt in 0..60 {
+            let id = id * 100 + attempt;
+            server.send(&call_tool(id, "crate_metadata", json!({ "crate": krate })));
+            told = server.response(id)["result"].clone();
+            if told["structuredContent"]["data"].get("declared").is_some()
+                || told["isError"] == true
+            {
+                break;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        told
+    };
+    let back = ask(1, "back");
+    assert_ne!(back["isError"], true, "{back}");
+    let content = &back["structuredContent"];
+    assert_eq!(content["provenance"]["source"], "project", "{back}");
+    assert_eq!(content["data"]["declared"]["edition"], "2024", "{back}");
+    assert_eq!(
+        content["data"]["dependencies"],
+        json!([{ "name": "front", "req": "*", "kind": "normal" }]),
+        "{back}"
+    );
+    assert!(content["data"].get("releases").is_none(), "{back}");
+    assert!(
+        content["warnings"]
+            .to_string()
+            .contains("is a workspace member or a path dependency"),
+        "{back}"
+    );
+    let front = ask(2, "front");
+    let declared = &front["structuredContent"]["data"]["declared"];
+    assert_eq!(declared["license"], "MIT", "inherited: {front}");
+    assert_eq!(declared["rust_version"], "1.85", "{front}");
+    assert!(server.finish().success());
+}
+
 /// `get_readme` reads a member's readme where it is, without building it: `front`'s, inherited
 /// from the workspace, and `back`'s of a default name (decided in M3e, decisions 78 and 80, as in
 /// M3, P8).
@@ -4702,6 +4774,7 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
         ("inspect_features", with(json!({}))),
         ("get_readme", with(json!({}))),
         ("find_examples", with(json!({}))),
+        ("crate_metadata", with(json!({}))),
     ];
     for (id, (tool, arguments)) in (100_u64..).zip(tools) {
         server.send(&call_tool(id, tool, arguments));
@@ -4740,6 +4813,17 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
     server.send(&call_tool(202, "find_examples", with(json!({}))));
     let found = server.response(202)["result"]["structuredContent"]["data"].clone();
     assert_eq!(found["examples"][0]["file"], "examples/try.rs", "{found}");
+    // What it declares, from its checkout, without crates.io (decided in M3f, decision 98).
+    server.send(&call_tool(203, "crate_metadata", with(json!({}))));
+    let metadata = server.response(203)["result"]["structuredContent"].clone();
+    assert!(metadata["data"]["declared"].is_object(), "{metadata}");
+    assert!(metadata["data"].get("releases").is_none(), "{metadata}");
+    assert!(
+        metadata["warnings"]
+            .to_string()
+            .contains("its dependencies are in [dependencies]"),
+        "{metadata}"
+    );
     reads_the_source_of_the_git_crate(&mut server, &with(json!({})));
     looked_up_by_hash_and_when_stale(&mut server, &commit);
     looked_up_while_rebuilding(&mut server, &commit);

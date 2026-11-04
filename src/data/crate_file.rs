@@ -594,6 +594,51 @@ pub struct Declaration {
     pub docs_rs_default_target: Option<TargetTriple>,
 }
 
+/// What the package whose `Cargo.toml` is at `manifest` declares, and what it inherits.
+///
+/// Those of its fields told in [`Declaration`] that it inherits from its workspace
+/// (`license.workspace = true`) are not read, and are given by their names in `crate_metadata`'s
+/// answer (decided in M3f, decision 98).
+///
+/// # Errors
+///
+/// Returns an error when the manifest cannot be read or is not TOML.
+#[cfg(feature = "local")]
+pub fn manifest_declaration(manifest: &Path) -> io::Result<(Declaration, Vec<Box<str>>)> {
+    let table = manifest_table(manifest)?;
+    let inherited = table
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .map(|package| {
+            package
+                .iter()
+                .filter(|(_, value)| {
+                    value
+                        .get("workspace")
+                        .and_then(toml::Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .filter(|(key, _)| DECLARED_FIELDS.contains(&key.as_str()))
+                .map(|(key, _)| Box::from(key.replace('-', "_")))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((declaration_of(&table), inherited))
+}
+
+/// The fields of `[package]` that [`Declaration`] tells.
+#[cfg(feature = "local")]
+const DECLARED_FIELDS: [&str; 8] = [
+    "description",
+    "license",
+    "license-file",
+    "repository",
+    "homepage",
+    "documentation",
+    "rust-version",
+    "edition",
+];
+
 /// What `name` at `version` declares, from the `Cargo.toml` in its `.crate` `contents`.
 ///
 /// # Errors
@@ -932,6 +977,26 @@ features = ["serde/derive"]
         fs::write(&manifest, large).expect("written");
         let error = manifest_features(&manifest).expect_err("too large");
         assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+    }
+
+    /// A manifest on disk: what it inherits from its workspace is told, by the names of the
+    /// answer, and not read (decided in M3f, decision 98).
+    #[cfg(feature = "local")]
+    #[test]
+    fn a_manifest_on_disk_tells_what_it_inherits() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let manifest = dir.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"demo\"\nversion.workspace = true\n\
+             license.workspace = true\nrust-version = { workspace = true }\n\
+             edition = \"2021\"\n[package.metadata.workspace]\nx = 1\n",
+        )
+        .expect("written");
+        let (declared, inherited) = manifest_declaration(&manifest).expect("read");
+        assert_eq!(declared.edition.as_deref(), Some("2021"));
+        assert_eq!(declared.license, None);
+        assert_eq!(&*inherited, ["license".into(), "rust_version".into()]);
     }
 
     #[test]

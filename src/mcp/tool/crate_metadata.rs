@@ -23,6 +23,10 @@ use super::{
     list_module::{self, CURSOR_EXAMPLE, CURSOR_FORM},
     resolve_version::{self, Release},
 };
+#[cfg(feature = "local")]
+use super::{project, recorded_git::GitFound};
+#[cfg(feature = "local")]
+use crate::data::{flight::Joined, metadata::Resolution};
 use crate::{
     data::{
         cache::sha256_hex,
@@ -178,7 +182,7 @@ fn output_schema() -> JsonObject {
                     "dev_dependencies": count,
                     "history": history_schema(),
                 },
-                "required": ["declared", "releases", "dependencies"],
+                "required": ["declared"],
             },
             "page": {
                 "type": "object",
@@ -308,7 +312,14 @@ pub(super) async fn execute(metadata: Metadata, state: Arc<ToolState>) -> CallTo
     // One deadline for every step (requirement R-ARCH-6).
     let until = state.until();
     let refresh = release.refresh;
-    let (resolved, _taken) = resolve_version::resolving(release, Arc::clone(&state), until).await;
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(
+            unused_variables,
+            reason = "only a project or a record has more to tell"
+        )
+    )]
+    let (resolved, taken) = resolve_version::resolving(release, Arc::clone(&state), until).await;
     // An error, or the response while the release is resolved, as it is.
     let Some(mut release) = resolved
         .structured_content
@@ -318,6 +329,16 @@ pub(super) async fn execute(metadata: Metadata, state: Arc<ToolState>) -> CallTo
     else {
         return resolved;
     };
+    #[cfg(feature = "local")]
+    if let Some(git) = &taken.git {
+        return git_metadata(git, &mut release, &paging).await;
+    }
+    #[cfg(feature = "local")]
+    if let Some(found) = taken.found.as_deref()
+        && !release.on_crates_io
+    {
+        return project_metadata((&state, &mut release), found, (refresh, until), &paging).await;
+    }
     if !release.on_crates_io {
         return not_a_release(&release);
     }
@@ -350,10 +371,239 @@ pub(super) async fn execute(metadata: Metadata, state: Arc<ToolState>) -> CallTo
         Api::of(&state, &release.name, (fresh, until), &paging),
     );
     release.warnings.extend(declaration_warning);
-    respond(&mut release, (&entry, declaration.as_ref()), &api, &paging)
+    let told = Told {
+        declared: declared(
+            &entry,
+            &release.version,
+            declaration.as_ref(),
+            &mut release.warnings,
+        ),
+        dependencies: Some(dependencies(&entry, &release.version)),
+        rest_in: "the release's Cargo.toml, which get_source reads (file Cargo.toml)",
+    };
+    respond(&mut release, told, Some((&entry, &api)), &paging)
 }
 
-/// The error for a release that is not one of crates.io, which the next step of M3f answers.
+/// The answer for a package that is not a release of crates.io: what it declares, and its
+/// dependencies when they are known (decided in M3f, decision 98). Of the project's copy of a
+/// crate of crates.io, what crates.io tells of the crate by its name is told too (decision 110);
+/// else that it is not had.
+#[cfg(feature = "local")]
+async fn declared_here(
+    (state, release): (&ToolState, &mut Release),
+    told: Told,
+    (refresh, until): (bool, Instant),
+    paging: &Paging,
+) -> CallToolResult {
+    let what = format!("{} {}", release.name, release.version);
+    let of = match release.source.as_ref() {
+        "crates.io" => None,
+        "path" => Some("a workspace member or a path dependency"),
+        "git" => Some("a crate of git"),
+        _ => Some("a crate of another registry"),
+    };
+    if let Some(of) = of {
+        release.warnings.push(
+            format!(
+                "{what} is {of}: what it declares is told; its releases, downloads, dependents \
+                 and history are not, as crates.io has none of them"
+            )
+            .into(),
+        );
+        return respond(release, told, None, paging);
+    }
+    // The crate of crates.io that the project's copy is of.
+    let Ok(entry) = state.index.entry(&release.name).await else {
+        release.warnings.push(
+            format!(
+                "{what} is the project's copy of a crate of crates.io, which the crates.io index \
+                 could not be read for: what it declares is told, from the copy"
+            )
+            .into(),
+        );
+        return respond(release, told, None, paging);
+    };
+    if refresh {
+        state.crates_io.forget(&release.name).await;
+    }
+    release.warnings.push(
+        format!(
+            "{what} is the project's copy, which is not known to be the release on crates.io: what \
+             it declares and its dependencies are of the copy; its releases, downloads, \
+             dependents and history are of the crate on crates.io"
+        )
+        .into(),
+    );
+    let fresh = refresh && paging.offset == 0;
+    let api = Api::of(state, &release.name, (fresh, until), paging).await;
+    respond(release, told, Some((&entry, &api)), paging)
+}
+
+/// What the crate of git `found` that `build_external_docs` recorded declares, from the
+/// `Cargo.toml` of its checkout; what it inherits from its workspace is not read.
+#[cfg(feature = "local")]
+async fn git_metadata(found: &GitFound, release: &mut Release, paging: &Paging) -> CallToolResult {
+    let Some(root) = found.built.record.package_root.clone() else {
+        return super::tool_error(
+            "docs_unavailable",
+            &format!(
+                "the record of {} is from before where its package is was kept",
+                found.package
+            ),
+            false,
+            &["build it again with build_external_docs"],
+        );
+    };
+    let read = crate::task::spawn_blocking(move || {
+        crate_file::manifest_declaration(&root.join("Cargo.toml"))
+    })
+    .await
+    .unwrap_or_else(|error| Err(std::io::Error::other(crate::task::resume_if_panic(error))));
+    let (declaration, inherited) = match read {
+        Ok(read) => read,
+        Err(error) => {
+            return super::tool_error(
+                "docs_unavailable",
+                &format!(
+                    "the Cargo.toml of {} could not be read: {}",
+                    found.package,
+                    ErrorChain(&error)
+                ),
+                false,
+                &["build it again with build_external_docs"],
+            );
+        },
+    };
+    if !inherited.is_empty() {
+        release.warnings.push(
+            format!(
+                "{} inherited from its workspace, which is not read: see the workspace's \
+                 Cargo.toml",
+                inherited.join(", ")
+            )
+            .into(),
+        );
+    }
+    release.warnings.push(
+        format!(
+            "{} {} is a crate of git: what it declares is told; its dependencies are in \
+             [dependencies] of its Cargo.toml, and its releases, downloads, dependents and history \
+             are not, as crates.io has none of them",
+            release.name, release.version
+        )
+        .into(),
+    );
+    let mut warnings = Vec::new();
+    let declared = declared_value(&declaration, &mut warnings);
+    release.warnings.extend(warnings);
+    let told = Told {
+        declared,
+        dependencies: None,
+        rest_in: "",
+    };
+    respond(release, told, None, paging)
+}
+
+/// What the project's package `found` declares, and its dependencies, from its `cargo metadata`,
+/// which resolves what it inherits from its workspace.
+#[cfg(feature = "local")]
+async fn project_metadata(
+    (state, release): (&ToolState, &mut Release),
+    found: &project::Found,
+    (refresh, until): (bool, Instant),
+    paging: &Paging,
+) -> CallToolResult {
+    let what = format!("{} {}", release.name, release.version);
+    let unknown = |why: &str| {
+        super::tool_error(
+            "docs_unavailable",
+            &format!("what {what} declares is not known: {why}"),
+            false,
+            &["read the [package] of its Cargo.toml"],
+        )
+    };
+    let resolution = match project::resolve_until(state, &found.workspace, until).await {
+        Joined::Done(Ok(resolution)) => resolution,
+        Joined::Done(Err(error)) => {
+            return unknown(&format!(
+                "the project could not be read: {}",
+                ErrorChain(&error)
+            ));
+        },
+        Joined::Going(doing) => {
+            let target = match release.target() {
+                Some(target) => target,
+                None => state.host().await.triple.clone(),
+            };
+            return project::resolving_crate(
+                &release.name,
+                &target,
+                (doing, found.project_from),
+                &release.warnings,
+            );
+        },
+        Joined::Ended => return get_item::stopped(),
+    };
+    let Resolution::Metadata { metadata, .. } = &*resolution else {
+        return unknown("cargo metadata of the project failed");
+    };
+    let Some(package) = project::metadata_package(metadata, &found.package) else {
+        return unknown("it is not in the project's cargo metadata");
+    };
+    let (dependencies, dev) = project_dependencies(&package.dependencies);
+    let mut warnings = Vec::new();
+    let declared = declared_value(&package.declaration(), &mut warnings);
+    release.warnings.extend(warnings);
+    let told = Told {
+        declared,
+        dependencies: Some((dependencies, dev)),
+        rest_in: "its Cargo.toml",
+    };
+    declared_here((state, release), told, (refresh, until), paging).await
+}
+
+/// The normal and build dependencies of a package of the project, as told, and how many dev ones
+/// (decision 107).
+#[cfg(feature = "local")]
+fn project_dependencies(dependencies: &[crate::data::metadata::Dependency]) -> (Vec<Value>, usize) {
+    let mut dev = 0_usize;
+    let told = dependencies
+        .iter()
+        .filter_map(|dependency| {
+            let kind = match dependency.kind.as_deref() {
+                None | Some("normal") => "normal",
+                Some("build") => "build",
+                Some("dev") => {
+                    dev = dev.saturating_add(1);
+                    return None;
+                },
+                Some(_) => "other",
+            };
+            let mut told = Map::new();
+            let given = dependency.rename.as_deref().unwrap_or(&dependency.name);
+            told.insert("name".to_owned(), json!(given));
+            if dependency.rename.is_some() {
+                told.insert("package".to_owned(), json!(dependency.name));
+            }
+            told.insert("req".to_owned(), json!(dependency.req));
+            told.insert("kind".to_owned(), json!(kind));
+            if dependency.optional {
+                told.insert("optional".to_owned(), json!(true));
+            }
+            if let Some(target) = &dependency.target {
+                told.insert("target".to_owned(), json!(target));
+            }
+            if !dependency.uses_default_features {
+                told.insert("default_features".to_owned(), json!(false));
+            }
+            Some(Value::Object(told))
+        })
+        .collect();
+    (told, dev)
+}
+
+/// The error for a release that is not one of crates.io, without a project or a record to read
+/// it from.
 fn not_a_release(release: &Release) -> CallToolResult {
     let of = if release.source.as_ref() == "crates.io" {
         "a copy of the project that the crates.io index does not have"
@@ -613,23 +863,44 @@ fn with_api(
     provenance
 }
 
+/// What is told of the package besides what crates.io tells of the crate.
+struct Told {
+    /// What it declares.
+    declared: Value,
+    /// Its normal and build dependencies, and how many dev ones, when they are known.
+    dependencies: Option<(Vec<Value>, usize)>,
+    /// Where the dependencies that do not fit are.
+    rest_in: &'static str,
+}
+
 /// The answer.
 fn respond(
     release: &mut Release,
-    (entry, declaration): (&IndexEntry, Option<&Declaration>),
-    api: &Api,
+    told: Told,
+    crates_io: Option<(&IndexEntry, &Api)>,
     paging: &Paging,
 ) -> CallToolResult {
     let mut warnings = std::mem::take(&mut release.warnings);
-    warnings.extend(api.warnings.iter().cloned());
-    let declared = declared(entry, &release.version, declaration, &mut warnings);
-    let releases = releases(entry, &release.version, api.history.as_ref());
-    let popularity = popularity(api);
-    let (dependencies, dev) = dependencies(entry, &release.version);
+    let Told {
+        declared,
+        dependencies,
+        rest_in,
+    } = told;
+    let told_dependencies = dependencies.is_some();
+    let (dependencies, dev) = dependencies.unwrap_or_default();
     let total = dependencies.len();
-    let provenance = with_api(&release.provenance, api, &mut warnings);
-    let page = match &api.history {
-        Some(history) => {
+    let releases =
+        crates_io.map(|(entry, api)| releases(entry, &release.version, api.history.as_ref()));
+    let popularity = crates_io.and_then(|(_, api)| popularity(api));
+    let provenance = match crates_io {
+        Some((_, api)) => {
+            warnings.extend(api.warnings.iter().cloned());
+            with_api(&release.provenance, api, &mut warnings)
+        },
+        None => release.provenance.clone(),
+    };
+    let page = match crates_io.and_then(|(entry, api)| Some((entry, api.history.as_ref()?))) {
+        Some((entry, history)) => {
             if let Some(cut) = &history.cut {
                 warnings.push(
                     format!("the history stops here: the next versions did not come ({cut}); call again with the cursor").into(),
@@ -645,15 +916,19 @@ fn respond(
     let answer = |dependencies: &[Value]| {
         let mut data = Map::new();
         data.insert("declared".to_owned(), declared.clone());
-        data.insert("releases".to_owned(), releases.clone());
+        if let Some(releases) = &releases {
+            data.insert("releases".to_owned(), releases.clone());
+        }
         if let Some(popularity) = &popularity {
             data.insert("popularity".to_owned(), popularity.clone());
         }
-        data.insert("dependencies".to_owned(), json!(dependencies));
-        if dependencies.len() < total {
-            data.insert("dependencies_total".to_owned(), json!(total));
+        if told_dependencies {
+            data.insert("dependencies".to_owned(), json!(dependencies));
+            if dependencies.len() < total {
+                data.insert("dependencies_total".to_owned(), json!(total));
+            }
+            data.insert("dev_dependencies".to_owned(), json!(dev));
         }
-        data.insert("dev_dependencies".to_owned(), json!(dev));
         if let Some((shown, _)) = &page {
             data.insert("history".to_owned(), json!(shown));
         }
@@ -680,7 +955,7 @@ fn respond(
             warned.push(
                 format!(
                     "{} of {total} dependencies are shown, as the answer is long: the rest are in \
-                     the release's Cargo.toml, which get_source reads (file Cargo.toml)",
+                     {rest_in}",
                     shown.len()
                 )
                 .into(),
@@ -720,6 +995,12 @@ fn declared(
         }
         return Value::Object(declared);
     };
+    declared_value(declaration, warnings)
+}
+
+/// What `declaration` tells, with the strings cut (decision 108).
+fn declared_value(declaration: &Declaration, warnings: &mut Vec<Box<str>>) -> Value {
+    let mut declared = Map::new();
     let mut cut = Vec::new();
     let mut put = |key: &str, value: Option<&str>, max: usize| {
         let Some(value) = value else {
@@ -1069,6 +1350,51 @@ mod tests {
         let from_api = releases(&without, &Version::new(1, 0, 0), Some(&api));
         assert_eq!(from_api["last_release_at"], "2026-01-01T00:00:00Z");
         assert!(from_api.get("this_version_yanked").is_none());
+    }
+
+    /// A package of the project as `cargo metadata` tells it, with what it inherits resolved: its
+    /// declaration, and its dependencies by the name it gives them (decided in M3f, decision 98).
+    #[cfg(feature = "local")]
+    #[test]
+    fn a_package_of_the_project_tells_what_it_declares_and_its_dependencies() {
+        let package: crate::data::metadata::Package = serde_json::from_value(json!({
+            "id": "path+file:///w/front#0.1.0",
+            "name": "front",
+            "version": "0.1.0",
+            "source": null,
+            "manifest_path": "/w/front/Cargo.toml",
+            "targets": [],
+            "license": "MIT",
+            "rust_version": "1.85",
+            "edition": "2024",
+            "description": " ",
+            "metadata": { "docs": { "rs": { "targets": ["x86_64-unknown-linux-gnu", "..x"] } } },
+            "dependencies": [
+                { "name": "serde_json", "rename": "json", "req": "^1", "kind": null,
+                  "optional": true, "uses_default_features": false, "target": "cfg(unix)" },
+                { "name": "cc", "req": "^1.2", "kind": "build" },
+                { "name": "proptest", "req": "^1", "kind": "dev" },
+            ],
+        }))
+        .expect("a package");
+        let declaration = package.declaration();
+        assert_eq!(declaration.license.as_deref(), Some("MIT"));
+        assert_eq!(declaration.description, None, "blank");
+        assert_eq!(
+            declaration.docs_rs_targets.map(|targets| targets.len()),
+            Some(1)
+        );
+        assert_eq!(declaration.docs_rs_targets_left_out, 1);
+        let (dependencies, dev) = project_dependencies(&package.dependencies);
+        assert_eq!(dev, 1);
+        assert_eq!(
+            json!(dependencies),
+            json!([
+                { "name": "json", "package": "serde_json", "req": "^1", "kind": "normal",
+                  "optional": true, "target": "cfg(unix)", "default_features": false },
+                { "name": "cc", "req": "^1.2", "kind": "build" },
+            ])
+        );
     }
 
     #[test]
