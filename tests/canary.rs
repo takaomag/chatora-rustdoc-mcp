@@ -6,13 +6,15 @@
 //!   items in `Attribute::Other`.
 //! - docs.rs, live: the format it serves, how it answers for crates, versions and targets it has
 //!   no JSON of (requirements R-DS-6 and §8), and which targets it builds (requirement R-TG-1).
+//! - crates.io's API, live: what `crate_metadata` and `search_crates` read of it (decided in
+//!   M3h, decision 133).
 //! - The beta, the next stable: whether it builds the rustdoc JSON of a workspace with
 //!   `RUSTC_BOOTSTRAP` for its crates alone, as the server does with a project's toolchain.
 //!
 //! The tests are ignored by default. Run them with `cargo test --release --test canary --
-//! --ignored`; the first needs a nightly toolchain, the second the network, with an empty cache in
-//! `CHATORA_RUSTDOC_MCP_CACHE__DIR` to see what docs.rs serves now, and the third the beta
-//! toolchain, which CI runs in a job of its own, without a nightly.
+//! --ignored`; the first needs a nightly toolchain, the second and the third the network, with an
+//! empty cache in `CHATORA_RUSTDOC_MCP_CACHE__DIR` to see what docs.rs and crates.io serve now,
+//! and the last the beta toolchain, which CI runs in a job of its own, without a nightly.
 
 #![cfg(test)]
 #![expect(
@@ -263,6 +265,72 @@ fn docs_rs_serves_what_this_server_expects() {
     assert!(
         unexpected.is_empty(),
         "docs.rs answered otherwise:\n{}",
+        unexpected.join("\n\n")
+    );
+}
+
+/// crates.io's API answers as the server reads it: `crate_metadata` tells serde's popularity and
+/// history with nothing left out, and `search_crates` finds `serde_json` (decided in M3h, decision
+/// 133).
+#[test]
+#[ignore = "needs the network; asks crates.io's API"]
+fn crates_io_api_answers_what_this_server_expects() {
+    let logs = tempfile::tempdir().expect("a temporary directory");
+    let mut client = Client::start(None, logs.path());
+    let mut unexpected = Vec::new();
+    let metadata = client.call("crate_metadata", &json!({ "crate": "serde" }));
+    let told = match &metadata {
+        Answer::Ok(_) => {
+            let result = metadata.ok();
+            // What the API did not tell (crate_metadata.rs's `left_out` and the pages of the
+            // history), or told only from the cache.
+            let not_told = ["the downloads", "the count of dependents", "the history"];
+            let left_out = result["warnings"].as_array().is_some_and(|warnings| {
+                warnings
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|warning| not_told.iter().any(|what| warning.starts_with(what)))
+            });
+            // serde changed its MSRV and edition over its releases.
+            let history = result["data"]["history"].as_array().is_some_and(|history| {
+                history.iter().any(|change| {
+                    change.get("rust_version").is_some() || change.get("edition").is_some()
+                })
+            });
+            result["data"]["popularity"]["downloads"].is_u64()
+                && result["data"]["popularity"]["dependents"].is_u64()
+                && result["data"]["releases"]["last_release_at"].is_string()
+                && history
+                && !left_out
+        },
+        Answer::Error(_) => false,
+    };
+    if !told {
+        unexpected.push(format!(
+            "crate_metadata serde:\n{}",
+            metadata.text().chars().take(1500).collect::<String>()
+        ));
+    }
+    let search = client.call(
+        "search_crates",
+        &json!({ "query": "json", "sort": "downloads", "limit": 5 }),
+    );
+    let found = match &search {
+        Answer::Ok(_) => search.ok()["data"]["crates"]
+            .as_array()
+            .is_some_and(|crates| crates.iter().any(|krate| krate["name"] == "serde_json")),
+        Answer::Error(_) => false,
+    };
+    if !found {
+        unexpected.push(format!(
+            "search_crates json:\n{}",
+            search.text().chars().take(1500).collect::<String>()
+        ));
+    }
+    client.finish();
+    assert!(
+        unexpected.is_empty(),
+        "crates.io's API answered otherwise:\n{}",
         unexpected.join("\n\n")
     );
 }

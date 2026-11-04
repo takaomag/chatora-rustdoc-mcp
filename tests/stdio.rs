@@ -1940,8 +1940,40 @@ fn set_trap(project: &Path, marker: &Path) {
     .expect("written");
 }
 
+/// A server in `project` whose crates.io API is a fake one that finds nothing for `demo`, with it.
+#[cfg(all(unix, feature = "local"))]
+fn with_a_search_api(project: &Path) -> (Server, registry::FakeRegistry) {
+    let registry = registry::FakeRegistry::start();
+    registry.put(
+        "/api/v1/crates?q=demo&sort=relevance&per_page=10",
+        r#"{"crates":[],"meta":{"total":0,"next_page":null,"prev_page":null}}"#,
+    );
+    let server = Server::start_with(Some(project), &[
+        ("CHATORA_RUSTDOC_TEST_API_URL", registry.base_url()),
+        ("NO_PROXY", "127.0.0.1"),
+        ("no_proxy", "127.0.0.1"),
+    ]);
+    (server, registry)
+}
+
+/// `search_crates`, which asks crates.io alone, does not set off the trap of `marker` in the
+/// default project of `server` (requirement R-MCP-4, decided in M3h, decision 134). The fake API
+/// is used in a debug build alone; a release build would ask crates.io.
+#[cfg(all(unix, feature = "local", debug_assertions))]
+fn search_starts_nothing(server: &mut Server, marker: &Path) {
+    server.send(&call_tool(0, "search_crates", json!({ "query": "demo" })));
+    let searched = server.response(0)["result"].clone();
+    assert_eq!(searched["isError"], false, "{searched}");
+    assert!(
+        !marker.exists(),
+        "search_crates started a process in the default project"
+    );
+}
+
 /// The lookup tools start no process for a project outside the default one, whose settings could
 /// run anything; in the default project, the same trap goes off (requirements R-MCP-3 and R-QA-5).
+/// `search_crates`, which asks crates.io alone, starts none even in the default project
+/// (requirement R-MCP-4, decided in M3h, decision 134).
 #[cfg(all(unix, feature = "local"))]
 #[test]
 fn lookups_start_nothing_for_a_project_outside_the_default_one() {
@@ -1954,7 +1986,9 @@ fn lookups_start_nothing_for_a_project_outside_the_default_one() {
     let outside = demo_workspace();
     set_trap(project.path(), &inside_marker);
     set_trap(outside.path(), &outside_marker);
-    let mut server = Server::start_in(Some(project.path()));
+    let (mut server, _registry) = with_a_search_api(project.path());
+    #[cfg(debug_assertions)]
+    search_starts_nothing(&mut server, &inside_marker);
     let elsewhere = outside.path().to_str().expect("UTF-8");
     let calls = [
         ("list_crates", json!({ "project": elsewhere })),
@@ -1983,6 +2017,10 @@ fn lookups_start_nothing_for_a_project_outside_the_default_one() {
     assert!(
         !outside_marker.exists(),
         "a process was started outside the default project"
+    );
+    assert!(
+        !inside_marker.exists(),
+        "nor in the default project, as by search_crates late"
     );
     // Nor once `build_external_docs` recorded it, which runs cargo there itself: they read the
     // record (decided in M2e's E4b-3).

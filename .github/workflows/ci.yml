@@ -113,7 +113,8 @@ jobs:
       # std の JSON: dist から取るもの (M1 の B8。毎回、最新の nightly の約 4 MB と、形式 58〜60 の
       # 確認用の 3 日分) と、手元の nightly の rust-docs-json から読むもの。
       - run: rustup toolchain install nightly --profile minimal --component rust-docs-json
-      - run: cargo test --locked --release --test std_dist -- --ignored
+      # rust-src (約 6 MB) を取るテストは canary だけで回す (M3h の決定 133)。
+      - run: cargo test --locked --release --test std_dist -- --ignored --skip the_sources_of_std
       # 実データでの動作の検査 (tests/real_data): 決定性 (要件 R-ARCH-5)、引数ごとに値を変えると結果が
       # 変わること、説明文が約束する問いに答えられること (R-QA-5)。応答は outputSchema で検証する。
       # 上の testdata の JSON と std を使い、足りないもの (index、.crate など) はネットワークから取る。

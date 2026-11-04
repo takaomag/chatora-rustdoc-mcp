@@ -134,6 +134,32 @@ async fn std_paths_are_followed_into_core_and_alloc_from_the_distribution_server
     check_paths(|path| look_up_in(&cache, &docs, path));
 }
 
+/// The sources of std of the latest nightly come from its `rust-src` on the distribution server,
+/// of the same commit as its JSON, with files of std where they are expected (requirement R-SC-2,
+/// decided in M3h, decision 133).
+#[tokio::test]
+#[ignore = "fetches about 4 MB and the rust-src of about 6 MB from static.rust-lang.org"]
+async fn the_sources_of_std_are_had_from_the_distribution_server() {
+    let (cache, docs) = std_docs(None).await;
+    let dist = Dist::new(&Network::default(), DistSettings::default()).expect("an HTTP client");
+    let sources = dist::rust_src(&cache, &dist, &docs.nightly)
+        .await
+        .expect("the rust-src of the nightly is had");
+    assert!(sources.root.starts_with(cache.dir()), "{:?}", sources.root);
+    assert!(sources.warnings.is_empty(), "{:?}", sources.warnings);
+    for file in [
+        "library/core/src/option.rs",
+        "library/alloc/src/vec/mod.rs",
+        "library/std/src/lib.rs",
+    ] {
+        assert!(
+            sources.root.join(file).is_file(),
+            "{file} in {:?}",
+            sources.root
+        );
+    }
+}
+
 /// Formats 58 to 60 write `Stability` flat, and format 58 has no `const_stability`. The shim maps
 /// them to the latest types (requirement R-FV-2); this checks it on the JSON of std of those
 /// formats.

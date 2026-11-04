@@ -650,6 +650,13 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 積み残しのレビュー (サブエージェント、読むだけ) の対応: 追いかけの止まり (`Elsewhere`、たどれる回数を使い切ったとき) の `item_not_found` にも照会の warnings を載せた (`item_error` が warnings を受け、`insert_warnings` で重ねずに)。決定 129 の記録の文を版の決め方ごとに書き分け、Cargo.lock の版はローカル機能ありの構成だけと添えた。テストを足した (warning が 1 度ずつ、semver 要件 `^0.2` が yanked の版だけに当たるときの warning)
 - 積み残しのレビューで残したもの: エラーの本文の `warnings` は R-ERR-2 の「該当するときだけ足すキー」に無いので、§7 の v0.21 で足す。再エクスポートをたどった先で item が無いとき、元の応答の warning は`… could not be looked up: item_not_found: <message>`だけで、行き先の R-FT-1 の warning と案内は落ちる (決定 128 の範囲外)。docs.rs が feature を欠かない release で `warnings` が出ないことの stdio のテストは無い (fixture が無い。単体の `missing_features` の空の場合は成功の応答のテストが押さえる)
 
+**H4 の実装 (2026-11-05)**: 決定 134。`build.rustc` の罠の stdio のテスト (`lookups_start_nothing_for_a_project_outside_the_default_one`) で、既定のプロジェクトに罠を置いたサーバーに偽の crates.io の API を渡し、最初に `search_crates` を呼んで、既定のプロジェクトでも何も起動しないことを確かめる (罠が効くことは、同じ位置で `list_crates` に替えると落ちることで確かめた)
+
+**H5 の実装 (2026-11-05)**: 決定 133。canary に 2 件: `tests/canary.rs` の `crates_io_api_answers_what_this_server_expects` (live の API で `crate_metadata` serde の `popularity` の `downloads` と `dependents`、`history` があり「… left out」の warning が無いこと、`search_crates` の `json` (DL 順、5 件) に serde_json が出ること) と、`tests/std_dist.rs` の `the_sources_of_std_are_had_from_the_distribution_server` (最新の nightly の JSON の後に `dist::rust_src` で manifest の rust-src を取り、キャッシュに置かれ、`library/core/src/option.rs`・`library/alloc/src/vec/mod.rs`・`library/std/src/lib.rs` があること)。canary.yml は `--ignored` で全件を回すので step は変えず、コメントと Issue の題と文に crates.io の API と rust-src を足した。ci.yml の testdata (3 OS) も std_dist を `--ignored` で回すので、rust-src のテストは `--skip` で canary だけにした。手元では通信しないので回しておらず、コミットの後に canary を手で回して確かめる
+
+- H4・H5 のレビュー (サブエージェント、読むだけ) の対応: rust-src のテストを CI の testdata から外した (上)。crate_metadata の判定を厳しくした (`history` に `rust_version` か `edition` の変わった版があること、`releases.last_release_at`。warning は「the downloads」「the count of dependents」「the history」で始まるもの (API が答えなかった、続きのページが来なかった、キャッシュの古い答えを使った) だけを数える。前の「 left out」は docs.rs の target の warning にも当たり、ページの途切れとキャッシュの古さには当たらなかった)。rust-src の `in_cache` は成功ならいつも真なので、ルートがキャッシュの下にあることと warning が無いことに替えた。罠のテストの `search_crates` は偽の API が効く debug ビルドだけで (release では live の crates.io に行く。補助の関数 `with_a_search_api`・`search_starts_nothing` に分けた)、外のプロジェクトの呼び出しの後にも既定のプロジェクトの印が無いことを確かめる。canary.rs の冒頭の doc のテストの数え方
+- H4・H5 のレビューで残したもの: crates.io の一時的な失敗 (429・5xx) でも canary は落ちて Issue が開く (翌日に通れば閉じる)。罠は cargo が rustc を呼ぶことだけを捉える (前から)
+
 聞かずに決めたこと: crate_metadata.md の無い構成の文と `refresh`、無い構成の instructions の版の規則は H1 で直す (説明と動きの食い違い)。段の順は H1 (説明文と instructions) → 積み残しのコード (決定 128・129・131) → H4 (決定 134) → H5 (決定 133) → H3 (README) → H2 (eval の全件、決定 124・126) → §7
 
 ## 7. M3 の終わり方
