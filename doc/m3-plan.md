@@ -440,6 +440,7 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 決定 86 (M3e、E2d) cargo metadata の example の target に `src_path` が無いとき (古い記録) は、決定 83 の走査に落とす
 - 決定 87 (M3e、E2d) プロジェクトの vendor した写し・別の registry の crate は、`examples/` を読まず warning を付けて doc のブロックだけを返す (エラーにしない)
 - 決定 88 (M3e、E2d) R11 (返した絶対パスを Claude Code の Read が開けるか) は E2d の終わりに headless の `claude -p` で、サーバーのキャッシュ・cargo の registry/src・cwd の中の 3 種を、Read を許さない・許す・`--add-dir` の 3 通りで試す。git の checkout は既にあるものを直接 Read させて代える。利用料と crates.io の index への通信はそのときに使う。Read が拒まれたときの対応は結果を見て決める
+- 決定 89 (M3e、E2d-4 の R11 の結果から) cwd の外の `path` を Read が開けないときに備え、README に `permissions.additionalDirectories` にキャッシュと `~/.cargo` を足す方法を書き、説明文に「開けなければ `content: true`」を添える。`content` の既定は false のまま
 
 **E2d の分け方**: E2d-1 (`here.rs` への移動、`examples/` の上限付きの走査と `[[example]]` の path、例を読む部分を根と一覧で一般化) → E2d-2 (find_examples に member・path・git と記録した git の crate、決定 87、git では版を渡さない、lib の名前の違う crate の `docs_from` と根の判定) → E2d-3 (std、決定 84・85、std_dist の計時) → E2d-4 (R11、決定 88)
 
@@ -452,6 +453,8 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 
 - E2d-3 のレビュー (サブエージェント、読むだけ。合わせた provenance の schema と、std で get_item が core・alloc をたどって正しい crate で並べることは問題なし) の対応: std では `refresh` が効かなかった (get_item の引数に渡していなかった。std は版の解決を通らないので、`for_examples` が std のときだけ `refresh` を渡す)。item を指さないときの hint は std のときだけ (core・alloc で自分を案内していた)。`docs_from` の比較で大文字小文字と `-`/`_` をそろえる。get_item の応答に答えが無ければログと `internal_error` (取得中の `data` の無い応答はそのまま)。`docs_from` の schema の説明を「版があれば」に。新しい stdio のテストの関数に `#[cfg(debug_assertions)]` (release でコンパイルできなかった)、呼び出しの id を離した。std_dist の計時テストの常に成り立つ確かめを、場所が 1 件はあること・正準パス・ブロックが 100 件を超えることに
 - E2d-3 のレビューで残したもの: std_dist の計時は `Origin::DocsRs` で呼び、本番の `Origin::Std` と `across::follow` を通らない。std の取得中の応答は `data` が無い (説明文の `data.docs: pending` と形が違う)。合わせた schema の単体テストは無い (stdio の応答の検査で見る)
+
+**E2d-4 (R11) の結果 (2026-11-04)**: release ビルドの server を `claude -p --strict-mcp-config --mcp-config <target/r11/mcp.json> --tools Read --setting-sources project` (Claude Code 2.1.318) で、`find_examples` が返した最初の例の `path` を Read で開かせた (6 回、合わせて約 0.45 USD、作業用のディレクトリは消した)。Read を許さないとき: cwd の中の member (`examples/hi.rs`) は読めた。サーバーのキャッシュ (compio 0.19.2 の `~/.cache/chatora-rustdoc-mcp/static.crates.io/…/src.v1/examples/basic.rs`) と cargo の registry/src (same-file 1.0.6。返したのは `~/.cargo` の symlink を解いた実パス `/opt/local/rust/.cargo/…`) は「許可が要る」で拒まれた。`--allowedTools …,Read` でも `--add-dir` (キャッシュ、`~/.cargo`) でも読めた。symlink の名前で足した `~/.cargo` は実パスにも効いた。git の checkout は cwd の外という点で registry/src と同じなので試していない。返す `path` はどれも開けるパスだった。決定 89 で README と説明文に案内を足した
 
 聞かずに決めたこと (前例のまま): `readme` の版の決め方は他のツールと同じ (`target` は版の決め方にだけ効く)。annotations は今の `annotations()` のまま。`required-features` は `.crate` の `[[example]]` から、member は cargo metadata から読む (`metadata::Target` に足す)。example の判定は Cargo の自動検出と同じにし、`examples/` の下の補助のモジュールは例として数えない。no_json の suggestions に `readme` を足すのは E3
 

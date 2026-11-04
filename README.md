@@ -69,6 +69,8 @@ The tools take a `project` argument to choose a workspace of the project, or one
 
 Every response says where its data came from (`provenance`): the crate, the version and how it was chosen, the target, whether docs.rs or a build here made it, and the features it was built with.
 
+`find_examples` gives the absolute paths of a crate's examples, for Claude Code to open with its `Read` tool. Those of the project are in its directory; those of a dependency are in this server's cache directory or in Cargo's (`~/.cargo/registry/src`, `~/.cargo/git/checkouts`), outside it, where Claude Code asks before it reads (and `claude -p` refuses). To let it read them, add those directories to `permissions.additionalDirectories` in your Claude Code settings, as `"additionalDirectories": ["~/.cache/chatora-rustdoc-mcp", "~/.cargo"]` on Linux and macOS (the cache directory is elsewhere on Windows, or with `XDG_CACHE_HOME`: see [Cache](#cache)); or ask with `content: true`, which gives the text of the files in the answer.
+
 ## When an answer is not ready
 
 The tools answer within 30 seconds (`limits.request_timeout_secs`); work that takes longer goes on in the background. A build of the project's documentation is waited for 15 seconds (`build.wait_secs`). Building this repository's own documentation (274 packages) took 51 to 114 seconds from nothing on a Linux machine of 12 CPUs, depending on the jobs, and about 7 seconds after an edit; on the runners of GitHub Actions (3 or 4 CPUs) it took 48 to 97 seconds on Linux, 102 to 181 on macOS and 114 to 231 on Windows from nothing, 8 to 15 seconds after an edit on macOS and Windows, and a dependency such as `axum` 14 to 17 seconds.
