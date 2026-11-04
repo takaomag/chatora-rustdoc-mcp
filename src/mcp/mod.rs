@@ -67,9 +67,9 @@ pub(crate) const INSTRUCTIONS: &str = const_format::concatcp!(
     FIND,
     "`crate_overview`, `list_module` or `search_items`; for the item itself, `get_item`; for \
      what a type or trait has, `list_methods`, `list_impls` or `list_implementors`; for a crate's \
-     features, README or examples, `inspect_features`, `get_readme` or `find_examples`; for its \
-     license, MSRV or upkeep, `crate_metadata`; to find a crate, `search_crates`. None needs an \
-     earlier call (but see below): give the crate or path directly.",
+     features, README, examples or changes, `inspect_features`, `get_readme`, `find_examples` or \
+     `get_changelog`; for its license, MSRV or upkeep, `crate_metadata`; to find a crate, \
+     `search_crates`. None needs an earlier call: pass the crate or path.",
     EXTERNAL,
     "\n",
     VERSIONS,

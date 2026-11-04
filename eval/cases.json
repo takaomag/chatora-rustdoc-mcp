@@ -133,6 +133,13 @@
     "answer": ["Router"]
   },
   {
+    "id": "q14-changelog",
+    "question": "Q14",
+    "prompt": "What changed in tokio from 1.52 to 1.53? Name a few of the changes.",
+    "tools": ["get_changelog"],
+    "answer": ["\\b1\\.53\\.0\\b", "OwnedFd|schedule latency|UCred|NuttX|track_caller"]
+  },
+  {
     "id": "q15-metadata",
     "question": "Q15",
     "prompt": "What are serde's MSRV and license, and is it still maintained?",

@@ -608,6 +608,11 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 
 - G1b (aad9569) の CI: testdata の 3 job が落ちた。実データの道具が crate を渡す呼び出しにはどれも `target` を付けるので、`get_changelog` が断っていた (`crate_metadata` と同じく schema に載せずに受け流す。断るのは `version` だけ)。`check (ubuntu-latest)` の crates_io の単体テストが 1 度落ちた (1 つの偽のサーバーに応答を並べていたので、最初の要求の接続が切れると送り直しが次の応答を取る。場合ごとにサーバーを分けた)。直しは G1c のコミットに入れた。canary は緑
 
+**G1d の実装 (2026-11-04)**: instructions の呼ぶ順を「for a crate's features, README, examples or changes, `inspect_features`, `get_readme`, `find_examples` or `get_changelog`」にし、字数のため「(but see below)」を外し (直後に `build_external_docs` を先に呼ぶ場合の文が続く)、「give the crate or path directly」を「pass the crate or path」に縮めた (ローカル機能ありで 2,046 字)。crate_overview.md に「版の間の変更は `get_changelog`」、crate_metadata.md の `history` に「else: `get_changelog`」(字数のため `declared` の「or the old」を「or old」、`history` のバックポートの注を「(a backport within its line)」に縮めた)。eval に `q14-changelog` (tokio の 1.52 から 1.53 で何が変わったか。tools は `get_changelog`、答えに 1.53.0 と、その節の中身の語 OwnedFd・schedule latency・UCred・NuttX・track_caller のどれか) を足した (決定 122)。eval (2026-11-04、既定のモデル、1 回): 合格 (`get_changelog` を 1 回、0.28 USD)
+
+- G1d のレビュー (サブエージェント、読むだけ。字数を Python で数えた) の対応: `history` の license_file の注は、過去の版の license が欠ける理由で `declared` の注 (今の版) と重ならないので戻した (「or a `license_file`」)。q14 の答えの正規表現は版の番号しか見ず「取得できなかった」でも通るので、1.53.0 の節の中身の語のどれかを足した (前回の答えに当たる)
+- G1d のレビューで残したもの: instructions はローカル機能ありで残り 2 字 (次に案内を足すときは縮める所を先に決める)。「None needs an earlier call」の直後に `build_external_docs` を先に呼ぶ例外が続く (合図の「(but see below)」は字数で外した)。ローカル機能の無い構成の版の規則は「version を渡せ」と言うが `get_changelog` は `version` を取らない (エラーで `from`/`to` を案内する。M3h で見直す)
+
 聞かずに決めたこと: 本文の見えない文字は決定 66 と同じく印を付けて warning。GitHub releases と token (P9 の G2) は G2 に入るときに決める。段の分け方は G1a (データ層: ファイルの選び方・版の見出し・範囲) → G1b (ツール、crates.io) → G1c (ローカル) → G1d (案内と eval)
 
 ## 7. M3 の終わり方
