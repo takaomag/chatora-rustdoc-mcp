@@ -591,6 +591,11 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 決定 121 (M3g) std・core・alloc は `invalid_argument` で断り、Rust のリリースノートはまだ引けないことと、`get_item` の `stability` (since の版) を案内する
 - 決定 122 (M3g) eval に `q14-changelog` を足し、最後の段で手で 1 回回す
 
+**G1a の実装 (2026-11-04)**: データ層。`data::changelog` に changelog のファイルの選び方 (`chosen`: 決定 118 の名前の順・拡張子の順、`is_changelog`、`is_markdown`。拡張子なしは Markdown として読む)。`query::changelog` に版の見出しの解釈 (`releases`: `outline` の見出しを `plain` で整え、先頭の `[`・`(`、`Version`・`Release`・`CHANGES WITH`・crate 名、`v` の後の版。2 つ組は `.0` を補う。日付は ISO、yanked の印。Unreleased・Upcoming・HEAD)、リリースの行の範囲 (`lines_of`)、範囲の端 `Bound` (全部の版か、1〜2 つの部分) と `in_range` (決定 114)。`plain` と `MAX_PLAIN_INPUT` を `get_readme` から `query::markdown` に移した (`get_readme` の動きは変えない)。手元の registry の 404 本で測った: リリース 10,724 (下調べの 10,605 とほぼ同じ)、その crate の最新版の節が見つかったのは 363、版の見出しが 1 つも無いのは 5 (下調べの 3 と、移行の説明の rustix、ディレクトリの bnum。ディレクトリはツールの段でファイルに限る)。r-efi の `CHANGES WITH 5.3.0:` は測って足した
+
+- G1a のレビュー (サブエージェント、読むだけ。解析を Python に写して実物の registry に当て、件数が合うことを確かめた) の対応: release-plz の見出し (parking_lot の `## parking_lot - [0.12.5](…) - 日付` の形。名前はコードの印付き) を拾えず、空の Unreleased に 2 つのリリースが入っていた (crate 名の後の `-`・`:`・`@`・`—` も読み飛ばす)。主な段 (版がそれだけで立つ見出しで最も多い段) より深い見出しは版がそれだけで立つときだけリリースにし、直前のリリースと同じ版なら捨てる (pmcp の `### v1.3 MCP Apps`・rayon の入れ子の重複)。2 つ組の版の後に語が続く見出し (`## 1.2 Introduction`) はリリースにしない。主な段以上の深さの「別の名前 + 版」の見出し (`parking_lot_core 0.9.9`) と、末尾のリンクのラベルの定義の塊で節を切る (`Releases::ends`)。範囲の比べ方は build metadata を見ない (`cmp_precedence`)。`lines_of` は無い節に `None`。Unreleased に `vNext` と `[2.16.0] - Unreleased` を足した。`cut` を `query::markdown` に 1 つにした。測り直した: リリース 10,713 (重複と偽を除いた)、最新版の節が見つかったのは 364、版の見出しが無いのは 4 (下調べの 3 と rustix)、節の終わり 118
+- G1a のレビューで残したもの: ファイルの順に返すので、新しい順の `limit` と `from` が `to` より新しい範囲の扱いは G1b で。日付は ISO の形だけ (`October 19th, 2026` は取らない)、取り消し線は yanked にしない。rayon の `Release rayon 1.11.0 / rayon-core 1.13.0` の 2 つ目の名前は拾わない (決定 119 で rayon-core が workspace の changelog を読むとき)。`Release.heading` は印を付ける前なので、出すときに `hidden::mark` を通す (G1b)
+
 聞かずに決めたこと: 本文の見えない文字は決定 66 と同じく印を付けて warning。GitHub releases と token (P9 の G2) は G2 に入るときに決める。段の分け方は G1a (データ層: ファイルの選び方・版の見出し・範囲) → G1b (ツール、crates.io) → G1c (ローカル) → G1d (案内と eval)
 
 ## 7. M3 の終わり方

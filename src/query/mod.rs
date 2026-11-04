@@ -2,6 +2,7 @@
 
 pub mod across;
 pub mod cfg;
+pub mod changelog;
 pub mod crate_metadata;
 pub mod docs;
 pub mod examples;

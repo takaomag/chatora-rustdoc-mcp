@@ -1751,18 +1751,7 @@ fn excerpt(
 
 /// `line` cut to at most `max` characters, but not within a mark such as `<U+202E>`.
 pub(super) fn cut(line: &str, max: usize) -> &str {
-    let end = line
-        .char_indices()
-        .nth(max)
-        .map_or(line.len(), |(at, _)| at);
-    let kept = line.get(..end).unwrap_or(line);
-    // A mark begun and not ended goes whole.
-    match kept.rfind("<U+") {
-        Some(at) if !kept.get(at..).unwrap_or_default().contains('>') => {
-            kept.get(..at).unwrap_or(kept)
-        },
-        Some(_) | None => kept,
-    }
+    crate::query::markdown::cut(line, max)
 }
 
 #[cfg(test)]

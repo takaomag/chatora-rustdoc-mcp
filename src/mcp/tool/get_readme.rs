@@ -34,7 +34,7 @@ use crate::{
     },
     query::{
         get_item::MAX_RESPONSE_CHARS,
-        markdown::{self, Heading},
+        markdown::{self, Heading, plain},
     },
 };
 
@@ -67,10 +67,6 @@ const SECTION_EXAMPLE: &[&str] =
 /// What to call when the readme is not to be had.
 const OVERVIEW: &str =
     "crate_overview gives the crate's root documentation, which often tells how to start";
-
-/// The most characters of a heading that are made plain: the rest is not looked at, so that a
-/// heading of megabytes costs no more than one of a line (requirement R-ARCH-6).
-const MAX_PLAIN_INPUT: usize = 400;
 
 /// What is asked of the readme, besides the release.
 #[derive(Debug)]
@@ -566,115 +562,6 @@ fn page(text: &str, starts: &[usize], from: usize, max: usize) -> Page {
         cut_line,
         marked,
     }
-}
-
-/// `heading` as the outline shows it and `section` is matched against: without the links' and
-/// images' targets, HTML tags, entities, and the marks of emphasis and code, its spaces folded.
-fn plain(heading: &str) -> String {
-    let mut out = String::new();
-    strip(get_source::cut(heading, MAX_PLAIN_INPUT), &mut out);
-    let folded = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    folded.trim_end_matches(':').trim_end().to_owned()
-}
-
-/// Appends `text` to `out` without what [`plain`] leaves out.
-fn strip(text: &str, out: &mut String) {
-    let mut rest = text;
-    while let Some(c) = rest.chars().next() {
-        let after = rest.get(c.len_utf8()..).unwrap_or_default();
-        // An image, as a badge: left out.
-        if c == '!'
-            && after.starts_with('[')
-            && let Some(end) = image(after)
-        {
-            rest = after.get(end..).unwrap_or_default();
-            out.push(' ');
-            continue;
-        }
-        // A link: its text.
-        if c == '['
-            && let Some((inner, end)) = link(rest)
-        {
-            strip(inner, out);
-            rest = rest.get(end..).unwrap_or_default();
-            continue;
-        }
-        // An HTML tag.
-        if c == '<'
-            && let Some(end) = rest.find('>')
-        {
-            out.push(' ');
-            rest = rest.get(end.saturating_add(1)..).unwrap_or_default();
-            continue;
-        }
-        // An entity, as `&emsp;`.
-        if c == '&'
-            && let Some(end) = rest.find(';').filter(|&end| {
-                (2..=10).contains(&end)
-                    && rest.get(1..end).is_some_and(|name| {
-                        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '#')
-                    })
-            })
-        {
-            out.push(' ');
-            rest = rest.get(end.saturating_add(1)..).unwrap_or_default();
-            continue;
-        }
-        if !matches!(c, '*' | '`' | '~') {
-            out.push(c);
-        }
-        rest = after;
-    }
-}
-
-/// The text of the link that `text` starts with (`[text](target)` or `[text][label]`), and where
-/// it ends; `None` when `text` does not start one.
-fn link(text: &str) -> Option<(&str, usize)> {
-    let close = matching(text, '[', ']')?;
-    let inner = text.get(1..close)?;
-    let after = text.get(close.saturating_add(1)..)?;
-    let target = match after.chars().next() {
-        Some('(') => matching(after, '(', ')')?,
-        Some('[') => matching(after, '[', ']')?,
-        _ => return None,
-    };
-    Some((
-        inner,
-        close
-            .saturating_add(1)
-            .saturating_add(target)
-            .saturating_add(1),
-    ))
-}
-
-/// Where the image whose alternative text `text` starts with (`[alt]`, then `(target)` or
-/// `[label]` if any) ends.
-fn image(text: &str) -> Option<usize> {
-    let close = matching(text, '[', ']')?;
-    let after = close.saturating_add(1);
-    let rest = text.get(after..)?;
-    let target = match rest.chars().next() {
-        Some('(') => matching(rest, '(', ')').map(|end| end.saturating_add(1)),
-        Some('[') => matching(rest, '[', ']').map(|end| end.saturating_add(1)),
-        _ => None,
-    };
-    Some(after.saturating_add(target.unwrap_or_default()))
-}
-
-/// Where the `close` that matches the `open` that `text` starts with is, nested ones counted.
-fn matching(text: &str, open: char, close: char) -> Option<usize> {
-    let mut depth = 0_usize;
-    for (at, c) in text.char_indices() {
-        if c == open {
-            depth = depth.saturating_add(1);
-        } else if c == close {
-            depth = depth.saturating_sub(1);
-            if depth == 0 {
-                return Some(at);
-            }
-        }
-    }
-    None
 }
 
 /// The heading of `outline` that `asked` names: the same, but for case and what [`plain`] leaves
@@ -1366,7 +1253,7 @@ mod tests {
         let started = std::time::Instant::now();
         let nested = format!("{}a{}", "[".repeat(200_000), "](x)".repeat(200_000));
         for heading in [nested, "[".repeat(1_000_000), "<&".repeat(500_000)] {
-            assert!(plain(&heading).chars().count() <= MAX_PLAIN_INPUT);
+            assert!(plain(&heading).chars().count() <= markdown::MAX_PLAIN_INPUT);
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),

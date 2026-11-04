@@ -14,6 +14,7 @@ pub mod cargo_config;
 pub mod cargo_lock;
 #[cfg(feature = "local")]
 mod cargo_tree;
+pub mod changelog;
 #[cfg(feature = "local")]
 pub mod child;
 pub mod clear;
