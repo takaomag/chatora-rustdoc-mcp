@@ -17,6 +17,7 @@ use semver::Version;
 use super::{
     cache::Cache,
     crate_name::CrateName,
+    crates_io::CRATES as API_CRATES,
     gc::{self, NotRun, Outcome, Reason, Removal},
     inventory::{self, Entry, Kind},
     layout,
@@ -171,6 +172,10 @@ fn covers(root: &Path, asked: &Asked, entry: &Entry) -> bool {
         // fetch it that is remembered next to it.
         (Kind::Index, [.., file]) => {
             version.is_none() && is(file.strip_suffix(".miss.json").unwrap_or(file))
+        },
+        // What the API said of the crate is of every version too.
+        (Kind::Api, [top, _, place, crate_name]) if *top == layout::CRATES_IO => {
+            version.is_none() && *place == API_CRATES && is(crate_name)
         },
         #[cfg(feature = "local")]
         (Kind::External, _) => external::covers(root, &entry.path, (&key, version.as_ref())),
@@ -375,6 +380,10 @@ mod tests {
         write(root, "index.crates.io/se/rd/serde_json.meta.json", "{}");
         write(root, "index.crates.io/se/rd/serde_json.miss.json", "{}");
         write(root, "index.crates.io/se/rd/serde", "");
+        write(root, "crates.io/v1/crates/serde-json/crate.json", "{}");
+        write(root, "crates.io/v1/crates/serde-json/versions.json", "{}");
+        write(root, "crates.io/v1/crates/serde/crate.json", "{}");
+        write(root, "crates.io/v1/search/0123.json", "{}");
         write(root, "t/0123456789ab/target/x", "");
         write(root, "locks/a", "");
         write(root, "work/0123/x", "");
@@ -402,7 +411,9 @@ mod tests {
             "docs.rs/serde-json/1.0.0+extra/_default"
         ]);
         let outcome = clear(&cache, &serde(None), false).expect("cleared");
-        assert_eq!(removed(&outcome).len(), 8, "{outcome:?}");
+        assert_eq!(removed(&outcome).len(), 9, "{outcome:?}");
+        // What the API said of it, of every version (decided in M3f, decision 94).
+        assert!(removed(&outcome).contains(&"crates.io/v1/crates/serde-json".to_owned()));
         assert!(removed(&outcome).contains(&"index.crates.io/se/rd/serde_json".to_owned()));
         assert!(
             removed(&outcome).contains(&"index.crates.io/se/rd/serde_json.miss.json".to_owned())
@@ -417,6 +428,8 @@ mod tests {
         );
         assert!(root.join("docs.rs/serde/1.0.0/_default/61.json").exists());
         assert!(root.join("index.crates.io/se/rd/serde").exists());
+        assert!(root.join("crates.io/v1/crates/serde/crate.json").exists());
+        assert!(root.join("crates.io/v1/search/0123.json").exists());
         assert!(root.join("t/0123456789ab/target/x").exists());
     }
 
@@ -442,6 +455,7 @@ mod tests {
         let mut kept = vec![
             layout::CACHEDIR_TAG,
             "config.toml",
+            "crates.io",
             "docs.rs",
             "index.crates.io",
             "locks",
@@ -453,6 +467,7 @@ mod tests {
         kept.sort_unstable();
         assert_eq!(left, kept);
         assert!(!root.join("docs.rs/serde").exists());
+        assert!(!root.join("crates.io/v1/search/0123.json").exists());
         assert_eq!(root.join("t/0123456789ab").exists(), !builds);
         assert!(root.join("work/0123/x").exists());
         assert!(root.join("locks/a").exists());

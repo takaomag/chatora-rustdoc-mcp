@@ -532,6 +532,11 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - F1a のレビュー (サブエージェント、読むだけ) の対応: 決定 95 を改めた (利用者が追加の 3 要求の実測を許した)。`?include=default_version` の応答は `max_version`・`newest_version` が `0.0.0`、`max_stable_version`・`recent_downloads` が null で、版を読み違える。`include=downloads` (957 バイト) なら `recent_downloads` と `default_version` が入るので、crate はこれで引き、最新版・最新の安定版は sparse index から取る (検索の応答の版は正しい)。テストの応答も実際の形にした。`Pacer` は予約方式にした (列の後ろでも、順番が期限の後なら待たずに断る。送り直しの待ちも順番に含め、期限を越えるなら送らない。断念した順番は空けたままにする)。プロセスに 1 つ (`static`)。crates.io のクライアントはリダイレクトを追わない (順番の外で送らないため)。`reqwest::Error` の文には URL (検索語) が入るので `without_url` で落とす。最初の順番の待ちは要求の時間 (R-OBS-1) に入れない。`next_page` を読めなければ warning
 - F1a のレビューで残したもの: 間隔は送り出しの時刻どうしで測る (応答が 1 秒より遅ければ 2 本が重なる)。カーソルは seek・page を q・sort・per_page と束ねて照合する (F3a)
 
+**F1b の実装 (2026-11-04)**: API の応答をキャッシュの `crates.io/v1/` に置く (形式の版は `formats::api_dir`)。crate ごとに `crates/<鍵>/` (`crate.json`・`versions.json`・続きの頁は `versions-<鍵>.json`・`dependents.json`)、検索は `search/<頼んだ内容の SHA-256 の前半>.json` (検索語そのものは書かない)。中身は `{fetched_at, value}`。若いうちは使い、`fresh` なら取り直す (検索は取らない)。API が答えないとき・offline のときは古さによらず代わりに使い、`stale` に理由。404・URL の誤り・キャッシュの読めないときは代わりにしない。一時的な失敗 (5xx・通信) は `.miss.json` で 30 秒覚え、`forget` で忘れる。在庫の分類 `api` (crate ごと・検索ごとに 1 か所。他の形式の版は `OtherFormat`)、GC は docs の上限で、`cache clear <crate>` (版の指定なし) で crate の分を消す
+
+- F1b のレビュー (サブエージェント、読むだけ) の対応: ロックの単位を在庫の単位 (crate のディレクトリ、検索のファイル) にそろえ、GC・clear と排他する。ロックは `until` までしか待たず、間に合わなければ残っている応答を `stale` で返し、無ければ `NoTurn`。`crates.io` は引き取りの判定の名前 (DISTINCTIVE) から外す (印を書く版しか作らず、crates.io のリポジトリの clone も同じ名前)。offline の `stale` の文を分けた。テストを足した (在庫、壊れたファイルの取り直し、続きの頁、同時の頼み、ロックの期限、`forget` の前の記憶)
+- F1b のレビューで残したもの: 404 は覚えない (F2 は index で先に絞るので、無い crate を API に聞かない)。`fresh` は回数で絞らない (`refresh` のときだけ)。検索のファイル名は塩なしのハッシュで、短い語なら推測でき、結果の `exact_match` からも分かる (README に書く。F3b)。symlink を通した書き込みと読めないキャッシュの扱いは sparse index と同じ既存の型
+
 聞かずに決めたこと: index に版があり API が 404 を返すとき (公開の直後など) は決定 93 と同じく API の項目を省いて warning にする。API の要求の数と待ちはログだけに出し、応答には入れない (R13)。
 
 ## 7. M3 の終わり方

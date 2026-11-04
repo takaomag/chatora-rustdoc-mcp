@@ -35,6 +35,8 @@ pub enum Kind {
     Index,
     /// The `.crate` files of a release.
     Crate,
+    /// The answers of the crates.io API about a crate, or to a search.
+    Api,
     /// What the toolchains were found to do, which is small and not removed by its age.
     Toolchains,
     /// A target directory of the local builds.
@@ -62,6 +64,7 @@ impl Kind {
             Self::DocsRs => "docs.rs JSON",
             Self::Std => "std",
             Self::Index => "index",
+            Self::Api => "api",
             Self::Crate => ".crate",
             Self::Toolchains => "toolchains",
             Self::TargetDir => "target dir",
@@ -175,6 +178,7 @@ impl Taking<'_> {
             layout::STD => self.std(),
             layout::STATIC_CRATES => self.levels(name, (Kind::Crate, 2), Kind::Crate),
             layout::INDEX => self.index(),
+            layout::CRATES_IO => self.versioned((name, &formats::api_dir()), Kind::Api, 2),
             layout::TOOLCHAINS => self.place(Path::new(name), Kind::Toolchains, class),
             layout::TARGETS => self.levels(name, (Kind::TargetDir, 1), Kind::TargetDir),
             layout::LOCAL => self.versioned((name, &formats::local_dir()), Kind::Local, 4),
@@ -220,6 +224,20 @@ impl Taking<'_> {
                         && layout::EXTERNAL_INDEXES.contains(&grandchild.as_str())
                     {
                         self.place(&path, kind, class);
+                        continue;
+                    }
+                    // A search of the crates.io API is a file of its own.
+                    if name == layout::CRATES_IO && grandchild == layout::API_SEARCHES {
+                        self.under(&path, 1, &mut |taking, path, _| {
+                            let is_file = fs::symlink_metadata(taking.root.join(path))
+                                .is_ok_and(|metadata| metadata.is_file());
+                            let (kind, class) = if is_file {
+                                (kind, class)
+                            } else {
+                                (Kind::Unknown, None)
+                            };
+                            taking.place(path, kind, class);
+                        });
                         continue;
                     }
                     self.under(
@@ -376,6 +394,7 @@ fn about(path: &Path, kind: Kind) -> Option<String> {
         | Kind::Std
         | Kind::Index
         | Kind::Crate
+        | Kind::Api
         | Kind::Toolchains
         | Kind::External
         | Kind::OldLayout
@@ -483,6 +502,12 @@ mod tests {
         write(root, "static.crates.io/serde/1.0.0/src.v1.json", 2);
         write(root, "index.crates.io/se/rd/serde", 2);
         write(root, "index.crates.io/se/rd/serde.meta.json", 3);
+        write(root, "crates.io/v1/crates/serde/crate.json", 3);
+        write(root, "crates.io/v1/crates/serde/versions.json", 4);
+        write(root, "crates.io/v1/search/0123.json", 5);
+        write(root, "crates.io/v1/search/4567.json", 6);
+        write(root, "crates.io/v1/search/odd/x", 1);
+        write(root, "crates.io/v0/crates/serde/crate.json", 1);
         write(root, "t/0123456789ab/target/debug/a", 100);
         write(root, "local/v1/ws/pkg/x86_64/lib/61.json", 40);
         write(root, "local/v2/whatever", 3);
@@ -512,6 +537,19 @@ mod tests {
         // The sources of std, apart from the JSON (decided in M3b, decision 21).
         let sources = entry(&inventory, "std/abc123/src.v1");
         assert_eq!((sources.kind, sources.bytes), (Kind::Std, 9));
+        // The answers of the crates.io API: a crate's together, and each search apart (decided
+        // in M3f, decision 94).
+        let api = entry(&inventory, "crates.io/v1/crates/serde");
+        assert_eq!(
+            (api.kind, api.class, api.bytes),
+            (Kind::Api, Some(Class::Docs), 7)
+        );
+        assert_eq!(entry(&inventory, "crates.io/v1/search/4567.json").bytes, 6);
+        assert_eq!(
+            entry(&inventory, "crates.io/v1/search/odd").kind,
+            Kind::Unknown
+        );
+        assert_eq!(entry(&inventory, "crates.io/v0").kind, Kind::OtherFormat);
         let index = entry(&inventory, "index.crates.io/se/rd/serde");
         assert_eq!((index.kind, index.bytes), (Kind::Index, 5));
         assert!(

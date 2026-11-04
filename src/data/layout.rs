@@ -38,6 +38,10 @@ pub const DOCS_RS: &str = "docs.rs";
 pub const INDEX: &str = "index.crates.io";
 /// The `.crate` files of static.crates.io.
 pub const STATIC_CRATES: &str = "static.crates.io";
+/// The answers of the crates.io API (decided in M3f, decision 94).
+pub const CRATES_IO: &str = "crates.io";
+/// The directory of the searches under the format's directory in [`CRATES_IO`]: a file each.
+pub const API_SEARCHES: &str = "search";
 /// The JSON of std and its archives.
 pub const STD: &str = "std";
 /// What the toolchains were found to do.
@@ -87,7 +91,7 @@ pub enum Class {
 #[must_use]
 pub fn class_of(name: &str) -> Option<Class> {
     match name {
-        DOCS_RS | INDEX | STATIC_CRATES | STD | TOOLCHAINS => Some(Class::Docs),
+        DOCS_RS | INDEX | STATIC_CRATES | CRATES_IO | STD | TOOLCHAINS => Some(Class::Docs),
         TARGETS | LOCAL | EXTERNAL => Some(Class::Targets),
         LOCKS | RECORDS | WORK | MARKER | CACHEDIR_TAG => Some(Class::Kept),
         _ => None,
@@ -243,6 +247,8 @@ pub fn unknown_names(root: &Path) -> io::Result<Vec<String>> {
 
 /// The names that only this server puts at the top of its cache, one of which a directory without
 /// the marker has to have to be adopted.
+// Not `CRATES_IO`: only a version that writes the marker puts it there, and a clone of the
+// crates.io repository has that name too.
 const DISTINCTIVE: [&str; 5] = [DOCS_RS, INDEX, STATIC_CRATES, TOOLCHAINS, RECORDS];
 
 /// The names at the top of the cache directory at `root`, none when it is not there, and those of

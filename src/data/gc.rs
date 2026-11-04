@@ -432,6 +432,7 @@ pub fn plan<S: BuildHasher, T: BuildHasher>(
             | Kind::Std
             | Kind::Index
             | Kind::Crate
+            | Kind::Api
             | Kind::Toolchains
             | Kind::Kept
             | Kind::Unknown => None,
@@ -587,6 +588,7 @@ fn held(cache: &Cache, removal: &Removal) -> Option<Vec<Held>> {
         | Kind::Std
         | Kind::Index
         | Kind::Crate
+        | Kind::Api
         | Kind::Toolchains
         | Kind::Local
         | Kind::OldLayout
@@ -830,6 +832,7 @@ mod tests {
             | Kind::Std
             | Kind::Index
             | Kind::Crate
+            | Kind::Api
             | Kind::Toolchains
             | Kind::OldLayout
             | Kind::OtherFormat => Some(Class::Docs),

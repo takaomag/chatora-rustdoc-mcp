@@ -382,6 +382,12 @@ impl Cache {
             .join(version.to_string())
     }
 
+    /// Where the answers of the crates.io API are kept, in a directory for each format.
+    #[must_use]
+    pub fn crates_io_dir(&self) -> PathBuf {
+        self.root.join(super::layout::CRATES_IO)
+    }
+
     /// Where the crates.io sparse index file at `index_path` (`se/rd/serde`) is kept. The record
     /// of how it was fetched is next to it, with `.meta.json` added (no crate name has a `.`).
     #[must_use]

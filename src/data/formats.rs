@@ -18,6 +18,8 @@ const TOOLCHAINS: u32 = 1;
 /// The sources unpacked from a `.crate`, and the listing of its files, beside it under
 /// `static.crates.io/` (decided in M3b, B1-1).
 const SOURCES: u32 = 1;
+/// The answers of the crates.io API, under `crates.io/` (decided in M3f, decision 94).
+const API: u32 = 1;
 /// The schema of the archives of rustdoc JSON (requirement R-CA-2): change it with the types that
 /// an archive holds, other than those of rustdoc-types, whose `FORMAT_VERSION` is in the header and
 /// the name of the archive too.
@@ -52,6 +54,12 @@ pub fn toolchains_dir() -> String {
 #[must_use]
 pub fn sources_dir() -> String {
     format!("src.{}", dir(SOURCES))
+}
+
+/// The directory of the answers of the crates.io API of this format: `v<n>`.
+#[must_use]
+pub fn api_dir() -> String {
+    dir(API)
 }
 
 /// The schema of the archives of rustdoc JSON.
