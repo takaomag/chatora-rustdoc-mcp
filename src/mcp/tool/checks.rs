@@ -426,9 +426,10 @@ fn schemas_are_plain_and_their_roots_are_objects() {
     }
 }
 
-/// With local features, every tool may run cargo or rustc, so none is read-only; without them,
-/// none runs anything (requirement R-MCP-4). Each may reach docs.rs or crates.io. Only
-/// `build_external_docs` does again what it did when called again (requirement R-WS-10).
+/// With local features, every tool may run cargo or rustc, so none is read-only but
+/// `search_crates`, which only reads crates.io; without them, none runs anything (requirement
+/// R-MCP-4). Each may reach docs.rs or crates.io. Only `build_external_docs` does again what it did
+/// when called again (requirement R-WS-10).
 #[test]
 fn annotations_say_what_the_tools_may_do() {
     for tool in tools() {
@@ -438,7 +439,7 @@ fn annotations_say_what_the_tools_may_do() {
             .unwrap_or_else(|| panic!("{name} has no annotations"));
         assert_eq!(
             annotations.read_only_hint,
-            Some(!cfg!(feature = "local")),
+            Some(!cfg!(feature = "local") || name == "search_crates"),
             "{name}"
         );
         assert_eq!(annotations.destructive_hint, Some(false), "{name}");

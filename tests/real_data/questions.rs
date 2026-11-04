@@ -314,9 +314,32 @@ fn metadata_questions() -> Vec<Question> {
     ]
 }
 
+/// The questions about finding a crate (decided in M3f).
+fn search_questions() -> Vec<Question> {
+    vec![
+        question(
+            "search_crates",
+            "which crate should I use to parse JSON?",
+            json!({ "query": "json", "sort": "downloads", "limit": 5 }),
+            |result| has(&result["data"]["crates"], "serde_json"),
+        ),
+        question(
+            "search_crates",
+            "is there a crate for rate limiting?",
+            json!({ "query": "rate limiting" }),
+            |result| {
+                result["page"]["total"]
+                    .as_u64()
+                    .is_some_and(|total| total > 0)
+            },
+        ),
+    ]
+}
+
 fn questions() -> Vec<Question> {
     let mut questions = item_questions();
     questions.extend(metadata_questions());
+    questions.extend(search_questions());
     questions.extend(feature_questions());
     questions.extend(readme_questions());
     questions.extend(example_questions());

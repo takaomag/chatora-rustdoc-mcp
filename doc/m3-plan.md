@@ -560,6 +560,12 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - F2c のレビュー (サブエージェント、読むだけ。手元の cargo_metadata 0.23.1 の型で項目名を照らした) の対応: crates.io 外の答えも `respond` を通し、応答の予算で依存を減らす (残りはそのパッケージの Cargo.toml と案内)。warning の文を source ごとに (workspace member か path の依存・git の crate・ほかの registry・写しは「crates.io のリリースと確かめられない」)。git の継承の warning は応答の項目だけに絞り、応答の名前 (`rust_version`) で。説明文の edition に継承の但し書き。単体テスト (cargo metadata の断片から宣言と依存の写し、改名の向き、build と dev、Cargo.toml の継承の判定) を足した
 - F2c のレビューで残したもの: 写しの経路の stdio のテストは無い (vendor の写しを作る準備が要る)。cargo を待つ間の応答の中身は stdio のテストの繰り返しで通るだけ
 
+**F3a の実装 (2026-11-04)**: 新しいツール `search_crates`。引数は `query` (必須、200 字まで)・`sort` (relevance・downloads・recent-downloads・recent-updates・new)・`limit` (既定 10、上限 50)・`cursor`。crates.io の検索の 1 要求の項目だけを返す (name・description・latest_stable・latest・downloads・recent_downloads・repository・updated_at・exact_match)。cursor は `s1.<query・sort・limit の digest>.<p 頁 か s seek>` (crates.io の `next_page` を丸ごと送り返さない)。provenance は `source`・`fetched_at`・`sort` (決定 102)。`refresh` を取らず (共通の付与から外す)、`readOnlyHint: true` (検査の例外に足した)。0 件なら語を減らす・言い換える案内 (R-SR-6)、そうでなければ `crate_metadata` と、relevance なら downloads の案内。答えられなければ `network_error` (offline でキャッシュも無ければ `offline_miss`)。README の表・接続先 (検索語を送る、キャッシュはハッシュで 1 時間)・Planned。単体・stdio (偽の API で頁・保持・別の検索の cursor の拒否)・実データの問い (Q16 の 2 問) と引数のケース
+
+- 決定 111 (M3f、F3a のレビューで利用者が決めた) `search_crates` の検索語は呼び出しのログに他の引数と同じく残し、README の接続先にそのことを書く
+- F3a のレビュー (サブエージェント、読むだけ) の対応: local の構成で `refresh` を持つかの単体テストが落ちる (例外に足した)。エラーの割り振りを他のツールにそろえた (キャッシュと URL は `internal_error`、`retryable` ごとの suggestions、offline の案内、`RecentFailure` に `retry_after_secs`)。crates.io が cursor を 4xx で断れば `invalid_argument`。応答の予算を超えたら description を 200 字に詰めて warning (seek の頁は途中で切れない)。頁番号は数字だけで 2 以上。`sort`・`cursor` の null は無いものとする。最後の空の頁の案内を分けた。版は版の上限 (100 字) で切る。`crate_metadata` の案内に yanked を足した。テストを足した (別の query・limit の cursor、`p1`・`p0`・`p+3`・`p03`・長すぎる seek、null、0 件の案内)
+- F3a のレビューで残したもの: cursor の形 (`s1.<digest>.<頁>`) は要件 R-OUT-3 の `c1.` の形と違う (M3 の終わりに要件に書く)。search_crates の stdio のテストは local の構成だけ (偽のレジストリが local 限定)。決定 102 の「骨格の検査の例外」は、ツールごとの provenance の必須を検査するものが無く、登録先が無い
+
 聞かずに決めたこと: index に版があり API が 404 を返すとき (公開の直後など) は決定 93 と同じく API の項目を省いて warning にする。API の要求の数と待ちはログだけに出し、応答には入れない (R13)。
 
 ## 7. M3 の終わり方

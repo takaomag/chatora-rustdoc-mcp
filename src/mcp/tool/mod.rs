@@ -42,6 +42,7 @@ mod recorded_git;
 mod recorded_workspace;
 mod resolve_version;
 mod search_across;
+mod search_crates;
 mod search_items;
 #[cfg(debug_assertions)]
 mod sleep;
@@ -436,6 +437,7 @@ pub(super) fn definitions() -> Vec<Tool> {
         list_methods::definition(),
         list_module::definition(),
         resolve_version::definition(),
+        search_crates::definition(),
         search_items::definition(),
     ];
     #[cfg_attr(
@@ -461,6 +463,11 @@ pub(super) fn definitions() -> Vec<Tool> {
 fn with_refresh(mut tool: Tool) -> Tool {
     #[cfg(feature = "local")]
     if tool.name == build_external_docs::NAME {
+        return tool;
+    }
+    // A search is asked again within the hour it is kept only by waiting, as `refresh` would send
+    // more requests to crates.io for what may not have changed (decided in M3f).
+    if tool.name == search_crates::NAME {
         return tool;
     }
     let mut schema = (*tool.input_schema).clone();
@@ -816,85 +823,73 @@ async fn dispatch(
     state: &Arc<ToolState>,
 ) -> Result<CallToolResult, ErrorData> {
     let arguments = request.arguments.as_ref();
+    // Only the tool that the request names takes it.
+    let shared = Arc::clone(state);
     match request.name.as_ref() {
         #[cfg(feature = "local")]
         build_external_docs::NAME => match build_external_docs::parse_arguments(arguments) {
-            Ok(arguments) => {
-                Ok(run_tool(build_external_docs::execute(arguments, Arc::clone(state))).await)
-            },
+            Ok(arguments) => Ok(run_tool(build_external_docs::execute(arguments, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         get_item::NAME => match get_item::parse_arguments(arguments) {
-            Ok(arguments) => Ok(run_tool(get_item::execute(arguments, Arc::clone(state))).await),
+            Ok(arguments) => Ok(run_tool(get_item::execute(arguments, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         crate_overview::NAME => match crate_overview::parse_arguments(arguments) {
-            Ok(arguments) => {
-                Ok(run_tool(crate_overview::execute(arguments, Arc::clone(state))).await)
-            },
+            Ok(arguments) => Ok(run_tool(crate_overview::execute(arguments, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         #[cfg(feature = "local")]
         list_crates::NAME => match list_crates::parse_arguments(arguments) {
-            Ok(arguments) => Ok(run_tool(list_crates::execute(arguments, Arc::clone(state))).await),
+            Ok(arguments) => Ok(run_tool(list_crates::execute(arguments, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         list_implementors::NAME => match list_implementors::parse_arguments(arguments) {
-            Ok(arguments) => {
-                Ok(run_tool(list_implementors::execute(arguments, Arc::clone(state))).await)
-            },
+            Ok(arguments) => Ok(run_tool(list_implementors::execute(arguments, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         crate_metadata::NAME => match crate_metadata::parse_arguments(arguments) {
-            Ok(arguments) => {
-                Ok(run_tool(crate_metadata::execute(arguments, Arc::clone(state))).await)
-            },
+            Ok(arguments) => Ok(run_tool(crate_metadata::execute(arguments, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         get_source::NAME => match get_source::parse_arguments(arguments) {
-            Ok(arguments) => Ok(run_tool(get_source::execute(arguments, Arc::clone(state))).await),
+            Ok(arguments) => Ok(run_tool(get_source::execute(arguments, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         inspect_features::NAME => match inspect_features::parse_arguments(arguments) {
-            Ok(inspect) => {
-                Ok(run_tool(inspect_features::execute(inspect, Arc::clone(state))).await)
-            },
+            Ok(inspect) => Ok(run_tool(inspect_features::execute(inspect, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         find_examples::NAME => match find_examples::parse_arguments(arguments) {
-            Ok(find) => {
-                Ok(Box::pin(run_tool(find_examples::execute(find, Arc::clone(state)))).await)
-            },
+            Ok(find) => Ok(Box::pin(run_tool(find_examples::execute(find, shared))).await),
             Err(error) => Ok(error.into_result()),
         },
         get_readme::NAME => match get_readme::parse_arguments(arguments) {
-            Ok(readme) => Ok(run_tool(get_readme::execute(readme, Arc::clone(state))).await),
+            Ok(readme) => Ok(run_tool(get_readme::execute(readme, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         list_impls::NAME => match list_impls::parse_arguments(arguments) {
-            Ok(arguments) => Ok(run_tool(list_impls::execute(arguments, Arc::clone(state))).await),
+            Ok(arguments) => Ok(run_tool(list_impls::execute(arguments, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         list_methods::NAME => match list_methods::parse_arguments(arguments) {
-            Ok(arguments) => {
-                Ok(run_tool(list_methods::execute(arguments, Arc::clone(state))).await)
-            },
+            Ok(arguments) => Ok(run_tool(list_methods::execute(arguments, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         list_module::NAME => match list_module::parse_arguments(arguments) {
-            Ok(arguments) => Ok(run_tool(list_module::execute(arguments, Arc::clone(state))).await),
+            Ok(arguments) => Ok(run_tool(list_module::execute(arguments, shared)).await),
+            Err(error) => Ok(error.into_result()),
+        },
+        search_crates::NAME => match search_crates::parse_arguments(arguments) {
+            Ok(search) => Ok(run_tool(search_crates::execute(search, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         search_items::NAME => match search_items::parse_arguments(arguments) {
-            Ok(arguments) => {
-                Ok(run_tool(search_items::execute(arguments, Arc::clone(state))).await)
-            },
+            Ok(arguments) => Ok(run_tool(search_items::execute(arguments, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         resolve_version::NAME => match resolve_version::parse_arguments(arguments) {
-            Ok(arguments) => {
-                Ok(run_tool(resolve_version::execute(arguments, Arc::clone(state))).await)
-            },
+            Ok(arguments) => Ok(run_tool(resolve_version::execute(arguments, shared)).await),
             Err(error) => Ok(error.into_result()),
         },
         #[cfg(debug_assertions)]
@@ -1215,7 +1210,7 @@ mod tests {
 
     /// With local features, every query tool takes `refresh`, as each may run cargo (§6.4);
     /// without them, none does (requirement R-ARCH-3). `build_external_docs` does not (requirement
-    /// R-WS-10).
+    /// R-WS-10), nor `search_crates`, which runs nothing (decided in M3f).
     #[test]
     fn every_query_tool_takes_refresh_with_local_features() {
         for tool in definitions() {
@@ -1228,6 +1223,7 @@ mod tests {
                 takes,
                 cfg!(feature = "local")
                     && tool.name != "sleep"
+                    && tool.name != "search_crates"
                     && tool.name != "build_external_docs",
                 "{}",
                 tool.name

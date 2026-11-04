@@ -1535,6 +1535,7 @@ fn tools_list_is_cacheable_and_not_paginated() {
         "list_methods",
         "list_module",
         "resolve_version",
+        "search_crates",
         "search_items",
     ]);
     if cfg!(debug_assertions) {
@@ -2532,6 +2533,86 @@ fn inspect_features_tells_a_members_features_and_whether_the_project_enables_the
         json!([{ "name": "extra", "enables": [], "items": 1, "enabled_in_project": true }]),
         "{told}"
     );
+    assert!(server.finish().success());
+}
+
+/// `search_crates` searches crates.io, a page at a time with the cursor that crates.io gives, and
+/// keeps a search (decided in M3f, decisions 100 to 103).
+#[cfg(feature = "local")]
+#[test]
+fn search_crates_searches_crates_io_a_page_at_a_time() {
+    let registry = registry::FakeRegistry::start();
+    registry.put(
+        "/api/v1/crates?q=json+parser&sort=relevance&per_page=1",
+        r#"{"crates":[{"name":"json-event-parser","description":"A JSON event parser","max_stable_version":null,"max_version":"0.3.0-alpha","downloads":10,"recent_downloads":2,"repository":null,"updated_at":"2026-01-01T00:00:00Z","exact_match":false}],"meta":{"total":2,"next_page":"?q=json+parser&per_page=1&seek=WyJhIl0","prev_page":null}}"#,
+    );
+    registry.put(
+        "/api/v1/crates?q=json+parser&sort=relevance&per_page=1&seek=WyJhIl0",
+        r#"{"crates":[{"name":"serde_json","max_stable_version":"1.0.145","max_version":"1.0.145","downloads":900,"updated_at":"2026-01-01T00:00:00Z"}],"meta":{"total":2,"next_page":null}}"#,
+    );
+    registry.put(
+        "/api/v1/crates?q=nothing+here&sort=relevance&per_page=10",
+        r#"{"crates":[],"meta":{"total":0,"next_page":null,"prev_page":null}}"#,
+    );
+    let base = registry.base_url().to_owned();
+    let mut server = Server::start_with(None, &[
+        ("CHATORA_RUSTDOC_TEST_API_URL", base.as_str()),
+        ("NO_PROXY", "127.0.0.1"),
+        ("no_proxy", "127.0.0.1"),
+    ]);
+    let mut call = |id, arguments: Value| {
+        server.send(&call_tool(id, "search_crates", arguments));
+        server.response(id)["result"].clone()
+    };
+    let first = call(1, json!({ "query": "json parser", "limit": 1 }));
+    assert_eq!(first["isError"], false, "{first}");
+    let content = &first["structuredContent"];
+    assert_eq!(content["provenance"]["source"], "crates.io", "{first}");
+    assert_eq!(
+        content["data"]["crates"],
+        json!([{
+            "name": "json-event-parser",
+            "description": "A JSON event parser",
+            "latest": "0.3.0-alpha",
+            "downloads": 10,
+            "recent_downloads": 2,
+            "updated_at": "2026-01-01T00:00:00Z",
+        }]),
+        "{first}"
+    );
+    assert_eq!(content["page"]["total"], 2, "{first}");
+    let cursor = content["page"]["next_cursor"].clone();
+    let second = call(
+        2,
+        json!({ "query": "json parser", "limit": 1, "cursor": cursor }),
+    );
+    let page = &second["structuredContent"];
+    assert_eq!(page["data"]["crates"][0]["name"], "serde_json", "{second}");
+    assert_eq!(page["page"]["has_more"], false, "{second}");
+    // Kept: asked once each.
+    call(3, json!({ "query": "json parser", "limit": 1 }));
+    let asked = registry
+        .requests()
+        .iter()
+        .filter(|request| request.starts_with("GET /api/"))
+        .count();
+    assert_eq!(asked, 2);
+    // Another sort is another search, whose cursor this is not.
+    let refused = call(
+        4,
+        json!({ "query": "json parser", "limit": 1, "sort": "downloads", "cursor": cursor }),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+    // None found: fewer or other words (requirement R-SR-6).
+    let none = call(5, json!({ "query": "nothing here" }));
+    assert_eq!(none["structuredContent"]["page"]["total"], 0, "{none}");
+    assert!(
+        none["structuredContent"]["hints"]
+            .to_string()
+            .contains("try fewer words"),
+        "{none}"
+    );
+    drop(call);
     assert!(server.finish().success());
 }
 

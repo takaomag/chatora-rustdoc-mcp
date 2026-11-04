@@ -136,6 +136,16 @@ fn item_cases() -> Vec<Case> {
         &json!({ "crate": TOKIO, "limit": 2 }),
         vec![("cursor", Change::NextCursor)],
     ));
+    cases.extend(each(
+        "search_crates",
+        &json!({ "query": "json", "limit": 2 }),
+        vec![
+            ("query", Change::Set(json!("yaml"))),
+            ("sort", Change::Set(json!("downloads"))),
+            ("limit", Change::Set(json!(3))),
+            ("cursor", Change::NextCursor),
+        ],
+    ));
     // No target: what a crate declares is of every target.
     cases.extend(each("crate_metadata", &json!({ "crate": TOKIO }), vec![
         ("crate", Change::Set(json!(AXUM))),
