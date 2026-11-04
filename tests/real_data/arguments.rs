@@ -136,6 +136,26 @@ fn item_cases() -> Vec<Case> {
         &json!({ "crate": TOKIO, "limit": 2 }),
         vec![("cursor", Change::NextCursor)],
     ));
+    // No target: what a crate declares is of every target.
+    cases.extend(each("crate_metadata", &json!({ "crate": TOKIO }), vec![
+        ("crate", Change::Set(json!(AXUM))),
+        ("limit", Change::Set(json!(1))),
+    ]));
+    cases.extend(each(
+        "crate_metadata",
+        &json!({ "crate": "tokio", "version": "1.53.3" }),
+        vec![("version", Change::Set(json!("1.45.1")))],
+    ));
+    cases.extend(each(
+        "crate_metadata",
+        &json!({ "crate": TOKIO, "limit": 1 }),
+        vec![("cursor", Change::NextCursor)],
+    ));
+    if cfg!(feature = "local") {
+        cases.extend(each("crate_metadata", &json!({ "crate": "tokio" }), vec![
+            ("project", Change::Set(json!(OTHER_PROJECT))),
+        ]));
+    }
     cases.extend(shared("find_examples", &json!({})));
     cases.extend(each("find_examples", &json!({ "crate": TOKIO }), vec![
         ("path", Change::Set(json!("sync::Mutex::lock"))),
@@ -298,6 +318,7 @@ fn refresh_cases() -> Vec<Case> {
     // As the local test a_member_that_failed_is_not_built_again_until_what_it_is_made_from_changes
     // and the stdio test a_member_whose_build_fails_again_is_told_failed check.
     [
+        "crate_metadata",
         "crate_overview",
         "find_examples",
         "get_item",
@@ -356,6 +377,7 @@ fn git_cases() -> Vec<Case> {
     }
     let tools = [
         "build_external_docs",
+        "crate_metadata",
         "crate_overview",
         "find_examples",
         "get_item",

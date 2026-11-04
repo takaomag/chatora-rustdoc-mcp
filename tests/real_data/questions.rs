@@ -290,8 +290,33 @@ fn readme_questions() -> Vec<Question> {
     ]
 }
 
+/// The questions about crates' metadata (decided in M3f).
+fn metadata_questions() -> Vec<Question> {
+    vec![
+        question(
+            "crate_metadata",
+            "what is serde's MSRV and license?",
+            json!({ "crate": "serde@1.0.228" }),
+            |result| {
+                has(&result["data"]["declared"]["license"], "MIT")
+                    && result["data"]["declared"]["rust_version"].is_string()
+            },
+        ),
+        question(
+            "crate_metadata",
+            "is this crate still maintained?",
+            json!({ "crate": "tokio@1.53.3" }),
+            |result| {
+                result["data"]["releases"]["recency"].is_string()
+                    && result["data"]["releases"]["days_since_last_release"].is_u64()
+            },
+        ),
+    ]
+}
+
 fn questions() -> Vec<Question> {
     let mut questions = item_questions();
+    questions.extend(metadata_questions());
     questions.extend(feature_questions());
     questions.extend(readme_questions());
     questions.extend(example_questions());

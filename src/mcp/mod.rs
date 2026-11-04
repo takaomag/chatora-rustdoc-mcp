@@ -305,6 +305,7 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
             rust_srcs: Flights::default(),
             dist: tool::dist(&network, DistSettings::from_settings(settings))?,
             index: tool::sparse_index(cache.clone(), &network)?,
+            crates_io: tool::crates_io(cache.clone(), &network)?,
             // The `.crate` files that cargo has fetched are read before static.crates.io is asked.
             static_crates: tool::static_crates(&network)?
                 .with_cargo_home(crate::data::cargo_home()),

@@ -107,15 +107,20 @@ impl FakeRegistry {
             name = krate.name,
             version = krate.version
         );
-        let mut state = self.state.lock();
-        state
+        self.state
+            .lock()
             .files
             .entry(index)
             .or_default()
             .extend_from_slice(format!("{line}\n").as_bytes());
-        state.files.insert(on_static, file.clone());
-        state.files.insert(download, file);
-        drop(state);
+        self.put(&on_static, file.clone());
+        self.put(&download, file);
+    }
+
+    /// Serves `body` at `path`, with its query if it has one (`/api/v1/crates/demo?include=downloads`),
+    /// as for the crates.io API.
+    pub(crate) fn put(&self, path: &str, body: impl Into<Vec<u8>>) {
+        self.state.lock().files.insert(path.to_owned(), body.into());
     }
 
     /// The requests received so far, as `GET /index/config.json`.

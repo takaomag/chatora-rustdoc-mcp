@@ -1518,6 +1518,7 @@ fn tools_list_is_cacheable_and_not_paginated() {
         expected.push("build_external_docs");
     }
     expected.extend([
+        "crate_metadata",
         "crate_overview",
         "find_examples",
         "get_item",
@@ -7390,6 +7391,8 @@ fn features_cache() -> TempDir {
     let cache = test_cache();
     // Its `.crate`.
     let manifest = "[package]\nname = \"demo\"\nversion = \"0.2.0\"\nreadme = \"docs/README.md\"\n\
+                    license = \"MIT\"\nrust-version = \"1.70\"\nedition = \"2021\"\n\
+                    repository = \"https://example.invalid/demo\"\n\
                     [features]\n\
                     default = [\"extra\"]\nextra = []\nfull = [\"extra\", \"dep:serde\"]\n\
                     [dependencies]\nserde = { version = \"1\", optional = true }\n\
@@ -7438,6 +7441,7 @@ fn features_cache() -> TempDir {
         "features2": { "full": ["extra", "dep:serde"] },
         "yanked": false,
         "v": 2,
+        "pubtime": "2026-01-02T03:04:05Z",
     });
     let index = cache.path().join("index.crates.io/de/mo/demo");
     std::fs::create_dir_all(index.parent().expect("a parent")).expect("made");
@@ -7550,6 +7554,138 @@ fn inspect_features_tells_the_features_from_the_index_and_the_crate_file() {
     let body = text_json(&none);
     assert_eq!(body["code"], "invalid_argument", "{none}");
     assert!(body["suggestions"].to_string().contains("full"), "{none}");
+    assert!(server.finish().success());
+}
+
+/// A fake crates.io with the index line of the demo crate of `cache` and the API's answers about
+/// it, for `crate_metadata`.
+#[cfg(feature = "local")]
+fn fake_api_of_demo(cache: &TempDir) -> registry::FakeRegistry {
+    let registry = registry::FakeRegistry::start();
+    let line = std::fs::read_to_string(cache.path().join("index.crates.io/de/mo/demo"))
+        .expect("its index line");
+    registry.put("/index/de/mo/demo", line);
+    registry.put(
+        "/api/v1/crates/demo?include=downloads",
+        r#"{"crate":{"name":"demo","downloads":1234,"recent_downloads":56,"default_version":"0.2.0","num_versions":2,"max_version":"0.0.0","newest_version":"0.0.0","created_at":"2025-01-01T00:00:00Z","updated_at":"2026-01-02T03:04:05.123Z"},"versions":null}"#,
+    );
+    registry.put(
+        "/api/v1/crates/demo/reverse_dependencies?per_page=1",
+        r#"{"dependencies":[],"versions":[],"meta":{"total":7}}"#,
+    );
+    registry.put(
+        "/api/v1/crates/demo/versions?per_page=100",
+        r#"{"versions":[{"num":"0.2.0","license":"MIT","created_at":"2026-01-02T03:04:05.123Z","yanked":false,"rust_version":"1.70","edition":"2021","published_by":{"login":"someone"}},{"num":"0.1.0","license":"MIT OR Apache-2.0","created_at":"2025-01-01T00:00:00Z","yanked":false,"rust_version":null,"edition":"2021"}],"meta":{"total":2,"next_page":null}}"#,
+    );
+    registry
+}
+
+/// `crate_metadata` tells what a release declares in its `.crate`, its dependencies and releases
+/// from the index, and from the crates.io API its downloads, dependents and the versions where its
+/// license changed; the API's answers are kept, and asked again with `refresh` (decided in M3f,
+/// decisions 93 to 109).
+#[cfg(feature = "local")]
+#[test]
+fn crate_metadata_tells_what_a_release_declares_and_how_it_is_kept() {
+    let cache = features_cache();
+    let registry = fake_api_of_demo(&cache);
+    let base = registry.base_url().to_owned();
+    let index = format!("{base}/index");
+    let mut server = Server::start_with_cache(cache, None, &[
+        ("CHATORA_RUSTDOC_TEST_API_URL", base.as_str()),
+        ("CHATORA_RUSTDOC_TEST_INDEX_URL", index.as_str()),
+        ("CHATORA_RUSTDOC_TEST_STATIC_URL", base.as_str()),
+        ("CHATORA_RUSTDOC_TEST_DOCS_RS_URL", base.as_str()),
+        ("NO_PROXY", "127.0.0.1"),
+        ("no_proxy", "127.0.0.1"),
+    ]);
+    let call = |server: &mut Server, id, arguments: Value| {
+        server.send(&call_tool(id, "crate_metadata", arguments));
+        server.response(id)["result"].clone()
+    };
+    let answer = call(&mut server, 1, json!({ "crate": "demo@0.2.0" }));
+    assert_eq!(answer["isError"], false, "{answer}");
+    let content = &answer["structuredContent"];
+    let data = &content["data"];
+    assert_eq!(data["declared"]["license"], "MIT", "{answer}");
+    assert_eq!(data["declared"]["rust_version"], "1.70", "{answer}");
+    assert_eq!(
+        data["declared"]["repository"], "https://example.invalid/demo",
+        "{answer}"
+    );
+    assert_eq!(data["releases"]["latest_stable"], "0.2.0", "{answer}");
+    assert_eq!(data["releases"]["versions"], 1, "{answer}");
+    assert_eq!(
+        data["releases"]["last_release_at"], "2026-01-02T03:04:05Z",
+        "{answer}"
+    );
+    assert_eq!(
+        data["popularity"],
+        json!({ "downloads": 1234, "recent_downloads": 56, "dependents": 7 }),
+        "{answer}"
+    );
+    assert_eq!(
+        data["dependencies"],
+        json!([
+            { "name": "serde", "req": "^1", "kind": "normal", "optional": true },
+            { "name": "log", "req": "^0.4", "kind": "normal", "optional": true, "target": "cfg(unix)" },
+        ]),
+        "{answer}"
+    );
+    assert_eq!(
+        data["history"],
+        json!([
+            {
+                "version": "0.2.0",
+                "published": "2026-01-02T03:04:05.123Z",
+                "license": { "from": "MIT OR Apache-2.0", "to": "MIT" },
+                "rust_version": { "to": "1.70" },
+            },
+            { "version": "0.1.0", "published": "2025-01-01T00:00:00Z", "first": true },
+        ]),
+        "{answer}"
+    );
+    assert_eq!(
+        content["page"],
+        json!({ "shown": 2, "total": 2, "has_more": false }),
+        "{answer}"
+    );
+    assert!(
+        content["provenance"]["api_fetched_at"].is_string(),
+        "{answer}"
+    );
+    assert!(!answer.to_string().contains("someone"), "{answer}");
+    let asked = |registry: &registry::FakeRegistry| {
+        registry
+            .requests()
+            .iter()
+            .filter(|request| request.starts_with("GET /api/"))
+            .count()
+    };
+    assert_eq!(asked(&registry), 3);
+    // Kept: not asked again, unless with `refresh`.
+    let again = call(&mut server, 2, json!({ "crate": "demo@0.2.0" }));
+    assert_eq!(again["structuredContent"]["data"], *data, "{again}");
+    assert_eq!(asked(&registry), 3);
+    call(
+        &mut server,
+        3,
+        json!({ "crate": "demo@0.2.0", "refresh": true }),
+    );
+    assert_eq!(asked(&registry), 6);
+    // Paged.
+    let first = call(&mut server, 4, json!({ "crate": "demo@0.2.0", "limit": 1 }));
+    let page = &first["structuredContent"]["page"];
+    assert_eq!(page["has_more"], true, "{first}");
+    let rest = call(
+        &mut server,
+        5,
+        json!({ "crate": "demo@0.2.0", "limit": 1, "cursor": page["next_cursor"] }),
+    );
+    assert_eq!(
+        rest["structuredContent"]["data"]["history"][0]["version"], "0.1.0",
+        "{rest}"
+    );
     assert!(server.finish().success());
 }
 

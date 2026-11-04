@@ -8,6 +8,7 @@ mod build_external_docs;
 mod call_log;
 #[cfg(test)]
 mod checks;
+mod crate_metadata;
 mod crate_overview;
 #[cfg(feature = "local")]
 mod external_build;
@@ -78,6 +79,7 @@ use crate::{
         Network,
         cache::Cache,
         crate_file::StaticCrates,
+        crates_io::CratesIo,
         dist::{Dist, DistSettings},
         docs_rs::DocsRs,
         fetches::Fetches,
@@ -115,6 +117,9 @@ pub(super) struct ToolState {
     pub(super) index: SparseIndex,
     /// static.crates.io, for the `.crate` of releases (requirement R-FT-1).
     pub(super) static_crates: StaticCrates,
+    /// The crates.io API, for what only it tells of a crate and for the search (requirement
+    /// R-NW-1, decided in M3f).
+    pub(super) crates_io: CratesIo,
     /// The host target, the default target of the documentation (requirement R-TG-1). It is
     /// found in the background from startup, as it runs rustc, so that the server answers at once
     /// (requirement R-MCP-11); see [`Self::host`].
@@ -342,6 +347,12 @@ const TEST_STATIC_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_STATIC_URL";
 #[cfg(debug_assertions)]
 const TEST_DIST_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_DIST_URL";
 
+/// The environment variable that points the client of the crates.io API of a debug build with the
+/// tool for testing at a fake one of the tests. Like [`TEST_DOCS_RS_ENV_VAR`], it is not a
+/// setting.
+#[cfg(debug_assertions)]
+const TEST_API_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_API_URL";
+
 /// The URL that the environment variable `name` gives a debug build with the tool for testing.
 #[cfg(debug_assertions)]
 fn test_url(name: &str) -> Option<String> {
@@ -376,6 +387,20 @@ pub(super) fn dist(network: &Network, settings: DistSettings) -> Result<Dist, re
     Dist::new(network, settings)
 }
 
+/// The client of the crates.io API, caching in `cache`: of crates.io, or of the server of the
+/// tests that [`TEST_API_ENV_VAR`] names in a debug build with the tool for testing.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be set up.
+pub(super) fn crates_io(cache: Cache, network: &Network) -> Result<CratesIo, reqwest::Error> {
+    #[cfg(debug_assertions)]
+    if let Some(base_url) = test_url(TEST_API_ENV_VAR) {
+        return CratesIo::with_base_url(cache, &base_url, network);
+    }
+    CratesIo::new(cache, network)
+}
+
 /// The client of static.crates.io: of it, or of the server of the tests that
 /// [`TEST_STATIC_ENV_VAR`] names in a debug build with the tool for testing.
 ///
@@ -396,6 +421,7 @@ pub(super) fn definitions() -> Vec<Tool> {
         // It builds what is outside the default project (requirement R-ARCH-4).
         #[cfg(feature = "local")]
         build_external_docs::definition(),
+        crate_metadata::definition(),
         crate_overview::definition(),
         find_examples::definition(),
         get_item::definition(),
@@ -789,90 +815,90 @@ async fn dispatch(
     context: RequestContext<RoleServer>,
     state: &Arc<ToolState>,
 ) -> Result<CallToolResult, ErrorData> {
+    let arguments = request.arguments.as_ref();
     match request.name.as_ref() {
         #[cfg(feature = "local")]
-        build_external_docs::NAME => {
-            match build_external_docs::parse_arguments(request.arguments.as_ref()) {
-                Ok(arguments) => {
-                    Ok(run_tool(build_external_docs::execute(arguments, Arc::clone(state))).await)
-                },
-                Err(error) => Ok(error.into_result()),
-            }
+        build_external_docs::NAME => match build_external_docs::parse_arguments(arguments) {
+            Ok(arguments) => {
+                Ok(run_tool(build_external_docs::execute(arguments, Arc::clone(state))).await)
+            },
+            Err(error) => Ok(error.into_result()),
         },
-        get_item::NAME => match get_item::parse_arguments(request.arguments.as_ref()) {
+        get_item::NAME => match get_item::parse_arguments(arguments) {
             Ok(arguments) => Ok(run_tool(get_item::execute(arguments, Arc::clone(state))).await),
             Err(error) => Ok(error.into_result()),
         },
-        crate_overview::NAME => match crate_overview::parse_arguments(request.arguments.as_ref()) {
+        crate_overview::NAME => match crate_overview::parse_arguments(arguments) {
             Ok(arguments) => {
                 Ok(run_tool(crate_overview::execute(arguments, Arc::clone(state))).await)
             },
             Err(error) => Ok(error.into_result()),
         },
         #[cfg(feature = "local")]
-        list_crates::NAME => match list_crates::parse_arguments(request.arguments.as_ref()) {
+        list_crates::NAME => match list_crates::parse_arguments(arguments) {
             Ok(arguments) => Ok(run_tool(list_crates::execute(arguments, Arc::clone(state))).await),
             Err(error) => Ok(error.into_result()),
         },
-        list_implementors::NAME => {
-            match list_implementors::parse_arguments(request.arguments.as_ref()) {
-                Ok(arguments) => {
-                    Ok(run_tool(list_implementors::execute(arguments, Arc::clone(state))).await)
-                },
-                Err(error) => Ok(error.into_result()),
-            }
+        list_implementors::NAME => match list_implementors::parse_arguments(arguments) {
+            Ok(arguments) => {
+                Ok(run_tool(list_implementors::execute(arguments, Arc::clone(state))).await)
+            },
+            Err(error) => Ok(error.into_result()),
         },
-        get_source::NAME => match get_source::parse_arguments(request.arguments.as_ref()) {
+        crate_metadata::NAME => match crate_metadata::parse_arguments(arguments) {
+            Ok(arguments) => {
+                Ok(run_tool(crate_metadata::execute(arguments, Arc::clone(state))).await)
+            },
+            Err(error) => Ok(error.into_result()),
+        },
+        get_source::NAME => match get_source::parse_arguments(arguments) {
             Ok(arguments) => Ok(run_tool(get_source::execute(arguments, Arc::clone(state))).await),
             Err(error) => Ok(error.into_result()),
         },
-        inspect_features::NAME => {
-            match inspect_features::parse_arguments(request.arguments.as_ref()) {
-                Ok(inspect) => {
-                    Ok(run_tool(inspect_features::execute(inspect, Arc::clone(state))).await)
-                },
-                Err(error) => Ok(error.into_result()),
-            }
+        inspect_features::NAME => match inspect_features::parse_arguments(arguments) {
+            Ok(inspect) => {
+                Ok(run_tool(inspect_features::execute(inspect, Arc::clone(state))).await)
+            },
+            Err(error) => Ok(error.into_result()),
         },
-        find_examples::NAME => match find_examples::parse_arguments(request.arguments.as_ref()) {
+        find_examples::NAME => match find_examples::parse_arguments(arguments) {
             Ok(find) => {
                 Ok(Box::pin(run_tool(find_examples::execute(find, Arc::clone(state)))).await)
             },
             Err(error) => Ok(error.into_result()),
         },
-        get_readme::NAME => match get_readme::parse_arguments(request.arguments.as_ref()) {
+        get_readme::NAME => match get_readme::parse_arguments(arguments) {
             Ok(readme) => Ok(run_tool(get_readme::execute(readme, Arc::clone(state))).await),
             Err(error) => Ok(error.into_result()),
         },
-        list_impls::NAME => match list_impls::parse_arguments(request.arguments.as_ref()) {
+        list_impls::NAME => match list_impls::parse_arguments(arguments) {
             Ok(arguments) => Ok(run_tool(list_impls::execute(arguments, Arc::clone(state))).await),
             Err(error) => Ok(error.into_result()),
         },
-        list_methods::NAME => match list_methods::parse_arguments(request.arguments.as_ref()) {
+        list_methods::NAME => match list_methods::parse_arguments(arguments) {
             Ok(arguments) => {
                 Ok(run_tool(list_methods::execute(arguments, Arc::clone(state))).await)
             },
             Err(error) => Ok(error.into_result()),
         },
-        list_module::NAME => match list_module::parse_arguments(request.arguments.as_ref()) {
+        list_module::NAME => match list_module::parse_arguments(arguments) {
             Ok(arguments) => Ok(run_tool(list_module::execute(arguments, Arc::clone(state))).await),
             Err(error) => Ok(error.into_result()),
         },
-        search_items::NAME => match search_items::parse_arguments(request.arguments.as_ref()) {
+        search_items::NAME => match search_items::parse_arguments(arguments) {
             Ok(arguments) => {
                 Ok(run_tool(search_items::execute(arguments, Arc::clone(state))).await)
             },
             Err(error) => Ok(error.into_result()),
         },
-        resolve_version::NAME => match resolve_version::parse_arguments(request.arguments.as_ref())
-        {
+        resolve_version::NAME => match resolve_version::parse_arguments(arguments) {
             Ok(arguments) => {
                 Ok(run_tool(resolve_version::execute(arguments, Arc::clone(state))).await)
             },
             Err(error) => Ok(error.into_result()),
         },
         #[cfg(debug_assertions)]
-        sleep::NAME if test_tools() => match sleep::parse_arguments(request.arguments.as_ref()) {
+        sleep::NAME if test_tools() => match sleep::parse_arguments(arguments) {
             Ok(seconds) => Ok(run_tool(sleep::execute(seconds, context)).await),
             Err(error) => Ok(error.into_result()),
         },

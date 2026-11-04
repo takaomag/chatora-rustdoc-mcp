@@ -33,12 +33,14 @@ pub struct Change {
     pub edition: Option<Changed>,
 }
 
-/// A declared value before a version and in it; `None` is not declared.
+/// A declared value before a version and in it; `None`, left out, is not declared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Changed {
     /// In the version before.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<Box<str>>,
     /// In this version.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub to: Option<Box<str>>,
 }
 

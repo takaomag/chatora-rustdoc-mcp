@@ -422,7 +422,7 @@ impl CratesIo {
         self.cached(
             (dir.join("crate.json"), &dir),
             (CRATE_TTL, fresh, until),
-            async || self.fetch_crate_info(name, until).await,
+            self.fetch_crate_info(name, until),
         )
         .await
     }
@@ -449,7 +449,7 @@ impl CratesIo {
         self.cached(
             (dir.join(file), &dir),
             (CRATE_TTL, fresh, until),
-            async || self.fetch_versions(name, next, until).await,
+            self.fetch_versions(name, next, until),
         )
         .await
     }
@@ -471,7 +471,7 @@ impl CratesIo {
         self.cached(
             (dir.join("dependents.json"), &dir),
             (CRATE_TTL, fresh, until),
-            async || self.fetch_dependents(name, until).await,
+            self.fetch_dependents(name, until),
         )
         .await
     }
@@ -501,7 +501,7 @@ impl CratesIo {
         self.cached(
             (path.clone(), &path),
             (SEARCH_TTL, false, until),
-            async || self.fetch_search(query, sort, per_page, next, until).await,
+            self.fetch_search(query, sort, per_page, next, until),
         )
         .await
     }
@@ -539,7 +539,7 @@ impl CratesIo {
         &self,
         (path, place): (PathBuf, &std::path::Path),
         (ttl, fresh, until): (Duration, bool, tokio::time::Instant),
-        fetch: impl AsyncFnOnce() -> Result<T, ApiError>,
+        fetch: impl Future<Output = Result<T, ApiError>>,
     ) -> Result<Cached<T>, ApiError>
     where
         T: Serialize + serde::de::DeserializeOwned + Send + 'static,
@@ -579,7 +579,7 @@ impl CratesIo {
         } else if let Some(retry_after) = super::recent_failure(&self.cache, &path).await {
             Err(ApiError::RecentFailure { retry_after })
         } else {
-            let fetched = fetch().await;
+            let fetched = fetch.await;
             if let Err(error) = &fetched
                 && error.is_remembered()
             {
@@ -723,11 +723,10 @@ impl CratesIo {
             return Err(ApiError::Offline);
         }
         let request = self.client.get(url);
-        let mut response =
-            http::send_in_turn(request, async |wait| self.pacer.turn(wait, until).await)
-                .await?
-                // The URL of the error has the query, which may be a search the user typed.
-                .map_err(|error| ApiError::Network(error.without_url()))?;
+        let mut response = http::send_in_turn(request, &(&self.pacer, until))
+            .await?
+            // The URL of the error has the query, which may be a search the user typed.
+            .map_err(|error| ApiError::Network(error.without_url()))?;
         match response.status() {
             StatusCode::OK => {},
             StatusCode::NOT_FOUND => return Err(ApiError::NotFound),

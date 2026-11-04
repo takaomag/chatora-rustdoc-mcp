@@ -542,6 +542,18 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - F2a のレビュー (サブエージェント、読むだけ。手元の index の 1,564 行・依存 24,350 件で形を確かめた) の対応: 頁の最後の版は次の頁の先頭と比べる (`After::Version`。前は境目の変化がどの頁にも出なかった)。index の依存は 1 件ずつ読み、読めない 1 件だけを除く。未知の `kind` は `other`、null は normal。依存に `features`・`default_features` を足した。docs.rs の target は `TargetTriple` で検証し (`..` や先頭の記号を除く)、`targets` が無いのと `[]` を分け、除いた数を数える。空白だけの値は無いものとする。テストを足した
 - F2a のレビューで残したもの: 長い description などは出力の段 (F2b) で切る。semver の順で隣と比べるので、系列の境目のバックポートは向きが逆の変化に見えうる (doc に書いた。説明文にも F2b で)。API の `license` の null は `license-file` だけの版でもなる (説明文で補う)
 
+**F2b で利用者が決めたこと (2026-11-04)**:
+
+- 決定 106 (M3f) `crate_metadata` の出力は問いごとに `declared` (その版の宣言)・`releases` (版と保守)・`popularity` (API)・`history` (変化のあった版) と `dependencies`。API が使えないときは `popularity` と `history` を省いて warning
+- 決定 107 (M3f) `dependencies` は normal と build を全件 (name・req・kind・optional・target、改名なら package、default_features が false ならその旨)。dev は件数だけ。features の中身は `inspect_features` に任せる。応答の予算を超えたら切って `truncated`
+- 決定 108 (M3f) 第三者の文字列は description 1,000 字・URL 500 字で切り、末尾に `…` と warning。見えない文字は出口で印にする (R-SEC-7)。URL は取得に使わない
+- 決定 109 (M3f) 履歴は常に API の `/versions` で作る (license・edition・MSRV・yanked)。1 回の要求は 3 回 (初回約 2 秒、以後 1 日はキャッシュ)。期限に間に合わなければ決定 93 のとおり省いて warning
+
+**F2b の実装 (2026-11-04)**: 新しいツール `crate_metadata` (crates.io のリリース)。`resolve_version` と同じ処理で版を決め、`declared` は `.crate` (取れなければ index の `rust_version` だけと warning)、`releases`・`dependencies` は index、`popularity` と `history` は API (`crate_info`・`dependents`・`versions`)。履歴の頁は API の頁を先頭から読み、要る変化が揃うか最後か、1 回に新しく取る頁が 3 まで (残りは cursor で続ける)。読んだ最後の版は次の頁を待つ。`refresh` は API の失敗の記憶を忘れて取り直す。`provenance.api_fetched_at`。応答の予算を超えたら依存を減らし `dependencies_total`。`http::send_in_turn` の順番は `Turns` トレイトで渡す (async クロージャでは `Send` の推論が通らなかった)。README の表・接続先 (crates.io の API、1 秒 1 回、crate の名前を送る)・Planned を直した。stdio のテストは偽の API (`FakeRegistry::put`) で、保持・`refresh`・頁を確かめる
+
+- F2b のレビュー (サブエージェント、読むだけ) の対応: 1 回に新しく取る版の頁を 1 にした (要求は 3 回まで。決定 109 に合わせた)。`.crate` と API を並べて待つ。`refresh` は cursor のない最初の頁でだけ API を取り直す (前は頁を送っても先へ進まなかった)。続きの頁が来なければ warning。cursor の digest に index の yanked の数を混ぜ、総数は先頭の頁のもの、終わりを越える cursor は断る、終わったら `page.total`。依存を減らしたら warning で数と `get_source` の Cargo.toml を案内する。index に無い版は warning。warning の文を直した (「did not answer」と言わない・呼び直しの案内・どの項目か)。std の案内の `rust_release` (このビルドに無い) を直した。data のキーを schema の順に。説明文 (refresh・旧表記の license・versions に yanked を含む・依存の package と default_features・バックポート・license-file・古い答えを使う) と README (host 名 crates.io、プロセスごとの 1 秒 1 回) を直した。単体テスト (履歴の頁・cursor の拒否・releases・切り詰め) を足した。実データの問いに Q15 の 2 問、引数のケースを足した
+- F2b のレビューで残したもの: instructions の呼ぶ順に `crate_metadata` が無い (F3b でまとめる)。git の引数は実データのケースで「別のテストで確かめる」としたが、そのテストは F2c で足す (今は git の crate を断る)。頁を送っても `declared`・`releases`・`dependencies` を毎回載せる。`pubtime` の無い index での最終リリースは読んだ API の頁の中だけから。`history.published` は API の小数秒のまま
+
 聞かずに決めたこと: index に版があり API が 404 を返すとき (公開の直後など) は決定 93 と同じく API の項目を省いて warning にする。API の要求の数と待ちはログだけに出し、応答には入れない (R13)。
 
 ## 7. M3 の終わり方

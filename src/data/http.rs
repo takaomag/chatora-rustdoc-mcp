@@ -150,12 +150,29 @@ fn redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect::Actio
 pub(super) async fn send(
     request: reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    let Ok(outcome) = send_in_turn(request, async |wait| {
-        tokio::time::sleep(wait).await;
-        Ok::<(), Infallible>(())
-    })
-    .await;
+    let Ok(outcome) = send_in_turn(request, &Sleeping).await;
     outcome
+}
+
+/// What gives each attempt of [`send_in_turn`] its turn.
+pub(super) trait Turns: Sync {
+    /// Why no turn was given.
+    type Error;
+
+    /// Waits at least `wait`, and then for the turn.
+    fn turn(&self, wait: Duration) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Every attempt in its turn after its wait: as [`send`] sends.
+struct Sleeping;
+
+impl Turns for Sleeping {
+    type Error = Infallible;
+
+    async fn turn(&self, wait: Duration) -> Result<(), Infallible> {
+        tokio::time::sleep(wait).await;
+        Ok(())
+    }
 }
 
 /// [`send`] with each attempt sent only when `turn` gives it its turn, as a [`Pacer`] does.
@@ -166,14 +183,14 @@ pub(super) async fn send(
 /// # Errors
 ///
 /// Returns `turn`'s error when nothing was sent, and else as [`send`].
-pub(super) async fn send_in_turn<E>(
+pub(super) async fn send_in_turn<T: Turns>(
     request: reqwest::RequestBuilder,
-    mut turn: impl AsyncFnMut(Duration) -> Result<(), E>,
-) -> Result<Result<reqwest::Response, reqwest::Error>, E> {
+    turns: &T,
+) -> Result<Result<reqwest::Response, reqwest::Error>, T::Error> {
     let mut current = request;
     let mut delay = FIRST_RETRY_DELAY;
     let mut attempt: u32 = 1;
-    turn(Duration::ZERO).await?;
+    turns.turn(Duration::ZERO).await?;
     // The wait for the first turn is not part of the request's time in the log.
     let started = std::time::Instant::now();
     loop {
@@ -190,7 +207,7 @@ pub(super) async fn send_in_turn<E>(
         match (wait, next) {
             (Some(wait), Some(next)) if attempt < MAX_ATTEMPTS && wait <= MAX_RETRY_AFTER => {
                 tracing::debug!(attempt, ?wait, "retrying a request that failed transiently");
-                if turn(wait).await.is_err() {
+                if turns.turn(wait).await.is_err() {
                     tracing::debug!(attempt, "no turn for a retry in time");
                     return Ok(noted(outcome, attempt, started));
                 }
@@ -230,6 +247,15 @@ pub(super) struct Pacer {
     /// When the next turn may start.
     next: Arc<parking_lot::Mutex<tokio::time::Instant>>,
     interval: Duration,
+}
+
+/// The turns of a [`Pacer`] until a time.
+impl Turns for (&Pacer, tokio::time::Instant) {
+    type Error = NoTurn;
+
+    async fn turn(&self, wait: Duration) -> Result<(), NoTurn> {
+        self.0.turn(wait, self.1).await
+    }
 }
 
 /// No turn would come by the time given.
