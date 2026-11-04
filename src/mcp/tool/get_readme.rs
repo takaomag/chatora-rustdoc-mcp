@@ -303,9 +303,12 @@ pub(super) async fn execute(readme: Readme, state: Arc<ToolState>) -> CallToolRe
         && !release.on_crates_io
         && !here::unpacked_from_crates_io(&state, found)
     {
-        return match here::of_project(&state, found, &release, until).await {
+        let what = format!("{} {}", release.name, release.version);
+        return match here::of_project(&state, (found, &release), until, ("readme", OVERVIEW)).await
+        {
             Ok(here) => answered(release, ask, move || here::read(&here)).await,
-            Err(answer) => *answer,
+            Err(here::NotHere::Answer(answer)) => *answer,
+            Err(here::NotHere::Copy(of)) => *here::copy(&what, &of),
         };
     }
     // As one that the project takes from crates.io, which cargo unpacked as it is (decided in M3e,
@@ -925,186 +928,27 @@ mod here {
     use rmcp::model::CallToolResult;
 
     use super::{Failure, ReadReadme, read_at};
+    pub(super) use crate::mcp::tool::here::{
+        Here,
+        HereRoot,
+        NotHere,
+        of_git,
+        of_project,
+        unpacked_from_crates_io,
+    };
     use crate::{
         data::{
             crate_file,
-            flight::Joined,
-            metadata::Resolution,
-            packages::Source,
             project as workspaces,
             readme::{self, DEFAULT_NAMES, Declared, NoReadme},
             source_root::{self, Root},
         },
-        mcp::tool::{
-            ErrorChain,
-            ToolState,
-            get_item,
-            get_source,
-            project::{self, Found},
-            recorded_git::GitFound,
-            resolve_version::Release,
-        },
+        mcp::tool::get_source,
     };
 
-    /// Where a package's readme is looked for.
-    #[derive(Debug)]
-    pub(super) struct Here {
-        /// The directory of its `Cargo.toml`.
-        dir: PathBuf,
-        /// What its files are judged under.
-        root: HereRoot,
-        /// Its readme as `cargo metadata` resolved it, relative to `dir`; else its manifest is
-        /// read, as of a crate of git that was recorded.
-        resolved: Option<PathBuf>,
-    }
-
-    /// What the files of a package here are judged under (requirement R-SC-4).
-    #[derive(Debug)]
-    enum HereRoot {
-        /// A path package, under the root of its workspace: the project's, or else its own, which
-        /// is looked for above it (decided in M3e, decision 78).
-        Package { workspace: Option<PathBuf> },
-        /// A git package, in the checkout that cargo finished: an inherited readme is looked for
-        /// no higher than it (decided in M3e, decision 80).
-        Checkout(PathBuf),
-    }
-
-    /// Where the readme of the crate of git `git`, as `build_external_docs` recorded it, is.
-    pub(super) fn of_git(state: &ToolState, git: &GitFound) -> Result<Here, Box<CallToolResult>> {
-        let build_again = |message: String| {
-            Box::new(crate::mcp::tool::tool_error(
-                "docs_unavailable",
-                &message,
-                false,
-                &["build it again with build_external_docs"],
-            ))
-        };
-        let Some(dir) = git.built.record.package_root.clone() else {
-            return Err(build_again(format!(
-                "the record of {} is from before where its package is was kept",
-                git.package
-            )));
-        };
-        let checkout = state
-            .resolver
-            .cargo_home()
-            .and_then(|home| get_source::checkout_of(&dir, home))
-            .ok_or_else(|| {
-                build_again(format!(
-                    "the checkout of {} that was built is not there any more",
-                    git.package
-                ))
-            })?;
-        Ok(Here {
-            dir,
-            root: HereRoot::Checkout(checkout),
-            resolved: None,
-        })
-    }
-
-    /// Where the readme of the project's package `found` of `release` is, from the project's
-    /// `cargo metadata`, waiting for it until `until`; copies of crates.io and other registries are
-    /// not read (decided in M3e, decision 79).
-    pub(super) async fn of_project(
-        state: &ToolState,
-        found: &Found,
-        release: &Release,
-        until: tokio::time::Instant,
-    ) -> Result<Here, Box<CallToolResult>> {
-        let what = format!("{} {}", release.name, release.version);
-        let not_known = |why: String| {
-            Box::new(crate::mcp::tool::tool_error(
-                "docs_unavailable",
-                &format!("the readme of {what} is not known: {why}"),
-                false,
-                &[super::OVERVIEW],
-            ))
-        };
-        let resolution = match project::resolve_until(state, &found.workspace, until).await {
-            Joined::Done(Ok(resolution)) => resolution,
-            Joined::Done(Err(error)) => {
-                return Err(not_known(format!(
-                    "the project could not be read: {}",
-                    ErrorChain(&error)
-                )));
-            },
-            Joined::Going(doing) => {
-                let target = match release.target() {
-                    Some(target) => target,
-                    None => state.host().await.triple.clone(),
-                };
-                return Err(Box::new(project::resolving_crate(
-                    &release.name,
-                    &target,
-                    (doing, found.project_from),
-                    &release.warnings,
-                )));
-            },
-            Joined::Ended => return Err(Box::new(get_item::stopped())),
-        };
-        let Resolution::Metadata { metadata, .. } = &*resolution else {
-            return Err(not_known("cargo metadata of the project failed".to_owned()));
-        };
-        let Some(listed) = project::metadata_package(metadata, &found.package) else {
-            return Err(not_known(
-                "it is not in the project's cargo metadata".to_owned(),
-            ));
-        };
-        let dir = listed
-            .manifest_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        let root = match &found.package.source {
-            Source::Local => HereRoot::Package {
-                workspace: dir
-                    .starts_with(&metadata.workspace_root)
-                    .then(|| metadata.workspace_root.clone()),
-            },
-            Source::Git(_) => {
-                let checkout = state
-                    .resolver
-                    .cargo_home()
-                    .and_then(|home| get_source::checkout_of(&dir, home));
-                match checkout {
-                    Some(checkout) => HereRoot::Checkout(checkout),
-                    None => return Err(copy(&what, "a vendored copy of a git repository")),
-                }
-            },
-            Source::CratesIo => {
-                return Err(copy(
-                    &what,
-                    "a copy of crates.io's, vendored or from a source that replaces crates.io, \
-                     which may differ from it",
-                ));
-            },
-            Source::Registry(registry) => {
-                return Err(copy(&what, &format!("the registry {registry}")));
-            },
-        };
-        Ok(Here {
-            dir,
-            root,
-            resolved: listed.readme.clone(),
-        })
-    }
-
-    /// Whether the project's package `found` is one of crates.io that cargo unpacked as it is,
-    /// whose `.crate` is read (decided in M3e, decision 79, as in M3c, decision 31).
-    pub(super) fn unpacked_from_crates_io(state: &ToolState, found: &Found) -> bool {
-        matches!(found.package.source, Source::CratesIo)
-            && found
-                .package
-                .manifest_path
-                .as_deref()
-                .and_then(Path::parent)
-                .zip(state.resolver.cargo_home())
-                .is_some_and(|(dir, home)| get_source::unpacked_from_crates_io(dir, home))
-    }
-
-    /// The tool error for the readme of `what`, a copy from `of`, which is not read (decided in
+    /// The tool error for the readme of `what`, of a copy from `of`, which is not read (decided in
     /// M3e, decision 79, as in M3c, decision 31).
-    fn copy(what: &str, of: &str) -> Box<CallToolResult> {
+    pub(super) fn copy(what: &str, of: &str) -> Box<CallToolResult> {
         Box::new(crate::mcp::tool::error_result(&serde_json::json!({
             "code": "docs_unavailable",
             "reason": "outside_package",
@@ -1119,7 +963,7 @@ mod here {
     /// judges its files, and shown relative to its directory (`../README.md`).
     pub(super) fn read(here: &Here) -> Result<ReadReadme, Failure> {
         let dir = &here.dir;
-        let (named, path, inherited_from) = match &here.resolved {
+        let (named, path, inherited_from) = match &here.readme {
             Some(resolved) => (resolved.display().to_string(), dir.join(resolved), None),
             None => declared(here)?,
         };
@@ -1225,7 +1069,8 @@ mod here {
             Here {
                 dir,
                 root: HereRoot::Package { workspace: None },
-                resolved: resolved.map(PathBuf::from),
+                readme: resolved.map(PathBuf::from),
+                examples: None,
             }
         }
 

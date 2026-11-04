@@ -21,6 +21,8 @@ mod find_examples;
 mod get_item;
 mod get_readme;
 mod get_source;
+#[cfg(feature = "local")]
+mod here;
 mod inspect_features;
 #[cfg(feature = "local")]
 mod list_crates;
@@ -833,7 +835,9 @@ async fn dispatch(
             }
         },
         find_examples::NAME => match find_examples::parse_arguments(request.arguments.as_ref()) {
-            Ok(find) => Ok(run_tool(find_examples::execute(find, Arc::clone(state))).await),
+            Ok(find) => {
+                Ok(Box::pin(run_tool(find_examples::execute(find, Arc::clone(state)))).await)
+            },
             Err(error) => Ok(error.into_result()),
         },
         get_readme::NAME => match get_readme::parse_arguments(request.arguments.as_ref()) {

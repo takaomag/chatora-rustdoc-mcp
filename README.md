@@ -205,7 +205,7 @@ The server always starts: a file that cannot be read or is not TOML is ignored, 
 
 ## Planned
 
-- Changelogs, and the examples of a crate built here or of git.
+- Changelogs, and the examples of the standard library.
 - The methods of the type a type dereferences to and of primitive types, the implementors of a trait across your dependency graph, and API diffs between versions.
 - Crate metadata and advisories.
 - A Claude Code plugin with a skill, and prebuilt binaries.

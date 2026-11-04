@@ -380,6 +380,22 @@ pub fn manifest_examples<'f>(
     Ok(examples::of_package(&manifest_table(manifest)?, files))
 }
 
+/// The examples of the package in `dir`, as Cargo finds them in its files and its manifest names
+/// them, without `cargo metadata` (decided in M3e, decisions 83 and 86).
+///
+/// # Errors
+///
+/// Returns an error when the manifest cannot be read, is too large or is not TOML.
+#[cfg(feature = "local")]
+pub fn examples_in(dir: &Path) -> io::Result<Vec<examples::Example>> {
+    let table = manifest_table(&dir.join("Cargo.toml"))?;
+    let files = examples::files_in(dir, &table);
+    Ok(examples::of_package(
+        &table,
+        files.iter().map(String::as_str),
+    ))
+}
+
 /// What the `[workspace.package]` of the workspace's manifest at `manifest` names as the readme
 /// that its packages inherit (decided in M3e, decision 80), as [`readme::of_workspace`] reads it.
 ///

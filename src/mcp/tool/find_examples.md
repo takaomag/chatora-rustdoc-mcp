@@ -1,4 +1,4 @@
-Find usage examples of a Rust crate on crates.io, or of one of its items first: the files of its `examples/` and the code blocks of its documentation. Answers questions such as "how is `tokio::sync::Mutex::lock` used?" or "are there examples of axum's `Router`?". For the API itself, call `get_item`; for how to start with the crate, `get_readme`.
+Find usage examples of a Rust crate⟪ on crates.io⟫⟨ (on crates.io, this workspace's own, or a path or git dependency)⟩, or of one of its items first: the files of its `examples/` and the code blocks of its documentation. Answers questions such as "how is `tokio::sync::Mutex::lock` used?" or "are there examples of axum's `Router`?". For the API itself, call `get_item`; for how to start with the crate, `get_readme`.
 
 `crate`, `version`⟨, `project`⟩ and `target` are as for `get_item`. `path` is an item, as for `get_item`: the examples that name it come first. `content: true` shows the text of the files too.
 

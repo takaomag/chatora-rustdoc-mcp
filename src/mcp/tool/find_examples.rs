@@ -13,6 +13,8 @@ use rustdoc_types::Id;
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
+#[cfg(feature = "local")]
+use super::here;
 use super::{
     InvalidArgument,
     ToolState,
@@ -26,6 +28,7 @@ use crate::{
         cache::sha256_hex,
         crate_file,
         crate_source::Sources,
+        examples::Example,
         hidden,
         source_root::{self, Root},
     },
@@ -338,7 +341,14 @@ pub(super) async fn execute(find: FindExamples, state: Arc<ToolState>) -> CallTo
     // One deadline for every step (requirement R-ARCH-6).
     let until = state.until();
     let asked_release = release.clone();
-    let (resolved, _) = resolve_version::resolving(release, Arc::clone(&state), until).await;
+    #[cfg_attr(
+        not(feature = "local"),
+        expect(
+            unused_variables,
+            reason = "only a project or a record has more to tell"
+        )
+    )]
+    let (resolved, taken) = resolve_version::resolving(release, Arc::clone(&state), until).await;
     // An error, or the response while the release is resolved, as it is.
     let Some(release) = resolved
         .structured_content
@@ -348,7 +358,51 @@ pub(super) async fn execute(find: FindExamples, state: Arc<ToolState>) -> CallTo
     else {
         return resolved;
     };
-    if !release.on_crates_io {
+    // A crate of git that `build_external_docs` recorded, in its checkout (decided in M3e,
+    // decisions 82 and 83).
+    #[cfg(feature = "local")]
+    if let Some(git) = &taken.git {
+        return match here::of_git(&state, git) {
+            Ok(found) => {
+                let files = files_here(found).await;
+                docs_and_files(&state, (asked_release, until), release, (ask, files)).await
+            },
+            Err(answer) => *answer,
+        };
+    }
+    // Another package of the project, where it is; of a copy, the docs alone (decided in M3e,
+    // decisions 82 and 87).
+    #[cfg(feature = "local")]
+    if let Some(found) = taken.found.as_deref()
+        && !release.on_crates_io
+        && !here::unpacked_from_crates_io(&state, found)
+    {
+        let mut release = release;
+        let looked_up =
+            here::of_project(&state, (found, &release), until, ("examples", DOCS_ONLY)).await;
+        let files = match looked_up {
+            Ok(found) => files_here(found).await,
+            Err(here::NotHere::Answer(answer)) => return *answer,
+            Err(here::NotHere::Copy(of)) => {
+                release.warnings.push(
+                    format!(
+                        "the files of examples/ are not read: the project uses {of}; the blocks \
+                         of the docs are of its build"
+                    )
+                    .into(),
+                );
+                Vec::new()
+            },
+        };
+        return docs_and_files(&state, (asked_release, until), release, (ask, files)).await;
+    }
+    // As one that the project takes from crates.io, which cargo unpacked as it is, its `.crate`
+    // (decided in M3e, decision 79).
+    #[cfg(feature = "local")]
+    let on_crates_io = release.on_crates_io || taken.found.is_some();
+    #[cfg(not(feature = "local"))]
+    let on_crates_io = release.on_crates_io;
+    if !on_crates_io {
         return not_a_release(&release);
     }
     let of = SourcesOf {
@@ -384,6 +438,48 @@ pub(super) async fn execute(find: FindExamples, state: Arc<ToolState>) -> CallTo
     docs_and_files(&state, (asked_release, until), release, (ask, files)).await
 }
 
+/// What to call when the examples of a package here are not known.
+#[cfg(feature = "local")]
+const DOCS_ONLY: &str = "get_item shows the examples in the docs of an item";
+
+/// The files of the `examples/` of the package `found`, as `cargo metadata` tells them or else as
+/// they are found in its directory, read where they are and judged as `get_source` judges its
+/// files (decided in M3e, decisions 82, 83 and 86), off the runtime's workers.
+#[cfg(feature = "local")]
+async fn files_here(found: here::Here) -> Vec<ExampleFile> {
+    let reading = crate::task::spawn_blocking(move || {
+        let dir = &found.dir;
+        let examples = found.examples.as_ref().map_or_else(
+            || crate_file::examples_in(dir).unwrap_or_default(),
+            Clone::clone,
+        );
+        let paths: Vec<std::path::PathBuf> = examples
+            .iter()
+            .map(|example| dir.join(&*example.file))
+            .collect();
+        match &found.root {
+            here::HereRoot::Package { workspace } => {
+                let package = source_root::Package {
+                    root: workspace.clone().unwrap_or_else(|| dir.clone()),
+                    dir: dir.clone(),
+                    examples: paths,
+                    ..source_root::Package::default()
+                };
+                read_examples(Root::Package(&package), dir, examples)
+            },
+            here::HereRoot::Checkout(checkout) => {
+                read_examples(Root::Checkout(checkout), dir, examples)
+            },
+        }
+    })
+    .await;
+    reading.unwrap_or_else(|error| {
+        let error = crate::task::resume_if_panic(error);
+        tracing::error!(%error, "the reading of the examples did not finish");
+        Vec::new()
+    })
+}
+
 /// The tool error for a release that is not of crates.io, whose examples are not found yet.
 fn not_a_release(release: &Release) -> CallToolResult {
     super::error_result(&json!({
@@ -411,6 +507,13 @@ fn example_files(sources: &Sources) -> Vec<ExampleFile> {
     let Ok(found) = crate_file::manifest_examples(&manifest.path, listed) else {
         return Vec::new();
     };
+    read_examples(root, &sources.root, found)
+}
+
+/// The files of `found`, relative to `dir`, read under `root`, judged as `get_source` judges its
+/// files: those that cannot be read, larger than [`MAX_FILE_BYTES`], after [`MAX_FILES`] or past
+/// [`MAX_TOTAL_BYTES`] in all are left out (requirement R-SC-4).
+fn read_examples(root: Root<'_>, dir: &Path, found: Vec<Example>) -> Vec<ExampleFile> {
     let mut read_in_all = 0_u64;
     found
         .into_iter()
@@ -419,7 +522,7 @@ fn example_files(sources: &Sources) -> Vec<ExampleFile> {
             if read_in_all >= MAX_TOTAL_BYTES {
                 return None;
             }
-            let resolved = source_root::resolve(root, Path::new(&*example.file)).ok()?;
+            let resolved = source_root::resolve(root, &dir.join(&*example.file)).ok()?;
             let mut contents = Vec::new();
             std::fs::File::open(&resolved.path)
                 .and_then(|opened| {
@@ -456,9 +559,12 @@ async fn docs_and_files(
     asked.name = release.name.clone();
     #[cfg(feature = "local")]
     let refresh = asked.refresh;
-    asked.version = Some(crate::data::version::VersionSpec::Exact(
-        release.version.clone(),
-    ));
+    // The version resolved, which a crate of git has from its record.
+    if asked.git.is_none() {
+        asked.version = Some(crate::data::version::VersionSpec::Exact(
+            release.version.clone(),
+        ));
+    }
     let files: Arc<[ExampleFile]> = files.into();
     let mut result = get_item::execute(
         get_item::Arguments::for_examples(asked, DocExamplesAsk {
@@ -906,6 +1012,58 @@ mod tests {
             path: format!("/p/examples/{name}.rs").into(),
             required_features: Box::default(),
             text: text.into(),
+        }
+    }
+
+    /// A path dependency outside the project's workspace: its examples under its directory are
+    /// read, one that leads outside it through a symlink is not, nor what `[[example]]` names
+    /// above it (decided in M3e, decisions 83 and 86, requirement R-SC-4).
+    #[cfg(all(feature = "local", unix))]
+    #[tokio::test]
+    async fn the_examples_of_a_package_outside_are_read_in_it_only() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = source_root::lexically(dir.path());
+        let write = |path: &str, text: &str| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+            std::fs::write(path, text).expect("written");
+        };
+        write("secret.rs", "fn secret() {}\n");
+        write(
+            "dep/Cargo.toml",
+            "[package]\nname = \"dep\"\nedition = \"2021\"\n[[example]]\nname = \"up\"\n\
+             path = \"../secret.rs\"\n",
+        );
+        write("dep/examples/inside.rs", "fn main() {}\n");
+        std::os::unix::fs::symlink(root.join("secret.rs"), root.join("dep/examples/leak.rs"))
+            .expect("linked");
+        // Without cargo metadata, as of a record, and as cargo metadata tells them.
+        let dir_of_dep = root.join("dep");
+        let listed = |examples| here::Here {
+            dir: dir_of_dep.clone(),
+            root: here::HereRoot::Package { workspace: None },
+            readme: None,
+            examples,
+        };
+        let told = vec![
+            Example {
+                name: "inside".into(),
+                file: "examples/inside.rs".into(),
+                required_features: Box::default(),
+            },
+            Example {
+                name: "leak".into(),
+                file: "examples/leak.rs".into(),
+                required_features: Box::default(),
+            },
+        ];
+        for examples in [None, Some(told)] {
+            let read: Vec<String> = files_here(listed(examples))
+                .await
+                .into_iter()
+                .map(|file| file.file.to_string())
+                .collect();
+            assert_eq!(read, ["examples/inside.rs"]);
         }
     }
 

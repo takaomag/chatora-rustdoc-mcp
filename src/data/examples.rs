@@ -144,6 +144,74 @@ pub fn of_targets(targets: &[super::metadata::Target], dir: &std::path::Path) ->
     examples
 }
 
+/// The most entries of `examples/` looked at (decided in M3e, decision 83).
+#[cfg(feature = "local")]
+const MAX_SCANNED: usize = 10_000;
+
+/// The files of the package in `dir`, whose manifest is `table`, that may be its examples.
+///
+/// They are relative to `dir` with `/`, for [`of_package`] when `cargo metadata` does not tell
+/// them (decided in M3e, decisions 83 and 86): `examples/<name>.rs` and `examples/<name>/main.rs`
+/// as Cargo finds them, and the files that `[[example]]` names. What starts with a dot, a name that
+/// is not UTF-8 and a directory under `examples/` through a symlink are not looked into, but
+/// `examples/` itself is followed, as Cargo does; a symlink to a file is listed, for the reading to
+/// judge where it leads. At most 10,000 entries of `examples/` and 10,000 `[[example]]` are looked
+/// at.
+#[cfg(feature = "local")]
+#[must_use]
+pub fn files_in(dir: &std::path::Path, table: &toml::Table) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    let mut looked_at = 0_usize;
+    let is_file = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() || metadata.file_type().is_symlink())
+    };
+    if let Ok(entries) = std::fs::read_dir(dir.join("examples")) {
+        for entry in entries.flatten() {
+            looked_at = looked_at.saturating_add(1);
+            if looked_at > MAX_SCANNED {
+                break;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if is_file(&entry.path().join("main.rs")) {
+                    files.push(format!("examples/{name}/main.rs"));
+                }
+            } else if std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|extension| extension == "rs")
+            {
+                files.push(format!("examples/{name}"));
+            }
+        }
+    }
+    let declared = table
+        .get("example")
+        .and_then(toml::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    for path in declared
+        .iter()
+        .take(MAX_SCANNED)
+        .filter_map(|entry| entry.get("path").and_then(toml::Value::as_str))
+        .filter_map(readme::relative)
+    {
+        if is_file(&dir.join(&path)) {
+            files.push(path);
+        }
+    }
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
 /// The name of the example that Cargo finds at `file`: `examples/<name>.rs` or
 /// `examples/<name>/main.rs`.
 fn discovered(file: &str) -> Option<&str> {
@@ -278,6 +346,44 @@ mod tests {
         )
         .expect("a target");
         assert_eq!(&*target.required_features, [Box::from("tls")]);
+    }
+
+    /// Without cargo metadata, the files of `examples/` that Cargo would find and those that
+    /// `[[example]]` names, not what starts with a dot nor a directory through a symlink
+    /// (decided in M3e, decision 83).
+    #[cfg(feature = "local")]
+    #[test]
+    fn the_files_that_may_be_examples_are_found_in_a_directory() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        // The package is below, so that `../x.rs` is a file outside it.
+        std::fs::write(dir.path().join("x.rs"), "fn main() {}\n").expect("written");
+        let root = &dir.path().join("pkg");
+        for path in [
+            "examples/chat.rs",
+            "examples/echo/main.rs",
+            "examples/echo/util.rs",
+            "examples/notes.md",
+            "examples/.hidden.rs",
+            "examples/.dir/main.rs",
+            "demos/tls.rs",
+            "outside/main.rs",
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+            std::fs::write(path, "fn main() {}\n").expect("written");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("outside"), root.join("examples/linked"))
+            .expect("linked");
+        let manifest = table(
+            "[package]\nname = \"demo\"\n[[example]]\nname = \"tls\"\npath = \"demos/tls.rs\"\n\
+             [[example]]\nname = \"up\"\npath = \"../x.rs\"\n",
+        );
+        assert_eq!(files_in(root, &manifest), [
+            "demos/tls.rs",
+            "examples/chat.rs",
+            "examples/echo/main.rs",
+        ]);
     }
 
     /// A member's examples, as cargo metadata tells them, in its directory only.

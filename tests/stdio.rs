@@ -2554,6 +2554,26 @@ fn get_readme_reads_a_members_readme_where_it_is() {
         back["structuredContent"]["data"]["format"], "text",
         "{back}"
     );
+    // Its examples, as cargo metadata tells them, where they are (decided in M3e, decision 82).
+    let mut examples = Value::Null;
+    for _ in 0..90 {
+        id += 1;
+        server.send(&call_tool(id, "find_examples", json!({ "crate": "front" })));
+        examples = server.response(id)["result"].clone();
+        if examples["structuredContent"]["data"]["docs"] == "read" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    assert_ne!(examples["isError"], true, "{examples}");
+    let first = &examples["structuredContent"]["data"]["examples"][0];
+    assert_eq!(first["kind"], "file", "{examples}");
+    assert_eq!(first["file"], "examples/demo.rs", "{examples}");
+    let path = first["path"].as_str().expect("a path");
+    assert!(
+        std::fs::read_to_string(path).is_ok_and(|text| text.contains("fn main")),
+        "{path}"
+    );
     assert!(server.finish().success());
 }
 
@@ -4513,8 +4533,11 @@ fn git_repository(dir: &Path) -> (PathBuf, PathBuf, String) {
          pub trait Shape {}\nimpl Shape for Thing {}\n",
     )
     .expect("written");
-    // A readme that the manifest does not name, of the first default name.
+    // A readme that the manifest does not name, of the first default name; an example that
+    // Cargo finds, which no cargo metadata of the record tells (decided in M3e, decision 83).
     std::fs::write(work.join("README.md"), "# Fixture\n").expect("written");
+    std::fs::create_dir_all(work.join("examples")).expect("made");
+    std::fs::write(work.join("examples/try.rs"), "fn main() {}\n").expect("written");
     git_in(&work, &gitconfig, &[
         "init",
         "--quiet",
@@ -4643,6 +4666,7 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
         ("resolve_version", with(json!({}))),
         ("inspect_features", with(json!({}))),
         ("get_readme", with(json!({}))),
+        ("find_examples", with(json!({}))),
     ];
     for (id, (tool, arguments)) in (100_u64..).zip(tools) {
         server.send(&call_tool(id, tool, arguments));
@@ -4677,6 +4701,10 @@ fn the_query_tools_look_up_a_crate_of_git_in_its_records() {
     let readme = server.response(201)["result"]["structuredContent"]["data"].clone();
     assert_eq!(readme["file"], "README.md", "{readme}");
     assert_eq!(readme["text"], "# Fixture\n", "{readme}");
+    // Its examples, from its checkout.
+    server.send(&call_tool(202, "find_examples", with(json!({}))));
+    let found = server.response(202)["result"]["structuredContent"]["data"].clone();
+    assert_eq!(found["examples"][0]["file"], "examples/try.rs", "{found}");
     reads_the_source_of_the_git_crate(&mut server, &with(json!({})));
     looked_up_by_hash_and_when_stale(&mut server, &commit);
     looked_up_while_rebuilding(&mut server, &commit);
