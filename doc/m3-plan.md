@@ -1,7 +1,7 @@
 # M3 (crate 情報とソース) の計画
 
 - 作成日: 2026-10-24
-- 状態: M3a〜M3h を実施し、§7 で要件 v0.21 を作った (2026-11-05)。§5 は 2026-10-24 に決めた
+- 状態: M3a〜M3h を実施し、§7 で要件 v0.21 を作り、M4 の計画を立てた (2026-11-05。M3 は完了)。§5 は 2026-10-24 に決めた
 - 前提: [requirements.md](requirements.md) v0.20。M3 の内容と完了条件は §12、M2 の既知の残りは [m2-plan.md](m2-plan.md) の §7.1 (決定 5・6・8・9)、M2 の結果は m2-plan.md の §6
 
 ---
@@ -687,3 +687,5 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 決定 145 `inspect_features` で feature を指したときの item の既定件数は、要件を実装に合わせて feature の一覧と同じ `limit` (既定 100・上限 200) とする。決定 56 の「50 件」は実装されておらず、改める (要件 v0.21 のレビューで分かった)
 - 決定 146 `.crate` と rust-src の展開でファイル数の上限 (10 万) を超えたときは `too_large` (再試行不可) とし、実装の `corrupt` を直す (展開した量の超過と同じ。壊れたアーカイブと区別する。get_source と get_item の振り分けと単体テスト)
 - 決定 147 README の `find_examples` の案内で `permissions.additionalDirectories` に足すのは `~/.cargo/registry/src` と `~/.cargo/git/checkouts` だけにし、`~/.cargo` を丸ごと足さない理由 (`credentials.toml` の token を Claude Code が確認なしに読める) を書く。一覧ページを書き換えたサブエージェントが気付いた、M3e (決定 89) の案内の誤り。要件 (R-SC-4 の examples と R-SEC-2) と一覧ページも直す。あわせて README の「リダイレクトを追わない」を crates.io の API に限った (index と static は同じホストのリダイレクトだけ追う)
+
+**§7 の手順 4 の結果 (2026-11-05)**: M4 の計画を [m4-plan.md](m4-plan.md) に立てた。下調べ (サブエージェント、読むだけ。target/claude-notes/m4-research.md) の P1〜P14 と、計画のレビューの J1〜J7 を利用者が 1 件ずつ決めた (どれも推した案)。M3 はこれで終わり
