@@ -8,7 +8,8 @@
 //! threads. For each step, it prints the median: reading the file, checking its SHA-256 (as the
 //! cache does, requirement R-CA-4), parsing it into the latest types, building the public path
 //! index, and freeing both. Then the crate and its index are archived once (requirement R-PF-1),
-//! and the archive is opened five times: mapped, its header compared and its bytes checked.
+//! and the archive is opened five times: mapped, its header compared and its bytes checked. The
+//! reverse index (decided in M4a) is built and archived alone too, for its share.
 
 #![expect(
     unused_crate_dependencies,
@@ -32,7 +33,7 @@ use chatora_rustdoc_mcp::{
         formats,
         rustdoc_json,
     },
-    query::{across::Indexed, path_index::PathIndex},
+    query::{across::Indexed, path_index::PathIndex, reverse::ReverseIndex},
     task,
 };
 use sha2::{Digest as _, Sha256};
@@ -140,6 +141,14 @@ fn measure_archive(path: &str) -> Result<String, String> {
     let dir = tempfile::tempdir().map_err(|e| error(&e))?;
     let cache = Cache::at(dir.path());
     let archive_path = dir.path().join("crate.rkyv");
+    // The reverse index alone, built and archived (decided in M4a): its share of the archive.
+    let started = Instant::now();
+    let reverse = ReverseIndex::build(&parsed.krate);
+    let reverse_built = started.elapsed();
+    let reverse_size = rkyv::to_bytes::<rkyv::rancor::Error>(&reverse)
+        .map_err(|e| error(&e))?
+        .len();
+    drop(reverse);
     let started = Instant::now();
     let indexed = Indexed::new(parsed);
     archive::write(&cache, &archive_path, &header, &indexed).map_err(|e| error(&e))?;
@@ -158,7 +167,8 @@ fn measure_archive(path: &str) -> Result<String, String> {
     }
     Ok(format!(
         "archive: {size} bytes, written in {write:?} (with the index); opened and checked in {:?} \
-         ({items} items)",
+         ({items} items); the reverse index alone: {reverse_size} bytes, built in \
+         {reverse_built:?}",
         median(opens)
     ))
 }
