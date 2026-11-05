@@ -23,7 +23,7 @@ const API: u32 = 1;
 /// The schema of the archives of rustdoc JSON (requirement R-CA-2): change it with the types that
 /// an archive holds, other than those of rustdoc-types, whose `FORMAT_VERSION` is in the header and
 /// the name of the archive too.
-const ARCHIVE: u32 = 8;
+const ARCHIVE: u32 = 9;
 
 /// The directory of the local builds' records of this format: `v<n>`.
 #[must_use]
@@ -106,6 +106,6 @@ mod tests {
         assert_eq!(records_dir(), "v1");
         assert_eq!(toolchains_dir(), "v1");
         assert_eq!(sources_dir(), "src.v1");
-        assert_eq!(archive_schema(), 8);
+        assert_eq!(archive_schema(), 9);
     }
 }

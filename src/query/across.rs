@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use super::{
     path_index::{PathIndex, Resolution},
+    reverse::ReverseIndex,
     search::SearchIndex,
     view::CrateView,
 };
@@ -26,6 +27,8 @@ pub struct Indexed {
     pub index: PathIndex,
     /// Its items, for search (requirement R-SR-1).
     pub search: SearchIndex,
+    /// Its impls by type and by trait, and the owners of its items (requirement R-TI-4).
+    pub reverse: ReverseIndex,
     /// What the data was made from: the SHA-256 of the JSON, or another key of 64 hex digits
     /// that changes with it. Empty when not known. Cursors are bound to it (requirement R-OUT-3).
     pub source: Box<str>,
@@ -37,10 +40,12 @@ impl Indexed {
     pub fn new(parsed: ParsedCrate) -> Self {
         let index = PathIndex::build(&parsed.krate);
         let search = SearchIndex::build(&parsed.krate, &index);
+        let reverse = ReverseIndex::build(&parsed.krate);
         Self {
             parsed,
             index,
             search,
+            reverse,
             source: Box::default(),
         }
     }

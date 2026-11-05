@@ -110,6 +110,7 @@ mod tests {
         let index = PathIndex::build(&krate);
         let indexed = Indexed {
             search: SearchIndex::build(&krate, &index),
+            reverse: crate::query::reverse::ReverseIndex::build(&krate),
             index,
             parsed: ParsedCrate {
                 krate,

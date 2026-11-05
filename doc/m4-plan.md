@@ -125,6 +125,33 @@ M4 は、1 つの crate の中だけでは答えられない問い (依存グラ
 
 ### 6.1 M4a
 
+**下調べ (2026-11-05、サブエージェント、読むだけ。target/claude-notes/m4a-research.md)**: 依存グラフの集合は `PackageGraph` の `dependents` の逆向きの閉包と `FeatureSets::normal` の積で作れる (`Direct` は依存の種類を捨てている)。並べて読む処理は `search_across` の中に閉じている。逆引きの索引は無く、`list_implementors` は自分の crate の `Trait.implementations` だけ、プリミティブは全 impl を走査する。他 crate の trait は `external_crates[crate_id].name` と `paths` のパスで引け、定義した側の `paths` と一致する (手元の 4 例)。索引はアーカイブを 1〜3% 増やす見込み (tokio 約 70KB、core 約 0.6MB)
+
+**判断 (2026-11-05、利用者が 1 件ずつ決めた。どれも推した案)**:
+
+- 決定 1 (M4a) std・core・alloc の trait (`Display`・`Iterator`・`std::error::Error` など) も `dependency_graph` で読む (全 package を上限と `partial` の下で)。auto trait (`Send`・`Sync` など) だけは全型が持つので `invalid_argument` にして `list_impls` を案内する
+- 決定 2 (M4a) 既定のプロジェクトの workspace の member は、`search_across` と同じく文書が無ければビルドする (J2 の「ビルドしない」は依存の話)
+- 決定 3 (M4a) 辺の絞り込みは、`cargo metadata` の辺の逆向きの閉包と `FeatureSets` (`cargo tree -e normal`、dev の引数なら `normal,dev`) の積に、`Direct` に足す依存の種類 (`dep_kinds`) で build だけ・dev だけの辺を外す。他の OS の cfg の辺は残る (余分に読むだけ)
+- 決定 4 (M4a) J2 でキャッシュにある前のローカルビルドは、入力の鍵を計算せずに `stale: true` で読む
+- 決定 5 (M4a) 依存グラフの照会で読むアーカイブは、crate ごとに引いて結果を所有の文字列にしてから写像を放し、最後の 32 個を開いたままにする仕組み (`load::keep`) にも入れない (R10)
+- 決定 6 (M4a) 逆引きの索引: trait ごとの実装者からは blanket impl の写しと auto trait の合成 impl を除き (写しは数え重ね。元の impl は定義した crate に 1 回)、型ごとの impl には印付きで入れる。negative impl は trait ごとの索引に入れる
+- 決定 7 (M4a) アーカイブの形式の版は A3 で 8 から 9 に、B3 で検索索引の形を変えたら 10 に上げる (同じ版で形の違うアーカイブを誤読しない)
+- 決定 8 (M4a) §9.1 の「依存グラフの implementors が索引ありで 1 秒未満」は、(W) 同じプロセスの 2 回目からと (F) 新しいプロセスでアーカイブはディスクにある状態に当て、(R) アーカイブの作り直しと (C) docs.rs から冷えて取る状態は参考にする。eval/fixture の `tower::Service` と、このリポジトリの `serde::Serialize`・`futures_core::Stream` で、各 20 回の p50・p95
+- 決定 9 (M4a) A4 の通信は、(a) 依存の約 300 crate に docs.rs の JSON があるかを確かめるだけ (約 600 回の要求、転送 ~1MB) と、(b) 測る trait の閉包の JSON を取る (転送は fixture で約 2〜3MB、このリポジトリで約 8〜25MB の見込み) を許可する。Q9 のテストに要る 4 crate (tower-service・axum-core・hyper-util・tower-http) を testdata に足す取得も含む。normal の依存グラフ全体 (c) は取らない。キャッシュは target/ の下に分け、測った後に消す
+- 決定 10 (M4a) 1 回の照会で読む crate の数の上限は定数 300 で始め (超えた分は読めていない crate に `too_many`)、設定にするかは M5 の実測で決める
+
+聞かずに決めたこと: 段の中の順は A1 → A3 → A2 → A4 (A2 は A1 の集合と A3 の索引を使う)
+
+**A1 の実装 (2026-11-05)**: データ層。`data::packages` の `Direct` に依存の種類 (`Kinds`: normal と dev。`cargo metadata` の `dep_kinds` から、知らない種類は normal、種類の無い古い cargo と Cargo.lock だけのときは両方) を持たせ、`PackageGraph::dependents_closure` (package を推移的に依存に含む package。normal の辺と、引数のときだけ member の dev の辺を逆にたどり、build script だけの辺は通らない。package 自身が先頭で、近い順) と `through_other_versions` (同じ名前の別の版ごとに、その閉包のうち照会した版の閉包に入らない package。J7) を足した。他の OS の cfg の辺は残り、ツールの層で `FeatureSets` と積を取る (決定 3)。テスト: 2 つの版の trait の crate、build だけ・dev だけ (member と非 member)・両方の版に依存する member、Cargo.lock だけのとき
+
+**A3 の実装 (2026-11-05)**: 新しい `query::reverse` の `ReverseIndex` を `Indexed` に足した: impl を型ごとに (`impls_by_type`。鍵は名前のある型なら `paths` の定義パス、無い型は `type_key` の形 (`str`・`[]`・`[;]`・`()`・`(,)`・`&`・`*`・`fn`・`dyn`・`impl`・`<>`・`_`)、`ImplKind` (Inherent・Trait・Blanket・Synthetic) の印付き)、trait ごとの実装 (`implementations_of`。鍵は trait の定義パス (`paths` の `ItemSummary.path` を `::` でつなぐ。crate 名から始まる)、negative も入れ、blanket の写しと合成 impl は除く。決定 6)、持ち主 (`parent_of`。impl・trait の item、variant、struct・union・variant のフィールド)。id の順に作り、同じ JSON から同じ索引になる。アーカイブの形式の版 `ARCHIVE` を 8 から 9 に (決定 7)。テスト: 自分の trait・他 crate の trait・blanket の写し・合成・negative・プリミティブの impl、名前の無い型の鍵
+
+- A1・A3 のレビュー (サブエージェント、読むだけ。手元の axum・tokio・futures・std・alloc・core の JSON を python で数えて裏を取った) の判断 (利用者が決めた):
+  - 決定 11 (M4a) `dependency_graph` は normal の依存だけを数え、dev を含める引数は作らない (決定 3 と計画の P1 の「dev は引数で」を改める)。`cargo rustdoc` の JSON にはテストのコード (cfg(test)) が入らず、dev 依存で足した crate から実装が見つかることはほぼ無い。dev の辺の先の member に依存する別の member まで入る誤りも無くなる
+  - 決定 12 (M4a) 形式の版を上げると、使っているディレクトリの中に古い版の `.rkyv` が残り続ける (GC はディレクトリ単位でしか消さない。std は nightly ごとに約 146MB)。GC が使っているディレクトリの中の他の版の `.rkyv` も消すようにし、A5 として M4a に足す
+- A1・A3 のレビューの対応: blanket impl の写しは元の impl と item を共有するので持ち主にしない (alloc の `to_owned` が写しを指していた)。proc-macro の crate は閉包に入れても広げない (`quote::ToTokens` などで全 package に広がっていた)。trait ごとの実装に trait の crate の id (`external_crates` の鍵、版を `html_root_url` で見分けるため) を持たせる。`&T` の impl は T の鍵でも引け (`by_ref` の印)、`dyn Trait` は `dyn <最初の trait の定義パス>` の鍵に。他 crate から取り込んだ impl (std の core のプリミティブの impl) は `inlined` の印を付け、trait ごとの実装からは除く。別の版は lib 名で見る (鍵が lib 名から始まるため)。テストを足した (写しが item を共有するとき、proc-macro、参照・`dyn`・取り込みの impl、trait の crate の id、variant とフィールドの持ち主)
+- A1・A3 のレビューで残したもの: 型の別名に書いた impl は別名の鍵に入る (`RawFd` の impl は `i32` で引けない)。同じ crate の 2 つの版に直接依存する crate では、trait の鍵がぶつかり、`trait_crate` で見分けるのは A2 で
+
 ### 6.2 M4b
 
 ### 6.3 M4c

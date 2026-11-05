@@ -19,5 +19,6 @@ pub mod methods;
 pub mod overview;
 pub mod path_index;
 pub mod render;
+pub mod reverse;
 pub mod search;
 pub mod view;

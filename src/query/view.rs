@@ -172,13 +172,19 @@ pub(super) mod tests {
     use super::*;
     use crate::{
         data::rustdoc_json::ParsedCrate,
-        query::{across::Indexed, path_index::PathIndex, search::SearchIndex},
+        query::{
+            across::Indexed,
+            path_index::PathIndex,
+            reverse::ReverseIndex,
+            search::SearchIndex,
+        },
     };
 
     /// `krate` and its index, archived as the cache keeps them.
     pub(in crate::query) fn archive(krate: Crate) -> AlignedVec {
         let indexed = Indexed {
             index: PathIndex::build(&krate),
+            reverse: ReverseIndex::build(&krate),
             parsed: ParsedCrate {
                 krate,
                 newer_than_supported: false,

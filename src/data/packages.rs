@@ -13,7 +13,7 @@ use semver::Version;
 
 use super::{
     cargo_lock::CargoLock,
-    metadata::{Metadata, PackageId, Resolution},
+    metadata::{DepKind, Metadata, PackageId, Resolution},
     sparse_index::IndexEntry,
 };
 
@@ -122,6 +122,9 @@ pub struct PackageGraph {
     edges: Box<[Direct]>,
     /// For each package, the packages that depend on it.
     dependents: Box<[Box<[usize]>]>,
+    /// For each package, whether it is a procedural macro, whose dependencies' items it does not
+    /// export. False when not known, as from Cargo.lock.
+    proc_macro: Box<[bool]>,
 }
 
 /// A dependency of a package, as of a member.
@@ -134,6 +137,20 @@ struct Direct {
     extern_name: Box<str>,
     /// The package depended on.
     package: usize,
+    /// Whether the code of the package that depends on it uses it: a normal dependency, not
+    /// only a dev- or build-dependency. True when not known, as from Cargo.lock.
+    normal: bool,
+}
+
+/// Whether a dependency, of the kinds that `cargo metadata` reports over its platforms, is one
+/// that the code of the package that depends on it uses: a normal one, not only of its tests and
+/// examples (dev) or its build script (build). A kind it does not know counts as normal, and no
+/// kind at all as normal too, so that no dependency is left out.
+fn is_normal(dep_kinds: &[DepKind]) -> bool {
+    dep_kinds.is_empty()
+        || dep_kinds
+            .iter()
+            .any(|kind| !matches!(kind.kind.as_deref(), Some("dev" | "build")))
 }
 
 /// A package that a name may mean, and the packages that use it.
@@ -209,6 +226,16 @@ impl PackageGraph {
                 }
             })
             .collect();
+        let proc_macro: Box<[bool]> = metadata
+            .packages
+            .iter()
+            .map(|package| {
+                package
+                    .targets
+                    .iter()
+                    .any(|target| target.kind.iter().any(|kind| kind.as_ref() == "proc-macro"))
+            })
+            .collect();
         let indices: HashMap<&PackageId, usize> = metadata
             .packages
             .iter()
@@ -238,10 +265,11 @@ impl PackageGraph {
                     member: from,
                     extern_name: dep.name.clone(),
                     package: to,
+                    normal: is_normal(&dep.dep_kinds),
                 });
             }
         }
-        Self::with(packages, members, edges, dependents)
+        Self::with(packages, members, edges, dependents, proc_macro)
     }
 
     /// The packages that Cargo.lock lists, when `cargo metadata` failed. Renames and lib names
@@ -281,11 +309,13 @@ impl PackageGraph {
                         member: from,
                         extern_name: package.lib_name.clone(),
                         package: to,
+                        normal: true,
                     });
                 }
             }
         }
-        Self::with(packages, members, edges, dependents)
+        let proc_macro = vec![false; packages.len()].into();
+        Self::with(packages, members, edges, dependents, proc_macro)
     }
 
     fn with(
@@ -293,6 +323,7 @@ impl PackageGraph {
         members: Box<[usize]>,
         edges: Vec<Direct>,
         dependents: Vec<BTreeSet<usize>>,
+        proc_macro: Box<[bool]>,
     ) -> Self {
         let direct = edges
             .iter()
@@ -308,6 +339,7 @@ impl PackageGraph {
                 .into_iter()
                 .map(|users| users.into_iter().collect())
                 .collect(),
+            proc_macro,
         }
     }
 
@@ -409,6 +441,84 @@ impl PackageGraph {
             }
         }
         found
+    }
+
+    /// `package`, one of [`Self::packages`], and the packages that depend on it, directly or
+    /// through others: those whose code can implement its traits (requirement R-TI-3, decided in
+    /// M4a, decision 3). Only normal dependencies count: not those of build scripts, nor dev ones,
+    /// whose code is not in the documentation. A procedural macro is in it, but not those that
+    /// depend on it alone, as it does not export its dependencies' items. `package` comes first,
+    /// then the others nearest first.
+    ///
+    /// The platforms are not looked at: a package that depends on it only for another target is
+    /// in it, which the caller narrows with the project's build (`FeatureSets`).
+    #[must_use]
+    pub fn dependents_closure(&self, package: &ProjectPackage) -> Vec<&ProjectPackage> {
+        let Some(start) = self.index_of(package) else {
+            return Vec::new();
+        };
+        self.closure_from(start)
+            .into_iter()
+            .filter_map(|index| self.packages.get(index))
+            .collect()
+    }
+
+    /// For each other version of `package` in the project (another package of the same lib name,
+    /// which the definition paths of its traits start with), the packages that depend on it as
+    /// [`Self::dependents_closure`] counts them, and not on `package`: their implementations are
+    /// of the other version's traits, not of those of `package` (decided in M4's plan, J7). Those
+    /// without any are left out.
+    #[must_use]
+    pub fn through_other_versions(
+        &self,
+        package: &ProjectPackage,
+    ) -> Vec<(&ProjectPackage, Vec<&ProjectPackage>)> {
+        let Some(start) = self.index_of(package) else {
+            return Vec::new();
+        };
+        let asked: BTreeSet<usize> = self.closure_from(start).into_iter().collect();
+        let lib = normalize(&package.lib_name);
+        self.packages
+            .iter()
+            .enumerate()
+            .filter(|&(index, other)| index != start && normalize(&other.lib_name) == lib)
+            .filter_map(|(index, other)| {
+                let only: Vec<&ProjectPackage> = self
+                    .closure_from(index)
+                    .into_iter()
+                    .filter(|dependent| !asked.contains(dependent))
+                    .filter_map(|dependent| self.packages.get(dependent))
+                    .collect();
+                (!only.is_empty()).then_some((other, only))
+            })
+            .collect()
+    }
+
+    /// The indices of [`Self::dependents_closure`] from the package at `start`.
+    fn closure_from(&self, start: usize) -> Vec<usize> {
+        let mut users: Vec<Vec<usize>> = vec![Vec::new(); self.packages.len()];
+        for edge in &self.edges {
+            if edge.normal
+                && let Some(of) = users.get_mut(edge.package)
+            {
+                of.push(edge.member);
+            }
+        }
+        let mut seen = vec![false; self.packages.len()];
+        let mut order = Vec::new();
+        let mut queue = std::collections::VecDeque::from([start]);
+        while let Some(index) = queue.pop_front() {
+            match seen.get_mut(index) {
+                Some(seen) if !*seen => *seen = true,
+                _ => continue,
+            }
+            order.push(index);
+            let exports = index == start || !self.proc_macro.get(index).copied().unwrap_or(false);
+            if exports {
+                queue.extend(users.get(index).map_or(&[][..], Vec::as_slice));
+            }
+        }
+        order
     }
 
     /// Where `package` is in [`Self::packages`].
@@ -634,6 +744,119 @@ mod tests {
         ))
         .expect("a Cargo.lock");
         (metadata, lock)
+    }
+
+    /// A project where the trait crate `svc` comes in two versions: `tower` uses 0.3 and `old`
+    /// 0.2, which the member `app` both depends on; `buildy` uses 0.3 in its build script alone;
+    /// `devy` uses it as a dev-dependency, and is not a member; the member `tests` uses it as a
+    /// dev-dependency alone; the procedural macro `derive` uses it, and `user` uses `derive`.
+    fn two_versions() -> PackageGraph {
+        let app = package("app", "0.1.0", None);
+        let tests = package("tests", "0.1.0", None);
+        let svc03 = package("svc", "0.3.3", Some(REGISTRY));
+        let svc02 = package("svc", "0.2.0", Some(REGISTRY));
+        let tower = package("tower", "0.5.3", Some(REGISTRY));
+        let old = package("old", "1.0.0", Some(REGISTRY));
+        let buildy = package("buildy", "1.0.0", Some(REGISTRY));
+        let devy = package("devy", "1.0.0", Some(REGISTRY));
+        let mut derive = package("derive", "1.0.0", Some(REGISTRY));
+        derive["targets"] = json!([{ "name": "derive", "kind": ["proc-macro"] }]);
+        let user = package("user", "1.0.0", Some(REGISTRY));
+        let dep = |package: &serde_json::Value, kind: Option<&str>| {
+            json!({
+                "name": package["name"].as_str().map(|name| name.replace('-', "_")),
+                "pkg": id(package),
+                "dep_kinds": [{ "kind": kind, "target": null }],
+            })
+        };
+        let node = |package: &serde_json::Value, deps: Vec<serde_json::Value>| json!({ "id": id(package), "deps": deps, "features": [] });
+        let nodes = vec![
+            node(&app, vec![
+                dep(&tower, None),
+                dep(&old, None),
+                dep(&buildy, None),
+                dep(&devy, None),
+            ]),
+            node(&tests, vec![dep(&svc03, Some("dev"))]),
+            node(&tower, vec![dep(&svc03, None)]),
+            node(&old, vec![dep(&svc02, None)]),
+            node(&buildy, vec![dep(&svc03, Some("build"))]),
+            node(&devy, vec![dep(&svc03, Some("dev"))]),
+            node(&derive, vec![dep(&svc03, None)]),
+            node(&user, vec![dep(&derive, None)]),
+        ];
+        let metadata = json!({
+            "packages": [&app, &tests, &svc03, &svc02, &tower, &old, &buildy, &devy, &derive, &user],
+            "workspace_members": [id(&app), id(&tests)],
+            "resolve": { "nodes": nodes },
+            "workspace_root": "/w",
+            "version": 1,
+        });
+        let metadata: Metadata = serde_json::from_value(metadata).expect("metadata");
+        let lock = CargoLock::parse("").expect("a Cargo.lock");
+        PackageGraph::from_metadata(&metadata, &lock)
+    }
+
+    /// The package `name` at `version` of `graph`.
+    fn named<'g>(graph: &'g PackageGraph, name: &str, version: &str) -> &'g ProjectPackage {
+        graph
+            .packages()
+            .iter()
+            .find(|package| package.name.as_ref() == name && package.version.to_string() == version)
+            .expect("the package")
+    }
+
+    fn names(packages: &[&ProjectPackage]) -> Vec<String> {
+        packages
+            .iter()
+            .map(|package| format!("{}@{}", package.name, package.version))
+            .collect()
+    }
+
+    /// The packages that can implement the traits of a package: those that depend on it through
+    /// their code, not a build script nor tests; a procedural macro, but not what depends on it
+    /// alone; the package itself first (decided in M4a, decision 3).
+    #[test]
+    fn the_dependents_of_a_package_are_those_whose_code_uses_it() {
+        let graph = two_versions();
+        let svc = named(&graph, "svc", "0.3.3");
+        assert_eq!(names(&graph.dependents_closure(svc)), [
+            "svc@0.3.3",
+            "tower@0.5.3",
+            "derive@1.0.0",
+            "app@0.1.0"
+        ]);
+        // Of Cargo.lock alone, the kinds are not known, and every dependency counts.
+        let lock = CargoLock::parse(&format!(
+            "[[package]]\nname = \"svc\"\nversion = \"0.3.3\"\nsource = \"{REGISTRY}\"\n\n\
+             [[package]]\nname = \"buildy\"\nversion = \"1.0.0\"\nsource = \"{REGISTRY}\"\n\
+             dependencies = [\"svc\"]\n"
+        ))
+        .expect("a Cargo.lock");
+        let graph = PackageGraph::from_lock(&lock);
+        let svc = named(&graph, "svc", "0.3.3");
+        assert_eq!(names(&graph.dependents_closure(svc)), [
+            "svc@0.3.3",
+            "buildy@1.0.0"
+        ]);
+    }
+
+    /// The packages that depend on another version of the trait's package, and not on the one
+    /// asked of, are told apart: a member that depends on both counts for the one asked of
+    /// (decided in M4's plan, J7).
+    #[test]
+    fn the_dependents_of_another_version_alone_are_told_apart() {
+        let graph = two_versions();
+        let svc = named(&graph, "svc", "0.3.3");
+        let others = graph.through_other_versions(svc);
+        let told: Vec<(String, Vec<String>)> = others
+            .iter()
+            .map(|(other, only)| (format!("{}@{}", other.name, other.version), names(only)))
+            .collect();
+        assert_eq!(told, [("svc@0.2.0".to_owned(), vec![
+            "svc@0.2.0".to_owned(),
+            "old@1.0.0".to_owned()
+        ])]);
     }
 
     fn version(lookup: &Lookup<'_>) -> Option<String> {
