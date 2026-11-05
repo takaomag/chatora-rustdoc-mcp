@@ -171,6 +171,34 @@ M4 は、1 つの crate の中だけでは答えられない問い (依存グラ
 
 ### 6.2 M4b
 
+**下調べ (2026-11-05、サブエージェント、読むだけ。target/claude-notes/m4b-research.md)**: B1 は、今の crate の照会で trait を解いて (re-export をたどる) 定義した package と定義パス (`paths` の、`implementations_of` の鍵) を得て、`dependents_closure` と `FeatureSets::normal` の積を `gather` の `CachedOnly` で読み、crate ごとに `implementations_of` を引いて今の `implementors_of` の描き方を使い回す。B2 は、他 crate の型の id から `paths` の定義パスと `external_crates` の版を得て、その crate の既存のアーカイブの `by_definition_path` と `canonical_path` で描く。B3 は、アーカイブを作るときには行き先の中身が無い (reqwest の `paths` の `http::header` の下は 26 件だけ) ので、照会のときに行き先を読んで付け替える
+
+**判断 (2026-11-05、利用者が 1 件ずつ決めた。どれも推した案)**:
+
+- 決定 13 (M4b) `dependency_graph` の `sources` は、読めていない crate (ビルドが要る・多すぎる・JSON が無い・失敗・取得中) と、前のビルドをそのまま読んだ crate (stale) だけを並べ、読んだ数を `crates_read` で返す (全件は 300 crate で約 6 万字になり、応答の上限 32,000 字を超える)
+- 決定 14 (M4b) 実装者は、trait を定義した crate の分を先に、次に package 名と版の順、その中で型と見出しの順に並べる
+- 決定 15 (M4b) std の trait は、std・alloc・core と通常のビルドの全 package (proc-macro を除く) を読み、member → 直接依存 → 深い順に並べる (上限で切るときに利用者に近い crate を残す)
+- 決定 16 (M4b) impl を持たない組み込みの marker (`Sized`・`Unsize`・`Tuple` など) は、auto trait と同じく `invalid_argument` にして `list_impls` を案内する (名前の一覧で見分ける)
+- 決定 17 (M4b) J7 で版を判じられない impl (ローカルビルドで版の URL が無く、同じ crate の 2 つの版に依存するなど) は、warning 付きで実装者に入れる
+- 決定 18 (M4b) B2 の std の型は、prelude の名前 (`Option`・`Vec`・`String`・`Result`・`Box` など) は短いまま、ほかは std の正準パス (`std::fmt::Formatter`) で描く (`$crate::fmt::Formatter` のような書き方が消える)
+- 決定 19 (M4b) B2 は、キャッシュにある既存のアーカイブを開いてプロセスで保持し、新しくは作らない (形式の版を上げない)。新しいプロセスの初回が遅ければ (core 88ms)、小さな写像のファイルに切り替える
+- 決定 20 (M4b) J1 の印は `data.not_canonical` の配列 (型・crate・版・`get_item` で引ける定義パス `lookup`) に、warning 1 行と「`get_item` で引けば次から正準パスで描く」の hint
+- 決定 21 (M4b) 公開パスの無い型 (`unnameable`) は、定義パスで `get_item` で引けるようにし、`unnameable` の印を付ける (R-PR-2 v0.20 の「依存の名前で書けない戻り値の型は引けない」を解く)
+- 決定 22 (M4b) B3 は照会のときに展開する: 検索の範囲の crate のモジュールの re-export の行き先を読み、その当たりを re-export した側のパスに付け替える (アーカイブの形は変えず、版を 10 に上げない)
+- 決定 23 (M4b) B3 の行き先の crate が手元に無ければ、範囲の crate と同じく docs.rs から取り、期限を過ぎれば `partial`
+- 決定 24 (M4b) glob で re-export した先も B3 に入れ、`get_item` の glob の追従を docs.rs の crate に広げる (std は今のまま。検索で出たパスを `get_item` で引けるように)
+- 決定 25 (M4b) B3 で行き先の crate も範囲にあれば、行き先のパスで 1 回だけ出す (範囲に無いときだけ re-export した側のパスで)
+- 決定 26 (M4b) `CachedOnly` で前のローカルビルドの JSON はあるがアーカイブが無いとき (形式の版を上げた後や GC の後) は、ビルドはせずに JSON からアーカイブを作り直して読む
+
+- 決定 27 (M4b、B1 のレビューの後) `dependency_graph` で上限 (300) を超えて読まなかった crate (`too_many`) は、`sources` に 1 件ずつ並べず、件数と先頭 20 件の名前 (`name@version`) を warning 1 行にまとめ、`partial` にする (依存グラフが大きいと `too_many` だけで応答の上限 32,000 字を超えうるため)
+
+聞かずに決めたこと: proc-macro の package は `dependency_graph` の範囲から外す (item を外へ出せない)。trait の定義パスと auto trait かどうかは、内部用の照会で、re-export をたどった先の crate の `paths` から得る。`too_many` の境目のテストは、debug ビルドだけの口 (`CHATORA_RUSTDOC_TEST_MAX_CRATES`) で上限を小さくして確かめる。段の中の順は B1 → B2 → B3
+
+**B1 の実装 (2026-11-05)**: `list_implementors` に `scope: "dependency_graph"` を足した (ローカル機能のある構成だけ。新しい `mcp::tool::implementors_across`)。まず今の照会で trait を引き (re-export をたどる)、auto trait と impl を持たない組み込みの marker は `invalid_argument` にする (決定 1・16)。プロジェクトの `PackageGraph` から trait を定義した package を名前と版で探し (無ければ `invalid_argument`。std の trait (決定 1・15) は B1c で)、`dependents_closure` から proc-macro を除き `FeatureSets::normal` で絞った範囲を、`gather::project_each` で読む。crate ごとに読み終えたらすぐ逆引きの索引で実装を引き (`query::implementors::implementors_in`)、アーカイブを手放す (決定 5)。依存は `CachedOnly` で読み (前のビルドが無ければ `local_build_required`)、trait の package だけは自分で引いた crate として `Allow` で読み、上限 (300) の前に先頭に置く。J7: 実装した package が trait の crate (lib 名で見る) のどの版に normal で依存するかで判じ、1 つでなければ trait の crate の `html_root_url` の版を互換 (Cargo の規則) で比べ、別の版の trait の実装を除いてその数を warning に、版の分からないものは warning 付きで入れる (決定 17)。別の版にだけ依存する package (範囲と同じく normal のビルドで proc-macro でないもの、その版の package 自身は除く) は warning とその版で引く hint に。並べ順は決定 14、`sources` と `crates_read` は決定 13、カーソルは読んだ crate のダイジェストに束縛する。`partial` (読めていない crate があるとき)・`status: building` (実装者が 0 件で読み込み中のものがあるとき)・`retry_after_secs`・要約の warning 1 行は `search_items` と同じ規則 (R-SR-5・R-OUT-9。`building_reason` を決める部分を `gather` に移して共有)。outputSchema に実装者の `crate`・`version`、provenance の `crates_read`・`sources` (`search_items` と共有)、`partial` を足した。決定 26: `query::local::published_before` で、前のビルドの JSON があってアーカイブが無ければ JSON から作り直して読む (`load` の `archived_unkept`。開いた crate の LRU に入れない)。テスト: stdio に 2 件 (依存グラフをまたぐ: プロジェクトの実装が出る、ビルドしていない依存は `local_build_required`、`get_item` でビルドした後は `unchecked` で読める、別の版の trait の実装は出ず warning と hint。上限: `CHATORA_RUSTDOC_TEST_MAX_CRATES=1` で trait の crate だけを読み、残りは `too_many` で `partial`)、単体テスト (J7 の版の読み方、stale の source、組み込みの marker、別の版の依存者)
+
+- B1 のレビュー (サブエージェント、読むだけ) の対応: `_definition` を消すときに `shift_remove` にする (`preserve_order` の `remove` は最後のキーを前に移し、`scope: crate` の data でも `implementors` が先頭に来ていた)。`stale_reason` の enum と説明に `unchecked` を足す (A2 から `search_items` も返していたのに無く、outputSchema に合わなかった。`stale_reason_schema` に分けた)。J7 は上の形にする (docs.rs の JSON の `html_root_url` は docs.rs が解決した版で、プロジェクトの版と完全一致で比べると互換の版の実装まで別の版として捨てていた。ローカルビルドは URL が無く、毎回「版が分からない」になっていた)。応答の大きさを `scope: crate` と同じく 4 分の 1 ずつ減らして上限に収める。応答を組み直し、状態 (`status`・`building_reason`・`partial`・`retry_after_secs`) と warnings を provenance の直後に置く。`too_many` は決定 27。trait の package は normal のビルドに無くても範囲に入れる (dev・build の依存だけだと黙って 0 件になっていた)。trait の package は `get_item` と同じ照合 (`explicit_package`。package 名と lib 名、大文字小文字) で探し、trait の crate かどうかは package で比べる。task や crate ごとの処理が答えなく終わった crate を `internal_error` の失敗として数える (A2 で `gather` に移したときに、件数にも `sources` にも入らず消えるようになっていた)。`CachedOnly` で docs.rs から作るアーカイブと、決定 26 で JSON から作り直すアーカイブも、開いた crate の LRU に入れない (`load::Keep` を公開して `docs_rs_archive` と `archive_from_unkept` に通す)。決定 26 の作り直しは `until` までしか待たず、過ぎたら `building` (`indexing`) にする (作り直しは裏で続く)。カーソルのダイジェストに各 crate の元の JSON の SHA-256 を含める (作り直しで中身が変わっても名前と版だけでは同じになっていた)。他の crate の negative impl も `has_negative_impls` に反映する。最初の照会の hints は「他の crate は並べない」の 1 件だけを除いて残す。`add_warnings` は既にある warning を足さない。`build_sets` の warning の文言を範囲に依らないものに (「all direct ones are searched」は検索の文言だった)。説明文に、member はここでビルドすること、`stale` で読んだ crate も `sources` に入ること、`partial`、並び順を足した。テストを足した (キーの順、ページ送り、版の判じ方、版の互換、`too_many` の warning)
+- B1 のレビューで残したもの: `gather::unread_source` と `search_across` の `sources` の分岐は重複したまま (`search_across` は target を付けるなど違いがある。B3 で検索を触るときにまとめる)。auto trait・組み込みの marker・プロジェクトに無い package の `invalid_argument` と、実装者が 0 件で読み込み中の `status: building` は stdio のテストが無い (前の 2 つは単体テストで名前の一覧を、残りは `search_items` と同じ組み立てで)。`CHATORA_RUSTDOC_TEST_MAX_CRATES` に 0 を渡すと trait の crate まで `too_many` になる (テスト専用の口)
+
 ### 6.3 M4c
 
 ### 6.4 M4d

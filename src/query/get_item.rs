@@ -2249,7 +2249,8 @@ pub(super) const fn summary_kind(kind: ItemKind) -> &'static str {
 
 /// The crate name and version of a docs.rs `html_root_url`
 /// (`https://docs.rs/axum-macros/0.5.1/x86_64-unknown-linux-gnu/`), if both are valid.
-fn docs_rs_release(url: &str) -> Option<(CrateName, Version)> {
+#[must_use]
+pub fn docs_rs_release(url: &str) -> Option<(CrateName, Version)> {
     let mut segments = url.strip_prefix("https://docs.rs/")?.split('/');
     let name = segments.next()?.parse().ok()?;
     let version = Version::parse(segments.next()?).ok()?;

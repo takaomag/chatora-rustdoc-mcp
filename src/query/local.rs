@@ -272,7 +272,7 @@ pub async fn rebuilding(cache: &Cache, wanted: &LocalWanted) -> Option<LocalBuil
         .lock()
         .get(&table_key(cache, wanted))
         .map(|(_, before)| Arc::clone(before))?;
-    stale_of(cache, Built::clone(&before)).await
+    stale_of(cache, Built::clone(&before), Opening::Kept).await
 }
 
 /// The build of what `wanted` names that was published before, as it is, as stale.
@@ -300,22 +300,42 @@ pub async fn published_before(
         .await
         .ok()
         .flatten()?;
-    stale_of(cache, before).await
+    stale_of(cache, before, Opening::Unkept).await
 }
 
-/// The build `before`, archived, as stale.
-async fn stale_of(cache: &Cache, before: Built) -> Option<LocalBuilt> {
+/// How [`stale_of`] opens the archive of a build before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opening {
+    /// Kept among the archives that this process holds open, if it was made; not made.
+    Kept,
+    /// Not kept among them, for a lookup across many crates (decided in M4a, decision 5); made
+    /// again from its JSON when it is not there, as after the schema of the archives changed or
+    /// the garbage collection removed it (decided in M4b, decision 26).
+    Unkept,
+}
+
+/// The build `before`, archived, as stale, opened as `opening` says.
+async fn stale_of(cache: &Cache, before: Built, opening: Opening) -> Option<LocalBuilt> {
     let Built { json, record, .. } = before;
     let dir = json.parent().unwrap_or(&json).to_path_buf();
     // For the garbage collection, which removes the least recently used (decided in M2f's F1, 3).
     used::note_later(&dir);
-    let mapped = load::archived(
-        cache,
-        &dir,
-        &record.format_version.to_string(),
-        &record.sha256,
-    )
-    .await?;
+    let stem = record.format_version.to_string();
+    let mapped = match opening {
+        Opening::Kept => load::archived(cache, &dir, &stem, &record.sha256).await?,
+        Opening::Unkept => {
+            if let Some(mapped) = load::archived_unkept(cache, &dir, &stem, &record.sha256).await {
+                mapped
+            } else {
+                let path = json.clone();
+                load::archive_from_unkept(cache, &dir, &stem, &record.sha256, move || {
+                    fs::read(&path).map(Vec::into_boxed_slice)
+                })
+                .await?
+                .ok()?
+            }
+        },
+    };
     // What it warned of when it was built, as when it is found fresh.
     let warnings = warnings_of(&record, record.warnings.clone());
     Some(LocalBuilt {

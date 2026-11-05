@@ -62,6 +62,11 @@ pub struct ImplementorsResponse<'a> {
     reason = "each is a fact of the trait that the JSON shows when it holds"
 )]
 pub struct Implementors {
+    /// The definition path of the trait, as the `paths` of the JSON write it, which the reverse
+    /// indexes of other crates key their implementations by (decided in M4b): for the lookup across
+    /// the dependency graph, which takes it out of the response.
+    #[serde(rename = "_definition")]
+    pub definition: Box<str>,
     /// The canonical path of the trait.
     pub path: Box<str>,
     /// Its declaration as Rust writes it.
@@ -172,6 +177,9 @@ pub fn list_implementors<'a>(
         .collect();
     let sealed = sealed(view, contents.bounds.as_slice());
     let path = query.path_of(trait_id);
+    let definition = view
+        .summary(trait_id)
+        .map_or_else(|| path.clone(), |summary| summary.path.join("::").into());
     let signature = query
         .item_data(trait_id, None)
         .and_then(|mut data| {
@@ -179,10 +187,18 @@ pub fn list_implementors<'a>(
             data.signature
         })
         .unwrap_or_default();
-    query.hint(format!(
-        "implementors in other crates are not listed; list_impls on a type tells whether it \
-         implements {path}"
-    ));
+    query.hint(if cfg!(feature = "local") {
+        format!(
+            "implementors in other crates are not listed: scope dependency_graph lists those of \
+             the project's dependencies, and list_impls on a type tells whether it implements \
+             {path}"
+        )
+    } else {
+        format!(
+            "implementors in other crates are not listed; list_impls on a type tells whether it \
+             implements {path}"
+        )
+    });
     let Notes { warnings, hints } = query.finish();
     let page = |shown: usize| {
         let next = options.offset.saturating_add(shown);
@@ -198,6 +214,7 @@ pub fn list_implementors<'a>(
         provenance,
         warnings,
         data: Implementors {
+            definition,
             path,
             signature,
             items,
@@ -266,6 +283,61 @@ fn implementors_of(
         });
     }
     (entries, has_negative_impls)
+}
+
+/// The crate of the trait that an implementation in another crate implements, as that crate's
+/// JSON tells it (decided in M4's plan, J7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraitCrate {
+    /// The crate itself: the trait is its own.
+    Own,
+    /// Another crate, by its name and the URL of its documentation, which tells its version for a
+    /// crate on docs.rs.
+    External {
+        /// Its name.
+        name: Box<str>,
+        /// The `html_root_url` of its documentation, if known.
+        html_root_url: Option<Box<str>>,
+    },
+    /// Not known: the `paths` of the JSON do not have the trait.
+    Unknown,
+}
+
+/// The implementors of the trait at `trait_path` in the crate of `view`, by its reverse index.
+///
+/// The trait is named by its definition path (`tower_service::Service`), and the crate as
+/// `request` names it. Each implementor comes with the crate of the trait that it implements,
+/// with whether one of them is negative (requirement R-TI-3, decided in M4b).
+#[must_use]
+pub fn implementors_in(
+    view: &CrateView<'_>,
+    request: ItemRequest<'_>,
+    trait_path: &str,
+) -> (Vec<(Implementor, TraitCrate)>, bool) {
+    let mut query = Query::new(view, request);
+    query.leave_out_paths();
+    let mut found = Vec::new();
+    let mut has_negative_impls = false;
+    for implementation in view.reverse_index().implementations_of(trait_path) {
+        let (entries, negative) = implementors_of(view, &mut query, &[implementation.id]);
+        has_negative_impls |= negative;
+        let trait_crate = match implementation.trait_crate {
+            Some(0) => TraitCrate::Own,
+            Some(id) => view
+                .external_crate(id)
+                .map_or(TraitCrate::Unknown, |external| TraitCrate::External {
+                    name: external.name.as_str().into(),
+                    html_root_url: external.html_root_url.as_deref().map(Into::into),
+                }),
+            None => TraitCrate::Unknown,
+        };
+        found.extend(
+            entries
+                .into_iter()
+                .map(|entry| (entry, trait_crate.clone())),
+        );
+    }
+    (found, has_negative_impls)
 }
 
 /// The trait at `path`.

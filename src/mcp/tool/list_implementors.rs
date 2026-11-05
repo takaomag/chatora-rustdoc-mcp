@@ -25,6 +25,33 @@ const DEFAULT_LIMIT: usize = 50;
 /// The most implementors in a page.
 const MAX_LIMIT: usize = 200;
 
+/// The values of `scope`: the dependency graph only where the project is read (decided in M4b).
+#[cfg(feature = "local")]
+const SCOPES: &[&str] = &["crate", "dependency_graph"];
+/// The values of `scope`: the dependency graph only where the project is read (decided in M4b).
+#[cfg(not(feature = "local"))]
+const SCOPES: &[&str] = &["crate"];
+
+/// What `scope` is.
+#[cfg(feature = "local")]
+const SCOPE_DESCRIPTION: &str = "Where to look for implementors: crate (the trait's crate; the \
+                                 default) or dependency_graph (every crate of the project's build \
+                                 that depends on it).";
+/// What `scope` is.
+#[cfg(not(feature = "local"))]
+const SCOPE_DESCRIPTION: &str = "Where to look for implementors: crate, the trait's crate.";
+
+/// What the tool is asked: the trait and its first page in its crate, and the dependency graph to
+/// look across, if asked.
+#[derive(Debug)]
+pub(super) struct Request {
+    /// The trait, and the page of its implementors in its crate.
+    arguments: Arguments,
+    /// The dependency graph to look across (decided in M4b).
+    #[cfg(feature = "local")]
+    graph: Option<super::implementors_across::Graph>,
+}
+
 /// How to pass `path`, for `invalid_argument`.
 const PATH_EXAMPLE: &[&str] =
     &[r#"pass the path of a type, for example {"path": "tokio::sync::Mutex"}"#];
@@ -63,9 +90,8 @@ pub(super) fn definition() -> Tool {
             },
             "scope": {
                 "type": "string",
-                "enum": ["crate"],
-                "description": "Where to look for implementors: crate (the trait's crate; the \
-                                default and, for now, the only one).",
+                "enum": SCOPES,
+                "description": SCOPE_DESCRIPTION,
             },
             "limit": {
                 "type": "integer",
@@ -161,6 +187,19 @@ fn output_schema() -> JsonObject {
         schema.pointer_mut("/properties/data/properties/implementors/items/properties")
     {
         properties.extend(get_item::conditions_properties());
+        // Across the dependency graph, the package that has it (decided in M4b).
+        properties.insert("crate".to_owned(), json!({ "type": "string" }));
+        properties.insert("version".to_owned(), json!({ "type": "string" }));
+    }
+    // Across the dependency graph: how many crates were read, and those that were not, or were
+    // read as built before (decided in M4b, decision 13).
+    if let Some(Value::Object(properties)) = schema.pointer_mut("/properties/provenance/properties")
+    {
+        properties.insert("crates_read".to_owned(), json!({ "type": "integer" }));
+        properties.insert("sources".to_owned(), super::search_items::sources_schema());
+    }
+    if let Some(Value::Object(properties)) = schema.pointer_mut("/properties") {
+        properties.insert("partial".to_owned(), json!({ "type": "boolean" }));
     }
     object(schema)
 }
@@ -176,9 +215,7 @@ fn object(value: Value) -> JsonObject {
 }
 
 /// Checks the arguments (requirement R-ARG-1).
-pub(super) fn parse_arguments(
-    arguments: Option<&JsonObject>,
-) -> Result<Arguments, InvalidArgument> {
+pub(super) fn parse_arguments(arguments: Option<&JsonObject>) -> Result<Request, InvalidArgument> {
     let release = get_item::parse_release(arguments)?;
     let argument = |name| arguments.and_then(|arguments| arguments.get(name));
     let path = match argument("path") {
@@ -214,37 +251,79 @@ pub(super) fn parse_arguments(
             ));
         },
     };
-    match argument("scope") {
-        None => {},
-        Some(Value::String(scope)) if scope.trim() == "crate" => {},
-        Some(Value::String(scope)) if scope.trim() == "dependency_graph" => {
-            return Err(InvalidArgument::new(
-                "`scope: dependency_graph` is not there yet: implementors are listed in the \
-                 trait's crate only",
-                &[
-                    r#"leave scope out, or pass {"scope": "crate"}; list_impls on a type tells whether it implements the trait"#,
-                ],
-            ));
+    let graph = match argument("scope") {
+        None => false,
+        Some(Value::String(scope)) if scope.trim() == "crate" => false,
+        Some(Value::String(scope))
+            if scope.trim() == "dependency_graph" && cfg!(feature = "local") =>
+        {
+            true
         },
         Some(other) => {
             return Err(InvalidArgument::new(
-                format!("`scope` is {other}, not crate"),
+                format!("`scope` is {other}, not one of {}", SCOPES.join(", ")),
                 &[r#"leave scope out, or pass {"scope": "crate"}"#],
             ));
         },
-    }
-    Ok(Arguments::for_implementors(release, path, Paging {
+    };
+    let paging = Paging {
         limit,
         offset,
         request_digest: format!("{CURSOR_FORM}.{request_digest}").into(),
         cursor_data,
-    }))
+    };
+    // The trait's crate for what the trait is, its first implementor only; the page is of the
+    // graph's (decided in M4b).
+    #[cfg(feature = "local")]
+    if graph {
+        let first = Paging {
+            limit: 1,
+            offset: 0,
+            request_digest: paging.request_digest.clone(),
+            cursor_data: None,
+        };
+        let again = get_item::parse_release(arguments)?;
+        return Ok(Request {
+            arguments: Arguments::for_implementors(release, path, first),
+            graph: Some(super::implementors_across::Graph {
+                project: again.project,
+                target: again.target,
+                paging,
+            }),
+        });
+    }
+    // Without local features, `scope: dependency_graph` is refused above.
+    #[cfg(not(feature = "local"))]
+    debug_assert!(!graph, "no dependency graph without local features");
+    Ok(Request {
+        arguments: Arguments::for_implementors(release, path, paging),
+        #[cfg(feature = "local")]
+        graph: None,
+    })
 }
 
 /// Lists the implementors as `get_item` looks an item up: the same version, target and cache,
 /// and following a trait re-exported from another crate.
-pub(super) async fn execute(arguments: Arguments, state: Arc<ToolState>) -> CallToolResult {
-    get_item::execute(arguments, state).await
+pub(super) async fn execute(request: Request, state: Arc<ToolState>) -> CallToolResult {
+    #[cfg(feature = "local")]
+    if let Some(graph) = request.graph {
+        return super::implementors_across::execute(request.arguments, graph, state).await;
+    }
+    without_definition(get_item::execute(request.arguments, state).await)
+}
+
+/// `result` without the trait's definition path, which only the lookup across the dependency
+/// graph uses (decided in M4b).
+fn without_definition(result: CallToolResult) -> CallToolResult {
+    match result.structured_content {
+        Some(Value::Object(mut response)) if result.is_error != Some(true) => {
+            if let Some(Value::Object(data)) = response.get_mut("data") {
+                data.shift_remove("_definition");
+            }
+            CallToolResult::structured(Value::Object(response))
+        },
+        _ => result,
+    }
 }
 
 #[cfg(test)]
@@ -268,13 +347,25 @@ mod tests {
             panic!("an object");
         };
         let parsed = parse_arguments(Some(&arguments)).expect("valid");
-        assert_eq!(&*parsed.path_for_test(), "tower::Service");
+        assert_eq!(&*parsed.arguments.path_for_test(), "tower::Service");
         let Value::Object(arguments) =
             json!({ "crate": "tower", "path": "Service", "scope": "dependency_graph" })
         else {
             panic!("an object");
         };
-        let error = parse_arguments(Some(&arguments)).expect_err("not yet");
-        assert!(error.message.contains("dependency_graph"), "{error:?}");
+        // Where the project is read only (decided in M4b).
+        let parsed = parse_arguments(Some(&arguments));
+        if cfg!(feature = "local") {
+            assert!(parsed.is_ok(), "{parsed:?}");
+        } else {
+            let error = parsed.expect_err("not in this build");
+            assert!(error.message.contains("dependency_graph"), "{error:?}");
+        }
+        let Value::Object(arguments) =
+            json!({ "crate": "tower", "path": "Service", "scope": "world" })
+        else {
+            panic!("an object");
+        };
+        parse_arguments(Some(&arguments)).expect_err("an unknown scope");
     }
 }

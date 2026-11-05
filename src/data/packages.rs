@@ -465,9 +465,9 @@ impl PackageGraph {
 
     /// For each other version of `package` in the project (another package of the same lib name,
     /// which the definition paths of its traits start with), the packages that depend on it as
-    /// [`Self::dependents_closure`] counts them, and not on `package`: their implementations are
-    /// of the other version's traits, not of those of `package` (decided in M4's plan, J7). Those
-    /// without any are left out.
+    /// [`Self::dependents_closure`] counts them, and not on `package`, other than the other version
+    /// itself: their implementations are of the other version's traits, not of those of `package`
+    /// (decided in M4's plan, J7). Those without any are left out.
     #[must_use]
     pub fn through_other_versions(
         &self,
@@ -486,12 +486,53 @@ impl PackageGraph {
                 let only: Vec<&ProjectPackage> = self
                     .closure_from(index)
                     .into_iter()
-                    .filter(|dependent| !asked.contains(dependent))
+                    .filter(|dependent| *dependent != index && !asked.contains(dependent))
                     .filter_map(|dependent| self.packages.get(dependent))
                     .collect();
                 (!only.is_empty()).then_some((other, only))
             })
             .collect()
+    }
+
+    /// The packages of the lib name `lib` that `package`, one of [`Self::packages`], depends on
+    /// through normal dependencies, each once: which version of a crate its code uses.
+    #[must_use]
+    pub fn normal_dependencies_by_lib(
+        &self,
+        package: &ProjectPackage,
+        lib: &str,
+    ) -> Vec<&ProjectPackage> {
+        let Some(index) = self.index_of(package) else {
+            return Vec::new();
+        };
+        let key = normalize(lib);
+        let mut found: Vec<usize> = self
+            .edges
+            .iter()
+            .filter(|edge| edge.member == index && edge.normal)
+            .map(|edge| edge.package)
+            .filter(|&dependency| {
+                self.packages
+                    .get(dependency)
+                    .is_some_and(|dependency| normalize(&dependency.lib_name) == key)
+            })
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        found
+            .into_iter()
+            .filter_map(|dependency| self.packages.get(dependency))
+            .collect()
+    }
+
+    /// Whether `package`, one of [`Self::packages`], is a procedural macro, whose dependencies'
+    /// items it does not export. False when not known, as from Cargo.lock.
+    #[must_use]
+    pub fn is_proc_macro(&self, package: &ProjectPackage) -> bool {
+        self.index_of(package)
+            .and_then(|index| self.proc_macro.get(index))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// The indices of [`Self::dependents_closure`] from the package at `start`.
@@ -854,7 +895,6 @@ mod tests {
             .map(|(other, only)| (format!("{}@{}", other.name, other.version), names(only)))
             .collect();
         assert_eq!(told, [("svc@0.2.0".to_owned(), vec![
-            "svc@0.2.0".to_owned(),
             "old@1.0.0".to_owned()
         ])]);
     }

@@ -632,6 +632,30 @@ fn output_schema() -> JsonObject {
     }))
 }
 
+/// The schema of `stale_reason` (requirement R-OUT-9).
+fn stale_reason_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": [
+            "rebuilding",
+            "unchecked",
+            "ref_ttl_expired",
+            "inputs_changed",
+            "project_missing",
+        ],
+        "description": "rebuilding: a workspace member is being built again, as what it \
+                        is made from changed; this is the build before, of built_at. \
+                        unchecked: a dependency built here before, read as it is, \
+                        without checking whether it is still up to date. \
+                        ref_ttl_expired: a branch or a tag of git was resolved more than \
+                        a day ago, at resolved_at. inputs_changed: what a build of \
+                        build_external_docs is made from changed since built_at, or the \
+                        workspace outside the default project that it recorded. \
+                        project_missing: the directory of that workspace is gone; this \
+                        is its record.",
+    })
+}
+
 /// The schema of `provenance`: `Provenance` in `query::get_item`.
 pub(super) fn provenance_schema() -> Value {
     let strings = json!({ "type": "array", "items": { "type": "string" } });
@@ -692,18 +716,7 @@ pub(super) fn provenance_schema() -> Value {
                 "type": "boolean",
                 "description": "The documentation is older than the code: stale_reason tells why.",
             },
-            "stale_reason": {
-                "type": "string",
-                "enum": ["rebuilding", "ref_ttl_expired", "inputs_changed", "project_missing"],
-                "description": "rebuilding: a workspace member is being built again, as what it \
-                                is made from changed; this is the build before, of built_at. \
-                                ref_ttl_expired: a branch or a tag of git was resolved more than \
-                                a day ago, at resolved_at. inputs_changed: what a build of \
-                                build_external_docs is made from changed since built_at, or the \
-                                workspace outside the default project that it recorded. \
-                                project_missing: the directory of that workspace is gone; this \
-                                is its record.",
-            },
+            "stale_reason": stale_reason_schema(),
             "features_requested": {
                 "type": "array",
                 "items": { "type": "string" },
@@ -1854,7 +1867,7 @@ pub(super) async fn explicit_found(
 /// crates.io, then the one package not from crates.io. The others of that name and version are
 /// told in `warnings`.
 #[cfg(feature = "local")]
-fn explicit_package<'a>(
+pub(super) fn explicit_package<'a>(
     graph: &'a PackageGraph,
     name: &CrateName,
     version: &Version,
@@ -3084,7 +3097,7 @@ fn with_lib_name(name: &str, path: &str) -> Box<str> {
 
 /// Whether `a` and `b` name the same crate, with `-` and `_` the same and the case ignored, as
 /// crates.io does (requirement R-PR-1).
-fn same_crate_name(a: &str, b: &str) -> bool {
+pub(super) fn same_crate_name(a: &str, b: &str) -> bool {
     let normalized = |byte: &u8| {
         if *byte == b'-' {
             b'_'
@@ -3706,10 +3719,13 @@ async fn load_and_look_up(
         &state.archives,
         &state.cache,
         &state.docs_rs,
-        &arguments.name,
-        &arguments.version,
-        arguments.docs_rs_target(),
+        (
+            &arguments.name,
+            &arguments.version,
+            arguments.docs_rs_target(),
+        ),
         arguments.until,
+        load::Keep::Yes,
     )
     .await
     {
@@ -5314,6 +5330,8 @@ pub(super) fn add_warnings(response: &mut Value, warnings: &[Box<str>]) {
         }
     }
     if let Some(Value::Array(more)) = fields.get_mut("warnings") {
+        // One told already, as by the lookup that the answer is made from, once.
+        all.retain(|warning| !more.contains(warning));
         all.append(more);
         fields.insert("warnings".to_owned(), Value::Array(all));
         return;

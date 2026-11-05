@@ -26,6 +26,8 @@ mod get_readme;
 mod get_source;
 #[cfg(feature = "local")]
 mod here;
+#[cfg(feature = "local")]
+mod implementors_across;
 mod inspect_features;
 #[cfg(feature = "local")]
 mod list_crates;

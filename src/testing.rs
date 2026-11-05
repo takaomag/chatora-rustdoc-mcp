@@ -15,6 +15,12 @@ const TOOLS_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_TOOLS";
 /// servers of different versions on one cache (decided in M3a, A4-1 and A4-2).
 const FORMAT_BUMP_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_FORMAT_BUMP";
 
+/// The environment variable that, with [`TOOLS_ENV_VAR`], sets the most crates that a lookup
+/// across the dependency graph reads, in place of 300, for the tests of those past it (decided
+/// in M4b).
+#[cfg(feature = "local")]
+const MAX_CRATES_ENV_VAR: &str = "CHATORA_RUSTDOC_TEST_MAX_CRATES";
+
 /// Whether the hooks are on: `CHATORA_RUSTDOC_TEST_TOOLS` is `1`.
 #[must_use]
 pub fn on() -> bool {
@@ -28,6 +34,18 @@ pub fn on() -> bool {
 pub fn format_bump() -> bool {
     static BUMP: OnceLock<bool> = OnceLock::new();
     *BUMP.get_or_init(|| on() && is_one(FORMAT_BUMP_ENV_VAR))
+}
+
+/// The most crates that a lookup across the dependency graph reads, if
+/// `CHATORA_RUSTDOC_TEST_MAX_CRATES` sets it with the hooks on.
+#[cfg(feature = "local")]
+#[must_use]
+pub fn max_crates() -> Option<usize> {
+    static MAX: OnceLock<Option<usize>> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        on().then(|| std::env::var(MAX_CRATES_ENV_VAR).ok()?.parse().ok())
+            .flatten()
+    })
 }
 
 /// Whether the environment variable `name` is `1`.

@@ -481,10 +481,9 @@ pub(super) async fn on_docs_rs(
         &state.archives,
         &state.cache,
         &state.docs_rs,
-        name,
-        version,
-        Some(target),
+        (name, version, Some(target)),
         until,
+        load::Keep::Yes,
     )
     .await;
     let release = format!("{name}@{version}");

@@ -567,25 +567,16 @@ fn hints(
     hints
 }
 
-/// Why the crates of `members` that are still being loaded are not in yet: `indexing` when any is
-/// being indexed, as that is the last step (requirement R-OUT-9).
+/// Why the crates of `members` that are still being loaded are not in yet
+/// ([`super::gather::building_reason`]).
 fn building_reason(members: &[Member]) -> &'static str {
-    // What docs.rs is read for first, then what is built here (decided in M2's D7).
-    [
-        Doing::Indexing,
-        Doing::Fetching,
-        Doing::Building,
-        Doing::WaitingForSlot,
-        Doing::WaitingForLock,
-    ]
-    .into_iter()
-    .find(|doing| {
-        members
-            .iter()
-            .any(|member| matches!(&member.outcome, Outcome::Going(going) if going == doing))
-    })
-    .unwrap_or(Doing::Fetching)
-    .as_str()
+    super::gather::building_reason(members.iter().filter_map(|member| {
+        if let Outcome::Going(doing) = &member.outcome {
+            Some(doing)
+        } else {
+            None
+        }
+    }))
 }
 
 /// Marks `source` as of the build before, while the crate is built again, to ask for again

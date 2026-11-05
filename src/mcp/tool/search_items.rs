@@ -145,12 +145,9 @@ pub(super) fn definition() -> Tool {
         .with_annotations(super::annotations())
 }
 
-/// The schema of the structured content: `SearchResponse` in `query::search`
-/// (requirement R-OUT-1).
-fn output_schema() -> JsonObject {
-    let strings = json!({ "type": "array", "items": { "type": "string" } });
-    // One crate's provenance, or with several crates the target and project they share and a
-    // source for each (requirement R-OUT-9).
+/// The schema of the `sources` of a response across crates: one crate's provenance, with how it
+/// was read or why not (requirement R-OUT-9).
+pub(super) fn sources_schema() -> Value {
     let mut source = get_item::provenance_schema();
     if let Some(properties) = source.get_mut("properties").and_then(Value::as_object_mut) {
         for (name, schema) in [
@@ -172,15 +169,19 @@ fn output_schema() -> JsonObject {
         // D7).
         fields.insert("required".to_owned(), json!(["crate", "version"]));
     }
+    json!({ "type": "array", "items": source })
+}
+
+/// The schema of the structured content: `SearchResponse` in `query::search`
+/// (requirement R-OUT-1).
+fn output_schema() -> JsonObject {
+    let strings = json!({ "type": "array", "items": { "type": "string" } });
     let mut provenance = get_item::provenance_schema();
     if let Some(properties) = provenance
         .get_mut("properties")
         .and_then(Value::as_object_mut)
     {
-        properties.insert(
-            "sources".to_owned(),
-            json!({ "type": "array", "items": source }),
-        );
+        properties.insert("sources".to_owned(), sources_schema());
     }
     if let Some(fields) = provenance.as_object_mut() {
         fields.remove("required");

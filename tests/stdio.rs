@@ -4613,6 +4613,212 @@ fn get_changelog_starts_after_the_version_that_the_project_uses() {
     assert!(server.finish().success());
 }
 
+/// A project `app` in `dir`, of a trait `svc::Service` of `svc` 0.3, implemented in it and in
+/// `impl-a`, and of `svc` 0.2 in `impl-old`, all on `registry`.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn graph_project(registry: &registry::FakeRegistry, dir: &Path) -> PathBuf {
+    use registry::FakeCrate;
+    for version in ["0.3.0", "0.2.0"] {
+        registry
+            .publish(&FakeCrate::new("svc", version).file("src/lib.rs", "pub trait Service {}\n"));
+    }
+    registry.publish(
+        &FakeCrate::new("impl-a", "0.1.0")
+            .dependency("svc", "0.3")
+            .file("src/lib.rs", "pub struct A;\nimpl svc::Service for A {}\n"),
+    );
+    registry.publish(
+        &FakeCrate::new("impl-old", "0.1.0")
+            .dependency("svc", "0.2")
+            .file(
+                "src/lib.rs",
+                "pub struct Old;\nimpl svc::Service for Old {}\n",
+            ),
+    );
+    let project = dir.join("app");
+    std::fs::create_dir_all(project.join("src")).expect("made");
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nsvc = \"0.3\"\nimpl-a = \"0.1\"\nimpl-old = \"0.1\"\n",
+    )
+    .expect("written");
+    std::fs::write(
+        project.join("src/lib.rs"),
+        "pub struct App;\nimpl svc::Service for App {}\n",
+    )
+    .expect("written");
+    let cargo_home = dir.join("cargo-home");
+    std::fs::create_dir_all(&cargo_home).expect("made");
+    std::fs::write(cargo_home.join("config.toml"), registry.cargo_config()).expect("written");
+    let status = Command::new("cargo")
+        .args(["generate-lockfile"])
+        .current_dir(&project)
+        .env("CARGO_HOME", &cargo_home)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "cargo generate-lockfile");
+    project
+}
+
+/// `list_implementors` with `arguments`, from the id `first`, again while what it reads is still
+/// built or fetched: while it tells to ask again.
+#[cfg(all(debug_assertions, feature = "local"))]
+fn call_until_done(server: &mut Server, first: u64, arguments: &Value) -> Value {
+    let mut told = Value::Null;
+    for id in first..first.saturating_add(120) {
+        server.send(&call_tool(id, "list_implementors", arguments.clone()));
+        told = server.response(id)["result"].clone();
+        let content = &told["structuredContent"];
+        if content["status"] != "building" && content.get("retry_after_secs").is_none() {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    told
+}
+
+/// `list_implementors` with `scope: dependency_graph` lists the implementations of a trait in the
+/// crates of the project's build that depend on its crate: a member's, built; a dependency's that
+/// docs.rs has no JSON of, not built for this, but read once built before, as stale; and those of
+/// another version's trait alone told apart (requirement R-TI-3, decided in M4's plan, J2 and J7,
+/// and in M4a and M4b).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn list_implementors_looks_across_the_dependency_graph() {
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let project = graph_project(&registry, dir.path());
+    let mut server = server_in_on(Some(&project), &registry, dir.path());
+    let across = json!({ "crate": "svc@0.3.0", "path": "Service", "scope": "dependency_graph" });
+    let told = call_until_done(&mut server, 1, &across);
+    assert_eq!(told["isError"], false, "{told}");
+    let content = &told["structuredContent"];
+    let implementors = content["data"]["implementors"].to_string();
+    assert!(
+        implementors.contains("App") && implementors.contains(r#""crate":"app""#),
+        "{told}"
+    );
+    assert!(!implementors.contains("Old"), "another version's: {told}");
+    let sources = content["provenance"]["sources"].to_string();
+    assert!(
+        sources.contains("impl-a") && sources.contains("local_build_required"),
+        "not built for this: {told}"
+    );
+    let warnings = content["warnings"].to_string();
+    assert!(
+        warnings.contains("svc 0.2.0") && warnings.contains("impl-old"),
+        "{told}"
+    );
+    // Each depends on one version of svc, which tells which version's trait it implements.
+    assert!(!warnings.contains("is not known"), "{told}");
+    assert_eq!(content["partial"], true, "impl-a is not read: {told}");
+    assert!(content["hints"].to_string().contains("svc@0.2.0"), "{told}");
+    // In the order of the other responses: the state, then the data.
+    let keys: Vec<&str> = content
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, [
+        "provenance",
+        "partial",
+        "warnings",
+        "data",
+        "page",
+        "hints"
+    ]);
+    let data_keys: Vec<&str> = content["data"]
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(data_keys.first(), Some(&"path"), "{told}");
+    assert_eq!(data_keys.last(), Some(&"implementors"), "{told}");
+    // Built once for a lookup of its own, it is read, as it is.
+    let lookup = json!({ "crate": "impl-a", "path": "A" });
+    for id in 200_u64..320 {
+        server.send(&call_tool(id, "get_item", lookup.clone()));
+        let found = server.response(id)["result"].clone();
+        if found["structuredContent"]["status"] != "building" {
+            assert_eq!(found["isError"], false, "{found}");
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    let told = call_until_done(&mut server, 400, &across);
+    let content = &told["structuredContent"];
+    let implementors = content["data"]["implementors"].to_string();
+    assert!(
+        implementors.contains(r#""crate":"impl-a""#),
+        "built before: {told}"
+    );
+    let sources = content["provenance"]["sources"].to_string();
+    assert!(sources.contains("unchecked"), "{told}");
+    // A page at a time, the trait's crate's first.
+    let mut paged = across.clone();
+    paged["limit"] = json!(1);
+    let first = call_until_done(&mut server, 600, &paged);
+    let content = &first["structuredContent"];
+    assert_eq!(content["page"]["has_more"], true, "{first}");
+    assert_eq!(
+        content["data"]["implementors"][0]["crate"], "app",
+        "{first}"
+    );
+    paged["cursor"] = content["page"]["next_cursor"].clone();
+    let second = call_until_done(&mut server, 800, &paged);
+    let content = &second["structuredContent"];
+    assert_eq!(content["page"]["has_more"], false, "{second}");
+    assert_eq!(
+        content["data"]["implementors"][0]["crate"], "impl-a",
+        "{second}"
+    );
+    assert!(server.finish().success());
+}
+
+/// Past the most crates that a lookup across the dependency graph reads, the others are told as
+/// too many, not read, and the trait's own crate is read first (decided in M4a, decision 10).
+#[cfg(all(debug_assertions, feature = "local"))]
+#[test]
+fn list_implementors_tells_the_crates_past_the_most() {
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let project = graph_project(&registry, dir.path());
+    let mut server = server_with_on(Some(&project), &registry, dir.path(), &[(
+        "CHATORA_RUSTDOC_TEST_MAX_CRATES",
+        "1",
+    )]);
+    let across = json!({ "crate": "svc@0.3.0", "path": "Service", "scope": "dependency_graph" });
+    let told = call_until_done(&mut server, 1, &across);
+    assert_eq!(told["isError"], false, "{told}");
+    let content = &told["structuredContent"];
+    assert_eq!(content["partial"], true, "{told}");
+    assert_eq!(content["provenance"]["crates_read"], 1, "{told}");
+    // Told in one warning, not one source each (decided in M4b, decision 27).
+    let sources = content["provenance"]["sources"].to_string();
+    assert!(!sources.contains("too_many"), "{told}");
+    let warnings = content["warnings"].as_array().expect("warnings");
+    let past = warnings
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|warning| warning.contains("past the most read at once (1)"))
+        .unwrap_or_else(|| panic!("{told}"));
+    assert!(
+        past.starts_with("2 crates") && past.contains("app@0.1.0") && past.contains("impl-a@0.1.0"),
+        "{told}"
+    );
+    assert!(!past.contains("svc"), "the trait's crate is read: {told}");
+    assert!(server.finish().success());
+}
+
 /// A dependency of the project that `cargo rustdoc -p` cannot name, as only its tests use it, is
 /// built by `build_external_docs` as the release alone, which the query tools then read in its
 /// place; one that it can name, the query tools build (decided in M2e's E2b).

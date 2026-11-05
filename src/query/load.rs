@@ -83,10 +83,9 @@ pub async fn docs_rs_archive(
     flights: &Flights<SharedArchive>,
     cache: &Cache,
     docs_rs: &DocsRs,
-    name: &CrateName,
-    version: &Version,
-    target: Option<&TargetTriple>,
+    (name, version, target): (&CrateName, &Version, Option<&TargetTriple>),
     until: Instant,
+    kept: Keep,
 ) -> Joined<SharedArchive> {
     let dir = cache.docs_rs_dir(name, version, target);
     let key = dir.to_string_lossy().into_owned();
@@ -97,6 +96,7 @@ pub async fn docs_rs_archive(
         version: version.clone(),
         target: target.cloned(),
         dir,
+        kept,
     };
     let what = format!("{name} {version}");
     flights
@@ -213,6 +213,9 @@ struct Release {
     version: Version,
     target: Option<TargetTriple>,
     dir: PathBuf,
+    /// Whether the archive is kept open, as the call that made the work asked (the others share
+    /// it).
+    kept: Keep,
 }
 
 impl Release {
@@ -220,9 +223,9 @@ impl Release {
     /// JSON fetched again, or in another format, when it cannot be parsed (requirements R-CA-4
     /// and R-DS-2). The work tells `stage` what it does.
     async fn archive(&self, stage: &Stage) -> Result<Archived, ArchiveError> {
-        let (cache, dir) = (self.cache.clone(), self.dir.clone());
+        let (cache, dir, kept) = (self.cache.clone(), self.dir.clone(), self.kept);
         let (opened, held) = holding(self.cache.lock(&self.dir).await, move || {
-            open_archived(&cache, &dir)
+            open_archived_as(&cache, &dir, kept)
         })
         .await?;
         match opened {
@@ -326,10 +329,10 @@ impl Release {
         ),
         ArchiveError,
     > {
-        let (cache, dir) = (self.cache.clone(), self.dir.clone());
+        let (cache, dir, kept) = (self.cache.clone(), self.dir.clone(), self.kept);
         let parsing = Parsing::enter_as_task().await;
         let ((made, json), held) = holding(held, move || {
-            let made = archive_json(&cache, &dir, &json, parsing);
+            let made = archive_json(&cache, &dir, &json, (parsing, kept));
             (made, json)
         })
         .await?;
@@ -503,6 +506,38 @@ fn archive_version() -> String {
 ///
 /// Returns an error when the cache cannot be read.
 pub fn open_archived(cache: &Cache, dir: &Path) -> io::Result<Option<Arc<Mapped<Indexed>>>> {
+    open_archived_as(cache, dir, Keep::Yes)
+}
+
+/// [`open_archived`], not kept among the archives that this process holds open.
+///
+/// One that was not there yet is not kept: for a lookup across many crates, which would push the
+/// others out, and hold many mapped, which Windows does not let the garbage collection remove
+/// (decided in M4a, decision 5).
+///
+/// # Errors
+///
+/// Returns an error when the cache cannot be read.
+pub fn open_archived_unkept(cache: &Cache, dir: &Path) -> io::Result<Option<Arc<Mapped<Indexed>>>> {
+    open_archived_as(cache, dir, Keep::No)
+}
+
+/// Whether an archive opened or made is kept among those that this process holds open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keep {
+    /// Kept, for the next lookup of the crate.
+    Yes,
+    /// Not kept, for a lookup across many crates, which would push the others out (decided in
+    /// M4a, decision 5).
+    No,
+}
+
+/// [`open_archived`], kept as `kept` says.
+fn open_archived_as(
+    cache: &Cache,
+    dir: &Path,
+    kept: Keep,
+) -> io::Result<Option<Arc<Mapped<Indexed>>>> {
     let Some((format, sha256)) = cache.docs_rs_source(dir)? else {
         return Ok(None);
     };
@@ -512,7 +547,12 @@ pub fn open_archived(cache: &Cache, dir: &Path) -> io::Result<Option<Arc<Mapped<
     if let Some(mapped) = opened(&path) {
         return Ok(Some(mapped));
     }
-    Ok(Mapped::open(cache, &path, &header(format, sha256))?.map(|mapped| keep(&path, mapped)))
+    Ok(
+        Mapped::open(cache, &path, &header(format, sha256))?.map(|mapped| match kept {
+            Keep::Yes => keep(&path, mapped),
+            Keep::No => Arc::new(mapped),
+        }),
+    )
 }
 
 /// Parses `json`, indexes it, and archives it in the cache directory `dir`, then opens the
@@ -526,7 +566,7 @@ fn archive_json(
     cache: &Cache,
     dir: &Path,
     json: &[u8],
-    parsing: Parsing,
+    (parsing, kept): (Parsing, Keep),
 ) -> Result<Arc<Mapped<Indexed>>, LoadError> {
     let parsed = rustdoc_json::parse(json)?;
     let format = parsed.krate.format_version;
@@ -541,7 +581,7 @@ fn archive_json(
             drop(indexed);
             give_back_memory();
             drop(parsing);
-            return Ok(keep(&path, mapped));
+            return Ok(kept_as(&path, mapped, kept));
         },
         Ok(None) => {
             tracing::warn!(path = %path.display(), "an archive just written does not check out");
@@ -581,10 +621,10 @@ pub fn archive_of(
     // Another thread that archives the same JSON goes first, and this one then opens its archive
     // (requirement R-WS-6).
     let _held = cache.lock_blocking(&path);
-    if let Some(mapped) = archived_at(cache, &path, source) {
+    if let Some(mapped) = archived_at(cache, &path, source, Keep::Yes) {
         return Ok(mapped);
     }
-    make_at(cache, &path, source, json, Parsing::enter())
+    make_at(cache, &path, source, json, (Parsing::enter(), Keep::Yes))
 }
 
 /// The archive of the JSON of the crate `stem` in `dir`, keyed by `source`, if it was made: opened,
@@ -595,12 +635,32 @@ pub async fn archived(
     stem: &str,
     source: &str,
 ) -> Option<Arc<Mapped<Indexed>>> {
+    archived_as(cache, (dir, stem, source), Keep::Yes).await
+}
+
+/// [`archived`], not kept among the archives that this process holds open when it was not there
+/// yet, as [`open_archived_unkept`] (decided in M4a, decision 5).
+pub async fn archived_unkept(
+    cache: &Cache,
+    dir: &Path,
+    stem: &str,
+    source: &str,
+) -> Option<Arc<Mapped<Indexed>>> {
+    archived_as(cache, (dir, stem, source), Keep::No).await
+}
+
+/// [`archived`], kept as `kept` says.
+async fn archived_as(
+    cache: &Cache,
+    (dir, stem, source): (&Path, &str, &str),
+    kept: Keep,
+) -> Option<Arc<Mapped<Indexed>>> {
     let path = archive_path_of(dir, stem, source);
     if let Some(mapped) = opened(&path) {
         return Some(mapped);
     }
     let (cache, source) = (cache.clone(), Box::<str>::from(source));
-    crate::task::spawn_blocking(move || archived_at(&cache, &path, &source))
+    crate::task::spawn_blocking(move || archived_at(&cache, &path, &source, kept))
         .await
         .ok()
         .flatten()
@@ -616,6 +676,28 @@ pub async fn archive_from(
     source: &str,
     json: impl FnOnce() -> io::Result<Box<[u8]>> + Send + 'static,
 ) -> Option<Result<Arc<Mapped<Indexed>>, LoadError>> {
+    archive_from_as(cache, (dir, stem, source), json, Keep::Yes).await
+}
+
+/// [`archive_from`], not kept among the archives that this process holds open when it was not
+/// open yet, as [`open_archived_unkept`] (decided in M4a, decision 5, and in M4b, decision 26).
+pub async fn archive_from_unkept(
+    cache: &Cache,
+    dir: &Path,
+    stem: &str,
+    source: &str,
+    json: impl FnOnce() -> io::Result<Box<[u8]>> + Send + 'static,
+) -> Option<Result<Arc<Mapped<Indexed>>, LoadError>> {
+    archive_from_as(cache, (dir, stem, source), json, Keep::No).await
+}
+
+/// [`archive_from`], kept as `kept` says.
+async fn archive_from_as(
+    cache: &Cache,
+    (dir, stem, source): (&Path, &str, &str),
+    json: impl FnOnce() -> io::Result<Box<[u8]>> + Send + 'static,
+    kept: Keep,
+) -> Option<Result<Arc<Mapped<Indexed>>, LoadError>> {
     let path = archive_path_of(dir, stem, source);
     if let Some(mapped) = opened(&path) {
         return Some(Ok(mapped));
@@ -624,7 +706,7 @@ pub async fn archive_from(
     let (looking, source) = ((cache.clone(), path.clone()), Box::<str>::from(source));
     let (found, held) = blocking_holding(cache.lock(&path).await, {
         let source = source.clone();
-        move || archived_at(&looking.0, &looking.1, &source)
+        move || archived_at(&looking.0, &looking.1, &source, kept)
     })
     .await?;
     if let Some(mapped) = found {
@@ -633,8 +715,10 @@ pub async fn archive_from(
     }
     let parsing = Parsing::enter_as_task().await;
     let cache = cache.clone();
-    let (made, _held) =
-        blocking_holding(held, move || make_at(&cache, &path, &source, json, parsing)).await?;
+    let (made, _held) = blocking_holding(held, move || {
+        make_at(&cache, &path, &source, json, (parsing, kept))
+    })
+    .await?;
     Some(made)
 }
 
@@ -660,11 +744,24 @@ fn archive_path_of(dir: &Path, stem: &str, source: &str) -> PathBuf {
     dir.join(format!("{stem}.{short}.{}.rkyv", archive_version()))
 }
 
+/// `mapped`, at `path`, kept as `kept` says.
+fn kept_as(path: &Path, mapped: Mapped<Indexed>, kept: Keep) -> Arc<Mapped<Indexed>> {
+    match kept {
+        Keep::Yes => keep(path, mapped),
+        Keep::No => Arc::new(mapped),
+    }
+}
+
 /// The archive at `path`, keyed by `source`, if another made it: under its lock.
-fn archived_at(cache: &Cache, path: &Path, source: &str) -> Option<Arc<Mapped<Indexed>>> {
+fn archived_at(
+    cache: &Cache,
+    path: &Path,
+    source: &str,
+    kept: Keep,
+) -> Option<Arc<Mapped<Indexed>>> {
     // The format is not compared when an archive is opened.
     match Mapped::open(cache, path, &header(0, source.into())) {
-        Ok(Some(mapped)) => Some(keep(path, mapped)),
+        Ok(Some(mapped)) => Some(kept_as(path, mapped, kept)),
         Ok(None) => None,
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "an archive could not be read");
@@ -681,7 +778,7 @@ fn make_at(
     path: &Path,
     source: &str,
     json: impl FnOnce() -> io::Result<Box<[u8]>>,
-    parsing: Parsing,
+    (parsing, kept): (Parsing, Keep),
 ) -> Result<Arc<Mapped<Indexed>>, LoadError> {
     let json = json().map_err(LoadError::Read)?;
     let parsed = rustdoc_json::parse(&json)?;
@@ -695,7 +792,7 @@ fn make_at(
             drop(indexed);
             give_back_memory();
             drop(parsing);
-            return Ok(keep(path, mapped));
+            return Ok(kept_as(path, mapped, kept));
         },
         Ok(None) => {
             tracing::warn!(path = %path.display(), "an archive just written does not check out");
@@ -750,7 +847,8 @@ mod tests {
             .write_docs_rs_json(&place, 61, JSON)
             .expect("the JSON is cached");
         assert!(open_archived(&cache, &place).expect("no error").is_none());
-        let made = archive_json(&cache, &place, JSON, Parsing::enter()).expect("archived");
+        let made =
+            archive_json(&cache, &place, JSON, (Parsing::enter(), Keep::Yes)).expect("archived");
         assert_eq!(CrateView::new(made.get()).crate_version(), Some("1.0.0"));
         let opened = open_archived(&cache, &place)
             .expect("no error")
@@ -798,7 +896,7 @@ mod tests {
                 &cache,
                 dir.path(),
                 br#"{"format_version":61}"#,
-                Parsing::enter()
+                (Parsing::enter(), Keep::Yes)
             ),
             Err(LoadError::Parse(_))
         ));
@@ -875,7 +973,15 @@ mod tests {
             let (flights, cache, docs_rs) = (Arc::clone(&flights), cache.clone(), docs_rs.clone());
             tokio::spawn(async move {
                 let (name, version) = c();
-                docs_rs_archive(&flights, &cache, &docs_rs, &name, &version, None, later()).await
+                docs_rs_archive(
+                    &flights,
+                    &cache,
+                    &docs_rs,
+                    (&name, &version, None),
+                    later(),
+                    Keep::Yes,
+                )
+                .await
             })
         };
         let first = call();
@@ -905,7 +1011,15 @@ mod tests {
         let flights = Flights::default();
         let (name, version) = c();
         let soon = Instant::now() + std::time::Duration::from_millis(50);
-        let first = docs_rs_archive(&flights, &cache, &docs_rs, &name, &version, None, soon).await;
+        let first = docs_rs_archive(
+            &flights,
+            &cache,
+            &docs_rs,
+            (&name, &version, None),
+            soon,
+            Keep::Yes,
+        )
+        .await;
         assert!(matches!(first, Joined::Going(Doing::Fetching)), "{first:?}");
         // Archived by the work that went on, which no call waits for.
         let place = cache.docs_rs_dir(&name, &version, None);
@@ -914,8 +1028,15 @@ mod tests {
             assert!(Instant::now() < deadline, "not archived");
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let later =
-            docs_rs_archive(&flights, &cache, &docs_rs, &name, &version, None, later()).await;
+        let later = docs_rs_archive(
+            &flights,
+            &cache,
+            &docs_rs,
+            (&name, &version, None),
+            later(),
+            Keep::Yes,
+        )
+        .await;
         assert!(matches!(later, Joined::Done(Ok(_))), "{later:?}");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }

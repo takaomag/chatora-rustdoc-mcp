@@ -57,6 +57,12 @@ impl<'a> CrateView<'a> {
         &self.archived.search
     }
 
+    /// The reverse index of the crate: its impls by type and by trait (requirement R-TI-4).
+    #[must_use]
+    pub const fn reverse_index(&self) -> &'a crate::query::reverse::ArchivedReverseIndex {
+        &self.archived.reverse
+    }
+
     /// What the data was made from (the SHA-256 of the JSON), or empty when not known.
     #[must_use]
     pub fn source_digest(&self) -> &'a str {

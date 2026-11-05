@@ -40,6 +40,7 @@ use crate::{
     query::{
         load::{self, ArchiveError},
         local::LocalBuilt,
+        view::CrateView,
     },
 };
 
@@ -127,8 +128,8 @@ pub(super) async fn build_sets(
         Joined::Done(Err(error)) => {
             warnings.push(
                 format!(
-                    "which dependencies the project builds for {target} is not known, so all \
-                     direct ones are searched: {}",
+                    "which dependencies the project builds for {target} is not known, so none is \
+                     left out for it: {}",
                     ErrorChain(&error)
                 )
                 .into(),
@@ -138,8 +139,8 @@ pub(super) async fn build_sets(
         Joined::Ended => {
             warnings.push(
                 format!(
-                    "which dependencies the project builds for {target} is not known, so all \
-                     direct ones are searched: {}",
+                    "which dependencies the project builds for {target} is not known, so none is \
+                     left out for it: {}",
                     get_item::NOT_READ
                 )
                 .into(),
@@ -149,8 +150,8 @@ pub(super) async fn build_sets(
         Joined::Going(doing) => {
             warnings.push(
                 format!(
-                    "which dependencies the project builds for {target} is not known yet, so all \
-                     direct ones are searched: {}",
+                    "which dependencies the project builds for {target} is not known yet, so \
+                     none is left out for it: {}",
                     get_item::still_reading(doing)
                 )
                 .into(),
@@ -158,6 +159,82 @@ pub(super) async fn build_sets(
             None
         },
     }
+}
+
+/// When to ask again for the crates still being fetched or indexed.
+#[cfg(feature = "local")]
+const RETRY_AFTER_SECS: u64 = get_item::RETRY_AFTER_SECS;
+
+/// What a crate that was not read is, for the `sources` of the response (requirement R-OUT-9):
+/// `unavailable` when it cannot be documented here, `failed`, or `building` while it is fetched,
+/// indexed or built (decided in M2's D7). `None` for one that was read.
+#[cfg(feature = "local")]
+pub(super) fn unread_source(member: &Member) -> Option<Value> {
+    let mut source = Map::new();
+    source.insert("crate".to_owned(), json!(member.name.as_str()));
+    source.insert("version".to_owned(), json!(member.version.to_string()));
+    match &member.outcome {
+        Outcome::Failed(failure) => {
+            let unavailable = failure
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| {
+                    matches!(
+                        reason,
+                        "local_build_required"
+                            | "too_many"
+                            | "build_unsupported"
+                            | "target_unsupported"
+                            | "scope_unknown"
+                            | "no_json"
+                            | "no_target_json"
+                            | "no_record"
+                    )
+                });
+            let status = if unavailable { "unavailable" } else { "failed" };
+            source.insert("status".to_owned(), json!(status));
+            if let Some(failure) = failure.as_object() {
+                source.extend(failure.clone());
+            }
+        },
+        Outcome::Going(doing) => {
+            source.insert("status".to_owned(), json!("building"));
+            source.insert("building_reason".to_owned(), json!(doing.as_str()));
+            source.insert("retry_after_secs".to_owned(), json!(RETRY_AFTER_SECS));
+        },
+        Outcome::Loaded(_) | Outcome::Built(_) | Outcome::Cached(_) | Outcome::Recorded(..) => {
+            return None;
+        },
+    }
+    Some(Value::Object(source))
+}
+
+/// A crate whose loading or looking at ended without an answer: failed, to be asked for again.
+#[cfg(feature = "local")]
+fn ended(name: CrateName, version: Version) -> Member {
+    Member {
+        name,
+        version,
+        outcome: Outcome::Failed(json!({ "code": "internal_error", "retryable": true })),
+    }
+}
+
+/// Why the crates still being loaded, doing `going`, are not in yet: `indexing` when any is
+/// being indexed, as that is the last step (requirement R-OUT-9).
+pub(super) fn building_reason<'a>(going: impl Iterator<Item = &'a Doing>) -> &'static str {
+    let going: Vec<&Doing> = going.collect();
+    // What docs.rs is read for first, then what is built here (decided in M2's D7).
+    [
+        Doing::Indexing,
+        Doing::Fetching,
+        Doing::Building,
+        Doing::WaitingForSlot,
+        Doing::WaitingForLock,
+    ]
+    .into_iter()
+    .find(|doing| going.contains(&doing))
+    .unwrap_or(Doing::Fetching)
+    .as_str()
 }
 
 /// Whether the crates that are not built yet may be built here.
@@ -177,6 +254,19 @@ pub(super) enum Builds {
 #[cfg(feature = "local")]
 pub(super) const MAX_CRATES: usize = 300;
 
+/// [`MAX_CRATES`], or, in a debug build, what the tests set in its place
+/// ([`crate::testing::max_crates`]).
+#[cfg(all(feature = "local", debug_assertions))]
+pub(super) fn max_crates() -> usize {
+    crate::testing::max_crates().unwrap_or(MAX_CRATES)
+}
+
+/// [`MAX_CRATES`].
+#[cfg(all(feature = "local", not(debug_assertions)))]
+pub(super) const fn max_crates() -> usize {
+    MAX_CRATES
+}
+
 /// What a package of the scope of the search is to the project.
 #[cfg(feature = "local")]
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +282,11 @@ pub(super) enum Kind {
     CratesIo,
 }
 
+/// The packages of the scope of a search, with what they are to the project, and how they may be
+/// loaded.
+#[cfg(feature = "local")]
+pub(super) type Scope = (Vec<(ProjectPackage, Kind)>, Builds);
+
 /// Loads or builds the packages of `scope` of `workspace` at once, as `builds` lets it, waiting for
 /// them until `until`, for `target`, whose JSON on docs.rs is of `docs_rs` (requirements R-SR-2 and
 /// R-SR-5, decided in M2's D7). What has not finished then goes on, so that the next call has it.
@@ -202,14 +297,136 @@ pub(super) enum Kind {
 pub(super) async fn project_all(
     state: &Arc<ToolState>,
     workspace: &Workspace,
-    (mut scope, builds): (Vec<(ProjectPackage, Kind)>, Builds),
-    (target, docs_rs): (&TargetTriple, Option<&TargetTriple>),
+    scope: Scope,
+    at: (&TargetTriple, Option<&TargetTriple>),
     until: Instant,
     warnings: &mut Vec<Box<str>>,
 ) -> Vec<Member> {
+    project_with(state, workspace, (scope, None), at, until, warnings, None).await
+}
+
+#[cfg(feature = "local")]
+/// A crate that [`project_each`] read: how, and what the call made of it.
+pub(super) struct Read<R> {
+    /// Its name.
+    pub(super) name: CrateName,
+    /// Its version.
+    pub(super) version: Version,
+    /// Where its documentation came from.
+    pub(super) how: How,
+    /// What the call made of it.
+    pub(super) result: R,
+}
+
+#[cfg(feature = "local")]
+/// Where the documentation of a crate that [`project_each`] read came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum How {
+    /// Its release on docs.rs.
+    Release,
+    /// Built here, made again while it is rebuilt if `stale` (decided in M2's D7).
+    Built {
+        /// It is the build before, while it is made again.
+        stale: bool,
+    },
+    /// The build before, read as it is ([`Outcome::Cached`]).
+    Cached,
+    /// Recorded by `build_external_docs`, made from what changed since if `changed`.
+    Recorded {
+        /// What it is made from changed since.
+        changed: bool,
+    },
+}
+
+#[cfg(feature = "local")]
+/// A crate of the scope of [`project_each`].
+pub(super) enum Gathered<R> {
+    /// Read, and looked at.
+    Read(Read<R>),
+    /// Not read: failed, still going, or too many ([`Outcome::Failed`] or [`Outcome::Going`]).
+    Unread(Member),
+}
+
+#[cfg(feature = "local")]
+/// What [`project_each`] does with each crate that it read.
+pub(super) type PerCrate<R> = Arc<dyn Fn(&Member, &CrateView<'_>) -> R + Send + Sync>;
+
+#[cfg(feature = "local")]
+/// [`project_all`], with `per_crate` done with each crate as soon as it is read, on a blocking
+/// thread, after which its archive is let go of: for a lookup across many crates, which would
+/// otherwise hold them all mapped (decided in M4a, decision 5). `asked`, the package of what the
+/// call asks of, which it looked up itself, is built as for a lookup of its own, even when the
+/// others are not.
+pub(super) async fn project_each<R: Send + 'static>(
+    state: &Arc<ToolState>,
+    workspace: &Workspace,
+    (scope, asked): (Scope, Option<ProjectPackage>),
+    at: (&TargetTriple, Option<&TargetTriple>),
+    until: Instant,
+    warnings: &mut Vec<Box<str>>,
+    per_crate: PerCrate<R>,
+) -> Vec<Gathered<R>> {
+    let finish: Finish<Gathered<R>> = Arc::new(move |member: Member| {
+        let how = match &member.outcome {
+            Outcome::Loaded(_) => How::Release,
+            Outcome::Built(built) => How::Built { stale: built.stale },
+            Outcome::Cached(_) => How::Cached,
+            Outcome::Recorded(_, changed) => How::Recorded { changed: *changed },
+            Outcome::Failed(_) | Outcome::Going(_) => return Gathered::Unread(member),
+        };
+        let result = match &member.outcome {
+            Outcome::Loaded(mapped) => per_crate(&member, &CrateView::new(mapped.get())),
+            Outcome::Built(built) | Outcome::Cached(built) | Outcome::Recorded(built, _) => {
+                per_crate(&member, &CrateView::new(built.archived.mapped.get()))
+            },
+            Outcome::Failed(_) | Outcome::Going(_) => return Gathered::Unread(member),
+        };
+        Gathered::Read(Read {
+            name: member.name,
+            version: member.version,
+            how,
+            result,
+        })
+    });
+    project_with(
+        state,
+        workspace,
+        (scope, asked),
+        at,
+        until,
+        warnings,
+        Some(finish),
+    )
+    .await
+}
+
+#[cfg(feature = "local")]
+/// What [`project_with`] does with each member, on a blocking thread.
+type Finish<T> = Arc<dyn Fn(Member) -> T + Send + Sync>;
+
+#[cfg(feature = "local")]
+/// [`project_all`], each member passed to `finish` in the task that loaded it, if given.
+async fn project_with<T: From<Member> + Send + 'static>(
+    state: &Arc<ToolState>,
+    workspace: &Workspace,
+    ((mut scope, builds), asked): (Scope, Option<ProjectPackage>),
+    (target, docs_rs): (&TargetTriple, Option<&TargetTriple>),
+    until: Instant,
+    warnings: &mut Vec<Box<str>>,
+    finish: Option<Finish<T>>,
+) -> Vec<T> {
+    // What the call asks of first, which is read whatever the most.
+    if let Some(at) = scope
+        .iter()
+        .position(|(package, _)| asked.as_ref() == Some(package))
+        && let Some(before) = scope.get_mut(..=at)
+    {
+        before.rotate_right(1);
+    }
     // Past the most, told as too many, not loaded (decided in M4a, decision 10).
-    let too_many = if builds == Builds::CachedOnly && scope.len() > MAX_CRATES {
-        scope.split_off(MAX_CRATES)
+    let most = max_crates();
+    let too_many = if builds == Builds::CachedOnly && scope.len() > most {
+        scope.split_off(most)
     } else {
         Vec::new()
     };
@@ -221,37 +438,64 @@ pub(super) async fn project_all(
             let name = package.name.parse::<CrateName>().ok()?;
             let (state, workspace) = (Arc::clone(state), workspace.clone());
             let (target, docs_rs) = (target.clone(), docs_rs.cloned());
-            let version = package.version.clone();
+            let finish = finish.clone();
+            let package_name = package.name.clone();
+            // Told as failed if its task ends without an answer, not left out (requirement
+            // R-SR-5).
+            let failed = (name.clone(), package.version.clone());
+            let builds = if asked.as_ref() == Some(&package) {
+                Builds::Allow
+            } else {
+                builds
+            };
             // Aborted if the call is cancelled while it waits (requirement R-WS-6).
             let handle = super::AbortOnDrop::new(super::spawn(async move {
                 let at = (&target, docs_rs.as_ref());
-                project_outcome(&state, &workspace, (&package, kind, builds), at, until).await
+                let (outcome, checked) =
+                    project_outcome(&state, &workspace, (&package, kind, builds), at, until).await;
+                let member = outcome.map(|outcome| Member {
+                    name,
+                    version: package.version.clone(),
+                    outcome,
+                });
+                let finished = match (member, finish) {
+                    (Some(member), Some(finish)) => {
+                        let (name, version) = (member.name.clone(), member.version.clone());
+                        Some(
+                            crate::task::spawn_blocking(move || finish(member))
+                                .await
+                                .unwrap_or_else(|error| {
+                                    tracing::error!(%error, "looking at a crate did not finish");
+                                    T::from(ended(name, version))
+                                }),
+                        )
+                    },
+                    (member, _) => member.map(T::from),
+                };
+                (finished, checked, package.version)
             }));
-            Some((name, version, handle))
+            Some((package_name, failed, handle))
         })
         .collect();
-    let mut members = Vec::new();
+    let mut finished = Vec::new();
     let mut unchecked = Vec::new();
-    for (name, version, handle) in handles {
-        let (outcome, checked) = handle.await.unwrap_or_else(|error| {
-            tracing::error!(%error, "loading a crate to search did not finish");
-            let failure = json!({ "code": "internal_error", "retryable": true });
-            (Some(Outcome::Failed(failure)), true)
-        });
-        if !checked {
-            unchecked.push(format!("{name} {version}"));
-        }
-        if let Some(outcome) = outcome {
-            members.push(Member {
-                name,
-                version,
-                outcome,
-            });
+    for (name, (crate_name, version), handle) in handles {
+        match handle.await {
+            Ok((one, checked, version)) => {
+                if !checked {
+                    unchecked.push(format!("{name} {version}"));
+                }
+                finished.extend(one);
+            },
+            Err(error) => {
+                tracing::error!(%error, "loading a crate to look at did not finish");
+                finished.push(T::from(ended(crate_name, version)));
+            },
         }
     }
     for (package, _) in too_many {
         if let Ok(name) = package.name.parse::<CrateName>() {
-            members.push(Member {
+            finished.push(T::from(Member {
                 name,
                 version: package.version.clone(),
                 outcome: Outcome::Failed(json!({
@@ -259,7 +503,7 @@ pub(super) async fn project_all(
                     "reason": "too_many",
                     "retryable": false,
                 })),
-            });
+            }));
         }
     }
     // Once for all, as the index could not be read for them (decided in M2's D7).
@@ -273,7 +517,14 @@ pub(super) async fn project_all(
             .into(),
         );
     }
-    members
+    finished
+}
+
+#[cfg(feature = "local")]
+impl<R> From<Member> for Gathered<R> {
+    fn from(member: Member) -> Self {
+        Self::Unread(member)
+    }
 }
 
 /// How a call finds `package`, of `kind`, of `workspace`, as `builds` lets it, for `target`, whose
@@ -303,11 +554,16 @@ pub(super) async fn project_outcome(
             && let Ok(Planned::Is { wanted, .. }) = &planned
         {
             let host = state.host().await.triple.clone();
-            return Some(
-                crate::query::local::published_before(&state.cache, wanted, &host)
-                    .await
-                    .map_or_else(not_built, |built| Outcome::Cached(Arc::new(built))),
-            );
+            // Its archive, made again from its JSON, is waited for until `until` only: the
+            // making goes on, for the next call (requirement R-ARCH-6).
+            let before = tokio::time::timeout_at(
+                until,
+                crate::query::local::published_before(&state.cache, wanted, &host),
+            )
+            .await;
+            return Some(before.map_or(Outcome::Going(Doing::Indexing), |before| {
+                before.map_or_else(not_built, |built| Outcome::Cached(Arc::new(built)))
+            }));
         }
         let failure = not_built();
         Some(
@@ -348,7 +604,9 @@ pub(super) async fn project_outcome(
                     (Some(Outcome::Failed(failure_of(&error))), true)
                 },
                 Some(get_item::InIndex::Release(_)) | None => {
-                    match load_release(state, &name, &package.version, docs_rs, until).await {
+                    match load_release(state, (&name, &package.version, docs_rs), until, builds)
+                        .await
+                    {
                         // docs.rs has no JSON of it: built here.
                         Outcome::Failed(failure)
                             if failure.get("reason").and_then(Value::as_str).is_some_and(
@@ -463,29 +721,36 @@ pub(super) fn outcome_of(result: &CallToolResult) -> Outcome {
 #[cfg(feature = "local")]
 pub(super) async fn load_release(
     state: &ToolState,
-    name: &CrateName,
-    version: &Version,
-    target: Option<&TargetTriple>,
+    (name, version, target): (&CrateName, &Version, Option<&TargetTriple>),
     until: Instant,
+    builds: Builds,
 ) -> Outcome {
     let dir = state.cache.docs_rs_dir(name, version, target);
     let cache = state.cache.clone();
-    let opened = crate::task::spawn_blocking(move || load::open_archived(&cache, &dir))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten();
+    // Not kept open for a lookup across many crates (decided in M4a, decision 5).
+    let opened = crate::task::spawn_blocking(move || match builds {
+        Builds::Allow => load::open_archived(&cache, &dir),
+        Builds::CachedOnly => load::open_archived_unkept(&cache, &dir),
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten();
     if let Some(mapped) = opened {
         return Outcome::Loaded(mapped);
     }
+    // Not kept open for a lookup across many crates either (decided in M4a, decision 5).
+    let kept = match builds {
+        Builds::Allow => load::Keep::Yes,
+        Builds::CachedOnly => load::Keep::No,
+    };
     let archived = load::docs_rs_archive(
         &state.archives,
         &state.cache,
         &state.docs_rs,
-        name,
-        version,
-        target,
+        (name, version, target),
         until,
+        kept,
     )
     .await;
     match archived {
