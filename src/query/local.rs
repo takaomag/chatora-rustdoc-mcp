@@ -272,7 +272,40 @@ pub async fn rebuilding(cache: &Cache, wanted: &LocalWanted) -> Option<LocalBuil
         .lock()
         .get(&table_key(cache, wanted))
         .map(|(_, before)| Arc::clone(before))?;
-    let Built { json, record, .. } = Built::clone(&before);
+    stale_of(cache, Built::clone(&before)).await
+}
+
+/// The build of what `wanted` names that was published before, as it is, as stale.
+///
+/// It is read whatever it was built with, without looking at whether its inputs changed since, nor
+/// building it: the one that the work builds again, or else the one in the cache. `host` is the
+/// host's target, which a procedural macro is documented for. `None` when there is none, or its
+/// archive cannot be made (decided in M4's plan, J2, and in M4a, decision 4).
+pub async fn published_before(
+    cache: &Cache,
+    wanted: &LocalWanted,
+    host: &TargetTriple,
+) -> Option<LocalBuilt> {
+    if let Some(built) = rebuilding(cache, wanted).await {
+        return Some(built);
+    }
+    let plan = &wanted.plan;
+    let target = if plan.is_proc_macro() {
+        host
+    } else {
+        plan.target.as_ref().unwrap_or(host)
+    };
+    let dir = plan.published_dir(cache.dir(), Some(target));
+    let before = crate::task::spawn_blocking(move || build::published(&dir))
+        .await
+        .ok()
+        .flatten()?;
+    stale_of(cache, before).await
+}
+
+/// The build `before`, archived, as stale.
+async fn stale_of(cache: &Cache, before: Built) -> Option<LocalBuilt> {
+    let Built { json, record, .. } = before;
     let dir = json.parent().unwrap_or(&json).to_path_buf();
     // For the garbage collection, which removes the least recently used (decided in M2f's F1, 3).
     used::note_later(&dir);

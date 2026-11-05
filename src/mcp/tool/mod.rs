@@ -19,6 +19,7 @@ mod external_target;
 #[cfg(feature = "local")]
 mod external_workspace;
 mod find_examples;
+mod gather;
 mod get_changelog;
 mod get_item;
 mod get_readme;

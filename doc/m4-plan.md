@@ -156,6 +156,11 @@ M4 は、1 つの crate の中だけでは答えられない問い (依存グラ
 
 - A5 のレビュー (サブエージェント、読むだけ) の対応: 上の形のうち、在庫の前に走らせる (上限で場所ごと消す計画が古いアーカイブの大きさで立っていた)、古い版だけを消す (2 つの版のサーバーが互いに消し合っていた)、docs.rs のディレクトリのロック、ロックの下での取り直し、一番上のリンク、区分の絞り込み、`src.v*` に降りない、`until`、dry run の二重の数え、理由を分ける、版の文字列を 1 か所に。残したもの: std の `std/local/<commit>/<host>` (JSON を持たずアーカイブだけ) は、古い版を消した後は自分のものと判じられず 1 週間の片付けから外れうる (`used` の印で判じると、`used` だけを持つ他人のディレクトリまで消すので見送った。そのディレクトリが使われれば今の版が作られる)。 書いた時刻で判じるので、長く動く古い版のサーバーが使い続けるアーカイブも 2 時間ごとに消え、作り直される (使った時刻を記録しない)。最初の公開の前の名前 (`v<n>` だけ) は対象外
 
+**A2 の実装 (2026-11-05)**: `search_across` から、多くの crate を並べて読むかビルドする部分 (`Member`・`Outcome`・`Kind`・`build_sets`・`project_all`・`project_outcome`・`planned_outcome`・`recorded_outcome`・`outcome_of`・`load_release`・`failure_of`) を新しい `mcp::tool::gather` に移した (動きは変えない)。そこに方針 `Builds` (`Allow`: 今の照会のとおりビルドする / `CachedOnly`: 依存はビルドせず、`query::local::rebuilding` が返す前のビルドを `stale` の印付きで読み、無ければ `docs_unavailable` の `local_build_required`。member はビルドする。J2・決定 2・4) と、1 回に読む crate の上限 `MAX_CRATES` 300 (超えた分は `docs_unavailable` の reason `too_many`。決定 10。§8 の reason の一覧には M4 の終わりに足す) を足した。`search_across` は `Allow` を渡す。`dependencies` の検索の範囲の組み立ては `scope_of` に切り出した (100 行の上限)。読み終わった crate を 1 つずつ受け取って写像を放す口 (決定 5) は、それを使う B1 で足す (使う形が見えてから)。`CachedOnly` と `too_many` のテストも B1 の stdio のテストで
+
+- A2 のレビュー (サブエージェント、読むだけ) の対応: `query::local::rebuilding` はプロセスの中の作り直し中の表しか見ず、ディスクにある前のビルド (新しいもの、誰も作り直していない古いもの、起動し直した後のもの) を読めなかった (決定 4 に反する) ので、`query::local::published_before` を足した (作り直し中の表、無ければ `Plan::published_dir` の `build::published`。proc-macro はホストの target。`rebuilding` と `LocalBuilt` を作る部分 `stale_of` を共有)。それを新しい `Outcome::Cached` で返し、`stale_reason` を作り直し中 (`rebuilding`) と分けて `unchecked` にし、`retry_after_secs` も「呼び直せば新しくなる」hint も付けない (このツールは作り直さない)。上限 300 は `CachedOnly` のときだけ効かせ、`search_across` の動きは変えない。`too_many` は読めないもの (`unavailable`) の一覧に入れる。`local_build_required` の本体を 1 つに、`RETRY_AFTER_SECS` を `search_across` に戻し、doc を直した
+- A2 のレビューで残したもの: 要件 §7.3 の `stale_reason` に `unchecked`、§8 の reason に `too_many` を、M4 の終わりに足す。`CachedOnly` で、get_item が初回のビルドをしている最中は `local_build_required` になる (少し後には読める)。`CachedOnly` のビルドが起きないこと、先にビルドした依存を読めること、起動し直した後に読めること、`too_many` の境目は B1 の stdio のテストで
+
 ### 6.2 M4b
 
 ### 6.3 M4c
