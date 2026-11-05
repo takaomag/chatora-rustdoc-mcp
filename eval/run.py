@@ -3,7 +3,7 @@
 project, with this server's tools alone, or with the built-in tools too, to see which the model
 picks (doc/m1-plan.md, E1 and P5; doc/m2-plan.md, M2f's F4a; requirement R-QA-6).
 
-Each run costs API usage. Usage: python3 -I eval/run.py [--model MODEL] [--budget-usd 1.0]
+Each run costs API usage. Usage: python3 -I eval/run.py [--model MODEL] [--budget-usd 1.0] [--total-usd 5.0]
 [--case ID ...] [--dry-run]. The raw stream of each case and a summary go to eval/results/<time>/.
 With --dry-run, each case's project is made and set up, and the command is shown, but Claude Code
 is not run.
@@ -331,6 +331,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", help="the model of the sessions (default: Claude Code's)")
     parser.add_argument("--budget-usd", type=float, default=1.0, help="the most one case may cost")
+    parser.add_argument(
+        "--total-usd",
+        type=float,
+        help="the most all the cases may cost: a case is not started when it could go over",
+    )
     parser.add_argument("--case", action="append", help="run only this case (repeatable)")
     parser.add_argument("--dry-run", action="store_true", help="make and set up the projects, run no session")
     args = parser.parse_args()
@@ -343,20 +348,27 @@ def main() -> int:
     binary = build_server()
     claude_version = subprocess.run(["claude", "--version"], capture_output=True, text=True, check=False).stdout.strip()
     rows = []
+    not_run = []
     for case in cases:
         # A case that the model may answer either way is asked more than once (`repeat`).
         repeat = case.get("repeat", 1)
         for time_asked in range(repeat):
             run = case["id"] if repeat == 1 else f"{case['id']}-{time_asked + 1}"
+            spent = sum(row["cost_usd"] for row in rows)
+            if args.total_usd is not None and spent + args.budget_usd > args.total_usd:
+                not_run.append(run)
+                continue
             print(f"{run} ...", file=sys.stderr, flush=True)
             rows.append(run_case(case, binary, args, out, run))
     if args.dry_run:
         return 0
     summary = f"Claude Code {claude_version}, model {args.model or 'default'}\n\n" + summarize(rows)
+    if not_run:
+        summary += f"\n\nNot run, as they could go over --total-usd {args.total_usd}: {', '.join(not_run)}"
     (out / "summary.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2))
     (out / "summary.md").write_text(summary + "\n")
     print(summary)
-    return 0 if all(row["ok"] for row in rows) else 1
+    return 0 if all(row["ok"] for row in rows) and not not_run else 1
 
 
 if __name__ == "__main__":

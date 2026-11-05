@@ -91,6 +91,18 @@
     "answer": ["TcpStream"]
   },
   {
+    "id": "q10-source",
+    "question": "Q10",
+    "prompt": "How is `lock` of tokio's `Mutex` implemented? Show the code of its body.",
+    "tools": [
+      "get_source"
+    ],
+    "answer": [
+      "\\bacquire\\b",
+      "MutexGuard"
+    ]
+  },
+  {
     "id": "q17-stability",
     "question": "Q17",
     "prompt": "Can I use `std::sync::LazyLock` with Rust 1.79?",

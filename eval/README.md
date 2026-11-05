@@ -8,6 +8,7 @@
 python3 -I eval/run.py                       # 全問
 python3 -I eval/run.py --case q8-send        # 1 問だけ
 python3 -I eval/run.py --model sonnet        # モデルを指定する
+python3 -I eval/run.py --budget-usd 0.5 --total-usd 5   # 全体の上限: 使った額と 1 問の上限の和が超える問いは回さず、要約に書く
 python3 -I eval/run.py --dry-run             # 各問いのプロジェクトを作って下準備だけをし、claude の引数を表示する (利用料はかからない)
 ```
 
