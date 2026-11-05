@@ -79,6 +79,9 @@ pub enum Reason {
     OldLayout,
     /// It is of another format of the cache, unused for `cache.target_max_age_days`.
     OtherFormat,
+    /// An archive of rustdoc JSON of an older schema, in a directory that is used (decided in
+    /// M4a, decision 12).
+    OlderSchema,
     /// The std of a nightly, unused for a week.
     UnusedStd,
     /// Asked for with `cache clear`, which removes it even when it was just used, if no one uses
@@ -97,6 +100,7 @@ impl Reason {
         match self {
             Self::OldLayout => "old layout",
             Self::OtherFormat => "other format, unused",
+            Self::OlderSchema => "archive of an older version",
             Self::Unused => "unused",
             Self::UnusedStd => "nightly unused for a week",
             Self::Asked => "asked for",
@@ -173,6 +177,8 @@ pub fn collect(
         empty_trash(root);
     }
     let std = unused_std(cache, dry_run);
+    // Before the inventory, so that the limits are reached with what is left.
+    let mut schemas = remove_other_schemas(cache, until, dry_run);
     let inventory = inventory::take(root, until)?;
     // After the inventory, so that what was used while it was taken counts as just used.
     let now = SystemTime::now();
@@ -184,9 +190,19 @@ pub fn collect(
             .iter()
             .all(|std| std.entry.path != removal.entry.path)
     });
+    // A dry run, which removes nothing, tells an archive in a place that goes once.
+    schemas.removed.retain(|archive| {
+        removals
+            .iter()
+            .chain(&std.removed)
+            .all(|removal| !archive.entry.path.starts_with(&removal.entry.path))
+    });
     let mut outcome = run(cache, removals, dry_run);
     outcome.removed.splice(0..0, std.removed);
+    outcome.removed.splice(0..0, schemas.removed);
     outcome.left.extend(std.left);
+    outcome.left.extend(schemas.left);
+    outcome.in_use.extend(schemas.in_use);
     #[cfg(feature = "local")]
     remove_orphan_aliases(cache, now, dry_run, &mut outcome);
     outcome.complete = inventory.complete;
@@ -245,6 +261,151 @@ fn unused_std(cache: &Cache, dry_run: bool) -> Outcome {
             .collect(),
         ..Outcome::default()
     }
+}
+
+/// The places whose directories hold archives of rustdoc JSON. `ext` has none: the bodies of
+/// `build_external_docs` are under `local`.
+const ARCHIVED: [&str; 3] = [layout::DOCS_RS, layout::STD, layout::LOCAL];
+
+/// How deep below a place of [`ARCHIVED`] an archive may be: `local/v1/<workspace>/<package>/
+/// <target>/<lib>/` is the deepest.
+const ARCHIVE_DEPTH: usize = 6;
+
+/// Removes the archives of rustdoc JSON of an older schema than this version's, written over
+/// [`KEPT_FOR`] ago, in the places of [`ARCHIVED`] of a class that this server collects, whose
+/// directories are kept as long as they are used (decided in M4a, decision 12): only where this
+/// version's archive was made beside them, which replaced them, so that a place of another
+/// format, or one unused since, is left to the removal of places (a removal makes a directory
+/// look just written). Those of a newer schema are another server's, which it uses. One being written or removed by another process,
+/// under the lock of the archive or of its directory, is in use. A server of an older version
+/// that maps one keeps it on Unix, and makes it again; Windows may not remove a mapped one, which
+/// is then left for the next collection. It stops at `until`. In a dry run, it only tells them.
+fn remove_other_schemas(cache: &Cache, until: Option<Instant>, dry_run: bool) -> Outcome {
+    let root = cache.dir();
+    let name = super::formats::archive_version();
+    let Some(schema) = schema_of(&name) else {
+        return Outcome::default();
+    };
+    let this = (schema, name.as_str());
+    let before = SystemTime::now()
+        .checked_sub(KEPT_FOR)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut outcome = Outcome::default();
+    for place in ARCHIVED {
+        let class = layout::class_of(place);
+        let top = root.join(place);
+        // Not a link, which may lead out of the cache, nor a class that is not collected.
+        if !class.is_some_and(|class| COLLECTED.contains(&class))
+            || fs::symlink_metadata(&top).map_or(true, |metadata| !metadata.is_dir())
+        {
+            continue;
+        }
+        let mut found = Vec::new();
+        older_schemas(&top, this, ARCHIVE_DEPTH, (until, &mut found));
+        for path in found {
+            let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            let Some(_held) = path
+                .parent()
+                .and_then(|dir| cache.try_lock_held(dir))
+                .zip(cache.try_lock_held(&path))
+            else {
+                outcome.in_use.push(relative);
+                continue;
+            };
+            // Under the locks: what another process made meanwhile under the name is kept.
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.modified().map_or(true, |written| written > before) {
+                continue;
+            }
+            if !dry_run && let Err(error) = remove_file(&path) {
+                outcome.left.push((relative, error.to_string()));
+                continue;
+            }
+            let bytes = metadata.len();
+            outcome.removed.push(Removal {
+                entry: Entry {
+                    kind: Kind::OtherFormat,
+                    class,
+                    path: relative,
+                    bytes,
+                    last_used: None,
+                    about: None,
+                },
+                reason: Reason::OlderSchema,
+                bodies: Vec::new(),
+                bytes,
+            });
+        }
+    }
+    outcome
+}
+
+/// The archives below `dir`, `depth` levels down at most, of a schema older than `this` (its
+/// numbers and its name, `v9t61`), in a directory with an archive of `this` too, into `found`,
+/// until `until`. Links are not followed, nor the unpacked sources (`src.v1`).
+fn older_schemas(
+    dir: &Path,
+    this: ((u32, u32), &str),
+    depth: usize,
+    (until, found): (Option<Instant>, &mut Vec<PathBuf>),
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let entries: Vec<fs::DirEntry> = entries.flatten().collect();
+    let (numbers, schema_name) = this;
+    let current = format!(".{schema_name}.rkyv");
+    let replaced = entries
+        .iter()
+        .any(|entry| entry.file_name().to_string_lossy().ends_with(&current));
+    for entry in entries {
+        if until.is_some_and(|until| Instant::now() >= until) {
+            return;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if kind.is_dir() {
+            if let Some(below) = depth.checked_sub(1)
+                && sources_dir(&name).is_none()
+            {
+                older_schemas(&entry.path(), this, below, (until, &mut *found));
+            }
+            continue;
+        }
+        let schema = name
+            .strip_suffix(".rkyv")
+            .and_then(|stem| stem.rsplit('.').next())
+            .and_then(schema_of);
+        let older = schema.is_some_and(|(schema, types)| {
+            (schema, types) != numbers && schema <= numbers.0 && types <= numbers.1
+        });
+        #[expect(
+            clippy::filetype_is_file,
+            reason = "only a regular file is an archive: not a link, a FIFO nor a device"
+        )]
+        let regular = kind.is_file();
+        if regular && older && replaced {
+            found.push(entry.path());
+        }
+    }
+}
+
+/// The schema and the version of rustdoc-types of the part of an archive's name `name` that
+/// tells them (`v9t61`).
+fn schema_of(name: &str) -> Option<(u32, u32)> {
+    let (schema, types) = name.strip_prefix('v')?.split_once('t')?;
+    let number = |part: &str| {
+        part.bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    Some((number(schema)?, number(types)?))
 }
 
 /// Removes the aliases of the workspaces outside the projects whose records are gone, which find
@@ -1255,6 +1416,98 @@ mod tests {
         empty_trash(root);
         let trash = root.join(layout::WORK).join(TRASH);
         assert!(!trash.exists(), "the trash is emptied");
+    }
+
+    /// In the directories that are kept, the archives of an older schema go once written long
+    /// enough ago where this schema's replaced them; this schema's, a newer one's (another
+    /// server's), a recent one, one not replaced, what is not an archive, the unpacked sources and
+    /// one under a lock stay (decided in M4a, decision 12).
+    #[test]
+    fn archives_of_an_older_schema_go_from_the_directories_kept() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        let (schema, types) =
+            schema_of(&crate::data::formats::archive_version()).expect("this schema");
+        let place = "docs.rs/a/1/_default";
+        let named = |schema: &str| format!("{place}/61.ab.{schema}.rkyv");
+        let old = named(&format!("v{}t{types}", schema.saturating_sub(1)));
+        let recent = format!("{place}/61.cd.v1t{types}.rkyv");
+        let current = named(&format!("v{schema}t{types}"));
+        let newer = named(&format!("v{}t{types}", schema.saturating_add(1)));
+        let other = named("vxt61");
+        let std = format!("std/abc/x86_64-unknown-linux-gnu/core.ab.v1t{types}.rkyv");
+        let sources = format!("std/abc/src.v1/library/old.ab.v1t{types}.rkyv");
+        let locked = format!("docs.rs/b/1/_default/61.ab.v1t{types}.rkyv");
+        let alone = format!("docs.rs/c/1/_default/61.ab.v1t{types}.rkyv");
+        for path in [
+            &old, &recent, &current, &newer, &other, &std, &sources, &locked, &alone,
+        ] {
+            write(root, path);
+        }
+        // What replaced them.
+        for dir in [
+            "std/abc/x86_64-unknown-linux-gnu",
+            "std/abc/src.v1/library",
+            "docs.rs/b/1/_default",
+        ] {
+            write(root, &format!("{dir}/61.ef.v{schema}t{types}.rkyv"));
+        }
+        write(root, &format!("{place}/61.json"));
+        let long_ago = SystemTime::now().checked_sub(days(2)).expect("a time");
+        for path in [
+            &old, &current, &newer, &other, &std, &sources, &locked, &alone,
+        ] {
+            fs::File::options()
+                .write(true)
+                .open(root.join(path))
+                .and_then(|file| file.set_modified(long_ago))
+                .expect("set");
+        }
+        let cache = Cache::at(root);
+        let held = cache
+            .try_lock_held(&root.join("docs.rs/b/1/_default"))
+            .expect("locked");
+        let told = |outcome: &Outcome| -> Vec<PathBuf> {
+            let mut told: Vec<PathBuf> = outcome
+                .removed
+                .iter()
+                .map(|removal| removal.entry.path.clone())
+                .collect();
+            told.sort();
+            told
+        };
+        let outcome = remove_other_schemas(&cache, None, true);
+        assert_eq!(told(&outcome), [PathBuf::from(&old), PathBuf::from(&std)]);
+        assert_eq!(outcome.in_use, [PathBuf::from(&locked)]);
+        assert!(root.join(&old).exists(), "a dry run removes nothing");
+        let outcome = remove_other_schemas(&cache, None, false);
+        assert_eq!(told(&outcome), [PathBuf::from(&old), PathBuf::from(&std)]);
+        assert!(
+            outcome
+                .removed
+                .iter()
+                .all(|removal| removal.reason == Reason::OlderSchema)
+        );
+        for path in [&old, &std] {
+            assert!(!root.join(path).exists(), "{path}");
+        }
+        for path in [&recent, &current, &newer, &other, &sources, &locked, &alone] {
+            assert!(root.join(path).exists(), "{path}");
+        }
+        drop(held);
+        assert_eq!(told(&remove_other_schemas(&cache, None, false)), [
+            PathBuf::from(&locked)
+        ]);
+        assert!(root.join(format!("{place}/61.json")).exists());
+    }
+
+    /// The part of an archive's name that tells its schema.
+    #[test]
+    fn the_schema_of_an_archive_is_read_from_its_name() {
+        assert_eq!(schema_of("v9t61"), Some((9, 61)));
+        for name in ["v9", "vt61", "v9t", "v+9t61", "x9t61", "v9t61x"] {
+            assert_eq!(schema_of(name), None, "{name}");
+        }
     }
 
     /// A target directory that a build uses, which holds its lock across processes, is in use.

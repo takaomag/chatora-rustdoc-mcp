@@ -75,6 +75,16 @@ pub fn archive_schema() -> u32 {
     ARCHIVE.saturating_add(bump())
 }
 
+/// The part of an archive's name that changes with what it holds, as in `v9t61`.
+///
+/// It is [`archive_schema`] and the version of rustdoc-types. An archive made by another version
+/// of the server is left alone, not replaced in place, which Windows does not allow while another
+/// process maps it; the GC removes those of older versions (decided in M4a, decision 12).
+#[must_use]
+pub fn archive_version() -> String {
+    format!("v{}t{}", archive_schema(), rustdoc_types::FORMAT_VERSION)
+}
+
 /// The directory of the format whose version is `version`, made newer for the tests.
 fn dir(version: u32) -> String {
     format!("v{}", version.saturating_add(bump()))

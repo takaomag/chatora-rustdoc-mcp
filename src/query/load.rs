@@ -490,16 +490,10 @@ fn header(format: u32, sha256: Box<str>) -> Header {
     }
 }
 
-/// The part of an archive's name that changes with what it holds: the schema of [`Indexed`] and
-/// the version of rustdoc-types, as in `v5t61`. An archive made by another version of the server
-/// is left alone (the GC removes it), not replaced in place, which Windows does not allow while
-/// another process maps it.
+/// The part of an archive's name that changes with the schema of [`Indexed`] and the version of
+/// rustdoc-types ([`formats::archive_version`]).
 fn archive_version() -> String {
-    format!(
-        "v{}t{}",
-        formats::archive_schema(),
-        rustdoc_types::FORMAT_VERSION
-    )
+    formats::archive_version()
 }
 
 /// The archive of the rustdoc JSON in the cache directory `dir`, if it is there and checks out.
