@@ -862,7 +862,8 @@ async fn dispatch(
             Err(error) => Ok(error.into_result()),
         },
         inspect_features::NAME => match inspect_features::parse_arguments(arguments) {
-            Ok(inspect) => Ok(run_tool(inspect_features::execute(inspect, shared)).await),
+            // Large on Windows, as `find_examples`.
+            Ok(inspect) => Ok(Box::pin(run_tool(inspect_features::execute(inspect, shared))).await),
             Err(error) => Ok(error.into_result()),
         },
         find_examples::NAME => match find_examples::parse_arguments(arguments) {
