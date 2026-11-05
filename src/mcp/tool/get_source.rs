@@ -1617,8 +1617,9 @@ fn sources_error(release: &str, error: &SourcesError, offline: bool) -> CallTool
         SourcesError::Crate(CrateError::NotFound) | SourcesError::NotCached => {
             ("docs_unavailable", Some("no_source"), false)
         },
+        // Too much to unpack, in bytes or in files (decided in M3, at §7 of the plan).
         SourcesError::Crate(CrateError::TooLarge { .. })
-        | SourcesError::Unpack(UnpackError::TooLarge { .. }) => {
+        | SourcesError::Unpack(UnpackError::TooLarge { .. } | UnpackError::TooManyFiles { .. }) => {
             ("docs_unavailable", Some("too_large"), false)
         },
         SourcesError::Crate(CrateError::Corrupt(_) | CrateError::Manifest(_))
@@ -1626,7 +1627,7 @@ fn sources_error(release: &str, error: &SourcesError, offline: bool) -> CallTool
             ("docs_unavailable", Some("corrupt"), true)
         },
         // Refused whole, the same each time (decided in M3b, decision 12).
-        SourcesError::Unpack(UnpackError::Refused { .. } | UnpackError::TooManyFiles { .. }) => {
+        SourcesError::Unpack(UnpackError::Refused { .. }) => {
             ("docs_unavailable", Some("corrupt"), false)
         },
         SourcesError::Crate(CrateError::Cache(_))
@@ -2293,6 +2294,12 @@ mod tests {
                 }),
                 "docs_unavailable",
                 Some("corrupt"),
+                false,
+            ),
+            (
+                SourcesError::Unpack(UnpackError::TooManyFiles { limit: 100_000 }),
+                "docs_unavailable",
+                Some("too_large"),
                 false,
             ),
             (

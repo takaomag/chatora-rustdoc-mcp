@@ -5191,9 +5191,11 @@ pub(super) fn dist_error_body(error: &DistError, message: &str, suggestions: &[&
         | DistError::Archive(_)
         | DistError::Unpack(UnpackError::Archive(_)) => ("docs_unavailable", Some("corrupt"), true),
         // Of the sources of std, which the JSON's fetch does not give: the same again each time.
-        DistError::Unpack(UnpackError::Refused { .. } | UnpackError::TooManyFiles { .. })
-        | DistError::CommitMismatch { .. } => ("docs_unavailable", Some("corrupt"), false),
-        DistError::Unpack(UnpackError::TooLarge { .. }) => {
+        DistError::Unpack(UnpackError::Refused { .. }) | DistError::CommitMismatch { .. } => {
+            ("docs_unavailable", Some("corrupt"), false)
+        },
+        // Too much to unpack, in bytes or in files (decided in M3, at §7 of the plan).
+        DistError::Unpack(UnpackError::TooLarge { .. } | UnpackError::TooManyFiles { .. }) => {
             ("docs_unavailable", Some("too_large"), false)
         },
         DistError::NoSource => ("docs_unavailable", Some("no_source"), false),
@@ -6147,5 +6149,33 @@ mod tests {
     fn the_description_fits_the_limit() {
         let len = super::super::for_this_build(DESCRIPTION).chars().count();
         assert!(len <= 2048, "{len} characters");
+    }
+
+    /// What is too much to unpack, in bytes or in files, is `too_large`; what is refused is
+    /// `corrupt`, neither to be tried again (decided in M3, at §7 of the plan).
+    #[test]
+    fn the_sources_of_std_too_large_or_refused_are_told_apart() {
+        for (error, reason) in [
+            (
+                DistError::Unpack(UnpackError::TooManyFiles { limit: 100_000 }),
+                "too_large",
+            ),
+            (
+                DistError::Unpack(UnpackError::TooLarge { limit: 1 }),
+                "too_large",
+            ),
+            (
+                DistError::Unpack(UnpackError::Refused {
+                    entry: "a/../b".into(),
+                    why: "a path with . or ..",
+                }),
+                "corrupt",
+            ),
+        ] {
+            let body = dist_error_body(&error, "m", &[]);
+            assert_eq!(body["code"], "docs_unavailable", "{error:?}");
+            assert_eq!(body["reason"], reason, "{error:?}");
+            assert_eq!(body["retryable"], false, "{error:?}");
+        }
     }
 }

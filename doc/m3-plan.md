@@ -1,7 +1,7 @@
 # M3 (crate 情報とソース) の計画
 
 - 作成日: 2026-10-24
-- 状態: 計画。§5 は 2026-10-24 に決めた
+- 状態: M3a〜M3h を実施し、§7 で要件 v0.21 を作った (2026-11-05)。§5 は 2026-10-24 に決めた
 - 前提: [requirements.md](requirements.md) v0.20。M3 の内容と完了条件は §12、M2 の既知の残りは [m2-plan.md](m2-plan.md) の §7.1 (決定 5・6・8・9)、M2 の結果は m2-plan.md の §6
 
 ---
@@ -12,28 +12,28 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 
 **範囲** (要件の §12 の M3):
 
-- 新しいツール 7 本: `get_source` (R-SC-1・R-SC-3・R-SC-5)・`inspect_features` (R-FT-1・R-FT-2)・`find_examples`・`readme` (R-SC-4)・`changelog`・`crate_metadata` (§5.9)・`search_crates` (§6.3・R-NW-1)。ツールは 10 本から 17 本になる
+- 新しいツール 7 本: `get_source` (R-SC-1・R-SC-3・R-SC-5)・`inspect_features` (R-FT-1・R-FT-2)・`find_examples`・`get_readme` (R-SC-4)・`get_changelog`・`crate_metadata` (§5.9)・`search_crates` (§6.3・R-NW-1)。ツールは 10 本から 17 本になる (M3 の結果: 名前は決定 77 で `get_readme`・`get_changelog` にした)
 - 横断の部品: `.crate` の展開 (R-SC-2・R-NW-3)、ソースルートの判定 (R-SC-4・R-SEC-3)、std のソース (rust-src。R-SC-2・R-STD-6)、crates.io の API (R-NW-1)、ソースの本文の見える印 (R-SEC-7)
 - M2 の既知の残り 9 件 (m2-plan.md の §7.1 の決定 5・6・8・9): R-WS-7 との 3 つのずれ、版の違うサーバーの結合テスト (Q-29)、`resolve_version` の M2e の決定 11、`search_items` の std の target、ローカル機能の無い構成の `search_items` の `crate` の required、外の workspace の `lockfile_outdated` の案内、ローカルビルドした member の `source_location.file`
 - M2 から回したもの: R-OUT-8 の `path` (m2-plan.md の §7.1 の決定 2)、R-SC-4 の継承した `readme` と拡張子の無い `README`、ソースの本文の見える印 (m2-plan.md の F7 の決定 4)、`.crate` の展開 (R-NW-3)
 
-**範囲の外**: `search_source`・`api_diff`・`unnameable`・`build_external_docs` の `document_hidden_items`・`also_reexported_at` ごとの feature の条件 (M4)、resources・`alwaysLoad` の比較 (M5)、Streamable HTTP (M6)。「M3 以降」とした 4 件 (`search.scope`・`build.prefer_local`・「(in a later version)」で答える場合・Windows の Job Object の隙間) も入れない (§5 の P15)。changelog の GitHub releases と R-NW-4 の token は、M3g の 2 つ目の段に分け、入れるかをその段に入るときに決める (§5 の P9。入れないと決めたら、§5.9 の changelog の「無ければ GitHub releases」を M4 以降に送ると §7 で要件に書く)
+**範囲の外**: `search_source`・`api_diff`・`unnameable`・`build_external_docs` の `document_hidden_items`・`also_reexported_at` ごとの feature の条件 (M4)、resources・`alwaysLoad` の比較 (M5)、Streamable HTTP (M6)。「M3 以降」とした 4 件 (`search.scope`・`build.prefer_local`・「(in a later version)」で答える場合・Windows の Job Object の隙間) も入れない (§5 の P15)。changelog の GitHub releases と R-NW-4 の token は、M3g の 2 つ目の段に分け、入れるかをその段に入るときに決める (§5 の P9。入れないと決めたら、§5.9 の changelog の「無ければ GitHub releases」を M4 以降に送ると §7 で要件に書く) (M3 の結果: G2 は決定 123 で M4 以降に回し、要件 v0.21 には決定 137 の形で書いた。「M3 以降」の 4 件は決定 138 で「M4 以降で検討」にした)
 
 **完了条件** (要件の §12): §3 の問い Q10〜Q13・Q15・Q16 と、Q14 のうち changelog で答えられる部分に答えられる。M2 の既知の残りが直っている。eval の新しいケース (§5 の P14) がすべて合格し、それまでのケースが落ちないことで確かめる (Q14 のケースは `.crate` に CHANGELOG を含む crate で作る)
 
 **M3 の利用者への影響**:
 
-- 外へ出る先が増える: crates.io の API (`crate_metadata`・`search_crates`、`.crate` に README が無いときの `readme`)、dist の rust-src (手元に合うものが無いとき)、(G2 を入れれば GitHub の API)。README の「サーバーが接続する先」の約束 (R-SEC-6) を H3 で改める
-- キャッシュに、展開した `.crate` のソースと rust-src が増える (GC と `cache clear` の対象に入れる)
+- 外へ出る先が増える: crates.io の API (`crate_metadata`・`search_crates`、`.crate` に README が無いときの `get_readme`)、dist の rust-src (手元に合うものが無いとき)、(G2 を入れれば GitHub の API)。README の「サーバーが接続する先」の約束 (R-SEC-6) を H3 で改める (M3 の結果: crates.io の README は決定 104 で使わず、GitHub の API には決定 123 で接続しない)
+- キャッシュに、展開した `.crate` のソースと rust-src が増える (GC と `cache clear` の対象に入れる) (M3 の結果: crates.io の API の答えも `crates.io/v1/` に置く。§6.6 の F1b)
 - ソースを読むツールは、パッケージの中身だけを返すが、Claude Code の Read の deny をこのサーバー経由ですり抜ける経路になる (R-SC-4・R-SEC-2。README の Security に書く)
-- ツールが 17 本になる。instructions (ローカル機能のある構成で 2,013/2,048 文字) と `get_item` の説明文 (2,046/2,048 文字) には案内を足す余地がほとんど無い
+- ツールが 17 本になる。instructions (ローカル機能のある構成で 2,013/2,048 文字) と `get_item` の説明文 (2,046/2,048 文字) には案内を足す余地がほとんど無い (M3 の結果: instructions は 2,046 文字、`get_item` は 2,044 文字。上限は決定 127 で 2,048 文字のまま)
 
 ## 2. 方針
 
 - **m2-plan.md の §2 を引き継ぐ**: 共通の印 (`cargo +nightly fmt`・`cargo clippy --all-targets`・`cargo test` が local ありとなしの両構成で通る)、層 (R-ARCH-1) と cargo feature `local` (R-ARCH-2)、測った結果と決めたことは日付と環境を付けて §6 に書き、要件への反映は M3 の終わりにまとめる (§7)、判断の要るものは利用者に 1 件ずつ聞く、ホストの環境を変えない、外部への要求に利用者のメールアドレスや名前を入れない、crates.io への公開は利用者が行い、commit と push は利用者に頼まれたときだけ Claude が行う
 - **ソースを誰が書くか** (§5 の P2): M2 と同じ。Claude が段ごとに書き、サブエージェントのレビューの後に利用者が差分をレビューする。利用者が自分で書くと言った段だけ、Claude が導く
 - **テストは外へ出ない**: crates.io の API・GitHub の API・dist の rust-src は、テストでは偽のサーバーで行う (M1 の `data::test_http` の形)。本物は CI の `testdata` と canary だけ。cargo・rustup・git を動かすテストは、M2 と同じく隔離した環境を渡す
-- **ソースルートの判定は 1 か所に置く**: R-SC-4 の「パッケージの中身」とルートの判定 (symlink の実パス、ドットファイル、manifest 由来のパス) を、`get_source`・`readme`・`find_examples`・`changelog`・`source_location.path` が共有する
+- **ソースルートの判定は 1 か所に置く**: R-SC-4 の「パッケージの中身」とルートの判定 (symlink の実パス、ドットファイル、manifest 由来のパス) を、`get_source`・`get_readme`・`find_examples`・`get_changelog`・`source_location.path` が共有する
 - **ローカル機能の無い構成** (R-ARCH-4): 新しいツールは、各段でこの構成の形も決めて作る。cargo を起動するものと既定のプロジェクトを読むもの (member・path・git の crate の `get_source`、`inspect_features` の `enabled_in_project`、引数 `project`・`git` など) は出さず、docs.rs・`.crate`・std の配布物・crates.io の API だけで答える。説明文は ⟨⟩⟪⟫ で出し分け、`descriptions_are_of_this_build` と README の検査 (R-QA-5) の「この構成に無いツール」の一覧も直す。§6.4 の共通引数 (`target`・`refresh`・`git` の鍵・`project`) を各ツールがどう受けるかも、その段で決める
 - **オフラインと配布物の設定**: `network.offline` (R-CA-7) では crates.io の API・dist の rust-src・(GitHub) に要求せず、キャッシュに無ければ `offline_miss` を返す。`std.fetch_from_dist = false` では dist の rust-src を取らない。どちらも各段のテストに入れる
 - **新しいキャッシュの中身** (R-CA-4・R-CA-5): 展開した `.crate` のソース、rust-src、crates.io の API の応答を、`layout` の分類 (docs の上限の側) と GC・`cache clear`・`cache ls` に入れる。展開は一時ディレクトリから名前を替えて置き (原子的に)、ロックの下で行い、同時に展開する複数のプロセスで壊れないようにする。GC は `.crate` を取得の時刻で判じているので、展開したソースを使い続けたときに消さないよう `used` の印を付ける。置き場のパスに形式の版を入れ、版の違うサーバーの GC が互いの置き場を消さないようにする (Q-29)。B1・B3・F1 で決める
@@ -49,9 +49,9 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 | **M3b** ソースの土台 | B1 `.crate` の展開 (§5 の P6。パスの検証・上限・置き場、原子的な展開とロック、GC・`cache clear`・`cache ls` への登録) / B2 ソースルートと R-SC-4 の判定 / B3 rust-src (§5 の P7。手元の sysroot と dist、sha256、`toolchain_missing`、置き場と R-STD-6 の 7 日の片付けとの関係) / B4 ソースの本文の見える印 (R-SEC-7。`data::hidden` の表は制御文字を含むので、改行・タブ・CRLF の CR は残し、ほかを `<U+XXXX>` にする。examples の本文も対象) / B5 `source_location.path` (§5 の P5。B1・B2 のルートの判定を使う) | M3a の A5 |
 | **M3c** `get_source` | C1 member と依存 (`manifest_path`)、`build_external_docs` で作った git の crate と外の workspace (記録から) / C2 docs.rs の crate (展開した `.crate`、docs.rs の span の絶対パスの写し替え) / C3 std / C4 前後の行・切り詰め・stale の warning・マクロの span (R-SC-1・R-SC-3・R-SC-5)、取得や展開を待つときの `status: building` | M3b |
 | **M3d** `inspect_features` | D1 sparse index の `features`・`features2` (`v`)・`deps` の読み取り (§5.9 のとおり `.crate` が無ければ index から先に返す) / D2 閉包と `enabled_by`、member・path・git の crate は `manifest_path` の Cargo.toml から / D3 feature から item への逆引き (§5 の P12) と `enabled_in_project` | 展開は要らない (`.crate` の Cargo.toml は今も読める) |
-| **M3e** `readme` と `find_examples` | E1 readme の決め方 (§5 の P8。`.crate` に無ければ crates.io の README) と見出し単位のページング / E2 examples (`examples/` と doc のコードブロック、`required-features`、並べ方は §5 の P13、本文の見える印) | M3b (E1 の crates.io は F1 の HTTP の部品) |
+| **M3e** `get_readme` と `find_examples` | E1 readme の決め方 (§5 の P8。`.crate` に無ければ crates.io の README) と見出し単位のページング / E2 examples (`examples/` と doc のコードブロック、`required-features`、並べ方は §5 の P13、本文の見える印) (M3 の結果: crates.io の README は決定 104 で使わない) | M3b (E1 の crates.io は F1 の HTTP の部品) |
 | **M3f** `crate_metadata` と `search_crates` | F1 crates.io の API のクライアント (§5 の P10。応答のキャッシュの分類と GC) / F2 `crate_metadata` (§5 の P11。index の `pubtime` の読み取り) / F3 `search_crates` (outputSchema の provenance の必須の項目) | M3b と並べられる |
-| **M3g** `changelog` | G1 `.crate` の changelog の解析 (版の見出しで分け、`from`・`to`、N リリースと予算) と、どこからも取れないときの crates.io の版の履歴への案内 / G2 GitHub releases と R-NW-4 の token (§5 の P9。入れるかを G2 に入るときに決める) | M3b、G2 は F1 の HTTP の部品 |
+| **M3g** `get_changelog` | G1 `.crate` の changelog の解析 (版の見出しで分け、`from`・`to`、N リリースと予算) と、どこからも取れないときの crates.io の版の履歴への案内 / G2 GitHub releases と R-NW-4 の token (§5 の P9。入れるかを G2 に入るときに決める) (M3 の結果: N は引数 `limit` (決定 115)。G2 は決定 123 で M4 以降に回した) | M3b、G2 は F1 の HTTP の部品 |
 | **M3h** 片付け | H1 instructions と説明文 (2,048 文字の内、`for_this_build`) / H2 eval (§5 の P14) / H3 README (ツールの表、状態の行と Planned、Security のソースを読むツールと接続する先、キャッシュ、設定) / H4 annotations と R-QA-5 の検査 (ローカル機能のある構成では `search_crates` だけ `readOnlyHint: true`、無い構成ではすべて `true`。`openWorldHint`・`idempotentHint` も) / H5 canary (crates.io の API と dist の rust-src の形の変化) | すべて |
 
 **危険と、決めるための実測** (下調べ。2026-10-24、読むだけ。下調べの番号を詰め直した):
@@ -62,7 +62,7 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - R4 ソースルートと symlink、dep-info の入力、`#[path]`: B2 の単体テストで (Unix の symlink、Windows の junction)
 - R5 span の形: A5 で取得元ごとに確かめる (`path` は B5)。外の workspace の member は `words/src/lib.rs` の形 (workspace のルートからの相対) だと手元のキャッシュで確かめた。workspace の外の path 依存・ローカルビルドした crates.io の依存・git の依存は絶対パスになる見込み (cargo の記憶で、確度は中)
 - R6 docs.rs の span の絶対パス (`/opt/rustwide/…`) の写し替え: C2 で testdata の tokio の span を分類する
-- R7 GitHub releases と token: G2 に入るときに、`.crate` に CHANGELOG が無く GitHub releases にある crate の割合を調べてから決める (手元の registry で CHANGELOG のある crate は 38%)
+- R7 GitHub releases と token: G2 に入るときに、`.crate` に CHANGELOG が無く GitHub releases にある crate の割合を調べてから決める (手元の registry で CHANGELOG のある crate は 38%) (M3 の結果: 決定 123 で M4 以降に回した。手元の 1,025 crate の 61% が `.crate` に changelog を持たない)
 - R8 crates.io の API: エンドポイントと応答の項目を F1 で文書から確かめる (外に出る実験は利用者の許可の上で)
 - R9 feature から item への逆引きの大きさ: D3 で tokio・axum の feature ごとの item の数を testdata の JSON で数える
 - R10 継承した readme: E1 で `cargo metadata` の `readme` の形と、`cargo package` が外の readme を中に写すかを fixture で確かめる
@@ -79,7 +79,7 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 | `.crate` の展開の置き場とファイル数の上限 (10 万) の実装 | R-SC-2・R-NW-3 | B1 (方針は §5 の P6) |
 | ソースの見える印の形 (`<U+202E>`) と warnings の文 | R-SEC-7 | B4 |
 | `source_location.path` の範囲 | R-OUT-8 | B5 (方針は §5 の P5) |
-| changelog の N の既定 (10) の設定の名前 | §5.9 | G1 |
+| changelog の N の既定 (10) の設定の名前 (M3 の結果: 設定にせず引数 `limit`。決定 115・141) | §5.9 | G1 |
 | `search_crates` の outputSchema の provenance の必須の項目 | R-OUT-9 | F3 |
 | ソースの見える印にする文字の範囲 (改行・タブ・CRLF を残す) | R-SEC-7 | B4 |
 
@@ -93,17 +93,17 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 4. P4 版の違うサーバーの結合テスト: debug ビルドのテスト用の口 (環境変数) で記録の形式の版を 1 つ上げた同じバイナリと普通のサーバーを、同じキャッシュで並べる。版の変わったコミットがまだ無いため。版の定数を 1 か所に集める
 5. P5 `source_location.path`: その crate のパッケージの中に加え、R-SC-4 で読めるソースルート (依存の `.crate` の展開先など) の下にある実パスに付ける (derive が依存のソースを指す span にも。このリポジトリの JSON では crate 自身の item の span の 3,283/8,626 件)。`get_source` で読めるものとそろえる。`file` はパッケージのルートからの相対に直す (パッケージの外の span は R-OUT-8 のとおり span のままで `url` を付けず warning)。依存のソースを指す span の `path` は、cargo がビルドに使った `$CARGO_HOME/registry/src` や git の checkout の実パスで、このサーバーの展開の有無によらない (R-ARCH-5)。R-OUT-8 は「ローカルビルドした crate」の `path` だけを書くので、§7 で要件を改める
 6. P6 `.crate` の中身: 初めて要るときに、キャッシュの `static.crates.io/<鍵>/<版>/src/` に `.crate` 全体を検証しながら展開する (絶対パス・`..`・symlink・hardlink を拒み、大きさと数に上限)。`$CARGO_HOME/registry/src` に展開済みならそれを読み、展開しない (R-SC-2)。以後のツールが同じ置き場を使え、`find_examples` のパスも開ける
-7. P7 std のソース: std の JSON と同じ commit の手元の rust-src (同じ sysroot の `rustc -vV` で照合) を使い、無ければ dist の rust-src を既定で取る (R-SC-2 のまま)。dist の大きさは B3 で測り、「既定で取る」を見直す材料にする
+7. P7 std のソース: std の JSON と同じ commit の手元の rust-src (同じ sysroot の `rustc -vV` で照合) を使い、無ければ dist の rust-src を既定で取る (R-SC-2 のまま)。dist の大きさは B3 で測り、「既定で取る」を見直す材料にする (M3 の結果: 決定 20〜22。既定で取り、設定は足さない。dist の rust-src は xz で 6.0MB)
 8. P8 readme の規則: (a) member と path・git の依存で workspace から継承した readme (パッケージの外の `../README.md`) は、その workspace のルートの下で文書の拡張子なら読む (`.crate` では中に写されるので、読めないと docs.rs の crate と食い違う) (b) 拡張子の無いファイルは名前が `README` (大文字小文字を問わない) のときだけ読む (c) `.mkd` は足さない (手元の 1,625 crate で継承は 0 件、拡張子の無い `README` は 1 件、`README.mkd` は 2 件)
-9. P9 changelog の GitHub: M3 では `.crate` の changelog ファイルと crates.io の版の履歴への案内だけを入れる。GitHub releases と R-NW-4 の token (gh・git credential・キーリング、偽の GitHub のテスト) は M3g の 2 つ目の段 (G2) に分け、入れるかを G2 に入るときに改めて決める。完了条件は「Q14 のうち changelog で答えられる部分」
+9. P9 changelog の GitHub: M3 では `.crate` の changelog ファイルと crates.io の版の履歴への案内だけを入れる。GitHub releases と R-NW-4 の token (gh・git credential・キーリング、偽の GitHub のテスト) は M3g の 2 つ目の段 (G2) に分け、入れるかを G2 に入るときに改めて決める。完了条件は「Q14 のうち changelog で答えられる部分」 (M3 の結果: G2 は入れず、決定 123 で M4 以降に回した)
 10. P10 crates.io の API: プロセスごとに 1 秒 1 回の待ち行列。応答はキャッシュする (検索は 1 時間、DL 数は 1 日を目安に、細部は F1)。被依存の一覧は crate ごとに複数の要求が要り期限に収まりにくいので M3 では入れず、被依存の数だけ出す
-11. P11 `crate_metadata`: 要件の初期案のまま (最新の安定版と最新版、最終リリース日、総 DL と 90 日の DL、被依存数、保守の状況 30・90・365 日、版ごとの feature・MSRV・ライセンスの変化、yanked)。取得元は index (版・yanked・MSRV・features・公開日 `pubtime`・宣言の依存) → `.crate` (その版の license・repository・docs.rs の target) → API (DL 数・被依存数・版ごとのライセンス) の順 (R-NW-1。版ごとのライセンスは全版の `.crate` を取らずに API から)。1 回に要る API の要求の数は F2 で数える
+11. P11 `crate_metadata`: 要件の初期案のまま (最新の安定版と最新版、最終リリース日、総 DL と 90 日の DL、被依存数、保守の状況 30・90・365 日、版ごとの feature・MSRV・ライセンスの変化、yanked)。取得元は index (版・yanked・MSRV・features・公開日 `pubtime`・宣言の依存) → `.crate` (その版の license・repository・docs.rs の target) → API (DL 数・被依存数・版ごとのライセンス) の順 (R-NW-1。版ごとのライセンスは全版の `.crate` を取らずに API から)。1 回に要る API の要求の数は F2 で数える (M3 の結果: crate の情報は `?include=downloads` で引き (決定 95)、版の履歴は API の `/versions` から license・MSRV・edition の変化と yanked (決定 96・109。feature は決定 139 で外した)、被依存は数だけ)
 12. P12 `inspect_features` の逆引き: feature ごとに、その feature を条件に含む item の数と上位 N 件をページング付きで返す。条件は正準パスのものだけ (再公開の先の条件は M4)
 13. P13 `find_examples` の並べ方: item を指したら、`examples/` のファイルと doc のコードブロックのうち、その item の名前 (最後の区切りと親の型) を識別子として含むものを先に並べる (字句の一致。型の解決はしない)
-14. P14 eval: 要件の問い Q10〜Q16 から 7〜9 問を `eval/cases.json` に足し、M3h で全体を 1 回回す (予算 3〜5 USD)
+14. P14 eval: 要件の問い Q10〜Q16 から 7〜9 問を `eval/cases.json` に足し、M3h で全体を 1 回回す (予算 3〜5 USD) (M3 の結果: q10〜q16 の 7 問を足し、全件を 1 回回して 36 回のうち 34 回が合格、3.31 USD。決定 124〜126)
 15. P15 「M3 以降」の 4 件 (`search.scope`・`build.prefer_local`・「(in a later version)」で答える場合・Windows の Job Object の隙間): M3 には入れない。それぞれ別の設計 (R-SR-2・R-DS-1) を要し、Job Object の隙間は手元で確かめられないので要件の残りのまま
 
-計画のレビュー (2026-10-26、サブエージェント、読むだけ) の対応 (18 件。どれも書き足しと直しで、新しい判断は無い): `path` を A5 から B5 に移す (ルートの判定と展開の後)、P5 が R-OUT-8 を広げることと展開の有無によらない形、ローカル機能の無い構成・オフライン・新しいキャッシュの中身の方針 (§2)、instructions の長さ (2,013)、P11 の版ごとのライセンスは API から、`search_crates` の outputSchema と見える印の文字の範囲を §4 に、README の crates.io のフォールバックと接続する先、P9 で GitHub を外すときの要件の扱い、`inspect_features` の member・path・git、`get_source` の git の crate と外の workspace と building、`readOnlyHint` の構成ごとの値、完了条件の合格の基準、危険の番号の詰め直し
+計画のレビュー (2026-10-26、サブエージェント、読むだけ) の対応 (18 件。どれも書き足しと直しで、新しい判断は無い): `path` を A5 から B5 に移す (ルートの判定と展開の後)、P5 が R-OUT-8 を広げることと展開の有無によらない形、ローカル機能の無い構成・オフライン・新しいキャッシュの中身の方針 (§2)、instructions の長さ (2,013)、P11 の版ごとのライセンスは API から、`search_crates` の outputSchema と見える印の文字の範囲を §4 に、README の crates.io のフォールバックと接続する先、P9 で GitHub を外すときの要件の扱い、`inspect_features` の member・path・git、`get_source` の git の crate と外の workspace と building、`readOnlyHint` の構成ごとの値、完了条件の合格の基準、危険の番号の詰め直し (後に決定 104 で改めた: crates.io の README は使わない)
 
 聞かずに決めたこと (要件が決めている): `search_crates` だけ `readOnlyHint: true` (R-MCP-4)、`.crate` の `cksum` の照合 (R-SC-2)、展開の拒否の規則 (R-SC-2)、キャッシュの symlink の拒否 (R-CA-4)、サニタイズの出口 (m2-plan.md の F7)、`get_source` の切り詰め 2 万文字 (R-SC-5)
 
@@ -237,7 +237,7 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 決定 20 (B3-1) 手元の rust-src は、span の完全な commit で照合して使う: std を手元の nightly から取ったときのその sysroot か、`rustc -vV` の commit-hash が span の commit と同じ nightly の sysroot (local 機能だけ。`local_std` が走らせた `rustc -vV` と `--print sysroot` の結果を使い、起動を増やさない)。ほかは dist から取る
 - 決定 21 (B3-2) dist から取った rust-src は `std/<短い commit>/src.v1/` (target によらない 1 つ) に置く。今の 7 日の片付け・在庫・GC にそのまま乗る。JSON (target ごと) とは別に 7 日を数える
 - 決定 22 (B3-3) 既定で取る。取るかどうかは今の `std.fetch_from_dist` に従い、設定は足さない。`get_source` で std を初めて引いたときだけ取る
-- 決定 23 (B3-4) 読めないときのエラーは理由ごとに分ける: オフラインでキャッシュに無ければ `offline_miss`、`std.fetch_from_dist = false` なら `toolchain_missing`、dist の失敗は `network_error`。導入の案内は rustup があれば `rustup toolchain install nightly-<日付> --component rust-src`、無ければ `std.fetch_from_dist` を有効にする案内。どれも別の版のソースは返さない
+- 決定 23 (B3-4) 読めないときのエラーは理由ごとに分ける: オフラインでキャッシュに無ければ `offline_miss`、`std.fetch_from_dist = false` なら `toolchain_missing`、dist の失敗は `network_error`。導入の案内は rustup があれば `rustup toolchain install nightly-<日付> --component rust-src`、無ければ `std.fetch_from_dist` を有効にする案内。どれも別の版のソースは返さない (後に決定 33 で改めた: 導入の案内は `rustup component add rust-src rust-docs-json --toolchain nightly` に)
 
 **B3a の実装 (2026-10-30)**: B3 は B3a (dist から取る rust-src と std の規則) と B3b (手元の nightly の sysroot の照合、決定 20) に分けた。
 
@@ -251,7 +251,7 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 
 - 決定 20: `local_std::rust_src(neutral_dir, commit)` は、手元の nightly の `rustc -vV` の commit-hash が JSON の完全な commit と同じとき、その sysroot の `lib/rustlib/src/rust` を返す。rust-src そのものの commit も確かめる: rustup が rust-src を入れた印 (`lib/rustlib/manifest-rust-src`) があり、rustup の channel の manifest (`multirust-channel-manifest.toml`) の `[pkg.rust-src]` の版の短い commit が JSON の commit の先頭と合うこと (manifest は 1MB ほどなので、TOML として解かずその節の行だけを読む)。`rustc -vV` と `--print sysroot` は `local_std` と同じコマンドで、同じディレクトリ (キャッシュのもの) なら 1 分は出力が覚えられているので起動は増えない。`std_json::rust_src(cache, dist, neutral_dir, json)` は選ばれた std の JSON から決める: dist の JSON なら、手元に合うものがあればそれ、無ければ `dist::rust_src`。手元の JSON なら、JSON の置き場 (`<sysroot>/share/doc/rust/json`) から sysroot を求め、プロセスを走らせずに同じ確かめ方をする (決定 20 の前半は「その sysroot を使う」だが、`rustup update` などで JSON の後に toolchain が変わりうるので、commit で照合し直す)。使えなければ `NoLocalSource` (理由は `NotRun`・`OtherCommit`・`NoComponent`。`toolchain_missing` で、走らせられず時間切れのときだけ再試行可。dist の日付が分からないので取らない)。`RustSrc.in_cache` で、手元のものは symlink を辿る側 (`Root::RustSrc` の `in_cache: false`) にする
 - レビュー (サブエージェント、読むだけ) の対応: 使えない理由を 1 つにまとめていたのを分けた。手元の JSON では sysroot を JSON の置き場から求め、プロセスを走らせない。rust-src そのものの commit を rustup の manifest で確かめる。起動が増えない条件 (1 分以内、同じディレクトリ) を doc に書いた。テスト: commit の照合 (完全な commit だけ)、rust-src を入れた印と manifest の commit、手元の JSON の sysroot (何も走らせない)、手元のソースでは symlink を辿り、キャッシュでは拒むこと、このマシンの nightly で無い commit には何も返さないこと、手元に合うものが無ければ dist の JSON は dist の rust-src に落ちること
-- 残したもの: M3c の `get_source` は、`neutral_dir` にキャッシュのディレクトリを渡し (起動を増やさないため)、`NoLocalSource` には `rustup component add rust-src --toolchain nightly` を案内する。dist の JSON で手元に合うものを使う経路は、このマシンの nightly の commit が JSON と合わないので通しでは確かめていない
+- 残したもの: M3c の `get_source` は、`neutral_dir` にキャッシュのディレクトリを渡し (起動を増やさないため)、`NoLocalSource` には `rustup component add rust-src --toolchain nightly` を案内する。dist の JSON で手元に合うものを使う経路は、このマシンの nightly の commit が JSON と合わないので通しでは確かめていない (後に決定 33 で改めた: 案内は `rustup component add rust-src rust-docs-json --toolchain nightly`)
 
 ### 6.3 M3c
 
@@ -278,7 +278,7 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 
 **コミットの順の案**: C1a (ツールの骨組み・本文の作り方・docs.rs の相対の span。偽のサーバーの stdio のテストで確かめられる) → C1b (member・path 依存) → C1c (git・ローカルビルドした crates.io の依存・`build_external_docs` の記録・B5 の穴) → C2 (rustwide の絶対パスの写し替え・building・オフライン) → C3 (std) → C4 (マクロ・stale・続きの案内)。合計 2,700〜3,800 行ほど (見積り)
 
-**M3 の終わり (§7) で要件に戻すもの**: R-SC-2 の `<name>-<ver>` の分け方 (名前として正しく残りが版になる最初の `-` で一通りに決まる) と、依存のソースを `manifest_path` から読むこと (vendor とオフライン)。std の失敗の分け方 (決定 23 と、その案内を改めた決定 33)。std の `file` の形 (決定 32)。決定 18 の直下のターゲット。cargo の展開の symlink の扱い。`get_source` のオフライン (決定 15)。instructions と `get_item.md` の説明文の余地 (H1 で詰め直す)
+**M3 の終わり (§7) で要件に戻すもの**: R-SC-2 の `<name>-<ver>` の分け方 (名前として正しく残りが版になる最初の `-` で一通りに決まる) と、依存のソースを `manifest_path` から読むこと (vendor とオフライン)。std の失敗の分け方 (決定 23 と、その案内を改めた決定 33)。std の `file` の形 (決定 32)。決定 18 の直下のターゲット。cargo の展開の symlink の扱い。`get_source` のオフライン (決定 15)。instructions と `get_item.md` の説明文の余地 (H1 で詰め直す) (済: 要件 v0.21 に書いた。説明文の余地は決定 127 で上限 2,048 文字のまま)
 
 **C1a の実装 (2026-10-30)**:
 
@@ -334,7 +334,7 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 決定 43 (M3d) ある feature の item として数えるのは、公開パスを持つ item と関連 item で、正準パスの条件にその feature が現れるもの (肯定でも否定でも)。各 item に条件の文 (`required_features`) を添える
 - 決定 44 (M3d) item の並べ方は、その feature が自分の条件として付く item (入口) を先に、親から受け継いだだけの item を後に。その中はパスの深さ、次に文字列の順
 - 決定 45 (M3d) プロジェクトが使わない crate や使う版と違う版では `enabled_in_project` を出さず、warnings に書く (get_item と同じく、プロジェクトの Cargo.lock の同じ版と分かったときだけ出す)
-- 決定 46 (M3d) docs.rs のビルドで有効にならなかった feature は、item の数も一覧も出さず、`in_docs: false` と「この文書には無い」を明示し、`build_external_docs` でその feature を含む文書を作る案内を付ける
+- 決定 46 (M3d) docs.rs のビルドで有効にならなかった feature は、item の数も一覧も出さず、`in_docs: false` と「この文書には無い」を明示し、`build_external_docs` でその feature を含む文書を作る案内を付ける (後に決定 51 で改めた: `build_external_docs` で作る案内でなく、どちらの文書にも無く `get_source` で読めると案内する)
 
 **コミットの順の案**: D1a (データ層: index のその版の行の `features`・`features2`・`deps`、feature の木の型 (暗黙の feature・`dep:`・`?/`・target・build・rename・名前の検証・閉包・`enabled_by`)、`crate_file` の `declared`/`closure` をこの型の上に作り直す) → D1b (ツールの骨組み: `What::Features`、docs.rs の crate、JSON の無い応答、README、偽の index の拡張と stdio のテスト) → D2 (member・path・git: `Package.features` の値、feature ごとの `enabled_in_project`・`enabled_in_dev_only`、tests/local) → D3 (逆引き: `cfg_note` の連言を切り出し、検索索引の entry を回して feature ごとに数え、上位 N 件とページング。testdata の tokio・axum で時間を測る) → D4 (get_item.md・crate_overview.md・instructions の案内、eval の Q11)。合計 2,000〜2,700 行 (見積り)
 
@@ -406,7 +406,7 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 
 - eval (2026-11-02、既定のモデル、各 1 回): `feature-hidden` は合格 (get_item → list_crates → inspect_features の 3 回、0.14 USD)。`q11-features` は inspect_features (`feature: ws`) を 1 回呼んで `ws`・既定に無いこと・`enabled_in_project: false`・有効にする書き方まで正しく答えた (0.22 USD) が、「doesn't enable it yet」「turned off」を採点の正規表現が拾わず不合格。正規表現を広げ (日本語の「ません」形も)、保存した答えに当てて合格を確かめた。回し直してはいない
 - D4 のレビュー (サブエージェント、読むだけ) の対応: q11-features の 2 つ目の正規表現は文のどこかに否定があれば通り、「既定では not enabled だがこのプロジェクトでは有効」のような誤答も通したので、否定を同じ文の中の「project / プロジェクト」から 80 字以内に限った (正答の例 8 件が通り、誤答の例 4 件のうち 3 件を落とす。同じ文で別の feature を否定する誤答は落とせない)。fixture の前提の食い違い (前から): tokio の `net` は fixture では挙げないが、axum の既定の `tokio` feature が `tokio/net` を有効にする (Cargo.lock に mio と socket2 がある)。`feature-hidden` の答えも「this project already has it turned on」で、これが正しい。fixture と eval/README のコメントを「axum 経由で有効」「axum の `ws` は有効にしない」に直した (採点は `net` だけなので合否は変わらない)。README の inspect_features の行の向き (「the items that need each」)。instructions の 100 字を超える行を折り返した
-- 残したもの: `item_not_found` のエラーでは照会の warning と hint が落ちる (前から)。feature が欠けて item が見つからないときこそ R-FT-1 の warning と inspect_features の案内が役に立つので、エラーにも載せるかを M3 の終わりに決める
+- 残したもの: `item_not_found` のエラーでは照会の warning と hint が落ちる (前から)。feature が欠けて item が見つからないときこそ R-FT-1 の warning と inspect_features の案内が役に立つので、エラーにも載せるかを M3 の終わりに決める (済: 決定 128)
 
 ### 6.5 M3e
 
@@ -418,7 +418,7 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 決定 64 (M3e) 1 回の本文の上限は 2 万字 (get_source の決定 26 と同じ)
 - 決定 65 (M3e) 見出しは Markdown の ATX と setext で判じ、コードブロックの中は見出しにしない。doctest の隠し行は消さない。`.rst`・`.adoc`・`.txt` は目次を作らず行の境目で切る
 - 決定 66 (M3e) README の本文の見えない文字はソースと同じく見える印にし (`hidden::mark`)、warning を付ける。get_source で読んだときとそろえる。要件 R-SEC-7 が README を「第三者の文字列」(出口で除く) に入れているのは M3 の終わりに改める
-- 決定 67 (M3e) `.crate` に README が無いときの crates.io への切り替えは E1 に入れない。M3f の F1 の後に、エンドポイントの形を実測して (そのとき通信の許可を得る) 入れるかを決める
+- 決定 67 (M3e) `.crate` に README が無いときの crates.io への切り替えは E1 に入れない。M3f の F1 の後に、エンドポイントの形を実測して (そのとき通信の許可を得る) 入れるかを決める (後に決定 104 で改めた: crates.io の README は使わない)
 - 決定 68 (M3e) README が無いとき (`readme = false`、`.mkd` だけ、決定 67 までの crates.io) は `docs_unavailable` に新しい reason `no_readme` (再試行不可) を付け、`crate_overview` を案内する。std は `invalid_argument` で `crate_overview`・`get_item` を案内する
 - 決定 69 (M3e) `find_examples` は `examples/` のファイルと、crate の公開の item すべての doc の Rust のコードブロックから探す (tests・benches は見ない)
 - 決定 70 (M3e) `examples/` の例は名前・絶対パス・相対の `file`・`required-features`・一致した行番号を返し、本文は `content: true` のときだけ (ファイルごとに 2 万字まで)。doc のブロックは本文 (隠し行を除き、`no_run` などの属性を付ける)・item のパス・その item の `source_location` を常に返す
@@ -429,9 +429,9 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 - 決定 75 (M3e) std は JSON の doc のブロックだけを使い、rust-src は取らない
 - 決定 76 (M3e、E1a のレビューから) manifest がドット付きのディレクトリの下の readme (pretty-xmlish 0.1.13 の `.github/README.md`) を名指しても読まない (R-SC-4 のまま)。`no_readme` の文に「ドットで始まるディレクトリの下なので読まない」と書く
 - 決定 77 (M3e、E1b の実装から) README を読むツールの名前は `get_readme` にする (要件 §6.3 の表の `readme` は R-MCP-7 の「動詞と名詞」に合わず、名前の検査が落ちた)。M3g の `changelog` も `get_changelog` にする。§6.3 の表の 2 行は、予定のツールの一覧を表と照らす検査のため今改め、Q13 などの残りは M3 の終わりに改める
-- 決定 78 (M3e、E1c) プロジェクトの workspace の外の path 依存が自分の workspace から継承した readme (`../README.md`) は、その依存自身の workspace のルート (manifest をたどって求め、cargo は起動しない) の下にある文書なら読む (P8(a) のとおり)。get_source は依存の dir より上を読まないので、そろえるかを M3 の終わりに決める
+- 決定 78 (M3e、E1c) プロジェクトの workspace の外の path 依存が自分の workspace から継承した readme (`../README.md`) は、その依存自身の workspace のルート (manifest をたどって求め、cargo は起動しない) の下にある文書なら読む (P8(a) のとおり)。get_source は依存の dir より上を読まないので、そろえるかを M3 の終わりに決める (済: 決定 130。`get_source` は読まないまま要件に書いた)
 - 決定 79 (M3e、E1c) 中身の違う crates.io の写し (vendor・置き換え)・ほかの registry の readme は、決定 31 と同じく読まない (`outside_package`、`crate_overview` を案内)。cargo が `registry/src/index.crates.io-*` に展開したものは `.crate` で読む
-- 決定 80 (M3e、E1c) `build_external_docs` が記録した git の crate の `readme.workspace = true` は、checkout の素の `Cargo.toml` を読み、checkout のルートを境に上へ workspace をたどって `[workspace.package]` の `readme` で解く (記録の形式は変えない)。workspace の `readme` は workspace のルートからのパスと読み、`true` はそのルートの `README.md` とする (cargo の振る舞いは確かめていない)
+- 決定 80 (M3e、E1c) `build_external_docs` が記録した git の crate の `readme.workspace = true` は、checkout の素の `Cargo.toml` を読み、checkout のルートを境に上へ workspace をたどって `[workspace.package]` の `readme` で解く (記録の形式は変えない)。workspace の `readme` は workspace のルートからのパスと読み、`true` はそのルートの `README.md` とする (cargo の振る舞いは確かめていない) (済: 決定 131。cargo と同じ解き方だと確かめた)
 - 決定 81 (M3e、E2c-2 のレビューから) `find_examples` の `path` が他の crate の item の再公開を指すときは、get_item と同じくその crate をたどり、doc のブロックはその crate のもの、`examples/` は元の crate のものを返す。`data.docs_from` (crate と版) と warning で知らせる
 - 決定 82 (M3e、E2d) ローカルのパッケージ (member・path・git、記録した git の crate) の置き場と判じる根を求める get_readme の `here` の部品 (`of_project`・`of_git`・根の種類・決定 79 の拒否) を共有のモジュール `here.rs` に移し、get_readme と find_examples が使う。readme の決め方は get_readme に残す
 - 決定 83 (M3e、E2d) 記録した git の crate (metadata が無い) の例の一覧は、checkout の `examples/` を深さ 2・1 万件まで走査し (ドットで始まるもの、symlink のディレクトリには入らない)、manifest の `[[example]]` の `path` を足して作る
@@ -454,7 +454,7 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 **E2d-3 の実装 (2026-11-04)**: `find_examples` は std・core・alloc (`get_item::std_crate`) なら版を解決せず、ファイル無しで get_item に `What::Examples` を引かせ (rust-src は取らない。決定 75)、get_item の provenance (`source: std`・`toolchain`・`std_from`) と warnings・hints をそのまま返す (決定 85)。outputSchema の provenance は resolve_version と get_item の schema を合わせたもの (欄を合わせ、`enum` は両方の値、必須は両方の共通)。item をたどって core・alloc の docs になれば `data.docs_from` にその crate。item を指さないときは hint で core・alloc か item の path を案内 (決定 84)。取得中・エラーの応答はそのまま。説明文に std を足した。テスト: stdio で rust-src の無い偽の配布サーバーの std の `hello` の自身の例 (provenance の `std`、outputSchema に合う) と、item を指さないときの hint。std_dist に計時テスト `the_examples_in_the_docs_of_std_are_found_in_a_short_time` (std の `HashMap::insert`、alloc の `Vec::push`、core の `Option::map`。自身の例が先頭、200 ms 未満、時間は失敗の文にも) を足し、配布サーバーから取るので CI で確かめる
 
 - E2d-3 のレビュー (サブエージェント、読むだけ。合わせた provenance の schema と、std で get_item が core・alloc をたどって正しい crate で並べることは問題なし) の対応: std では `refresh` が効かなかった (get_item の引数に渡していなかった。std は版の解決を通らないので、`for_examples` が std のときだけ `refresh` を渡す)。item を指さないときの hint は std のときだけ (core・alloc で自分を案内していた)。`docs_from` の比較で大文字小文字と `-`/`_` をそろえる。get_item の応答に答えが無ければログと `internal_error` (取得中の `data` の無い応答はそのまま)。`docs_from` の schema の説明を「版があれば」に。新しい stdio のテストの関数に `#[cfg(debug_assertions)]` (release でコンパイルできなかった)、呼び出しの id を離した。std_dist の計時テストの常に成り立つ確かめを、場所が 1 件はあること・正準パス・ブロックが 100 件を超えることに
-- E2d-3 のレビューで残したもの: std_dist の計時は `Origin::DocsRs` で呼び、本番の `Origin::Std` と `across::follow` を通らない。std の取得中の応答は `data` が無い (説明文の `data.docs: pending` と形が違う)。合わせた schema の単体テストは無い (stdio の応答の検査で見る)
+- E2d-3 のレビューで残したもの: std_dist の計時は `Origin::DocsRs` で呼び、本番の `Origin::Std` と `across::follow` を通らない。std の取得中の応答は `data` が無い (説明文の `data.docs: pending` と形が違う)。合わせた schema の単体テストは無い (stdio の応答の検査で見る) (済: 決定 132。説明文を応答の形に合わせた)
 
 **E2d-4 (R11) の結果 (2026-11-04)**: release ビルドの server を `claude -p --strict-mcp-config --mcp-config <target/r11/mcp.json> --tools Read --setting-sources project` (Claude Code 2.1.318) で、`find_examples` が返した最初の例の `path` を Read で開かせた (6 回、合わせて約 0.45 USD、作業用のディレクトリは消した)。Read を許さないとき: cwd の中の member (`examples/hi.rs`) は読めた。サーバーのキャッシュ (compio 0.19.2 の `~/.cache/chatora-rustdoc-mcp/static.crates.io/…/src.v1/examples/basic.rs`) と cargo の registry/src (same-file 1.0.6。返したのは `~/.cargo` の symlink を解いた実パス `/opt/local/rust/.cargo/…`) は「許可が要る」で拒まれた。`--allowedTools …,Read` でも `--add-dir` (キャッシュ、`~/.cargo`) でも読めた。symlink の名前で足した `~/.cargo` は実パスにも効いた。git の checkout は cwd の外という点で registry/src と同じなので試していない。返す `path` はどれも開けるパスだった。決定 89 で README と説明文に案内を足した
 
@@ -475,12 +475,12 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 **E1b の実装 (2026-11-02)**: 新しいツール `get_readme` (決定 77)。引数は `crate`・`version`・`target`・`project`・`section`・`cursor` (ローカル機能では他のツールと同じく `refresh`・`git`・`rev`・`branch`・`tag` も。git の crate は E1c まで `build_unsupported`)。`resolve_version` と同じ処理で版と取得元を決め (`inspect_features` の `Release` を `resolve_version` に移して共有)、crates.io のリリースなら get_source の `release_sources` (`SourcesOf` を受ける形にして共有) で `.crate` の展開を得て、その `Cargo.toml` (目録の中、`source_root` で判じる) の `readme` から `chosen` で選び、`source_root` で判じてから読む (8 MiB を超えれば `too_large`)。member・path・git は E1c まで `build_unsupported`。std は `invalid_argument` (決定 68)。応答: `file`、`format` (`.md`・`.markdown` は `markdown`、ほかは `text`)、`outline` (Markdown だけ。見出しはリンクの文字を残しバッジ・HTML・実体参照・強調と code の印を除き、見える印を付け、120 字で切る。100 件まで、超えれば `outline_total`)、`text` (見える印を付けた行を、見出しの境目で 2 万字まで。1 行が 2 万字を超えれば印の途中で切らずに切り `cut_line`)、`truncated`、`page` (`first_line`・`last_line`・`total_lines`・`has_more`・`next_cursor`。cursor は引数と readme の中身のダイジェストから)。`section` は見出しの表示の文字と大文字小文字を問わず一致、無ければ前方一致、無ければ部分一致で探し、無ければ `invalid_argument` に見出しの一覧 (20 件まで)。エラー: README が無い・読めない (`no_readme`、決定 68・76)、置き場で拒まれた (`outside_package`・`source_missing`)、manifest が読めない (`corrupt`)、大きすぎる (`too_large`)。どれも再試行不可で `crate_overview` を案内。説明文、README の表と Security の文、tools/list の名前の並び。テスト: 単体で説明文の長さ・見出しの表示・`section` の照合・ページの切り方と印と長い行・応答とカーソルと中身の変化・`section` の誤り・テキストの readme・エラーの reason・引数。stdio でオフラインの `.crate` の `docs/README.md` (バッジ付きの見出し、コードブロックの中の `#`、U+202E) を目次・本文・warning・`section`・無い `section`・std で。実データ (tests/real_data) に引数のケース (`section`、`refresh`・`git` の一覧、`cursor` は単体で) と、説明文の 2 つの問い (axum の始め方、tokio の Example の節)
 
 - E1b のレビュー (サブエージェント、読むだけ) の対応: 見出しを表示の形にするのは先頭の 400 字だけにした (`[` の多い見出しで二乗の時間がかかり、深い入れ子で再帰がスタックを使い切った。1 MB の見出しで 21〜83 秒)。読み取りから応答を作るまでを `spawn_blocking` の中で。応答の予算 (R-OUT-3): 目次はカーソルの無いページだけに付け、応答を測って 32,000 字を超えれば目次を半分ずつ、次に本文を縮める (本文は 2,000 字まで)。目次の見出しは表示の段で 120 字に切る (`section` が無いときのエラーの一覧も)。sources のエラー (`no_source` など) の案内を get_source の「docs.rs の source_location の url」から `crate_overview` に差し替えた。カーソルの位置が終わりと同じでも拒む (偽のカーソルで先頭に巡回した)。BOM を本文でも除く。`section` の照合で求める側にも見える印を付ける (U+FE0F のある見出しが合わなかった)。`not_a_release` の文を、crates.io の index が持っていても中身の違う写しのときに合う形に。テスト: 1 MB の見出し、応答の予算 (長い見出し 150 個と引用符 3 万字)、終わりのカーソル、2 ページ目に目次が無いこと、中身の変わったカーソルの文、stdio の warning を件数で
-- E1b のレビューで変えなかったもの (M3 の終わりに見る): `resolve_version` を通るので docs.rs の JSON の有無も問い合わせ、分からなければその warning が付く (版の解決を get_item と同じにするため)。yanked の版でも warning を付けない (`resolve_version` の `data.yanked` を `Release` が持たない)。warning の印の数は本文と目次で重なる分を二重に数える
+- E1b のレビューで変えなかったもの (M3 の終わりに見る): `resolve_version` を通るので docs.rs の JSON の有無も問い合わせ、分からなければその warning が付く (版の解決を get_item と同じにするため)。yanked の版でも warning を付けない (`resolve_version` の `data.yanked` を `Release` が持たない)。warning の印の数は本文と目次で重なる分を二重に数える (後に決定 129 の確かめで、yanked の warning を付けないというのは誤りと分かった: 2 つのツールは付けていた。§6.8。docs.rs の JSON の問い合わせと印の二重の数えは、そのまま要件 v0.21 に書いた)
 
 **E1c の実装 (2026-11-02)**: `get_readme` が crates.io のリリースのほかに、プロジェクトの member・path 依存・git 依存と、`build_external_docs` が記録した git の crate の readme を、ビルドせずに読む (get_readme.rs の `here`)。プロジェクトのパッケージは、プロジェクトの `cargo metadata` (`project::resolve_until`。取得中なら `status: building`) で `metadata_package` (inspect_features から切り出して共有) を探し、その `readme` (cargo が継承を解いたもの) をパッケージの dir から読む。path は `source_root::Package` の readme として、プロジェクトの workspace の下ならそのルート、外ならその依存自身の workspace のルート (決定 78) の下で判じる。git は cargo の checkout の下で (`checkout_of` を共有)。中身の違う crates.io の写しとほかの registry は `outside_package` (決定 79)。記録した git の crate は、記録の `package_root` の素の `Cargo.toml` を読み、`readme.workspace = true` なら checkout のルートを境に workspace をたどって `[workspace.package]` から (決定 80。`data::project::workspace_within`、`crate_file::workspace_readme`、`readme::Declared::Workspace`・`of_workspace`)。metadata に readme が無ければ素の manifest で、`false` は無し、欄なしは既定名。上に継承した readme も `readme::judged` で文書かどうかとドットの下かを判じる。応答の `file` はパッケージからの相対 (`../README.md`)。説明文と README の表を合わせた。テスト: データ層で継承・workspace の readme・`..` の判定、stdio で member の継承 (`front` の `../README.md`) と既定名 (`back` の README.txt)、記録した git の crate (既定名の README.md)、プロジェクトが使わない crates.io のリリースを `build_external_docs` で記録したもの (`.crate` から)
 
 - E1c のレビュー (サブエージェント、読むだけ) の対応: プロジェクトの外の path 依存の manifest が `package.workspace = "/"` と `readme = "../x.md"` を書くと、読む根が `/` になり、ドットの下でない文書はどれでも読めた (決定 78 の実装が継承でない readme にも広い根を当て、その根を確かめていなかった)。根を広げるのは manifest が `readme.workspace = true` のときだけにし、その根は、その package を `members` に挙げる workspace (自身の `[workspace]`、`package.workspace` が名指す先、上の最初の workspace のどれか) に限った (`data::project::listing_workspace`。git の checkout ではその根を境に、名指す先も境の中だけ)。パスは字面のままで比べる (`find_workspace` は symlink を解くので、`~/.cargo` が symlink のこのホストで、git の継承した readme が境の外とされ読めなかった)。readme の実パスも文書であることを確かめる (symlink で `Cargo.lock` などに行けた)。cargo が crates.io から展開したプロジェクトの依存 (Cargo.lock に checksum が無いものなど) は `.crate` から読む (写しとして拒んでいた)。`not_a_release`・`NotInherited`・manifest の読めないときの文と、README の Security の節を直した。テスト: `listing_workspace` (挙げる・挙げない・`/` を名指す・自身・境)、外の path 依存の H1 の回帰と継承、文書でないファイルへの symlink
-- E1c のレビューで残したもの: 決定 79 の拒否 (vendor・別の registry・vendor した git) と、member の `readme = false` の stdio のテスト (写しを作る fixture が無い)。git の `readme.workspace = true` は単体のテストだけ (build_external_docs を通す stdio は重い)。`[workspace.package] readme = true` の解き先 (決定 80) は cargo の振る舞いを M3 の終わりに確かめる
+- E1c のレビューで残したもの: 決定 79 の拒否 (vendor・別の registry・vendor した git) と、member の `readme = false` の stdio のテスト (写しを作る fixture が無い)。git の `readme.workspace = true` は単体のテストだけ (build_external_docs を通す stdio は重い)。`[workspace.package] readme = true` の解き先 (決定 80) は cargo の振る舞いを M3 の終わりに確かめる (済: 決定 131。`[workspace.package] readme = true` の解き先は cargo と同じだった)
 
 **E2a の実装 (2026-11-02)**: 新しい `query::examples`。`doc_blocks` は crate の根 (検索索引に無いので別に) と公開の item (`search::public_items`、D3a と同じ範囲) の docs から、fence (backtick と tilde、本数、backtick の info に backtick が無いこと。閉じない fence は終わりまで) の Rust のブロック (`docs::is_rust` を共有) を集め、doctest の隠し行を除き (`##` は `#`)、info の属性 (`no_run`・`ignore`・`should_panic`・`compile_fail`・`edition2021` など。`rust` は除く) を添える。並びは根、次にパスの深さと文字列 (一つの item の中は書かれた順)。`rank` は決定 71 の段 (`Own`: その item 自身の docs、`Both`: 名前と親の型の両方、親の無い item は名前で、`Name`: 名前だけ、`Other`) を識別子としての一致 (`has_word`) で決め、`ranked` は段ごとに並べる (段の中は `doc_blocks` の順。`examples/` を同じ段の先にするのは E2c)。testdata の計時テスト `the_examples_in_the_docs_are_found_in_a_short_time` (tokio の `Mutex::lock`、axum の `Router::route`。自身のブロックが先頭、両方に一致が 1 件以上、隠し行が残らない、200 ms 未満) は、手元の testdata のテストがキャッシュの JSON を読めなかった (target ごとの置き場にはあり、パスの食い違いは未調査) ので CI の testdata で確かめる (D3a と同じ)。テスト: 単体でブロックの見つけ方 (隠し行・`##`・text と sh を除く・属性・閉じない fence)、段の決め方 (識別子の境)、並べ方
 
@@ -546,13 +546,13 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 
 - 決定 106 (M3f) `crate_metadata` の出力は問いごとに `declared` (その版の宣言)・`releases` (版と保守)・`popularity` (API)・`history` (変化のあった版) と `dependencies`。API が使えないときは `popularity` と `history` を省いて warning
 - 決定 107 (M3f) `dependencies` は normal と build を全件 (name・req・kind・optional・target、改名なら package、default_features が false ならその旨)。dev は件数だけ。features の中身は `inspect_features` に任せる。応答の予算を超えたら切って `truncated`
-- 決定 108 (M3f) 第三者の文字列は description 1,000 字・URL 500 字で切り、末尾に `…` と warning。見えない文字は出口で印にする (R-SEC-7)。URL は取得に使わない
+- 決定 108 (M3f) 第三者の文字列は description 1,000 字・URL 500 字で切り、末尾に `…` と warning。見えない文字は出口で印にする (R-SEC-7)。URL は取得に使わない (実装は出口で除く。要件 v0.21 もそう書いた)
 - 決定 109 (M3f) 履歴は常に API の `/versions` で作る (license・edition・MSRV・yanked)。1 回の要求は 3 回 (初回約 2 秒、以後 1 日はキャッシュ)。期限に間に合わなければ決定 93 のとおり省いて warning
 
 **F2b の実装 (2026-11-04)**: 新しいツール `crate_metadata` (crates.io のリリース)。`resolve_version` と同じ処理で版を決め、`declared` は `.crate` (取れなければ index の `rust_version` だけと warning)、`releases`・`dependencies` は index、`popularity` と `history` は API (`crate_info`・`dependents`・`versions`)。履歴の頁は API の頁を先頭から読み、要る変化が揃うか最後か、1 回に新しく取る頁が 3 まで (残りは cursor で続ける)。読んだ最後の版は次の頁を待つ。`refresh` は API の失敗の記憶を忘れて取り直す。`provenance.api_fetched_at`。応答の予算を超えたら依存を減らし `dependencies_total`。`http::send_in_turn` の順番は `Turns` トレイトで渡す (async クロージャでは `Send` の推論が通らなかった)。README の表・接続先 (crates.io の API、1 秒 1 回、crate の名前を送る)・Planned を直した。stdio のテストは偽の API (`FakeRegistry::put`) で、保持・`refresh`・頁を確かめる
 
 - F2b のレビュー (サブエージェント、読むだけ) の対応: 1 回に新しく取る版の頁を 1 にした (要求は 3 回まで。決定 109 に合わせた)。`.crate` と API を並べて待つ。`refresh` は cursor のない最初の頁でだけ API を取り直す (前は頁を送っても先へ進まなかった)。続きの頁が来なければ warning。cursor の digest に index の yanked の数を混ぜ、総数は先頭の頁のもの、終わりを越える cursor は断る、終わったら `page.total`。依存を減らしたら warning で数と `get_source` の Cargo.toml を案内する。index に無い版は warning。warning の文を直した (「did not answer」と言わない・呼び直しの案内・どの項目か)。std の案内の `rust_release` (このビルドに無い) を直した。data のキーを schema の順に。説明文 (refresh・旧表記の license・versions に yanked を含む・依存の package と default_features・バックポート・license-file・古い答えを使う) と README (host 名 crates.io、プロセスごとの 1 秒 1 回) を直した。単体テスト (履歴の頁・cursor の拒否・releases・切り詰め) を足した。実データの問いに Q15 の 2 問、引数のケースを足した
-- F2b のレビューで残したもの: instructions の呼ぶ順に `crate_metadata` が無い (F3b でまとめる)。git の引数は実データのケースで「別のテストで確かめる」とした (F2c で git の記録の stdio のテストに足した)。頁を送っても `declared`・`releases`・`dependencies` を毎回載せる。`pubtime` の無い index での最終リリースは読んだ API の頁の中だけから。`history.published` は API の小数秒のまま
+- F2b のレビューで残したもの: instructions の呼ぶ順に `crate_metadata` が無い (F3b でまとめる)。git の引数は実データのケースで「別のテストで確かめる」とした (F2c で git の記録の stdio のテストに足した)。頁を送っても `declared`・`releases`・`dependencies` を毎回載せる。`pubtime` の無い index での最終リリースは読んだ API の頁の中だけから。`history.published` は API の小数秒のまま (済: instructions の `crate_metadata` は F3b で足した)
 
 **F2c の実装 (2026-11-04)**: `crate_metadata` の crates.io 外 (決定 98)。プロジェクトのパッケージ (member・path・git の依存・ほかの registry・crates.io の写し) は `cargo metadata` から宣言 (workspace からの継承も解決済み。`metadata::Package` に description・license・license_file・repository・homepage・documentation・rust_version・edition・`[package.metadata]`、`Dependency` に req・kind・target・uses_default_features を足した) と依存。`build_external_docs` が記録した git の crate はチェックアウトの Cargo.toml から宣言だけ (`crate_file::manifest_declaration`。workspace から継承する項目は読まず warning、依存は warning で Cargo.toml を案内)。どちらも releases・popularity・history は無いと warning。stdio のテスト (member の宣言・継承の license・path の依存、git の記録)
 
@@ -564,7 +564,7 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 
 - 決定 111 (M3f、F3a のレビューで利用者が決めた) `search_crates` の検索語は呼び出しのログに他の引数と同じく残し、README の接続先にそのことを書く
 - F3a のレビュー (サブエージェント、読むだけ) の対応: local の構成で `refresh` を持つかの単体テストが落ちる (例外に足した)。エラーの割り振りを他のツールにそろえた (キャッシュと URL は `internal_error`、`retryable` ごとの suggestions、offline の案内、`RecentFailure` に `retry_after_secs`)。crates.io が cursor を 4xx で断れば `invalid_argument`。応答の予算を超えたら description を 200 字に詰めて warning (seek の頁は途中で切れない)。頁番号は数字だけで 2 以上。`sort`・`cursor` の null は無いものとする。最後の空の頁の案内を分けた。版は版の上限 (100 字) で切る。`crate_metadata` の案内に yanked を足した。テストを足した (別の query・limit の cursor、`p1`・`p0`・`p+3`・`p03`・長すぎる seek、null、0 件の案内)
-- F3a のレビューで残したもの: cursor の形 (`s1.<digest>.<頁>`) は要件 R-OUT-3 の `c1.` の形と違う (M3 の終わりに要件に書く)。search_crates の stdio のテストは local の構成だけ (偽のレジストリが local 限定)。決定 102 の「骨格の検査の例外」は、ツールごとの provenance の必須を検査するものが無く、登録先が無い
+- F3a のレビューで残したもの: cursor の形 (`s1.<digest>.<頁>`) は要件 R-OUT-3 の `c1.` の形と違う (M3 の終わりに要件に書く)。search_crates の stdio のテストは local の構成だけ (偽のレジストリが local 限定)。決定 102 の「骨格の検査の例外」は、ツールごとの provenance の必須を検査するものが無く、登録先が無い (済: cursor の形は要件 v0.21 の R-OUT-3 に書き、骨格の検査の例外は決定 135 で、provenance の必須をツールごとの outputSchema で決めると要件に書いた)
 
 **F3b の実装 (2026-11-04)**: instructions の呼ぶ順に「for its license, MSRV or upkeep, `crate_metadata`; to find one, `search_crates`」を足し、字数のため版の規則 (Cargo.lock の言い方、worktree の文)・stale の説明 (「its lines moved」)・language server の案内 (「by path or name」) を縮めた。eval に `q15-metadata` (serde の MSRV と license と保守。tools は `crate_metadata`、答えに MIT と 1.xx) と `q16-search` (コマンドラインの引数を解析する crate。tools は `search_crates`、答えに clap) を足した (決定 105)。eval (2026-11-04、既定のモデル、各 1 回): `q15-metadata` は合格 (`crate_metadata` を 1 回、0.23 USD)、`q16-search` は合格 (`search_crates` の後に `crate_metadata`、0.07 USD)
 
@@ -611,11 +611,11 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 **G1d の実装 (2026-11-04)**: instructions の呼ぶ順を「for a crate's features, README, examples or changes, `inspect_features`, `get_readme`, `find_examples` or `get_changelog`」にし、字数のため「(but see below)」を外し (直後に `build_external_docs` を先に呼ぶ場合の文が続く)、「give the crate or path directly」を「pass the crate or path」に縮めた (ローカル機能ありで 2,046 字)。crate_overview.md に「版の間の変更は `get_changelog`」、crate_metadata.md の `history` に「else: `get_changelog`」(字数のため `declared` の「or the old」を「or old」、`history` のバックポートの注を「(a backport within its line)」に縮めた)。eval に `q14-changelog` (tokio の 1.52 から 1.53 で何が変わったか。tools は `get_changelog`、答えに 1.53.0 と、その節の中身の語 OwnedFd・schedule latency・UCred・NuttX・track_caller のどれか) を足した (決定 122)。eval (2026-11-04、既定のモデル、1 回): 合格 (`get_changelog` を 1 回、0.28 USD)
 
 - G1d のレビュー (サブエージェント、読むだけ。字数を Python で数えた) の対応: `history` の license_file の注は、過去の版の license が欠ける理由で `declared` の注 (今の版) と重ならないので戻した (「or a `license_file`」)。q14 の答えの正規表現は版の番号しか見ず「取得できなかった」でも通るので、1.53.0 の節の中身の語のどれかを足した (前回の答えに当たる)
-- G1d のレビューで残したもの: instructions はローカル機能ありで残り 2 字 (次に案内を足すときは縮める所を先に決める)。「None needs an earlier call」の直後に `build_external_docs` を先に呼ぶ例外が続く (合図の「(but see below)」は字数で外した)。ローカル機能の無い構成の版の規則は「version を渡せ」と言うが `get_changelog` は `version` を取らない (エラーで `from`/`to` を案内する。M3h で見直す)
+- G1d のレビューで残したもの: instructions はローカル機能ありで残り 2 字 (次に案内を足すときは縮める所を先に決める)。「None needs an earlier call」の直後に `build_external_docs` を先に呼ぶ例外が続く (合図の「(but see below)」は字数で外した)。ローカル機能の無い構成の版の規則は「version を渡せ」と言うが `get_changelog` は `version` を取らない (エラーで `from`/`to` を案内する。M3h で見直す) (済: ローカル機能の無い構成の版の規則は H1 で直した (「(to `get_changelog`, as `from`)」))
 
 - 決定 123 (M3g、G1 の後に利用者が決めた) G2 (GitHub releases と token、R-NW-4) は M3 に入れず、資格情報の扱いを要件のセキュリティと合わせて決める後の段 (M4 以降) に回す。M3 の `get_changelog` は `.crate` と手元の changelog だけで、無ければ GitHub の releases の頁を案内する。要件の「M3 で」の記述は M3 の終わりに改める (判断の材料: 手元の 1,025 crate の 61% が `.crate` に changelog を持たず、その 612 は repository が github.com)
 
-聞かずに決めたこと: 本文の見えない文字は決定 66 と同じく印を付けて warning。GitHub releases と token (P9 の G2) は G2 に入るときに決める。段の分け方は G1a (データ層: ファイルの選び方・版の見出し・範囲) → G1b (ツール、crates.io) → G1c (ローカル) → G1d (案内と eval)
+聞かずに決めたこと: 本文の見えない文字は決定 66 と同じく印を付けて warning。GitHub releases と token (P9 の G2) は G2 に入るときに決める (後に決定 123 で改めた: M3 に入れず M4 以降)。段の分け方は G1a (データ層: ファイルの選び方・版の見出し・範囲) → G1b (ツール、crates.io) → G1c (ローカル) → G1d (案内と eval)
 
 ### 6.8 M3h
 
@@ -672,3 +672,18 @@ M3 は、crate 単位の情報 (feature・README・changelog・例・メタデ�
 2. requirements.md を次の版 (v0.21) にし、§14 に経緯を書く。セキュリティの仕様が変われば一覧ページも直して公開する
 3. README を合わせる (M3h の H3)。`cargo publish --dry-run --locked` を確かめる。crates.io への公開は利用者が M3 の後にまとめて行う (m2-plan.md の §5 の P9)
 4. M4 の計画を立てる
+
+**§7 の手順 1 の結果 (2026-11-05)**: 反映するものの一覧はサブエージェント (読むだけ) が作り、target/claude-notes/m3-v021-list.md に置いた (判断の要るもの A1〜A9、書き写すだけのもの B1〜B47、セキュリティの変化 C、この計画の古い記述 D、§11 の Q の変化 E)。手順 3 の `cargo publish --dry-run --locked` は CI の package の job が毎回回しており、79d5859 で通った。手元の `cargo package --list` は 147 ファイル (`include` の白リストのとおり)。判断 (利用者が 1 件ずつ決めた。どれも推した案):
+
+- 決定 136 vendor・crates.io でない registry・置き換えた crates.io のソースは読まない (`outside_package`) と規則に書き、読むかは M4 以降で検討する (A1)
+- 決定 137 GitHub releases と token (G2) は、要件の本文を残して各所に「M4 以降 (決定 123)」と添え、§5.9 の changelog の行は今の振る舞い (パッケージの changelog、無ければ releases の頁の URL を示すだけ) に書き換え、§12 の M4 の行に足す (A2)
+- 決定 138 「M3 以降で検討」の 4 件 (R-DS-1、R-SR-2、Job Object の隙間、「in a later version」のビルドできない依存) は「M4 以降で検討」に書き換え、§12 の M4 の行に並べる (A3)
+- 決定 139 `crate_metadata` の履歴は license・MSRV・edition の変化と yanked で、feature は `inspect_features` で版を指して見ると書く (A4)
+- 決定 140 被依存の一覧は M4 以降の任意に回し、今は数だけと書く (A5)
+- 決定 141 changelog の N の設定は消し、引数 `limit` (既定 10・上限 50) と 2 万字と書く (A6)
+- 決定 142 決定 136 と 137 の決め方を §11.2 の Q-33 (vendor・他の registry のソース) と Q-34 (GitHub releases と資格情報) に立て、§12 の M4 の行から指す (A7)
+- 決定 143 R-SEC-7 を実装に合わせ、例として返すコード (examples/ のファイルと doc のブロック) は印と書く (A8)
+- 決定 144 セキュリティの一覧ページは、C の変化 (接続先・読むファイル・展開・見えない文字・プロセス・テストの口) を全部入れて直し、同じ URL に公開し直す (A9)
+- 決定 145 `inspect_features` で feature を指したときの item の既定件数は、要件を実装に合わせて feature の一覧と同じ `limit` (既定 100・上限 200) とする。決定 56 の「50 件」は実装されておらず、改める (要件 v0.21 のレビューで分かった)
+- 決定 146 `.crate` と rust-src の展開でファイル数の上限 (10 万) を超えたときは `too_large` (再試行不可) とし、実装の `corrupt` を直す (展開した量の超過と同じ。壊れたアーカイブと区別する。get_source と get_item の振り分けと単体テスト)
+- 決定 147 README の `find_examples` の案内で `permissions.additionalDirectories` に足すのは `~/.cargo/registry/src` と `~/.cargo/git/checkouts` だけにし、`~/.cargo` を丸ごと足さない理由 (`credentials.toml` の token を Claude Code が確認なしに読める) を書く。一覧ページを書き換えたサブエージェントが気付いた、M3e (決定 89) の案内の誤り。要件 (R-SC-4 の examples と R-SEC-2) と一覧ページも直す。あわせて README の「リダイレクトを追わない」を crates.io の API に限った (index と static は同じホストのリダイレクトだけ追う)
