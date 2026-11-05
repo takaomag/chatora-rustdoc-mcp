@@ -161,6 +161,8 @@ M4 は、1 つの crate の中だけでは答えられない問い (依存グラ
 - A2 のレビュー (サブエージェント、読むだけ) の対応: `query::local::rebuilding` はプロセスの中の作り直し中の表しか見ず、ディスクにある前のビルド (新しいもの、誰も作り直していない古いもの、起動し直した後のもの) を読めなかった (決定 4 に反する) ので、`query::local::published_before` を足した (作り直し中の表、無ければ `Plan::published_dir` の `build::published`。proc-macro はホストの target。`rebuilding` と `LocalBuilt` を作る部分 `stale_of` を共有)。それを新しい `Outcome::Cached` で返し、`stale_reason` を作り直し中 (`rebuilding`) と分けて `unchecked` にし、`retry_after_secs` も「呼び直せば新しくなる」hint も付けない (このツールは作り直さない)。上限 300 は `CachedOnly` のときだけ効かせ、`search_across` の動きは変えない。`too_many` は読めないもの (`unavailable`) の一覧に入れる。`local_build_required` の本体を 1 つに、`RETRY_AFTER_SECS` を `search_across` に戻し、doc を直した
 - A2 のレビューで残したもの: 要件 §7.3 の `stale_reason` に `unchecked`、§8 の reason に `too_many` を、M4 の終わりに足す。`CachedOnly` で、get_item が初回のビルドをしている最中は `local_build_required` になる (少し後には読める)。`CachedOnly` のビルドが起きないこと、先にビルドした依存を読めること、起動し直した後に読めること、`too_many` の境目は B1 の stdio のテストで
 
+**テストが利用者のキャッシュに触れていた件 (2026-11-05)**: A4 で手元のキャッシュ (`~/.cache/chatora-rustdoc-mcp`) を計測に使おうとしたところ、`.rkyv` が 1 つも無かった。std と docs.rs のディレクトリの更新時刻、`locks/` に 1 ミリ秒の間に作られた 19 個のロックから、14:21:40 (A5 の最初の版、「今と違う版のアーカイブは消す」を含む全検査の最中) にサーバーの起動時の GC が利用者のキャッシュで走ったと分かった。原因は `tests/common/schema.rs` の `tools()` (`tools/list` の schema を取る、ignore されない実データのテストからも呼ばれる) が、キャッシュの置き場を渡さずにサーバーを起動していたこと (M1 から)。それまでの GC は上限を超えたときしか消さないので目立たなかった。置き場をテストの一時ディレクトリに渡すように直した。ほかのサーバーの起動 (stdio の 5 か所) は置き場を渡しており、実データのクライアントは環境の置き場を使う作り (ignore されたテスト用。CI は置き場を渡す) で、そのままにした。消えたのはアーカイブだけで、JSON はあり、使うときに通信なしで作り直される
+
 ### 6.2 M4b
 
 ### 6.3 M4c

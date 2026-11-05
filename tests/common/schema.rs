@@ -24,6 +24,9 @@ pub(crate) fn tools() -> &'static BTreeMap<String, Value> {
             // The tool for testing (`sleep`) in a debug build, whose schema is checked too.
             .env("CHATORA_RUSTDOC_TEST_TOOLS", "1")
             .env("CHATORA_RUSTDOC_MCP_LOG__DIR", logs.path())
+            // Not the cache of the user who runs the tests, which the server collects the
+            // garbage of when it starts.
+            .env("CHATORA_RUSTDOC_MCP_CACHE__DIR", logs.path().join("cache"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
