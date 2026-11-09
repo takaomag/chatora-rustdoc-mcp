@@ -11,6 +11,9 @@ expression: response
     "target": "x86_64-unknown-linux-gnu",
     "format_version": 61
   },
+  "warnings": [
+    "/rustc/92b5b8c87c61b20adc9001b41baf587634a74734/library/core/src/convert/mod.rs is outside the package, so the definition has no docs.rs URL"
+  ],
   "data": {
     "path": "reqwest::ClientBuilder::from",
     "kind": "method",
@@ -21,6 +24,10 @@ expression: response
       "not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))"
     ],
     "cfg_source": "inherited",
-    "docs": "Returns the argument unchanged."
+    "docs": "Returns the argument unchanged.",
+    "source_location": {
+      "file": "/rustc/92b5b8c87c61b20adc9001b41baf587634a74734/library/core/src/convert/mod.rs",
+      "lines": "790"
+    }
   }
 }
