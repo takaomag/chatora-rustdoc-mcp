@@ -252,6 +252,13 @@ pub(super) struct Listing {
 }
 
 impl Arguments {
+    /// Whether the crate asked for is one of std's, read from a nightly toolchain's documentation,
+    /// not reached through a re-export.
+    #[cfg(feature = "local")]
+    pub(super) fn names_std(&self) -> bool {
+        std_crate(&self.name).is_some()
+    }
+
     /// The path, for the tests of the tools that make arguments.
     #[cfg(test)]
     pub(super) fn path_for_test(&self) -> Box<str> {

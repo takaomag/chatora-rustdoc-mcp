@@ -336,6 +336,9 @@ pub(super) enum How {
         /// What it is made from changed since.
         changed: bool,
     },
+    /// The documentation of std of a nightly toolchain, read by its caller, not by
+    /// [`project_each`].
+    Std,
 }
 
 #[cfg(feature = "local")]

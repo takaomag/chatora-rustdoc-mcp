@@ -7,7 +7,10 @@
 //! code depends on the trait's package are read at once, each looked at and let go of as soon as
 //! it is read, without building a dependency (decided in M4a, decisions 4 and 5).
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use rmcp::model::CallToolResult;
 use semver::Version;
@@ -15,13 +18,14 @@ use serde_json::{Map, Value, json};
 
 use super::{
     ToolState,
-    gather::{self, Builds, Gathered, How, Kind, Member, Outcome, PerCrate},
-    get_item::{self, Arguments, Paging},
+    gather::{self, Builds, Gathered, How, Kind, Member, Outcome, PerCrate, Read},
+    get_item::{self, Arguments, Paging, StdUnready},
     local,
 };
 use crate::{
     data::{
         crate_name::CrateName,
+        dist::StdCrate,
         flight::{Doing, Joined},
         packages::{PackageGraph, ProjectPackage, Source},
         target::TargetTriple,
@@ -36,6 +40,8 @@ use crate::{
             docs_rs_release,
         },
         implementors::{Implementor, TraitCrate, implementors_in},
+        load,
+        view::CrateView,
     },
 };
 
@@ -85,6 +91,8 @@ struct TheTrait {
     response: Map<String, Value>,
     /// Its definition path, which the reverse indexes key its implementations by.
     definition: Box<str>,
+    /// Whether it is of std, alloc or core, read from a nightly toolchain's documentation.
+    std: bool,
     /// Its crate's package name, as the provenance tells it.
     name: CrateName,
     /// Its version.
@@ -127,6 +135,15 @@ pub(super) struct InCrate {
     digest: Box<str>,
 }
 
+/// What defines the trait asked of.
+#[derive(Debug, Clone, Copy)]
+enum Owner<'a> {
+    /// A package of the project.
+    Package(&'a ProjectPackage),
+    /// std, alloc or core, which every crate depends on, in one version.
+    Std,
+}
+
 /// Whether an implementation is of the trait asked of, or of another version's (decided in M4's
 /// plan, J7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +163,13 @@ pub(super) async fn execute(
     graph: Graph,
     state: Arc<ToolState>,
 ) -> CallToolResult {
+    // std as the lookup reads it: for the project asked of, or, reached through a re-export,
+    // for the default one (`get_item`'s `follow_into`).
+    let std_project = if first.names_std() {
+        graph.project.clone()
+    } else {
+        None
+    };
     // The trait, in its crate, as `scope: crate` finds it, through re-exports.
     let the_trait = match the_trait(get_item::execute(first, Arc::clone(&state)).await) {
         Ok(the_trait) => the_trait,
@@ -163,48 +187,55 @@ pub(super) async fn execute(
     };
     let packages = PackageGraph::new(&resolution);
     // As the lookup of the trait chose it; what it told of the others is in its answer.
-    let Some(trait_package) = get_item::explicit_package(
-        &packages,
-        &the_trait.name,
-        &the_trait.version,
-        &mut Vec::new(),
-    ) else {
-        return super::tool_error(
-            "invalid_argument",
-            &format!(
-                "{} {}, whose trait {} is, is not a package of the project, so its dependency \
-                 graph has no implementors of it",
-                the_trait.name, the_trait.version, the_trait.definition
-            ),
-            false,
-            &[
-                "leave scope out to list the implementors in the trait's crate",
-                "call list_impls on a type, which tells whether it implements the trait",
-            ],
-        );
+    let owner = match owner_of(&the_trait, &packages) {
+        Ok(owner) => owner,
+        Err(result) => return *result,
     };
     let triple = target.triple.clone();
     let sets = gather::build_sets(&state, &workspace, &triple, until, &mut warnings).await;
-    let scope = scope_of(&packages, trait_package, sets.as_deref());
+    let (scope, asked) = match owner {
+        Owner::Std => (normal_scope(&packages, sets.as_deref()), None),
+        Owner::Package(trait_package) => (
+            scope_of(&packages, trait_package, sets.as_deref()),
+            Some(trait_package.clone()),
+        ),
+    };
+    // std, alloc and core first, then the project's packages (decided in M4b, decision 15).
+    let mut gathered = if the_trait.std {
+        let at = (&triple, std_project.as_deref());
+        let asked = (&*the_trait.definition, the_trait.name.as_str());
+        match read_std(&state, at, asked, until, &warnings).await {
+            Ok(gathered) => gathered,
+            Err(result) => return *result,
+        }
+    } else {
+        Vec::new()
+    };
     let docs_rs = target.docs_rs().cloned();
-    let gathered = gather::project_each(
-        &state,
-        &workspace,
-        ((scope, Builds::CachedOnly), Some(trait_package.clone())),
-        (&triple, docs_rs.as_ref()),
-        until,
-        &mut warnings,
-        per_crate(&state, the_trait.definition.clone()),
-    )
-    .await;
-    let collected = collect(gathered, &packages, trait_package);
-    warn(&collected, &the_trait, &mut warnings);
-    let hints = other_versions(
-        (&packages, sets.as_deref()),
-        trait_package,
-        &the_trait,
-        &mut warnings,
+    gathered.extend(
+        gather::project_each(
+            &state,
+            &workspace,
+            ((scope, Builds::CachedOnly), asked),
+            (&triple, docs_rs.as_ref()),
+            until,
+            &mut warnings,
+            per_crate(&state, the_trait.definition.clone()),
+        )
+        .await,
     );
+    let collected = collect(gathered, &packages, owner);
+    warn(&collected, &the_trait, &mut warnings);
+    let hints = match owner {
+        Owner::Package(trait_package) => other_versions(
+            (&packages, sets.as_deref()),
+            trait_package,
+            &the_trait,
+            &mut warnings,
+        ),
+        // One std, of one toolchain.
+        Owner::Std => Vec::new(),
+    };
     let digest = crate::data::cache::sha256_hex(collected.read_crates.as_bytes());
     let state = Partly {
         to_come: collected.to_come,
@@ -218,6 +249,40 @@ pub(super) async fn execute(
         (collected.sources, collected.crates_read, state),
         (warnings, hints),
     )
+}
+
+/// What defines `the_trait` in `packages`: std, or the package that the lookup of the trait chose;
+/// or the answer to return when the project has none.
+fn owner_of<'a>(
+    the_trait: &TheTrait,
+    packages: &'a PackageGraph,
+) -> Result<Owner<'a>, Box<CallToolResult>> {
+    if the_trait.std {
+        return Ok(Owner::Std);
+    }
+    // As the lookup of the trait chose it; what it told of the others is in its answer.
+    get_item::explicit_package(
+        packages,
+        &the_trait.name,
+        &the_trait.version,
+        &mut Vec::new(),
+    )
+    .map(Owner::Package)
+    .ok_or_else(|| {
+        Box::new(super::tool_error(
+            "invalid_argument",
+            &format!(
+                "{} {}, whose trait {} is, is not a package of the project, so its \
+                     dependency graph has no implementors of it",
+                the_trait.name, the_trait.version, the_trait.definition
+            ),
+            false,
+            &[
+                "leave scope out to list the implementors in the trait's crate",
+                "call list_impls on a type, which tells whether it implements the trait",
+            ],
+        ))
+    })
 }
 
 /// The trait that `found`, the answer for it in its crate, tells; or the answer to return: an
@@ -263,9 +328,11 @@ fn the_trait(found: CallToolResult) -> Result<TheTrait, Box<CallToolResult>> {
     ) else {
         return Err(Box::new(found));
     };
+    let std = field("source") == Some("std");
     Ok(TheTrait {
         response,
         definition,
+        std,
         name,
         version,
     })
@@ -335,26 +402,155 @@ fn scope_of(
                     && sets
                         .is_none_or(|sets| sets.normal(&package.name, &package.version).is_some()))
         })
-        .map(|package| {
-            let kind = if packages.is_member(package) {
-                Kind::Member
-            } else if package.source == Source::CratesIo {
-                Kind::CratesIo
-            } else {
-                Kind::Dependency
-            };
-            (package.clone(), kind)
-        })
+        .map(|package| (package.clone(), kind_of(packages, package)))
         .collect()
 }
 
-/// What `gathered` tells of the implementations of the trait of `trait_package`, of `packages`:
-/// those of another version's trait left out (decided in M4's plan, J7), and those whose version
-/// is not told kept (decided in M4b, decision 17), sorted (decision 14).
+/// The packages to read for a trait of std, alloc or core, which any may implement: those of the
+/// project's normal build as `sets` tells it, or all of them without it, nearest first, but
+/// procedural macros (decided in M4a, decision 1, and in M4b, decision 15).
+fn normal_scope(
+    packages: &PackageGraph,
+    sets: Option<&crate::data::features::FeatureSets>,
+) -> Vec<(ProjectPackage, Kind)> {
+    packages
+        .normal_build_order()
+        .into_iter()
+        .filter(|package| {
+            sets.is_none_or(|sets| sets.normal(&package.name, &package.version).is_some())
+        })
+        .map(|package| (package.clone(), kind_of(packages, package)))
+        .collect()
+}
+
+/// What `package` is to the project, for how it is read.
+fn kind_of(packages: &PackageGraph, package: &ProjectPackage) -> Kind {
+    if packages.is_member(package) {
+        Kind::Member
+    } else if package.source == Source::CratesIo {
+        Kind::CratesIo
+    } else {
+        Kind::Dependency
+    }
+}
+
+/// The crates of the toolchain's documentation that may implement the trait at `definition`: its
+/// own and those that depend on it, of std, alloc, core and `proc_macro` (`test`, which has no
+/// implementations of their traits for others to look for, only for its own).
+fn std_crates_of(definition: &str) -> &'static [StdCrate] {
+    match definition.split("::").next() {
+        Some("alloc") => &[StdCrate::Alloc, StdCrate::Std, StdCrate::ProcMacro],
+        Some("std") => &[StdCrate::Std, StdCrate::ProcMacro],
+        Some("proc_macro") => &[StdCrate::ProcMacro],
+        Some("test") => &[StdCrate::Test],
+        _ => &[
+            StdCrate::Core,
+            StdCrate::Alloc,
+            StdCrate::Std,
+            StdCrate::ProcMacro,
+        ],
+    }
+}
+
+/// The implementations of the trait at `definition` in the crates of std that may have them, of
+/// the nightly toolchain that `get_item` reads std from for `target` and the project at `project`
+/// (requirement R-STD-1); or the answer to return when std cannot be read. A crate whose archive
+/// is not made by `until` is told as still being indexed.
+async fn read_std(
+    state: &Arc<ToolState>,
+    (target, project): (&TargetTriple, Option<&Path>),
+    (definition, trait_crate): (&str, &str),
+    until: tokio::time::Instant,
+    warnings: &[Box<str>],
+) -> Result<Vec<Gathered<InCrate>>, Box<CallToolResult>> {
+    let at_least = get_item::project_toolchain(state, project).await;
+    let host = state.host().await.triple.clone();
+    let chosen = match get_item::shared_std(state, target, &host, at_least.as_ref(), until).await {
+        Ok(chosen) => chosen,
+        Err(StdUnready::Failed(error)) => {
+            return Err(Box::new(get_item::dist_error(StdCrate::Std, &error)));
+        },
+        Err(StdUnready::Stopped) => return Err(Box::new(get_item::stopped())),
+        Err(StdUnready::Going(doing)) => {
+            return Err(Box::new(get_item::std_building(
+                trait_crate,
+                target,
+                doing,
+                warnings,
+            )));
+        },
+    };
+    let version = chosen
+        .json
+        .release()
+        .unwrap_or_else(|| Version::new(0, 0, 0));
+    let mut gathered = Vec::new();
+    for &krate in std_crates_of(definition) {
+        let Ok(name) = krate.as_str().parse::<CrateName>() else {
+            continue;
+        };
+        let unread = |outcome| {
+            Gathered::Unread(Member {
+                name: name.clone(),
+                version: version.clone(),
+                outcome,
+            })
+        };
+        let archiving = load::archive_std_crate(&state.cache, &chosen, krate);
+        let mapped = match tokio::time::timeout_at(until, archiving).await {
+            Ok(Some(Ok(mapped))) => mapped,
+            Ok(Some(Err(error))) => {
+                tracing::warn!(krate = krate.as_str(), %error, "the JSON of std could not be loaded");
+                gathered.push(unread(Outcome::Failed(json!({
+                    "code": "docs_unavailable",
+                    "reason": "unparsable",
+                    "retryable": false,
+                }))));
+                continue;
+            },
+            Ok(None) => return Err(Box::new(get_item::shutting_down())),
+            // Made on: read by the next call (requirement R-ARCH-6).
+            Err(_) => {
+                gathered.push(unread(Outcome::Going(Doing::Indexing)));
+                continue;
+            },
+        };
+        let looking = (
+            name.clone(),
+            version.clone(),
+            Arc::clone(&chosen),
+            at_least.clone(),
+            Box::<str>::from(definition),
+        );
+        let looked = crate::task::spawn_blocking(move || {
+            look_at_std(&CrateView::new(mapped.get()), looking)
+        })
+        .await;
+        gathered.push(match looked {
+            Ok((result, version)) => Gathered::Read(Read {
+                name,
+                version,
+                how: How::Std,
+                result,
+            }),
+            Err(error) => {
+                tracing::error!(%error, "looking at a crate of std did not finish");
+                unread(Outcome::Failed(
+                    json!({ "code": "internal_error", "retryable": true }),
+                ))
+            },
+        });
+    }
+    Ok(gathered)
+}
+
+/// What `gathered` tells of the implementations of the trait of `owner`, of `packages`: those of
+/// another version's trait left out (decided in M4's plan, J7), and those whose version is not
+/// told kept (decided in M4b, decision 17), sorted (decision 14).
 fn collect(
     gathered: Vec<Gathered<InCrate>>,
     packages: &PackageGraph,
-    trait_package: &ProjectPackage,
+    owner: Owner<'_>,
 ) -> Collected {
     let mut collected = Collected::default();
     for gathered in gathered {
@@ -399,14 +595,21 @@ fn collect(
             get_item::same_crate_name(&package.name, read.name.as_str())
                 && package.version == read.version
         });
-        let own = implementer.is_some_and(|package| package == trait_package);
+        let own = match owner {
+            Owner::Package(trait_package) => implementer == Some(trait_package),
+            Owner::Std => read.how == How::Std,
+        };
         for (implementor, trait_crate) in read.result.implementors {
-            match judge(
-                &trait_crate,
-                implementer.filter(|_| !own),
-                packages,
-                trait_package,
-            ) {
+            let judged = match owner {
+                Owner::Package(trait_package) => judge(
+                    &trait_crate,
+                    implementer.filter(|_| !own),
+                    packages,
+                    trait_package,
+                ),
+                Owner::Std => Judged::Same,
+            };
+            match judged {
                 Judged::Other => {
                     collected.other_version = collected.other_version.saturating_add(1);
                     continue;
@@ -563,6 +766,46 @@ fn other_versions(
     hints
 }
 
+/// What the crate of std of `view` tells of the implementations of the trait at `definition`, with
+/// its version: the one that its JSON says, as `get_item` tells it, else `release`, the
+/// toolchain's.
+fn look_at_std(
+    view: &CrateView<'_>,
+    (name, release, chosen, at_least, definition): (
+        CrateName,
+        Version,
+        Arc<crate::data::std_json::Chosen>,
+        Option<Version>,
+        Box<str>,
+    ),
+) -> (InCrate, Version) {
+    let version = view
+        .crate_version()
+        .and_then(|version| Version::parse(version).ok())
+        .unwrap_or(release);
+    let toolchain = chosen.json.toolchain();
+    let request = ItemRequest {
+        name: &name,
+        version: &version,
+        path: name.as_str(),
+        origin: Origin::Std {
+            toolchain: &toolchain,
+            std_from: chosen.json.source(),
+            why: &chosen.why,
+            project_release: at_least.as_ref(),
+        },
+        detail: Detail::Normal,
+        project_features: None,
+        follow: false,
+        target: None,
+    };
+    let result = InCrate {
+        implementors: implementors_in(view, request, &definition).0,
+        digest: view.source_digest().into(),
+    };
+    (result, version)
+}
+
 /// What each crate read is looked at for: the implementations of the trait at `definition`
 /// in it, by its reverse index.
 fn per_crate(state: &ToolState, definition: Box<str>) -> PerCrate<InCrate> {
@@ -687,7 +930,10 @@ fn stale_source(name: &CrateName, version: &Version, how: &How) -> Option<Value>
         How::Cached => "unchecked",
         How::Built { stale: true } => "rebuilding",
         How::Recorded { changed: true } => "inputs_changed",
-        How::Release | How::Built { stale: false } | How::Recorded { changed: false } => {
+        How::Release
+        | How::Std
+        | How::Built { stale: false }
+        | How::Recorded { changed: false } => {
             return None;
         },
     };
@@ -974,6 +1220,29 @@ mod tests {
             stale_source(&name, &version, &How::Built { stale: false }),
             None
         );
+    }
+
+    /// A trait of std is looked for in the crates of std that depend on its crate.
+    #[test]
+    fn a_trait_of_std_is_looked_for_where_its_crate_is_depended_on() {
+        assert_eq!(std_crates_of("core::fmt::Display"), [
+            StdCrate::Core,
+            StdCrate::Alloc,
+            StdCrate::Std,
+            StdCrate::ProcMacro
+        ]);
+        assert_eq!(std_crates_of("alloc::borrow::ToOwned"), [
+            StdCrate::Alloc,
+            StdCrate::Std,
+            StdCrate::ProcMacro
+        ]);
+        assert_eq!(std_crates_of("std::io::Read"), [
+            StdCrate::Std,
+            StdCrate::ProcMacro
+        ]);
+        assert_eq!(std_crates_of("proc_macro::MultiSpan"), [
+            StdCrate::ProcMacro
+        ]);
     }
 
     /// The traits that the compiler implements are known by their definition paths.

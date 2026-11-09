@@ -473,6 +473,13 @@ fn dist_archive(top: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
 /// [`STD_LIB`]. Other paths are not found.
 #[cfg(debug_assertions)]
 fn fake_dist(with_rust_src: bool) -> String {
+    fake_dist_with(with_rust_src, false)
+}
+
+/// [`fake_dist`], with a trait `core::fmt::Display` in core, `with_display`, as the real one is
+/// defined: for the lookups across the dependency graph of a trait of std.
+#[cfg(debug_assertions)]
+fn fake_dist_with(with_rust_src: bool, with_display: bool) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port is free");
     let url = format!("http://{}", listener.local_addr().expect("bound"));
     let json = |name: &str| {
@@ -491,9 +498,16 @@ fn fake_dist(with_rust_src: bool) -> String {
             // An example of its own (decided in M3e, decision 75).
             hello.docs = Some(format!("Says hello.\n\n```\n{name}::hello();\n```\n"));
         }
+        if with_display && name == "core" {
+            add_display(&mut krate);
+        }
+        if with_display && name == "alloc" {
+            add_display_impl(&mut krate);
+        }
         serde_json::to_vec(&krate).expect("serializes")
     };
     let (std, core, alloc) = (json("std"), json("core"), json("alloc"));
+    let proc_macro = json("proc_macro");
     let docs = dist_archive(&format!("rust-docs-json-nightly-{TARGET}"), &[
         ("git-commit-hash", NIGHTLY_COMMIT.as_bytes()),
         ("rust-docs-json-preview/share/doc/rust/json/std.json", &std),
@@ -504,6 +518,10 @@ fn fake_dist(with_rust_src: bool) -> String {
         (
             "rust-docs-json-preview/share/doc/rust/json/alloc.json",
             &alloc,
+        ),
+        (
+            "rust-docs-json-preview/share/doc/rust/json/proc_macro.json",
+            &proc_macro,
         ),
     ]);
     let sources = dist_archive("rust-src-nightly", &[
@@ -558,6 +576,123 @@ fn fake_dist(with_rust_src: bool) -> String {
     .collect();
     serve_paths(listener, files);
     url
+}
+
+/// Adds to `krate`, the core of [`fake_dist_with`], a module `fmt` with a trait `Display` that has
+/// no items, at `core::fmt::Display`.
+#[cfg(debug_assertions)]
+fn add_display(krate: &mut Crate) {
+    let (fmt, display) = (Id(10), Id(11));
+    let item = |id, name: &str, inner| Item {
+        id,
+        crate_id: 0,
+        name: Some(name.to_owned()),
+        span: None,
+        visibility: Visibility::Public,
+        docs: None,
+        links: HashMap::new(),
+        attrs: Vec::new(),
+        deprecation: None,
+        stability: None,
+        const_stability: None,
+        inner,
+    };
+    let module = item(
+        fmt,
+        "fmt",
+        ItemEnum::Module(Module {
+            is_crate: false,
+            items: vec![display],
+            is_stripped: false,
+        }),
+    );
+    let the_trait = item(
+        display,
+        "Display",
+        ItemEnum::Trait(rustdoc_types::Trait {
+            is_auto: false,
+            is_unsafe: false,
+            is_dyn_compatible: true,
+            items: Vec::new(),
+            generics: Generics {
+                params: Vec::new(),
+                where_predicates: Vec::new(),
+            },
+            bounds: Vec::new(),
+            implementations: Vec::new(),
+        }),
+    );
+    if let Some(ItemEnum::Module(root)) =
+        krate.index.get_mut(&krate.root).map(|root| &mut root.inner)
+    {
+        root.items.push(fmt);
+    }
+    krate.index.insert(fmt, module);
+    krate.index.insert(display, the_trait);
+    for (id, path, kind) in [
+        (fmt, vec!["core", "fmt"], rustdoc_types::ItemKind::Module),
+        (
+            display,
+            vec!["core", "fmt", "Display"],
+            rustdoc_types::ItemKind::Trait,
+        ),
+    ] {
+        krate.paths.insert(id, rustdoc_types::ItemSummary {
+            crate_id: 0,
+            path: path.into_iter().map(str::to_owned).collect(),
+            kind,
+        });
+    }
+}
+
+/// Adds to `krate`, the alloc of [`fake_dist_with`], an `impl core::fmt::Display for str`, of
+/// core's trait, as another crate's.
+#[cfg(debug_assertions)]
+fn add_display_impl(krate: &mut Crate) {
+    let (display, implementation) = (Id(11), Id(20));
+    krate
+        .external_crates
+        .insert(1, rustdoc_types::ExternalCrate {
+            name: "core".to_owned(),
+            html_root_url: Some("https://doc.rust-lang.org/nightly/".to_owned()),
+            path: PathBuf::from("core.json"),
+        });
+    krate.paths.insert(display, rustdoc_types::ItemSummary {
+        crate_id: 1,
+        path: ["core", "fmt", "Display"].map(str::to_owned).to_vec(),
+        kind: rustdoc_types::ItemKind::Trait,
+    });
+    krate.index.insert(implementation, Item {
+        id: implementation,
+        crate_id: 0,
+        name: None,
+        span: None,
+        visibility: Visibility::Default,
+        docs: None,
+        links: HashMap::new(),
+        attrs: Vec::new(),
+        deprecation: None,
+        stability: None,
+        const_stability: None,
+        inner: ItemEnum::Impl(rustdoc_types::Impl {
+            is_unsafe: false,
+            generics: Generics {
+                params: Vec::new(),
+                where_predicates: Vec::new(),
+            },
+            provided_trait_methods: Vec::new(),
+            trait_: Some(rustdoc_types::Path {
+                path: "Display".to_owned(),
+                id: display,
+                args: None,
+            }),
+            for_: Type::Primitive("str".to_owned()),
+            items: Vec::new(),
+            is_negative: false,
+            is_synthetic: false,
+            blanket_impl: None,
+        }),
+    });
 }
 
 /// Serves on `listener`, in the background, the bodies of `files` by path, and 404 for others.
@@ -4816,6 +4951,100 @@ fn list_implementors_tells_the_crates_past_the_most() {
         "{told}"
     );
     assert!(!past.contains("svc"), "the trait's crate is read: {told}");
+    assert!(server.finish().success());
+}
+
+/// A trait of std is looked for in std, alloc, core and `proc_macro`, which come first, and in the
+/// packages of the project's normal build, which it would not be in by the dependency graph alone
+/// (decided in M4a, decision 1, and in M4b, decision 15). The nightly toolchain here, whose std
+/// would be read instead of the fake one, is hidden by a `rustup` that does not run it. Only where
+/// the fake distribution server has std for the host, which the project is built for.
+#[cfg(all(
+    debug_assertions,
+    feature = "local",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+#[test]
+fn list_implementors_looks_for_a_trait_of_std_in_the_whole_build() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let registry = registry::FakeRegistry::start();
+    let dir = TempDir::new().expect("a temporary directory");
+    let project = dir.path().join("app");
+    std::fs::create_dir_all(project.join("src")).expect("made");
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("written");
+    std::fs::write(
+        project.join("src/lib.rs"),
+        "pub struct App;\nimpl std::fmt::Display for App {\n    fn fmt(&self, f: &mut \
+         std::fmt::Formatter<'_>) -> std::fmt::Result {\n        f.write_str(\"app\")\n    \
+         }\n}\n",
+    )
+    .expect("written");
+    // Without dependencies, as cargo writes it.
+    std::fs::write(
+        project.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("written");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("made");
+    let real = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("rustup"))
+        .find(|rustup| rustup.is_file());
+    let rustup = bin.join("rustup");
+    let pass_on = real.map_or_else(
+        || "exit 1".to_owned(),
+        |real| format!("exec '{}' \"$@\"", real.display()),
+    );
+    std::fs::write(
+        &rustup,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = run ] && [ \"$2\" = nightly ]; then exit 1; fi\n{pass_on}\n"
+        ),
+    )
+    .expect("written");
+    std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755)).expect("runnable");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let dist = fake_dist_with(false, true);
+    let mut server = server_with_on(Some(&project), &registry, dir.path(), &[
+        ("PATH", path.as_str()),
+        ("CHATORA_RUSTDOC_TEST_DIST_URL", dist.as_str()),
+    ]);
+    let across = json!({ "crate": "core", "path": "fmt::Display", "scope": "dependency_graph" });
+    let told = call_until_done(&mut server, 1, &across);
+    assert_eq!(told["isError"], false, "{told}");
+    let content = &told["structuredContent"];
+    assert_eq!(content["provenance"]["source"], "std", "{told}");
+    assert_eq!(
+        content["provenance"]["std_from"]["source"], "dist",
+        "the fake one: {told}"
+    );
+    // core, alloc, std and proc_macro, and the project's member.
+    assert_eq!(content["provenance"]["crates_read"], 5, "{told}");
+    assert!(content.get("partial").is_none(), "{told}");
+    // std's first, of the nightly's version.
+    let first = &content["data"]["implementors"][0];
+    assert_eq!(first["crate"], "alloc", "{told}");
+    assert_eq!(first["type"], "str", "{told}");
+    assert_eq!(first["version"], content["provenance"]["version"], "{told}");
+    let implementors = content["data"]["implementors"].to_string();
+    assert!(
+        implementors.contains("App") && implementors.contains(r#""crate":"app""#),
+        "{told}"
+    );
+    // One std, of one version.
+    assert!(
+        !content["hints"].to_string().contains("for those"),
+        "{told}"
+    );
     assert!(server.finish().success());
 }
 

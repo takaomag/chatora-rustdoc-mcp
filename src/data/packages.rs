@@ -494,6 +494,40 @@ impl PackageGraph {
             .collect()
     }
 
+    /// The packages of the project's normal build, nearest first: the workspace members, then
+    /// what they depend on directly, then deeper, through normal dependencies, each once. Not
+    /// procedural macros, whose items are not in the build, nor what only they depend on (decided
+    /// in M4b, decision 15).
+    #[must_use]
+    pub fn normal_build_order(&self) -> Vec<&ProjectPackage> {
+        let mut uses: Vec<Vec<usize>> = vec![Vec::new(); self.packages.len()];
+        for edge in &self.edges {
+            if edge.normal
+                && let Some(of) = uses.get_mut(edge.member)
+            {
+                of.push(edge.package);
+            }
+        }
+        let mut seen = vec![false; self.packages.len()];
+        let mut order = Vec::new();
+        let mut queue: std::collections::VecDeque<usize> = self.members.iter().copied().collect();
+        while let Some(index) = queue.pop_front() {
+            match seen.get_mut(index) {
+                Some(seen) if !*seen => *seen = true,
+                _ => continue,
+            }
+            if self.proc_macro.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            order.push(index);
+            queue.extend(uses.get(index).map_or(&[][..], Vec::as_slice));
+        }
+        order
+            .into_iter()
+            .filter_map(|index| self.packages.get(index))
+            .collect()
+    }
+
     /// The packages of the lib name `lib` that `package`, one of [`Self::packages`], depends on
     /// through normal dependencies, each once: which version of a crate its code uses.
     #[must_use]
@@ -897,6 +931,64 @@ mod tests {
         assert_eq!(told, [("svc@0.2.0".to_owned(), vec![
             "old@1.0.0".to_owned()
         ])]);
+    }
+
+    /// The normal build is ordered from the members out, through normal dependencies only
+    /// (decided in M4b, decision 15).
+    #[test]
+    fn the_normal_build_is_ordered_from_the_members_out() {
+        let graph = two_versions();
+        let order = names(&graph.normal_build_order());
+        assert_eq!(order, [
+            "app@0.1.0",
+            "tests@0.1.0",
+            "tower@0.5.3",
+            "old@1.0.0",
+            "buildy@1.0.0",
+            "devy@1.0.0",
+            "svc@0.3.3",
+            "svc@0.2.0"
+        ]);
+    }
+
+    /// A procedural macro is not in the normal build, nor what only it depends on, nor what only a
+    /// dev- or build-dependency brings.
+    #[test]
+    fn the_normal_build_does_not_go_through_a_procedural_macro() {
+        let app = package("app", "0.1.0", None);
+        let mut derive = package("derive", "1.0.0", Some(REGISTRY));
+        derive["targets"] = json!([{ "name": "derive", "kind": ["proc-macro"] }]);
+        let syn = package("syn", "2.0.0", Some(REGISTRY));
+        let tested = package("tested", "1.0.0", Some(REGISTRY));
+        let built = package("built", "1.0.0", Some(REGISTRY));
+        let dep = |package: &serde_json::Value, kind: Option<&str>| {
+            json!({
+                "name": package["name"],
+                "pkg": id(package),
+                "dep_kinds": [{ "kind": kind, "target": null }],
+            })
+        };
+        let metadata = json!({
+            "packages": [&app, &derive, &syn, &tested, &built],
+            "workspace_members": [id(&app)],
+            "resolve": { "nodes": [
+                { "id": id(&app), "deps": [
+                    dep(&derive, None),
+                    dep(&tested, Some("dev")),
+                    dep(&built, Some("build")),
+                ], "features": [] },
+                { "id": id(&derive), "deps": [dep(&syn, None)], "features": [] },
+                { "id": id(&syn), "deps": [], "features": [] },
+                { "id": id(&tested), "deps": [], "features": [] },
+                { "id": id(&built), "deps": [], "features": [] },
+            ] },
+            "workspace_root": "/w",
+            "version": 1,
+        });
+        let metadata: Metadata = serde_json::from_value(metadata).expect("metadata");
+        let lock = CargoLock::parse("").expect("a Cargo.lock");
+        let graph = PackageGraph::from_metadata(&metadata, &lock);
+        assert_eq!(names(&graph.normal_build_order()), ["app@0.1.0"]);
     }
 
     fn version(lookup: &Lookup<'_>) -> Option<String> {
