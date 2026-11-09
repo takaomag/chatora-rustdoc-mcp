@@ -29,3 +29,7 @@ reqwest	0.13.5	61	1507623	daad57897a86a1f25b2b6141afceed3b4256ea1c3c2385b5e23aa4
 serde_json	1.0.154	61	1436439	d1792ebe7ea578b113f7bbf04d8ea9bfca4d4088bb6baff5341da215a4a50686	compared with rustdoc_processor (A10)
 hyper	1.12.0	61	1274756	b38c93bf8d68c5ef818502f2a83a89e9398068602a835870e5d5b2159b8df4af	compared with rustdoc_processor (A10)
 tower	0.5.3	61	3467945	67c9af961fd475b4642a8468c61401cac480b171ef1103249290f6a7772cade7	compared with rustdoc_processor (A10); re-exports modules under other names
+tower-service	0.3.3	61	112058	6f49a36182ba067dbd84aaa900faf207d0dd33d31fa45a40f36a9b55c3da4fd8	the dependency graph of the eval fixture's tower::Service (M4b, decision 9)
+axum-core	0.5.6	61	1148344	a72240c7d03a05476b6b09d6a02d139bdb4d3fbf7342d986367ee37b853110bf	the dependency graph of the eval fixture's tower::Service (M4b, decision 9)
+hyper-util	0.1.21	61	1744302	ce660a2b9beb0ae41a19c86e31a687598f11a8cc711ba07b442667fb0ffa51c1	the dependency graph of the eval fixture's tower::Service (M4b, decision 9)
+tower-http	0.6.11	57	4997037	251f1b5ab813accab220ee2047b505a78a36a5289b8c0a7e36ed48347313d2a2	the dependency graph of the eval fixture's tower::Service (M4b, decision 9)

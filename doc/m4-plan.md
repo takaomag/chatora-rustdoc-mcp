@@ -181,6 +181,8 @@ M4 は、1 つの crate の中だけでは答えられない問い (依存グラ
 - 新しいプロセスの anon のピークは 9〜16 MB (アーカイブを読み終えたら手放す。決定 5)。W のプロセスは 70〜123 MB (作り直しの R は 78〜278 MB)
 - F の約 0.5 秒の内訳は分けて測っていない。crate を読む部分は W と同じ 20〜30 ms 程度と見られ、残りはプロジェクトの解決 (cargo metadata・Cargo.lock) と member の鮮度の確認と推測する
 
+**testdata と eval の Q9 (2026-11-09、決定 9 と §5 の P10)**: fixture の `tower::Service` の依存グラフに要る 4 crate (tower-service 0.3.3・axum-core 0.5.6・hyper-util 0.1.21・tower-http 0.6.11。tower-http だけ format 57) の docs.rs の JSON を取って testdata/docs-rs-json.txt に足した。eval に `q9-graph-service` (「このプロジェクトの依存で `tower::Service` を実装している型と crate は？」。`list_implementors` を `scope: dependency_graph` で呼び、答えに tower-http と axum) を足し、`arguments` は値が同じでも合格にした (それまではパスとして比べていた)。1 回回して合格 (4 回の呼び出し、0.74 USD、45 秒)。モデルは `limit: 200` で 167 件をページ送りでたどり、応答の上限 (32,000 字) で 1 ページは 38・30・74・25 件に縮んだ (`tool_result` の p50 は 29,211 字)。1 件の見出しが長い (where 句) ため。M4h の全件の eval で費用を見る
+
 ### 6.2 M4b
 
 **下調べ (2026-11-05、サブエージェント、読むだけ。target/claude-notes/m4b-research.md)**: B1 は、今の crate の照会で trait を解いて (re-export をたどる) 定義した package と定義パス (`paths` の、`implementations_of` の鍵) を得て、`dependents_closure` と `FeatureSets::normal` の積を `gather` の `CachedOnly` で読み、crate ごとに `implementations_of` を引いて今の `implementors_of` の描き方を使い回す。B2 は、他 crate の型の id から `paths` の定義パスと `external_crates` の版を得て、その crate の既存のアーカイブの `by_definition_path` と `canonical_path` で描く。B3 は、アーカイブを作るときには行き先の中身が無い (reqwest の `paths` の `http::header` の下は 26 件だけ) ので、照会のときに行き先を読んで付け替える

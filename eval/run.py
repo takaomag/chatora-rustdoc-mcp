@@ -260,7 +260,12 @@ def run_case(case: dict, binary: Path, args: argparse.Namespace, out: Path, run:
     for name, value in case.get("arguments", {}).items():
         wanted = placed(value, paths)
         given = [str((call["input"] or {}).get(name, "")) for call in stream["calls"] if call["name"].startswith(PREFIX)]
-        if not any(Path(given_value).resolve() == Path(wanted).resolve() for given_value in given if given_value):
+        # A path, as `project`, or a value, as `scope`.
+        if not any(
+            given_value == wanted or Path(given_value).resolve() == Path(wanted).resolve()
+            for given_value in given
+            if given_value
+        ):
             problems.append(f"no call with {name} = {wanted}")
     for pattern in case["answer"]:
         if not re.search(pattern, answer, re.IGNORECASE):

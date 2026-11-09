@@ -91,6 +91,14 @@
     "answer": ["TcpStream"]
   },
   {
+    "id": "q9-graph-service",
+    "question": "Q9",
+    "prompt": "Which types in this project's dependencies implement `tower::Service`? Name the crates that they are in.",
+    "tools": ["list_implementors"],
+    "answer": ["tower[-_]http", "axum"],
+    "arguments": {"scope": "dependency_graph"}
+  },
+  {
     "id": "q10-source",
     "question": "Q10",
     "prompt": "How is `lock` of tokio's `Mutex` implemented? Show the code of its body.",
