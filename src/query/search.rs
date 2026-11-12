@@ -579,6 +579,10 @@ pub struct SearchData<'a> {
     /// With no results, names of items that are spelt like the query (requirement R-SR-5).
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub did_you_mean: Box<[Box<str>]>,
+    /// The types of other crates in it that are shown as rustdoc writes them, not by their
+    /// canonical paths (decided in M4b, decision 20).
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub not_canonical: Box<[crate::query::external::NotCanonical]>,
 }
 
 /// How a result matched, best first (requirement R-SR-3).
@@ -743,7 +747,11 @@ pub fn search_across<'a>(
     } else {
         Box::default()
     };
-    let Notes { warnings, hints } = notes(queries);
+    let Notes {
+        warnings,
+        hints,
+        not_canonical,
+    } = notes(queries);
     let page = |shown: usize| {
         let next = options.offset.saturating_add(shown);
         Page {
@@ -762,6 +770,7 @@ pub fn search_across<'a>(
             query: options.query.into(),
             items: Vec::new(),
             did_you_mean,
+            not_canonical,
         },
         page: page(0),
     };
@@ -973,14 +982,27 @@ fn shows(source: &Searched<'_>, entry: u32) -> bool {
 /// The warnings and hints of all the queries, in order.
 fn notes(queries: Vec<Query<'_>>) -> Notes {
     let (mut warnings, mut hints) = (Vec::new(), Vec::new());
+    let mut not_canonical = std::collections::BTreeMap::new();
     for query in queries {
-        let notes = query.finish();
+        let notes = query.finish_untold();
         warnings.extend(notes.warnings);
         hints.extend(notes.hints);
+        for told in notes.not_canonical {
+            let key = (
+                told.krate.clone(),
+                told.version.clone(),
+                told.lookup.clone(),
+            );
+            not_canonical.entry(key).or_insert(told);
+        }
     }
+    // Told once for all the crates searched.
+    let not_canonical: Vec<_> = not_canonical.into_values().collect();
+    super::get_item::told_not_canonical(&not_canonical, &mut warnings, &mut hints);
     Notes {
         warnings: warnings.into(),
         hints: hints.into(),
+        not_canonical: not_canonical.into(),
     }
 }
 

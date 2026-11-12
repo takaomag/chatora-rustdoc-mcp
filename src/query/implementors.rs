@@ -14,7 +14,6 @@ use super::{
         GetItemError,
         ItemRequest,
         MAX_RESPONSE_CHARS,
-        Notes,
         Provenance,
         Query,
         kind_of,
@@ -91,6 +90,10 @@ pub struct Implementors {
     /// The implementors of the page, in its crate only.
     #[serde(rename = "implementors")]
     pub listed: Vec<Implementor>,
+    /// The types of other crates in it that are shown as rustdoc writes them, not by their
+    /// canonical paths (decided in M4b, decision 20).
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub not_canonical: Box<[crate::query::external::NotCanonical]>,
 }
 
 /// An item of a trait.
@@ -117,6 +120,10 @@ pub struct Implementor {
     /// The features and other conditions that the `impl` is written with (requirement R-FT-2).
     #[serde(flatten)]
     pub conditions: Conditions,
+    /// What it is ordered by: its type and its header with the types of other crates as rustdoc
+    /// writes them, whatever the cache has (requirement R-OUT-3, decided in M4b).
+    #[serde(skip)]
+    pub key: (Box<str>, Box<str>),
 }
 
 /// The implementors of the trait at `request.path` in its crate.
@@ -163,7 +170,7 @@ pub fn list_implementors<'a>(
     let (mut entries, has_negative_impls) =
         implementors_of(view, &mut query, &contents.implementations);
     // By the type, then the header (requirement R-OUT-4).
-    entries.sort_by(|a, b| (&a.ty, &a.header).cmp(&(&b.ty, &b.header)));
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
     let total = entries.len();
     if options.offset > total {
         return Err(GetItemError::BadCursor(
@@ -199,7 +206,7 @@ pub fn list_implementors<'a>(
              implements {path}"
         )
     });
-    let Notes { warnings, hints } = query.finish();
+    let notes = query.finish();
     let page = |shown: usize| {
         let next = options.offset.saturating_add(shown);
         Page {
@@ -212,8 +219,9 @@ pub fn list_implementors<'a>(
     };
     let mut response = ImplementorsResponse {
         provenance,
-        warnings,
+        warnings: notes.warnings,
         data: Implementors {
+            not_canonical: notes.not_canonical,
             definition,
             path,
             signature,
@@ -226,7 +234,7 @@ pub fn list_implementors<'a>(
             listed: Vec::new(),
         },
         page: page(0),
-        hints,
+        hints: notes.hints,
     };
     fit(&mut response, shown, &page);
     Ok(response)
@@ -275,11 +283,16 @@ fn implementors_of(
         } else {
             "trait"
         };
+        let (ty, header) = (query.type_text(&contents.for_), query.impl_text(impl_item));
+        let key = query
+            .literally(|query| (query.type_text(&contents.for_), query.impl_text(impl_item)))
+            .unwrap_or_else(|| (ty.clone(), header.clone()));
         entries.push(Implementor {
-            ty: query.type_text(&contents.for_),
+            ty,
             kind,
-            header: query.impl_text(impl_item),
+            header,
             conditions: query.own_conditions(impl_item.id),
+            key,
         });
     }
     (entries, has_negative_impls)

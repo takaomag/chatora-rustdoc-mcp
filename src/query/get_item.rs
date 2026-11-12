@@ -493,6 +493,10 @@ pub struct ItemData<'a> {
     /// Something was cut to keep the response within its budget (requirement R-OUT-3).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// The types of other crates in it that are shown as rustdoc writes them, not by their
+    /// canonical paths (decided in M4b, decision 20).
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub not_canonical: Box<[crate::query::external::NotCanonical]>,
     /// What `get_source` judges a macro's output by, which is not shown (decided in M3c,
     /// decision 35).
     #[serde(skip)]
@@ -858,7 +862,13 @@ pub fn get_item<'a>(
     let Some(data) = data else {
         return Err(GetItemError::NotFound);
     };
-    let Notes { warnings, hints } = query.finish();
+    let Notes {
+        warnings,
+        hints,
+        not_canonical,
+    } = query.finish();
+    let mut data = data;
+    data.not_canonical = not_canonical;
     let mut response = ItemResponse {
         provenance,
         warnings,
@@ -1058,6 +1068,36 @@ const fn list_mut<'b>(data: &'b mut ItemData<'_>, fields: bool) -> &'b mut Box<[
 /// The documentation is not cut shorter than this many characters.
 const MIN_DOCS_CHARS: usize = 200;
 
+/// What `not_canonical` tells in `warnings`, one line, and in `hints`: how to have the types
+/// shown by their canonical paths (decided in M4b, decision 20).
+pub(super) fn told_not_canonical(
+    not_canonical: &[crate::query::external::NotCanonical],
+    warnings: &mut Vec<Cow<'static, str>>,
+    hints: &mut Vec<Box<str>>,
+) {
+    if not_canonical.is_empty() {
+        return;
+    }
+    let told = match not_canonical.len() {
+        1 => "1 type of another crate is shown as rustdoc writes it".to_owned(),
+        many => format!("{many} types of other crates are shown as rustdoc writes them"),
+    };
+    warnings.push(Cow::Owned(format!(
+        "{told}, not by canonical paths (see data.not_canonical)"
+    )));
+    // Only what is not cached is shown by its canonical path after it is looked up.
+    if not_canonical
+        .iter()
+        .any(|told| told.reason == crate::query::external::Reason::NotCached)
+    {
+        hints.push(
+            "call get_item with the crate, version and lookup of a not_canonical entry: the \
+             calls after it show the types of that crate by their canonical paths"
+                .into(),
+        );
+    }
+}
+
 /// One lookup, with what it has found to warn about so far.
 /// What a query says besides its data.
 pub(super) struct Notes {
@@ -1065,6 +1105,9 @@ pub(super) struct Notes {
     pub(super) warnings: Box<[Cow<'static, str>]>,
     /// What to call next.
     pub(super) hints: Box<[Box<str>]>,
+    /// The items of other crates shown as written, not by their canonical paths (decided in M4b,
+    /// decision 20).
+    pub(super) not_canonical: Box<[crate::query::external::NotCanonical]>,
 }
 
 pub(super) struct Query<'a> {
@@ -1112,6 +1155,19 @@ impl<'a> Query<'a> {
         self.paths = false;
     }
 
+    /// What `render` makes with the items of other crates written as rustdoc gives them, when
+    /// they are shown otherwise; `None` when they are not: for an order that does not change with
+    /// what the cache has (requirement R-OUT-3, decided in M4b).
+    pub(super) fn literally<R>(&mut self, render: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let external = self.renderer.replace_external(None)?;
+        // What it warns of again is warned of once.
+        let kept = self.renderer.warnings().len();
+        let rendered = render(self);
+        self.renderer.keep_warnings(kept);
+        self.renderer.replace_external(Some(external));
+        Some(rendered)
+    }
+
     /// Adds a hint of what to call next.
     pub(super) fn hint(&mut self, hint: String) {
         self.hints.push(hint.into());
@@ -1126,11 +1182,30 @@ impl<'a> Query<'a> {
 
     /// The warnings and the hints of the query, the renderer's warnings last.
     pub(super) fn finish(self) -> Notes {
+        let Notes {
+            warnings,
+            hints,
+            not_canonical,
+        } = self.finish_untold();
+        let (mut warnings, mut hints) = (warnings.into_vec(), hints.into_vec());
+        told_not_canonical(&not_canonical, &mut warnings, &mut hints);
+        Notes {
+            warnings: warnings.into(),
+            hints: hints.into(),
+            not_canonical,
+        }
+    }
+
+    /// [`Self::finish`], without telling of the types shown as written, for a caller that tells
+    /// of those of several queries at once.
+    pub(super) fn finish_untold(self) -> Notes {
         let mut warnings = self.warnings;
+        let not_canonical = self.renderer.not_canonical();
         warnings.extend(self.renderer.into_warnings());
         Notes {
             warnings: warnings.into(),
             hints: self.hints.into(),
+            not_canonical: not_canonical.into(),
         }
     }
 
@@ -2304,6 +2379,38 @@ pub(super) mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The types shown as written are told in one warning, with how to have them shown by their
+    /// canonical paths, unless none can be (decided in M4b, decisions 20 and 32).
+    #[test]
+    fn the_types_shown_as_written_are_told_once() {
+        use crate::query::external::{NotCanonical, Reason};
+        let told = |reason| NotCanonical {
+            ty: "T".into(),
+            krate: "c".into(),
+            version: None,
+            lookup: "c::T".into(),
+            reason,
+        };
+        let (mut warnings, mut hints) = (Vec::new(), Vec::new());
+        told_not_canonical(&[], &mut warnings, &mut hints);
+        assert!(warnings.is_empty() && hints.is_empty());
+        told_not_canonical(
+            &[told(Reason::NotCached), told(Reason::Unnameable)],
+            &mut warnings,
+            &mut hints,
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("2 types"), "{warnings:?}");
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        // Looking up what is not found, or has no public path, does not change it.
+        for reason in [Reason::Unnameable, Reason::NotFound] {
+            let (mut warnings, mut hints) = (Vec::new(), Vec::new());
+            told_not_canonical(&[told(reason)], &mut warnings, &mut hints);
+            assert_eq!((warnings.len(), hints.len()), (1, 0), "{reason:?}");
+            assert!(warnings[0].starts_with("1 type of"), "{warnings:?}");
+        }
+    }
 
     #[test]
     fn std_sources_are_in_the_rust_repository() {

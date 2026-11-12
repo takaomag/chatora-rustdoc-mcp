@@ -101,6 +101,10 @@ pub struct Impls {
     /// The other impls of the page: those of this crate, then of other crates, then of std.
     #[serde(rename = "impls")]
     pub entries: Vec<ImplEntry>,
+    /// The types of other crates in it that are shown as rustdoc writes them, not by their
+    /// canonical paths (decided in M4b, decision 20).
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub not_canonical: Box<[crate::query::external::NotCanonical]>,
 }
 
 /// One `impl`.
@@ -195,7 +199,7 @@ pub fn list_impls<'a>(
         mut entries,
     } = classify(view, &mut query, item, ty);
     // By where the trait comes from, then how, then the trait, then the header (R-OUT-4).
-    entries.sort_by(|a, b| (a.0, a.1, &a.2, &a.3.header).cmp(&(b.0, b.1, &b.2, &b.3.header)));
+    entries.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
     std_blanket.sort_unstable();
     std_blanket.dedup();
     let total = entries.len();
@@ -212,7 +216,11 @@ pub fn list_impls<'a>(
         .collect();
     let (non_exhaustive, has_private_fields) = shape_of(view, item);
     let path = query.path_of(ty);
-    let Notes { warnings, hints } = query.finish();
+    let Notes {
+        warnings,
+        hints,
+        not_canonical,
+    } = query.finish();
     let page = |shown: usize| {
         let next = options.offset.saturating_add(shown);
         Page {
@@ -227,6 +235,7 @@ pub fn list_impls<'a>(
         provenance,
         warnings,
         data: Impls {
+            not_canonical,
             path,
             kind: kind_of(item, false),
             non_exhaustive,
@@ -248,8 +257,12 @@ struct Classified {
     std_blanket: Vec<Box<str>>,
     /// The other impls, with what they are sorted by: where the trait comes from (this crate,
     /// another, std), how the impl was made, and the trait.
-    entries: Vec<(u8, How, Box<str>, ImplEntry)>,
+    entries: Vec<Sorted>,
 }
+
+/// An impl, with what it is sorted by: where the trait comes from, how the impl was made, the
+/// trait, and the header as rustdoc writes the types of other crates.
+type Sorted = (u8, How, (Box<str>, Box<str>), ImplEntry);
 
 /// Sorts out the impls of the type `ty`, `item`: auto traits, the blanket impls of std's
 /// general traits, and the rest.
@@ -257,7 +270,7 @@ fn classify(view: &CrateView<'_>, query: &mut Query<'_>, item: &Item, ty: Id) ->
     let auto_ids = auto_traits_of(view);
     let mut auto_traits = BTreeMap::new();
     let mut std_blanket = Vec::new();
-    let mut entries: Vec<(u8, How, Box<str>, ImplEntry)> = Vec::new();
+    let mut entries: Vec<Sorted> = Vec::new();
     for &impl_id in impls_of(item) {
         let Some(impl_item) = view.item(impl_id) else {
             continue;
@@ -332,10 +345,15 @@ fn classify(view: &CrateView<'_>, query: &mut Query<'_>, item: &Item, ty: Id) ->
             Some(_) => 1,
         };
         let header = query.impl_text(impl_item);
+        // Ordered by the header as rustdoc writes the types of other crates, whatever the cache
+        // has (requirement R-OUT-3, decided in M4b).
+        let key = query
+            .literally(|query| query.impl_text(impl_item))
+            .unwrap_or_else(|| header.clone());
         entries.push((
             rank,
             how,
-            trait_path.clone().unwrap_or_default(),
+            (trait_path.clone().unwrap_or_default(), key),
             ImplEntry {
                 kind: how.name(),
                 trait_path,

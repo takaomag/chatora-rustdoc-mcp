@@ -1,12 +1,13 @@
 //! Rendering rustdoc's type trees as Rust code (requirement R-OUT-2).
 //!
 //! A signature is shown as one line of Rust, not as the JSON tree, which is several times larger.
-//! Types of this crate are written with their canonical path. Types of other crates are written as
-//! rustdoc gives them until M1 indexes those crates too (R-PR-4). The where clauses, the named
+//! Types of this crate are written with their canonical path. Types of other crates are written
+//! with theirs where an [`ExternalPaths`] tells them, and as rustdoc gives them otherwise (R-PR-4,
+//! decided in M4b). The where clauses, the named
 //! fields of a struct and the variants of an enum are rendered separately, one string each
 //! (R-OUT-2).
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use rustdoc_types::{
     Abi,
@@ -41,7 +42,14 @@ use rustdoc_types::{
     WherePredicate,
 };
 
-use super::view::CrateView;
+use super::{
+    external::{ExternalPaths, NotCanonical, Shown},
+    view::CrateView,
+};
+
+/// What tells the items shown as written apart: their crate, its version and their definition
+/// path, so that two versions of a crate are told each.
+type NotCanonicalKey = (Box<str>, Option<Box<str>>, Box<str>);
 
 /// Renders items and types of one crate.
 #[derive(Debug)]
@@ -49,20 +57,45 @@ pub struct Renderer<'a> {
     view: &'a CrateView<'a>,
     /// Forms that could not be rendered faithfully (requirement R-OUT-2).
     warnings: Vec<Cow<'static, str>>,
+    /// How the items of other crates are shown, if known (decided in M4b).
+    external: Option<&'a dyn ExternalPaths>,
+    /// The items of other crates shown as written, not by their canonical paths, by their crates,
+    /// versions and definition paths (decided in M4b, decision 20).
+    not_canonical: BTreeMap<NotCanonicalKey, NotCanonical>,
     /// Whether the fields that are not public or are hidden are left out, as another crate sees
     /// them, and not a workspace member's own (decided in M2's D6).
     public_only: bool,
 }
 
 impl<'a> Renderer<'a> {
-    /// A renderer for the items of the crate in `view`.
+    /// A renderer for the items of the crate in `view`, showing those of other crates as the view
+    /// tells ([`CrateView::external`]).
     #[must_use]
     pub const fn new(view: &'a CrateView<'a>) -> Self {
         Self {
             view,
             warnings: Vec::new(),
+            external: view.external(),
+            not_canonical: BTreeMap::new(),
             public_only: false,
         }
+    }
+
+    /// Shows the items of other crates as `external` tells from now on, and returns what told
+    /// before: `None` writes them as rustdoc gives them, and does not tell them in
+    /// [`Self::not_canonical`].
+    pub const fn replace_external(
+        &mut self,
+        external: Option<&'a dyn ExternalPaths>,
+    ) -> Option<&'a dyn ExternalPaths> {
+        std::mem::replace(&mut self.external, external)
+    }
+
+    /// The items of other crates shown as written so far, by their crates, versions and
+    /// definition paths.
+    #[must_use]
+    pub fn not_canonical(&self) -> Vec<NotCanonical> {
+        self.not_canonical.values().cloned().collect()
     }
 
     /// The same, leaving out the fields that are not public or are hidden, as another crate sees
@@ -91,6 +124,11 @@ impl<'a> Renderer<'a> {
     #[must_use]
     pub fn warnings(&self) -> &[Cow<'static, str>] {
         &self.warnings
+    }
+
+    /// Forgets the warnings after the first `kept`, as of what was rendered again, literally.
+    pub fn keep_warnings(&mut self, kept: usize) {
+        self.warnings.truncate(kept);
     }
 
     /// What could not be rendered faithfully, taken out of the renderer.
@@ -740,10 +778,19 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// A path, by its canonical path if it is an item of this crate, and as rustdoc gives it
-    /// otherwise (requirement R-PR-2 for this crate, R-PR-4 for others in M1).
+    /// A path, by what the [`ExternalPaths`] tells if it tells a path, else by its canonical path
+    /// if it is an item of this crate, and as rustdoc gives it otherwise (requirements R-PR-2 and
+    /// R-OUT-2, decided in M4b). The [`ExternalPaths`] is asked of the items of this crate too:
+    /// those of alloc and core are shown through std (decided in M4b, decision 18).
     fn push_path(&mut self, out: &mut String, path: &Path) {
-        if let Some(canonical) = self.view.index().canonical_path(path.id) {
+        let shown = self.external.and_then(|external| {
+            let summary = self.view.summary(path.id)?;
+            external.shown(self.view, path.id, summary)
+        });
+        let start = out.len();
+        if let Some(Shown::Path(shown)) = &shown {
+            out.push_str(shown);
+        } else if let Some(canonical) = self.view.index().canonical_path(path.id) {
             for (position, segment) in canonical.segments().iter().enumerate() {
                 if position > 0 {
                     out.push_str("::");
@@ -765,6 +812,20 @@ impl<'a> Renderer<'a> {
                 path.id.0
             )));
             out.push('_');
+        }
+        if let Some(Shown::NotCanonical(told)) = shown {
+            // Where it is first met, as written there; once for each version of its crate.
+            let written = out.get(start..).unwrap_or_default();
+            self.not_canonical
+                .entry((
+                    told.krate.clone(),
+                    told.version.clone(),
+                    told.lookup.clone(),
+                ))
+                .or_insert_with(|| NotCanonical {
+                    ty: written.into(),
+                    ..told
+                });
         }
         if let Some(args) = &path.args {
             self.push_generic_args(out, args);
@@ -1160,6 +1221,69 @@ mod tests {
             ))),
             "Option<T>"
         );
+    }
+
+    /// Shows `core::option::Option` (99) as `std::option::Option`, and tells `core::fmt::Formatter`
+    /// (98) as not canonical, as its crate's archive is not in the cache.
+    #[derive(Debug)]
+    struct FakeExternal;
+
+    impl ExternalPaths for FakeExternal {
+        fn shown(&self, _view: &CrateView<'_>, id: Id, summary: &ItemSummary) -> Option<Shown> {
+            match id.0 {
+                99 => Some(Shown::Path("std::option::Option".into())),
+                98 => Some(Shown::NotCanonical(NotCanonical {
+                    ty: String::new().into(),
+                    krate: "core".into(),
+                    version: None,
+                    lookup: summary.path.join("::").into(),
+                    reason: crate::query::external::Reason::NotCached,
+                })),
+                _ => None,
+            }
+        }
+    }
+
+    /// The types of other crates are shown as the view's [`ExternalPaths`] tells, those it does
+    /// not know as written and told apart, and as written when rendered literally (decided in
+    /// M4b, decision 20).
+    #[test]
+    fn types_of_other_crates_are_shown_as_their_crates_tell() {
+        let mut krate = krate(Vec::new());
+        for (id, path) in [
+            (99, ["core", "option", "Option"]),
+            (98, ["core", "fmt", "Formatter"]),
+        ] {
+            krate.paths.insert(Id(id), ItemSummary {
+                crate_id: 1,
+                path: path.map(str::to_owned).to_vec(),
+                kind: ItemKind::Struct,
+            });
+        }
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes)).with_external(&FakeExternal);
+        let mut renderer = Renderer::new(&view);
+        let ty = Type::Tuple(vec![
+            Type::ResolvedPath(path("Option", 99, Some(angle(vec![generic("T")])))),
+            Type::ResolvedPath(path("fmt::Formatter", 98, None)),
+            Type::ResolvedPath(path("Guard", 3, None)),
+        ]);
+        assert_eq!(
+            renderer.render_type(&ty),
+            "(std::option::Option<T>, fmt::Formatter, c::sync::Guard)"
+        );
+        let told = renderer.not_canonical();
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(&*told[0].ty, "fmt::Formatter");
+        assert_eq!(&*told[0].lookup, "core::fmt::Formatter");
+        // Literally, as rustdoc writes them, for an order that does not change with the cache.
+        let external = renderer.replace_external(None);
+        assert_eq!(
+            renderer.render_type(&ty),
+            "(Option<T>, fmt::Formatter, c::sync::Guard)"
+        );
+        renderer.replace_external(external);
+        assert_eq!(renderer.not_canonical().len(), 1);
     }
 
     #[test]

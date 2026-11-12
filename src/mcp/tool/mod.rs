@@ -1001,6 +1001,19 @@ pub(super) fn building_reason_schema() -> Value {
     })
 }
 
+/// `schema` with `data.not_canonical`, for a tool whose data shows signatures (decided in M4b,
+/// decision 20).
+pub(super) fn with_not_canonical(mut schema: JsonObject) -> JsonObject {
+    if let Some(Value::Object(properties)) = schema
+        .get_mut("properties")
+        .and_then(|properties| properties.get_mut("data"))
+        .and_then(|data| data.get_mut("properties"))
+    {
+        properties.insert("not_canonical".to_owned(), get_item::not_canonical_schema());
+    }
+    schema
+}
+
 /// `schema`, the `outputSchema` of a tool that looks a crate up, with the fields of the response
 /// while the crate is being fetched or indexed, which has no `data` (requirement R-OUT-9):
 /// `status`, `building_reason` and `retry_after_secs`, after `provenance`. Its root has no
@@ -1080,6 +1093,36 @@ fn error_result(body: &Value) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tools whose data shows signatures tell the types of other crates shown as written
+    /// (decided in M4b, decision 20), and only those.
+    #[test]
+    fn the_tools_that_show_signatures_declare_not_canonical() {
+        let showing = [
+            "crate_overview",
+            "get_item",
+            "list_implementors",
+            "list_impls",
+            "list_methods",
+            "list_module",
+            "search_items",
+        ];
+        for tool in definitions() {
+            let declared = tool
+                .output_schema
+                .as_ref()
+                .and_then(|schema| schema.get("properties"))
+                .and_then(|properties| properties.get("data"))
+                .and_then(|data| data.get("properties"))
+                .is_some_and(|data| data.get("not_canonical").is_some());
+            assert_eq!(
+                declared,
+                showing.contains(&tool.name.as_ref()),
+                "{}",
+                tool.name
+            );
+        }
+    }
 
     #[test]
     fn an_answer_is_sanitized_and_its_text_written_from_its_structured_content() {

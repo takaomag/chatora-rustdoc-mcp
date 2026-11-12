@@ -76,6 +76,10 @@ pub struct Overview<'a> {
     /// Something was cut to keep the response within its budget (requirement R-OUT-3).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// The types of other crates in it that are shown as rustdoc writes them, not by their
+    /// canonical paths (decided in M4b, decision 20).
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub not_canonical: Box<[crate::query::external::NotCanonical]>,
 }
 
 /// The features of a crate.
@@ -235,11 +239,16 @@ pub fn crate_overview<'a>(
     }
     let features = features(request);
     let (docs, docs_truncated, sections) = root_docs(root_item.docs.as_deref(), request.detail);
-    let Notes { warnings, hints } = query.finish();
+    let Notes {
+        warnings,
+        hints,
+        not_canonical,
+    } = query.finish();
     let mut response = OverviewResponse {
         provenance,
         warnings,
         data: Overview {
+            not_canonical,
             path,
             docs,
             docs_truncated,

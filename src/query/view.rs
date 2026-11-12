@@ -16,6 +16,8 @@ pub struct CrateView<'a> {
     items: FrozenMap<Id, Box<Item>>,
     summaries: FrozenMap<Id, Box<ItemSummary>>,
     external_crates: FrozenMap<u32, Box<ExternalCrate>>,
+    /// How the items of other crates are shown from this one, if known (decided in M4b).
+    external: Option<&'a dyn crate::query::external::ExternalPaths>,
 }
 
 impl std::fmt::Debug for CrateView<'_> {
@@ -36,7 +38,26 @@ impl<'a> CrateView<'a> {
             items: FrozenMap::new(),
             summaries: FrozenMap::new(),
             external_crates: FrozenMap::new(),
+            external: None,
         }
+    }
+
+    /// The same, showing the items of other crates as `external` tells: by their canonical paths
+    /// where it knows them (requirement R-OUT-2, decided in M4b).
+    #[must_use]
+    pub fn with_external(
+        mut self,
+        external: &'a dyn crate::query::external::ExternalPaths,
+    ) -> Self {
+        self.external = Some(external);
+        self
+    }
+
+    /// How the items of other crates are shown from this crate, if known; as rustdoc writes them
+    /// otherwise.
+    #[must_use]
+    pub const fn external(&self) -> Option<&'a dyn crate::query::external::ExternalPaths> {
+        self.external
     }
 
     /// The public path index.

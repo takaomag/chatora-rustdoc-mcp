@@ -636,8 +636,7 @@ fn collect(
                 !found.own,
                 found.package.as_str().to_owned(),
                 found.version.clone(),
-                found.implementor.ty.clone(),
-                found.implementor.header.clone(),
+                found.implementor.key.clone(),
             )
         };
         key(a).cmp(&key(b))

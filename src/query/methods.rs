@@ -136,6 +136,10 @@ pub struct Methods<'a> {
     /// Without `expand_blanket`, the other blanket impls, one for each trait.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub blanket: Vec<BlanketTrait>,
+    /// The types of other crates in it that are shown as rustdoc writes them, not by their
+    /// canonical paths (decided in M4b, decision 20).
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub not_canonical: Box<[crate::query::external::NotCanonical]>,
 }
 
 /// A method.
@@ -263,7 +267,11 @@ pub fn list_methods<'a>(
         .skip(options.offset)
         .take(options.limit)
         .collect();
-    let Notes { warnings, hints } = query.finish();
+    let Notes {
+        warnings,
+        hints,
+        not_canonical,
+    } = query.finish();
     let page = |shown: usize| {
         let next = options.offset.saturating_add(shown);
         Page {
@@ -278,6 +286,7 @@ pub fn list_methods<'a>(
         provenance,
         warnings,
         data: Methods {
+            not_canonical,
             path: type_path,
             kind: kind_of(item, false),
             listed: Vec::new(),

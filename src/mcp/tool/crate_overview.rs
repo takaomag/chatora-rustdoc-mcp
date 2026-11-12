@@ -57,7 +57,9 @@ pub(super) fn definition() -> Tool {
     }));
     Tool::new(NAME, super::for_this_build(DESCRIPTION), input_schema)
         .with_title("Overview of a Rust crate")
-        .with_raw_output_schema(Arc::new(super::with_building(output_schema())))
+        .with_raw_output_schema(Arc::new(super::with_building(super::with_not_canonical(
+            output_schema(),
+        ))))
         .with_annotations(super::annotations())
 }
 

@@ -619,7 +619,9 @@ pub(super) fn definition() -> Tool {
     }));
     Tool::new(NAME, super::for_this_build(DESCRIPTION), input_schema)
         .with_title("Get a Rust item")
-        .with_raw_output_schema(Arc::new(super::with_building(output_schema())))
+        .with_raw_output_schema(Arc::new(super::with_building(super::with_not_canonical(
+            output_schema(),
+        ))))
         .with_annotations(super::annotations())
 }
 
@@ -823,6 +825,31 @@ fn visibility_schema() -> Value {
     json!({
         "type": "string",
         "description": "In a workspace member: pub, pub(crate), pub(in crate::path) or private.",
+    })
+}
+
+/// The schema of `not_canonical`: the types of other crates shown as rustdoc writes them, not by
+/// their canonical paths (decided in M4b, decisions 20 and 32).
+pub(super) fn not_canonical_schema() -> Value {
+    json!({
+        "type": "array",
+        "description": "Types of other crates shown as rustdoc writes them, not by their \
+                        canonical paths: for reason not_cached, get_item with crate, version and \
+                        lookup has them shown so after it.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "type": { "type": "string" },
+                "crate": { "type": "string" },
+                "version": { "type": "string" },
+                "lookup": { "type": "string" },
+                "reason": {
+                    "type": "string",
+                    "enum": ["not_cached", "not_found", "unnameable"],
+                },
+            },
+            "required": ["type", "crate", "lookup", "reason"],
+        },
     })
 }
 
@@ -6045,6 +6072,45 @@ mod tests {
         assert_eq!(renamed["data"]["parent"], "other");
     }
 
+    /// A type of another crate shown as written, with every field.
+    fn not_canonical() -> crate::query::external::NotCanonical {
+        crate::query::external::NotCanonical {
+            ty: "x".into(),
+            krate: "x".into(),
+            version: Some("x".into()),
+            lookup: "x".into(),
+            reason: crate::query::external::Reason::NotCached,
+        }
+    }
+
+    /// A provenance with every field, of `features`.
+    fn full_provenance(features: &[Box<str>]) -> crate::query::get_item::Provenance<'_> {
+        use crate::query::get_item::{Provenance, Source, StdFrom};
+        let some_str = || Some("x");
+        Provenance {
+            source: Source::DocsRs,
+            package_source: Some("path"),
+            name: "x",
+            version: "1.0.0".into(),
+            resolved_from: Some(ResolvedFrom::Explicit),
+            project_from: Some("cwd"),
+            toolchain: some_str(),
+            std_from: Some(StdFrom {
+                source: "dist",
+                reason: "x",
+            }),
+            target: "x",
+            format_version: 61,
+            features: Some(features),
+            all_features: true,
+            cfg: features,
+            built_at: some_str(),
+            features_requested: Some(features),
+            features_effective: Some(features),
+            recorded_by: Some("build_external_docs"),
+        }
+    }
+
     #[test]
     fn the_output_schema_covers_the_response() {
         use crate::query::get_item::{
@@ -6053,14 +6119,10 @@ mod tests {
             ItemData,
             ItemResponse,
             Made,
-            Provenance,
             ReexportOf,
-            ResolvedFrom,
             Section,
-            Source,
             SourceLocation,
             StabilityNote,
-            StdFrom,
         };
 
         let some_str = || Some("x");
@@ -6069,28 +6131,7 @@ mod tests {
         let many = || Box::from([Box::<str>::from("x")]);
         let features: Box<[Box<str>]> = many();
         let response = ItemResponse {
-            provenance: Provenance {
-                source: Source::DocsRs,
-                package_source: Some("path"),
-                name: "x",
-                version: "1.0.0".into(),
-                resolved_from: Some(ResolvedFrom::Explicit),
-                project_from: Some("cwd"),
-                toolchain: some_str(),
-                std_from: Some(StdFrom {
-                    source: "dist",
-                    reason: "x",
-                }),
-                target: "x",
-                format_version: 61,
-                features: Some(&features),
-                all_features: true,
-                cfg: &features,
-                built_at: some_str(),
-                features_requested: Some(&features),
-                features_effective: Some(&features),
-                recorded_by: Some("build_external_docs"),
-            },
+            provenance: full_provenance(&features),
             warnings: Box::from(["x".into()]),
             data: ItemData {
                 path: "x".into(),
@@ -6143,12 +6184,17 @@ mod tests {
                 }]),
                 attrs: many(),
                 truncated: true,
+                not_canonical: Box::from([not_canonical()]),
                 made: Made::default(),
             },
             hints: many(),
         };
-        let value = serde_json::to_value(&response).expect("serializes");
-        assert_declared(&value, &Value::Object(output_schema()), "");
+        let schema = super::super::with_not_canonical(output_schema());
+        assert_declared(
+            &serde_json::to_value(&response).expect("serializes"),
+            &schema.into(),
+            "",
+        );
     }
 
     /// Checks that every key of the objects in `value` is a property in `schema`.

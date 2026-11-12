@@ -102,6 +102,10 @@ pub struct ModuleData<'a> {
     pub docs_truncated: bool,
     /// The items of the page, each at the path it is listed at.
     pub items: Vec<ItemData<'a>>,
+    /// The types of other crates in it that are shown as rustdoc writes them, not by their
+    /// canonical paths (decided in M4b, decision 20).
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub not_canonical: Box<[crate::query::external::NotCanonical]>,
 }
 
 /// Which part of a list a response has (requirement R-OUT-3).
@@ -213,7 +217,11 @@ pub fn list_module<'a>(
         },
         (Detail::Brief, _) | (_, None) => (None, false),
     };
-    let Notes { warnings, hints } = query.finish();
+    let Notes {
+        warnings,
+        hints,
+        not_canonical,
+    } = query.finish();
     let cursor = |offset: usize| -> Box<str> {
         format!("{}.{data_digest}.{offset}", options.cursor_request).into()
     };
@@ -230,6 +238,7 @@ pub fn list_module<'a>(
         provenance,
         warnings,
         data: ModuleData {
+            not_canonical,
             path: listed_at,
             docs,
             docs_truncated,

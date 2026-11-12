@@ -6,6 +6,7 @@ pub mod changelog;
 pub mod crate_metadata;
 pub mod docs;
 pub mod examples;
+pub mod external;
 pub mod feature_items;
 pub mod get_item;
 pub mod implementors;
