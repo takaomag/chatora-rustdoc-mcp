@@ -153,6 +153,10 @@ pub struct Method<'a> {
     /// The trait it comes from, by the path of its definition.
     #[serde(rename = "trait", skip_serializing_if = "Option::is_none")]
     pub trait_path: Option<Box<str>>,
+    /// What it is ordered by among the traits: the path of the trait's definition, however it is
+    /// shown (requirement R-OUT-3, decided in M4b, decision 28).
+    #[serde(skip)]
+    pub trait_key: Option<Box<str>>,
     /// The trait must be in scope to call it, as it is not in std's prelude.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub needs_use: bool,
@@ -248,7 +252,7 @@ pub fn list_methods<'a>(
         let key = |method: &Method<'_>| {
             (
                 ORIGINS.iter().position(|origin| *origin == method.from),
-                method.trait_path.clone(),
+                method.trait_key.clone(),
                 method.data.path.clone(),
             )
         };
@@ -267,11 +271,13 @@ pub fn list_methods<'a>(
         .skip(options.offset)
         .take(options.limit)
         .collect();
+    // Told of once the page is cut to its size, for what it shows.
     let Notes {
         warnings,
         hints,
         not_canonical,
-    } = query.finish();
+        always,
+    } = query.finish_untold();
     let page = |shown: usize| {
         let next = options.offset.saturating_add(shown);
         Page {
@@ -296,7 +302,7 @@ pub fn list_methods<'a>(
         page: page(0),
         hints,
     };
-    fit(&mut response, shown, &page);
+    fit_shown(&mut response, shown, (&page, &always));
     Ok(response)
 }
 
@@ -327,7 +333,18 @@ fn hint_elsewhere(
     let look_up = match target {
         Type::Slice(_) => "path slice in crate core".to_owned(),
         Type::Primitive(name) => format!("path {name} in crate core"),
-        Type::ResolvedPath(path) => format!("path {}", query.path_of(path.id)),
+        // Of another crate, by where it is defined there, which get_item looks it up by, not by
+        // the path that it has in none of this crate's (decided in M4b).
+        Type::ResolvedPath(path) => view
+            .summary(path.id)
+            .filter(|summary| summary.crate_id != 0)
+            .and_then(|summary| Some((summary, view.external_crate(summary.crate_id)?)))
+            .map_or_else(
+                || format!("path {}", query.path_of(path.id)),
+                |(summary, krate)| {
+                    format!("path {} in crate {}", summary.path.join("::"), krate.name)
+                },
+            ),
         Type::DynTrait(_)
         | Type::Generic(_)
         | Type::FunctionPointer(_)
@@ -417,12 +434,13 @@ fn collect<'a>(
                     });
                 if shown
                     && is_function(view, member)
-                    && let Some(data) = query.item_data(member, Some(ty)).map(ItemData::listed)
+                    && let Some(data) = query.listed_item(member, Some(ty)).map(ItemData::listed)
                 {
                     collected.methods.push(Method {
                         data,
                         from: From::Inherent.name(),
                         trait_path: None,
+                        trait_key: None,
                         needs_use: false,
                         provided: None,
                     });
@@ -527,6 +545,7 @@ fn trait_methods<'a>(
         data,
         from: origin.from.name(),
         trait_path: Some(origin.trait_path.into()),
+        trait_key: Some(origin.trait_path.into()),
         needs_use: origin.needs_use,
         provided,
     };
@@ -551,7 +570,7 @@ fn trait_methods<'a>(
             continue;
         }
         let provided = provided_in_trait(name);
-        if let Some(mut data) = query.item_data(member, Some(ty)).map(ItemData::listed) {
+        if let Some(mut data) = query.listed_item(member, Some(ty)).map(ItemData::listed) {
             data.path = format!("{type_path}::{name}").into();
             collected.methods.push(method(data, provided));
         }
@@ -577,7 +596,7 @@ fn trait_methods<'a>(
             continue;
         }
         let mut data = in_trait
-            .and_then(|id| query.item_data(id, Some(trait_id)))
+            .and_then(|id| query.listed_item(id, Some(trait_id)))
             .map_or_else(
                 || ItemData {
                     kind: "method",
@@ -615,6 +634,37 @@ fn method_names(view: &CrateView<'_>, contents: &Impl) -> Vec<Box<str>> {
 fn is_function(view: &CrateView<'_>, id: Id) -> bool {
     view.item(id)
         .is_some_and(|item| matches!(item.inner, ItemEnum::Function(_)))
+}
+
+/// [`fit`], then the types of other crates shown as written in the methods that `response`
+/// shows, and `always`, those shown outside them, told of once the page is cut to its size
+/// (decided in M4b, decision 20).
+fn fit_shown<'a>(
+    response: &mut MethodsResponse<'a>,
+    methods: Vec<Method<'a>>,
+    (page, always): (&impl Fn(usize) -> Page, &[crate::query::external::Key]),
+) {
+    // Of the page first, for its size; then of what it shows.
+    super::get_item::keep_not_canonical(
+        &mut response.data.not_canonical,
+        always
+            .iter()
+            .chain(methods.iter().flat_map(|method| method.data.shown_met())),
+        &mut response.warnings,
+        &mut response.hints,
+    );
+    fit(response, methods, page);
+    let shown = response
+        .data
+        .listed
+        .iter()
+        .flat_map(|method| method.data.shown_met());
+    super::get_item::keep_not_canonical(
+        &mut response.data.not_canonical,
+        always.iter().chain(shown),
+        &mut response.warnings,
+        &mut response.hints,
+    );
 }
 
 /// Puts as many of `methods` into `response` as fit in the budget, and at least one.

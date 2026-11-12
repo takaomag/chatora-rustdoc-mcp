@@ -6,7 +6,7 @@
 //! other crates are written as rustdoc gives them, as before M4b.
 
 use rustdoc_types::{Id, ItemSummary};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::view::CrateView;
 
@@ -35,7 +35,7 @@ pub enum Shown {
 
 /// An item of another crate that is not shown by its canonical path, and how to look it up, so
 /// that the next calls show it by that path (decided in M4b, decision 20).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NotCanonical {
     /// The type as rustdoc writes it, which the signature shows, where it is first met.
     #[serde(rename = "type")]
@@ -52,8 +52,24 @@ pub struct NotCanonical {
     pub reason: Reason,
 }
 
+/// What tells the items shown as written apart: their crate, its version and their definition
+/// path, so that two versions of a crate are told each.
+pub type Key = (Box<str>, Option<Box<str>>, Box<str>);
+
+impl NotCanonical {
+    /// What tells it apart.
+    #[must_use]
+    pub fn key(&self) -> Key {
+        (
+            self.krate.clone(),
+            self.version.clone(),
+            self.lookup.clone(),
+        )
+    }
+}
+
 /// Why an item of another crate is not shown by its canonical path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
     /// Its crate's archive is not in the cache: looking it up makes it.

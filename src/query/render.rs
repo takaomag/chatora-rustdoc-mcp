@@ -43,13 +43,9 @@ use rustdoc_types::{
 };
 
 use super::{
-    external::{ExternalPaths, NotCanonical, Shown},
+    external::{ExternalPaths, Key, NotCanonical, Shown},
     view::CrateView,
 };
-
-/// What tells the items shown as written apart: their crate, its version and their definition
-/// path, so that two versions of a crate are told each.
-type NotCanonicalKey = (Box<str>, Option<Box<str>>, Box<str>);
 
 /// Renders items and types of one crate.
 #[derive(Debug)]
@@ -61,7 +57,10 @@ pub struct Renderer<'a> {
     external: Option<&'a dyn ExternalPaths>,
     /// The items of other crates shown as written, not by their canonical paths, by their crates,
     /// versions and definition paths (decided in M4b, decision 20).
-    not_canonical: BTreeMap<NotCanonicalKey, NotCanonical>,
+    not_canonical: BTreeMap<Key, NotCanonical>,
+    /// Each time one of [`Self::not_canonical`] was met, in order: for what is shown of what
+    /// was rendered.
+    met: Vec<Key>,
     /// Whether the fields that are not public or are hidden are left out, as another crate sees
     /// them, and not a workspace member's own (decided in M2's D6).
     public_only: bool,
@@ -77,6 +76,7 @@ impl<'a> Renderer<'a> {
             warnings: Vec::new(),
             external: view.external(),
             not_canonical: BTreeMap::new(),
+            met: Vec::new(),
             public_only: false,
         }
     }
@@ -89,6 +89,26 @@ impl<'a> Renderer<'a> {
         external: Option<&'a dyn ExternalPaths>,
     ) -> Option<&'a dyn ExternalPaths> {
         std::mem::replace(&mut self.external, external)
+    }
+
+    /// How many times an item shown as written was met so far: a mark for [`Self::met_since`].
+    #[must_use]
+    pub const fn met(&self) -> usize {
+        self.met.len()
+    }
+
+    /// The items shown as written that were met since `mark` ([`Self::met`]), each once.
+    #[must_use]
+    pub fn met_since(&self, mark: usize) -> Box<[Key]> {
+        let mut met: Vec<Key> = self.met.get(mark..).unwrap_or_default().to_vec();
+        met.sort_unstable();
+        met.dedup();
+        met.into()
+    }
+
+    /// Forgets that the items shown as written since `mark` were met, as their entry keeps them.
+    pub fn forget_met(&mut self, mark: usize) {
+        self.met.truncate(mark);
     }
 
     /// The items of other crates shown as written so far, by their crates, versions and
@@ -816,12 +836,10 @@ impl<'a> Renderer<'a> {
         if let Some(Shown::NotCanonical(told)) = shown {
             // Where it is first met, as written there; once for each version of its crate.
             let written = out.get(start..).unwrap_or_default();
+            let key = told.key();
+            self.met.push(key.clone());
             self.not_canonical
-                .entry((
-                    told.krate.clone(),
-                    told.version.clone(),
-                    told.lookup.clone(),
-                ))
+                .entry(key)
                 .or_insert_with(|| NotCanonical {
                     ty: written.into(),
                     ..told

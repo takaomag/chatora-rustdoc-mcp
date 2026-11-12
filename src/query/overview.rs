@@ -137,7 +137,7 @@ fn add<'a>(
     child: Option<&str>,
     (modules, items): (&mut Vec<ItemData<'a>>, &mut Vec<ItemData<'a>>),
 ) {
-    let Some(mut data) = query.item_data(id, None).map(ItemData::listed) else {
+    let Some(mut data) = query.listed_item(id, None).map(ItemData::listed) else {
         return;
     };
     if let Some(child) = child
@@ -239,11 +239,13 @@ pub fn crate_overview<'a>(
     }
     let features = features(request);
     let (docs, docs_truncated, sections) = root_docs(root_item.docs.as_deref(), request.detail);
+    // Told of once the page is cut to its size, for what it shows.
     let Notes {
         warnings,
         hints,
         not_canonical,
-    } = query.finish();
+        always,
+    } = query.finish_untold();
     let mut response = OverviewResponse {
         provenance,
         warnings,
@@ -262,7 +264,7 @@ pub fn crate_overview<'a>(
         },
         hints,
     };
-    fit(&mut response);
+    fit_shown(&mut response, &always);
     Ok(response)
 }
 
@@ -349,6 +351,38 @@ fn first_sentence(docs: &str) -> Cow<'_, str> {
         })
         .map_or(paragraph.len(), |(at, _)| at.saturating_add(1));
     Cow::Borrowed(paragraph.get(..end).unwrap_or(paragraph))
+}
+
+/// [`fit`], then the types of other crates shown as written in what `response` shows, and
+/// `always`, those shown outside its modules and items, told of once it is cut to its size
+/// (decided in M4b, decision 20).
+fn fit_shown(response: &mut OverviewResponse<'_>, always: &[crate::query::external::Key]) {
+    // Of all first, for its size; then of what it shows.
+    let all = response
+        .data
+        .modules
+        .iter()
+        .chain(&response.data.items)
+        .flat_map(ItemData::shown_met);
+    super::get_item::keep_not_canonical(
+        &mut response.data.not_canonical,
+        always.iter().chain(all),
+        &mut response.warnings,
+        &mut response.hints,
+    );
+    fit(response);
+    let shown = response
+        .data
+        .modules
+        .iter()
+        .chain(&response.data.items)
+        .flat_map(ItemData::shown_met);
+    super::get_item::keep_not_canonical(
+        &mut response.data.not_canonical,
+        always.iter().chain(shown),
+        &mut response.warnings,
+        &mut response.hints,
+    );
 }
 
 /// Cuts `response` to its budget (requirement R-OUT-3): the text of the sections, the items, the

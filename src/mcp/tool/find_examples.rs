@@ -729,8 +729,14 @@ fn tell_followed(
     (answer, warnings): (&mut Map<String, Value>, &mut Vec<Box<str>>),
     release: &Release,
 ) {
+    // Not of the types of other crates shown as written, which this answer does not show.
     if let Some(Value::Array(told)) = content.remove("warnings") {
-        warnings.extend(told.iter().filter_map(Value::as_str).map(Box::from));
+        warnings.extend(
+            told.iter()
+                .filter_map(Value::as_str)
+                .filter(|line| !crate::query::get_item::tells_not_canonical(line))
+                .map(Box::from),
+        );
     }
     if let Some(from) = docs_from(content, release) {
         warnings.push(
@@ -823,8 +829,14 @@ async fn of_std(
     if !crate_of_docs.is_empty() && normal(&crate_of_docs) != normal(name.as_str()) {
         answer.insert("docs_from".to_owned(), json!(crate_of_docs));
     }
+    // Not of the types of other crates shown as written, which this answer does not show.
+    let shows = |line: &Value| {
+        !line
+            .as_str()
+            .is_some_and(crate::query::get_item::tells_not_canonical)
+    };
     let mut hints: Vec<Value> = match content.remove("hints") {
-        Some(Value::Array(hints)) => hints,
+        Some(Value::Array(hints)) => hints.into_iter().filter(shows).collect(),
         _ => Vec::new(),
     };
     if all {
@@ -837,6 +849,7 @@ async fn of_std(
     let warnings: Vec<Box<str>> = match content.remove("warnings") {
         Some(Value::Array(warnings)) => warnings
             .iter()
+            .filter(|line| shows(line))
             .filter_map(Value::as_str)
             .map(Box::from)
             .collect(),

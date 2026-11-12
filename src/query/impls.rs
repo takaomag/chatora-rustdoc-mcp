@@ -123,6 +123,9 @@ pub struct ImplEntry {
     /// The features and other conditions that the `impl` is written with (requirement R-FT-2).
     #[serde(flatten)]
     pub conditions: Conditions,
+    /// The types of other crates shown as written in it, kept if it is shown (decided in M4b).
+    #[serde(skip)]
+    pub met: Box<[crate::query::external::Key]>,
 }
 
 /// How an `impl` was made (requirement R-TI-2).
@@ -216,11 +219,13 @@ pub fn list_impls<'a>(
         .collect();
     let (non_exhaustive, has_private_fields) = shape_of(view, item);
     let path = query.path_of(ty);
+    // Told of once the page is cut to its size, for what it shows.
     let Notes {
         warnings,
         hints,
         not_canonical,
-    } = query.finish();
+        always,
+    } = query.finish_untold();
     let page = |shown: usize| {
         let next = options.offset.saturating_add(shown);
         Page {
@@ -247,7 +252,27 @@ pub fn list_impls<'a>(
         page: page(0),
         hints,
     };
+    // Of the page first, for its size; then of what it shows.
+    super::get_item::keep_not_canonical(
+        &mut response.data.not_canonical,
+        always
+            .iter()
+            .chain(impls.iter().flat_map(|entry| entry.met.iter())),
+        &mut response.warnings,
+        &mut response.hints,
+    );
     fit(&mut response, impls, &page);
+    let shown = response
+        .data
+        .entries
+        .iter()
+        .flat_map(|entry| entry.met.iter());
+    super::get_item::keep_not_canonical(
+        &mut response.data.not_canonical,
+        always.iter().chain(shown),
+        &mut response.warnings,
+        &mut response.hints,
+    );
     Ok(response)
 }
 
@@ -344,7 +369,7 @@ fn classify(view: &CrateView<'_>, query: &mut Query<'_>, item: &Item, ty: Id) ->
             Some(_) if of_std => 2,
             Some(_) => 1,
         };
-        let header = query.impl_text(impl_item);
+        let (header, met) = query.entry(|query| query.impl_text(impl_item));
         // Ordered by the header as rustdoc writes the types of other crates, whatever the cache
         // has (requirement R-OUT-3, decided in M4b).
         let key = query
@@ -360,6 +385,7 @@ fn classify(view: &CrateView<'_>, query: &mut Query<'_>, item: &Item, ty: Id) ->
                 trait_crate,
                 header,
                 conditions: query.own_conditions(impl_id),
+                met,
             },
         ));
     }

@@ -1010,11 +1010,19 @@ fn answer(
     if let Some(after) = item.get("retry_after_secs") {
         answer.insert("retry_after_secs".to_owned(), after.clone());
     }
+    // Not of the types of other crates shown as written, which this answer does not show.
     let mut told: Vec<Value> = item
         .get("warnings")
         .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|line| {
+            !line
+                .as_str()
+                .is_some_and(crate::query::get_item::tells_not_canonical)
+        })
         .cloned()
-        .unwrap_or_default();
+        .collect();
     // That a dependency's file has no URL, which it has as that release's.
     if file_crate.is_some()
         && let Some(span) = data

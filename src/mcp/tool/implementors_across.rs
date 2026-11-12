@@ -8,6 +8,7 @@
 //! it is read, without building a dependency (decided in M4a, decisions 4 and 5).
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -31,6 +32,7 @@ use crate::{
         target::TargetTriple,
     },
     query::{
+        external::{Key, NotCanonical},
         get_item::{
             Detail,
             ItemRequest,
@@ -125,12 +127,16 @@ struct Collected {
     negative: bool,
     /// The crates past the most read, as `name@version`.
     too_many: Vec<String>,
+    /// The types of other crates shown as written in the implementors, by what tells them apart.
+    not_canonical: BTreeMap<Key, NotCanonical>,
 }
 
 /// What a crate read tells of the trait's implementations.
 pub(super) struct InCrate {
     /// The implementations, each with the crate of the trait that it implements.
     implementors: Vec<(Implementor, TraitCrate)>,
+    /// The types of other crates that they show as written (decided in M4b, decision 20).
+    not_canonical: Box<[NotCanonical]>,
     /// What the crate's data was made from.
     digest: Box<str>,
 }
@@ -245,7 +251,12 @@ pub(super) async fn execute(
     };
     respond(
         the_trait.response,
-        (collected.listed, &graph.paging, &digest),
+        (
+            collected.listed,
+            collected.not_canonical,
+            &graph.paging,
+            &digest,
+        ),
         (collected.sources, collected.crates_read, state),
         (warnings, hints),
     )
@@ -599,6 +610,9 @@ fn collect(
             Owner::Package(trait_package) => implementer == Some(trait_package),
             Owner::Std => read.how == How::Std,
         };
+        for told in read.result.not_canonical {
+            collected.not_canonical.entry(told.key()).or_insert(told);
+        }
         for (implementor, trait_crate) in read.result.implementors {
             let judged = match owner {
                 Owner::Package(trait_package) => judge(
@@ -798,8 +812,10 @@ fn look_at_std(
         follow: false,
         target: None,
     };
+    let found = implementors_in(view, request, &definition);
     let result = InCrate {
-        implementors: implementors_in(view, request, &definition).0,
+        implementors: found.found,
+        not_canonical: found.not_canonical,
         digest: view.source_digest().into(),
     };
     (result, version)
@@ -820,8 +836,10 @@ fn per_crate(state: &ToolState, definition: Box<str>) -> PerCrate<InCrate> {
             follow: false,
             target: None,
         };
+        let found = implementors_in(view, request, &definition);
         InCrate {
-            implementors: implementors_in(view, request, &definition).0,
+            implementors: found.found,
+            not_canonical: found.not_canonical,
             digest: view.source_digest().into(),
         }
     })
@@ -970,7 +988,12 @@ struct Partly {
 /// R-OUT-3, as `scope: crate`).
 fn respond(
     mut response: Map<String, Value>,
-    (listed, paging, digest): (Vec<Found>, &Paging, &str),
+    (listed, not_canonical, paging, digest): (
+        Vec<Found>,
+        BTreeMap<Key, NotCanonical>,
+        &Paging,
+        &str,
+    ),
     (sources, crates_read, partly): (Vec<Value>, usize, Partly),
     (warnings, hints): (Vec<Box<str>>, Vec<Box<str>>),
 ) -> CallToolResult {
@@ -986,7 +1009,7 @@ fn respond(
         );
     }
     let total = listed.len();
-    let shown: Vec<Value> = listed
+    let (shown, met): (Vec<Value>, Vec<Box<[Key]>>) = listed
         .into_iter()
         .skip(paging.offset)
         .take(paging.limit)
@@ -996,9 +1019,9 @@ fn respond(
                 entry.insert("crate".to_owned(), json!(found.package.as_str()));
                 entry.insert("version".to_owned(), json!(found.version.to_string()));
             }
-            entry
+            (entry, found.implementor.met)
         })
-        .collect();
+        .unzip();
     if let Some(Value::Object(provenance)) = response.get_mut("provenance") {
         provenance.insert("crates_read".to_owned(), json!(crates_read));
         provenance.insert("sources".to_owned(), Value::Array(sources));
@@ -1054,17 +1077,77 @@ fn respond(
     ordered.insert("hints".to_owned(), Value::Array(all_hints));
     let mut result = Value::Object(ordered);
     get_item::add_warnings(&mut result, &warnings);
-    fit(&mut result, shown, (paging, total, data_digest));
+    // The trait's own, then those of the page, for its size; then of what it shows.
+    let of_the_trait: Vec<NotCanonical> = result
+        .pointer("/data/not_canonical")
+        .and_then(|told| serde_json::from_value(told.clone()).ok())
+        .unwrap_or_default();
+    let told = (of_the_trait.as_slice(), &not_canonical);
+    tell_not_canonical(&mut result, told, met.iter().flatten());
+    let count = fit(&mut result, shown, (paging, total, data_digest));
+    tell_not_canonical(&mut result, told, met.iter().take(count).flatten());
     CallToolResult::structured(result)
 }
 
+/// Tells in `result` the types of other crates shown as written: `of_the_trait`, of the trait in
+/// its crate, and those of `across`, of the implementors across the graph, that `shown` has, of
+/// the implementors shown, told once for all in place of what was told before (decided in M4b,
+/// decision 20).
+fn tell_not_canonical<'k>(
+    result: &mut Value,
+    (of_the_trait, across): (&[NotCanonical], &BTreeMap<Key, NotCanonical>),
+    shown: impl Iterator<Item = &'k Key>,
+) {
+    let shown: std::collections::BTreeSet<&Key> = shown.collect();
+    let mut not_canonical: BTreeMap<Key, NotCanonical> = across
+        .iter()
+        .filter(|(key, _)| shown.contains(key))
+        .map(|(key, told)| (key.clone(), told.clone()))
+        .collect();
+    for told in of_the_trait {
+        not_canonical
+            .entry(told.key())
+            .or_insert_with(|| told.clone());
+    }
+    let all: Vec<NotCanonical> = not_canonical.into_values().collect();
+    let Some(fields) = result.as_object_mut() else {
+        return;
+    };
+    // What was told before is told again, of all.
+    for (field, told) in [
+        (
+            "warnings",
+            crate::query::get_item::NOT_CANONICAL_WARNING_END,
+        ),
+        ("hints", crate::query::get_item::NOT_CANONICAL_HINT),
+    ] {
+        if let Some(Value::Array(lines)) = fields.get_mut(field) {
+            lines.retain(|line| !line.as_str().is_some_and(|line| line.ends_with(told)));
+        }
+    }
+    let (mut warnings, mut hints) = (Vec::new(), Vec::new());
+    crate::query::get_item::told_not_canonical(&all, &mut warnings, &mut hints);
+    if let Some(Value::Object(data)) = fields.get_mut("data") {
+        if all.is_empty() {
+            data.shift_remove("not_canonical");
+        } else {
+            data.insert("not_canonical".to_owned(), json!(all));
+        }
+    }
+    if let Some(Value::Array(lines)) = fields.get_mut("hints") {
+        lines.extend(hints.into_iter().map(|hint| json!(hint)));
+    }
+    let warnings: Vec<Box<str>> = warnings.into_iter().map(Into::into).collect();
+    get_item::add_warnings(result, &warnings);
+}
+
 /// Puts as many of `shown` into `result` as fit in the size of a response, and at least one, with
-/// their page of `total`.
+/// their page of `total`: how many.
 fn fit(
     result: &mut Value,
     mut shown: Vec<Value>,
     (paging, total, data_digest): (&Paging, usize, &str),
-) {
+) -> usize {
     loop {
         let count = shown.len();
         let next = paging.offset.saturating_add(count);
@@ -1086,7 +1169,7 @@ fn fit(
         }
         let size = serde_json::to_string(&*result).map_or(0, |json| json.chars().count());
         if size <= MAX_RESPONSE_CHARS || count <= 1 {
-            return;
+            return count;
         }
         shown = match result.pointer_mut("/data/implementors") {
             Some(Value::Array(shown)) => std::mem::take(shown),
@@ -1242,6 +1325,51 @@ mod tests {
         assert_eq!(std_crates_of("proc_macro::MultiSpan"), [
             StdCrate::ProcMacro
         ]);
+    }
+
+    /// Across the graph, the types shown as written are those of the trait in its crate and of
+    /// the implementors shown, told once for all in place of what the trait's crate told
+    /// (decided in M4b, decision 20).
+    #[test]
+    fn the_types_shown_as_written_are_told_once_across_the_graph() {
+        let told = |lookup: &str| NotCanonical {
+            ty: "T".into(),
+            krate: "c".into(),
+            version: None,
+            lookup: lookup.into(),
+            reason: crate::query::external::Reason::NotCached,
+        };
+        let mut result = json!({
+            "provenance": {},
+            "warnings": [format!("1 type of another crate is shown as rustdoc writes it{}", crate::query::get_item::NOT_CANONICAL_WARNING_END), "other"],
+            "data": { "not_canonical": [told("c::Signature")], "implementors": [] },
+            "hints": [crate::query::get_item::NOT_CANONICAL_HINT],
+        });
+        let across: BTreeMap<Key, NotCanonical> = [told("c::Shown"), told("c::Cut")]
+            .into_iter()
+            .map(|told| (told.key(), told))
+            .collect();
+        let shown = told("c::Shown").key();
+        let of_the_trait = [told("c::Signature")];
+        tell_not_canonical(&mut result, (&of_the_trait, &across), [&shown].into_iter());
+        let lookups: Vec<&str> = result["data"]["not_canonical"]
+            .as_array()
+            .expect("told")
+            .iter()
+            .filter_map(|told| told["lookup"].as_str())
+            .collect();
+        assert_eq!(lookups, ["c::Shown", "c::Signature"]);
+        let warnings = result["warnings"].to_string();
+        assert!(
+            warnings.contains("2 types") && !warnings.contains("1 type"),
+            "{warnings}"
+        );
+        assert!(warnings.contains("other"), "{warnings}");
+        assert_eq!(
+            result["hints"].as_array().map(Vec::len),
+            Some(1),
+            "{result}"
+        );
     }
 
     /// The traits that the compiler implements are known by their definition paths.

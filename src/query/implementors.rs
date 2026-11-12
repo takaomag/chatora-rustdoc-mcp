@@ -124,6 +124,9 @@ pub struct Implementor {
     /// writes them, whatever the cache has (requirement R-OUT-3, decided in M4b).
     #[serde(skip)]
     pub key: (Box<str>, Box<str>),
+    /// The types of other crates shown as written in it, kept if it is shown (decided in M4b).
+    #[serde(skip)]
+    pub met: Box<[crate::query::external::Key]>,
 }
 
 /// The implementors of the trait at `request.path` in its crate.
@@ -206,7 +209,9 @@ pub fn list_implementors<'a>(
              implements {path}"
         )
     });
-    let notes = query.finish();
+    // Told of once the page is cut to its size, for what it shows.
+    let notes = query.finish_untold();
+    let always = notes.always;
     let page = |shown: usize| {
         let next = options.offset.saturating_add(shown);
         Page {
@@ -236,8 +241,44 @@ pub fn list_implementors<'a>(
         page: page(0),
         hints: notes.hints,
     };
-    fit(&mut response, shown, &page);
+    fit_shown(&mut response, shown, (&page, &always));
     Ok(response)
+}
+
+/// [`fit`], with the types of other crates shown as written in the implementors of the page,
+/// and `always`, those shown outside them, told of first, for its size; then of those that it
+/// shows (decided in M4b, decision 20).
+fn fit_shown(
+    response: &mut ImplementorsResponse<'_>,
+    shown: Vec<Implementor>,
+    (page, always): (&impl Fn(usize) -> Page, &[crate::query::external::Key]),
+) {
+    super::get_item::keep_not_canonical(
+        &mut response.data.not_canonical,
+        always
+            .iter()
+            .chain(shown.iter().flat_map(|entry| entry.met.iter())),
+        &mut response.warnings,
+        &mut response.hints,
+    );
+    fit(response, shown, page);
+    keep_shown(response, always);
+}
+
+/// The types of other crates shown as written in what `response` shows, and `always`, those
+/// shown outside its entries, told of (decided in M4b, decision 20).
+fn keep_shown(response: &mut ImplementorsResponse<'_>, always: &[crate::query::external::Key]) {
+    let shown = response
+        .data
+        .listed
+        .iter()
+        .flat_map(|entry| entry.met.iter());
+    super::get_item::keep_not_canonical(
+        &mut response.data.not_canonical,
+        always.iter().chain(shown),
+        &mut response.warnings,
+        &mut response.hints,
+    );
 }
 
 /// The implementors that `implementations` (impls of the trait) give, and whether one of them is
@@ -283,7 +324,8 @@ fn implementors_of(
         } else {
             "trait"
         };
-        let (ty, header) = (query.type_text(&contents.for_), query.impl_text(impl_item));
+        let ((ty, header), met) =
+            query.entry(|query| (query.type_text(&contents.for_), query.impl_text(impl_item)));
         let key = query
             .literally(|query| (query.type_text(&contents.for_), query.impl_text(impl_item)))
             .unwrap_or_else(|| (ty.clone(), header.clone()));
@@ -293,6 +335,7 @@ fn implementors_of(
             header,
             conditions: query.own_conditions(impl_item.id),
             key,
+            met,
         });
     }
     (entries, has_negative_impls)
@@ -326,7 +369,7 @@ pub fn implementors_in(
     view: &CrateView<'_>,
     request: ItemRequest<'_>,
     trait_path: &str,
-) -> (Vec<(Implementor, TraitCrate)>, bool) {
+) -> Implementations {
     let mut query = Query::new(view, request);
     query.leave_out_paths();
     let mut found = Vec::new();
@@ -350,7 +393,23 @@ pub fn implementors_in(
                 .map(|entry| (entry, trait_crate.clone())),
         );
     }
-    (found, has_negative_impls)
+    Implementations {
+        found,
+        has_negative_impls,
+        not_canonical: query.finish_untold().not_canonical,
+    }
+}
+
+/// The implementations of a trait in a crate, by [`implementors_in`].
+#[derive(Debug)]
+pub struct Implementations {
+    /// The implementors, each with the crate of the trait that it implements, and the types of
+    /// other crates that it shows as written ([`Implementor::met`]).
+    pub found: Vec<(Implementor, TraitCrate)>,
+    /// Whether one of them is negative.
+    pub has_negative_impls: bool,
+    /// The types of other crates that they show as written (decided in M4b, decision 20).
+    pub not_canonical: Box<[crate::query::external::NotCanonical]>,
 }
 
 /// The trait at `path`.
@@ -623,6 +682,115 @@ mod tests {
             kind: ItemKind::Trait,
         });
         krate
+    }
+
+    /// Tells every item of another crate as shown as written, not cached.
+    #[derive(Debug)]
+    struct NoneCached;
+
+    impl crate::query::external::ExternalPaths for NoneCached {
+        fn shown(
+            &self,
+            _view: &CrateView<'_>,
+            _id: Id,
+            summary: &ItemSummary,
+        ) -> Option<crate::query::external::Shown> {
+            (summary.crate_id != 0).then(|| {
+                crate::query::external::Shown::NotCanonical(crate::query::external::NotCanonical {
+                    ty: Box::default(),
+                    krate: "other".into(),
+                    version: None,
+                    lookup: summary.path.join("::").into(),
+                    reason: crate::query::external::Reason::NotCached,
+                })
+            })
+        }
+    }
+
+    /// The lookups that `list_implementors` tells as shown as written, with `limit` implementors
+    /// from `offset` of [`with_lock`], plus an implementation for another crate's `other::Thing` (90) and a
+    /// supertrait of another crate's, `other::Bound` (91).
+    fn told_with(limit: usize, offset: usize) -> Vec<String> {
+        let mut krate = with_lock();
+        for (id, path, kind) in [
+            (90, ["other", "thing", "Thing"], ItemKind::Struct),
+            (91, ["other", "bound", "Bound"], ItemKind::Trait),
+        ] {
+            krate.paths.insert(Id(id), ItemSummary {
+                crate_id: 1,
+                path: path.map(str::to_owned).to_vec(),
+                kind,
+            });
+        }
+        if let Some(ItemEnum::Trait(lock)) =
+            krate.index.get_mut(&Id(30)).map(|item| &mut item.inner)
+        {
+            lock.implementations.push(Id(35));
+            lock.bounds.push(GenericBound::TraitBound {
+                trait_: path(91, "Bound"),
+                generic_params: Vec::new(),
+                modifier: TraitBoundModifier::None,
+            });
+        }
+        let mut other = krate.index.get(&Id(31)).expect("the impl").clone();
+        other.id = Id(35);
+        if let ItemEnum::Impl(implementation) = &mut other.inner {
+            implementation.for_ = Type::ResolvedPath(path(90, "Thing"));
+        }
+        krate.index.insert(Id(35), other);
+        let bytes = archive(krate);
+        let view = CrateView::new(archived(&bytes)).with_external(&NoneCached);
+        let (name, version) = (
+            "my-crate".parse::<CrateName>().expect("a name"),
+            Version::new(1, 2, 3),
+        );
+        let response = list_implementors(
+            &view,
+            ItemRequest {
+                name: &name,
+                version: &version,
+                path: "my_crate::Lock",
+                origin: Origin::DocsRs {
+                    resolved_from: ResolvedFrom::Explicit,
+                    project_from: None,
+                    build: None,
+                },
+                detail: Detail::Normal,
+                project_features: None,
+                follow: false,
+                target: None,
+            },
+            ImplementorOptions {
+                limit,
+                offset,
+                cursor_request: "c1.req",
+                cursor_data: None,
+            },
+        )
+        .expect("listed");
+        response
+            .data
+            .not_canonical
+            .iter()
+            .map(|told| told.lookup.to_string())
+            .collect()
+    }
+
+    /// What the trait's own signature shows as written is told whatever the page, and what an
+    /// implementor shows only when it is on the page (decided in M4b, decision 20).
+    #[test]
+    fn the_types_shown_as_written_are_those_of_the_page_and_the_trait() {
+        assert_eq!(told_with(50, 0), [
+            "other::bound::Bound",
+            "other::thing::Thing"
+        ]);
+        // `Thing` comes first as rustdoc writes it; the second page has `Mutex` alone.
+        assert_eq!(told_with(1, 0), [
+            "other::bound::Bound",
+            "other::thing::Thing"
+        ]);
+        assert_eq!(told_with(1, 1), ["other::bound::Bound"]);
+        assert_eq!(told_with(0, 0), ["other::bound::Bound"]);
     }
 
     #[test]

@@ -221,17 +221,16 @@ pub fn list_module<'a>(
         warnings,
         hints,
         not_canonical,
-    } = query.finish();
-    let cursor = |offset: usize| -> Box<str> {
-        format!("{}.{data_digest}.{offset}", options.cursor_request).into()
-    };
+        always,
+    } = query.finish_untold();
     let page = |shown: usize| {
         let next = options.offset.saturating_add(shown);
         Page {
             shown,
             total,
             has_more: next < total,
-            next_cursor: (next < total).then(|| cursor(next)),
+            next_cursor: (next < total)
+                .then(|| format!("{}.{data_digest}.{next}", options.cursor_request).into()),
         }
     };
     let mut response = ModuleResponse {
@@ -247,8 +246,41 @@ pub fn list_module<'a>(
         page: page(0),
         hints,
     };
-    fit(&mut response, items, &page);
+    fit_shown(&mut response, items, (&page, &always));
     Ok(response)
+}
+
+/// [`fit`], then the types of other crates shown as written in what `response` shows, and
+/// `always`, those shown outside its items, told of once the page is cut to its size (decided in
+/// M4b, decision 20).
+fn fit_shown<'a>(
+    response: &mut ModuleResponse<'a>,
+    items: Vec<ItemData<'a>>,
+    (page, always): (&impl Fn(usize) -> Page, &[crate::query::external::Key]),
+) {
+    // Of the page first, for its size; then of what it shows.
+    super::get_item::keep_not_canonical(
+        &mut response.data.not_canonical,
+        always
+            .iter()
+            .chain(items.iter().flat_map(ItemData::shown_met)),
+        &mut response.warnings,
+        &mut response.hints,
+    );
+    fit(response, items, page);
+    keep_shown(response, always);
+}
+
+/// The types of other crates shown as written in what `response` shows, and `always`, those
+/// shown outside its entries, told of (decided in M4b, decision 20).
+fn keep_shown(response: &mut ModuleResponse<'_>, always: &[crate::query::external::Key]) {
+    let shown = response.data.items.iter().flat_map(ItemData::shown_met);
+    super::get_item::keep_not_canonical(
+        &mut response.data.not_canonical,
+        always.iter().chain(shown),
+        &mut response.warnings,
+        &mut response.hints,
+    );
 }
 
 /// The module at `path`: an item that is a module, or the one module among the items there.
@@ -456,7 +488,7 @@ fn entry_data<'a>(
             }
         },
         Entry::Item(id) => {
-            let Some(mut data) = query.item_data(*id, None).map(ItemData::listed) else {
+            let Some(mut data) = query.listed_item(*id, None).map(ItemData::listed) else {
                 return ItemData {
                     path: path.into(),
                     kind: "unknown",
@@ -467,6 +499,7 @@ fn entry_data<'a>(
                 // The rest is for `get_item`; a list keeps one line or so of each.
                 data.fields = Box::default();
                 data.variants = Box::default();
+                data.met_fields = Box::default();
                 data.sections = Box::default();
                 data.also_reexported_at = Box::default();
                 query.drop_source_location(&mut data);

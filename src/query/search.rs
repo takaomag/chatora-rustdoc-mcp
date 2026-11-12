@@ -747,11 +747,7 @@ pub fn search_across<'a>(
     } else {
         Box::default()
     };
-    let Notes {
-        warnings,
-        hints,
-        not_canonical,
-    } = notes(queries);
+    let notes = notes(queries);
     let page = |shown: usize| {
         let next = options.offset.saturating_add(shown);
         Page {
@@ -764,17 +760,17 @@ pub fn search_across<'a>(
     };
     let mut found = Found {
         provenances,
-        warnings,
-        hints,
+        warnings: notes.warnings,
+        hints: notes.hints,
         data: SearchData {
             query: options.query.into(),
             items: Vec::new(),
             did_you_mean,
-            not_canonical,
+            not_canonical: notes.not_canonical,
         },
         page: page(0),
     };
-    fit(&mut found, items, &page);
+    fit_shown(&mut found, items, &page);
     Ok(found)
 }
 
@@ -988,21 +984,16 @@ fn notes(queries: Vec<Query<'_>>) -> Notes {
         warnings.extend(notes.warnings);
         hints.extend(notes.hints);
         for told in notes.not_canonical {
-            let key = (
-                told.krate.clone(),
-                told.version.clone(),
-                told.lookup.clone(),
-            );
-            not_canonical.entry(key).or_insert(told);
+            not_canonical.entry(told.key()).or_insert(told);
         }
     }
-    // Told once for all the crates searched.
+    // Told once for all the crates searched, for the items that the page shows.
     let not_canonical: Vec<_> = not_canonical.into_values().collect();
-    super::get_item::told_not_canonical(&not_canonical, &mut warnings, &mut hints);
     Notes {
         warnings: warnings.into(),
         hints: hints.into(),
         not_canonical: not_canonical.into(),
+        always: Box::default(),
     }
 }
 
@@ -1307,7 +1298,7 @@ fn result<'a>(
         });
     }
     let parent = found.parent.as_ref().map(view::native);
-    let mut data = query.item_data(id, parent)?.listed();
+    let mut data = query.listed_item(id, parent)?.listed();
     if detail == Detail::Brief {
         data.docs = view
             .item(id)
@@ -1316,6 +1307,7 @@ fn result<'a>(
     } else {
         data.fields = Box::default();
         data.variants = Box::default();
+        data.met_fields = Box::default();
         data.sections = Box::default();
         data.also_reexported_at = Box::default();
         query.drop_source_location(&mut data);
@@ -1411,6 +1403,26 @@ pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
         }
     }
     row.last().copied().unwrap_or_default()
+}
+
+/// [`fit`], then the types of other crates shown as written in the items that `found` shows,
+/// told of once the page is cut to its size (decided in M4b, decision 20).
+fn fit_shown<'a>(found: &mut Found<'a>, items: Vec<ItemData<'a>>, page: &impl Fn(usize) -> Page) {
+    // Of the page first, for its size; then of what it shows.
+    super::get_item::keep_not_canonical(
+        &mut found.data.not_canonical,
+        items.iter().flat_map(ItemData::shown_met),
+        &mut found.warnings,
+        &mut found.hints,
+    );
+    fit(found, items, page);
+    let shown = found.data.items.iter().flat_map(ItemData::shown_met);
+    super::get_item::keep_not_canonical(
+        &mut found.data.not_canonical,
+        shown,
+        &mut found.warnings,
+        &mut found.hints,
+    );
 }
 
 /// Puts as many of `items` into `found` as fit in the budget, and at least one

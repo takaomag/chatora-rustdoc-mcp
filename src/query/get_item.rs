@@ -497,6 +497,13 @@ pub struct ItemData<'a> {
     /// canonical paths (decided in M4b, decision 20).
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub not_canonical: Box<[crate::query::external::NotCanonical]>,
+    /// The types of other crates shown as written in it, but in its fields and variants, as a
+    /// list keeps those of what it shows (`Query::listed_item`).
+    #[serde(skip)]
+    pub met: Box<[crate::query::external::Key]>,
+    /// The same, in its fields and variants, which a list may leave out.
+    #[serde(skip)]
+    pub met_fields: Box<[crate::query::external::Key]>,
     /// What `get_source` judges a macro's output by, which is not shown (decided in M3c,
     /// decision 35).
     #[serde(skip)]
@@ -633,6 +640,11 @@ pub(super) fn crate_path(view: &CrateView<'_>, id: Id) -> Option<Box<str>> {
 }
 
 impl ItemData<'_> {
+    /// The types of other crates shown as written in what it shows (decided in M4b).
+    pub fn shown_met(&self) -> impl Iterator<Item = &crate::query::external::Key> {
+        self.met.iter().chain(self.met_fields.iter())
+    }
+
     /// The item as a list shows it: with its visibility only when it is not `pub` (decided in
     /// M2's D6).
     #[must_use]
@@ -866,6 +878,7 @@ pub fn get_item<'a>(
         warnings,
         hints,
         not_canonical,
+        ..
     } = query.finish();
     let mut data = data;
     data.not_canonical = not_canonical;
@@ -1068,9 +1081,42 @@ const fn list_mut<'b>(data: &'b mut ItemData<'_>, fields: bool) -> &'b mut Box<[
 /// The documentation is not cut shorter than this many characters.
 const MIN_DOCS_CHARS: usize = 200;
 
+/// The items of `not_canonical` that are among `kept`, those of what a list shows, told in
+/// `warnings` and `hints` ([`told_not_canonical`]) in place of what they told before. A list
+/// keeps those of its page before it cuts it to its size, so that the size is of what it may
+/// show, and then those of what it shows.
+pub(super) fn keep_not_canonical<'k>(
+    not_canonical: &mut Box<[crate::query::external::NotCanonical]>,
+    kept: impl IntoIterator<Item = &'k crate::query::external::Key>,
+    warnings: &mut Box<[Cow<'static, str>]>,
+    hints: &mut Box<[Box<str>]>,
+) {
+    let kept: BTreeSet<&crate::query::external::Key> = kept.into_iter().collect();
+    let shown: Vec<crate::query::external::NotCanonical> = std::mem::take(not_canonical)
+        .into_vec()
+        .into_iter()
+        .filter(|told| kept.contains(&told.key()))
+        .collect();
+    // What it told before, of more, is told again.
+    let mut all_warnings: Vec<Cow<'static, str>> = std::mem::take(warnings)
+        .into_vec()
+        .into_iter()
+        .filter(|line| !tells_not_canonical(line))
+        .collect();
+    let mut all_hints: Vec<Box<str>> = std::mem::take(hints)
+        .into_vec()
+        .into_iter()
+        .filter(|line| !tells_not_canonical(line))
+        .collect();
+    told_not_canonical(&shown, &mut all_warnings, &mut all_hints);
+    *warnings = all_warnings.into();
+    *hints = all_hints.into();
+    *not_canonical = shown.into();
+}
+
 /// What `not_canonical` tells in `warnings`, one line, and in `hints`: how to have the types
 /// shown by their canonical paths (decided in M4b, decision 20).
-pub(super) fn told_not_canonical(
+pub fn told_not_canonical(
     not_canonical: &[crate::query::external::NotCanonical],
     warnings: &mut Vec<Cow<'static, str>>,
     hints: &mut Vec<Box<str>>,
@@ -1082,21 +1128,30 @@ pub(super) fn told_not_canonical(
         1 => "1 type of another crate is shown as rustdoc writes it".to_owned(),
         many => format!("{many} types of other crates are shown as rustdoc writes them"),
     };
-    warnings.push(Cow::Owned(format!(
-        "{told}, not by canonical paths (see data.not_canonical)"
-    )));
+    warnings.push(Cow::Owned(format!("{told}{NOT_CANONICAL_WARNING_END}")));
     // Only what is not cached is shown by its canonical path after it is looked up.
     if not_canonical
         .iter()
         .any(|told| told.reason == crate::query::external::Reason::NotCached)
     {
-        hints.push(
-            "call get_item with the crate, version and lookup of a not_canonical entry: the \
-             calls after it show the types of that crate by their canonical paths"
-                .into(),
-        );
+        hints.push(NOT_CANONICAL_HINT.into());
     }
 }
+
+/// Whether `line`, a warning or a hint, is one of [`told_not_canonical`]: for a response made from
+/// `get_item`'s that has no `data.not_canonical` (decided in M4b).
+#[must_use]
+pub fn tells_not_canonical(line: &str) -> bool {
+    line.ends_with(NOT_CANONICAL_WARNING_END) || line == NOT_CANONICAL_HINT
+}
+
+/// How the warning of [`told_not_canonical`] ends, which tells it among others.
+pub const NOT_CANONICAL_WARNING_END: &str = ", not by canonical paths (see data.not_canonical)";
+
+/// The hint of [`told_not_canonical`].
+pub const NOT_CANONICAL_HINT: &str = "call get_item with the crate, version and lookup of a \
+                                      not_canonical entry: the calls after it show the types of \
+                                      that crate by their canonical paths";
 
 /// One lookup, with what it has found to warn about so far.
 /// What a query says besides its data.
@@ -1108,6 +1163,9 @@ pub(super) struct Notes {
     /// The items of other crates shown as written, not by their canonical paths (decided in M4b,
     /// decision 20).
     pub(super) not_canonical: Box<[crate::query::external::NotCanonical]>,
+    /// Of [`Query::finish_untold`], those of them shown outside the entries of a list
+    /// ([`Query::entry`]), which it always shows.
+    pub(super) always: Box<[crate::query::external::Key]>,
 }
 
 pub(super) struct Query<'a> {
@@ -1155,6 +1213,36 @@ impl<'a> Query<'a> {
         self.paths = false;
     }
 
+    /// The item `id` as an entry of a list ([`Self::item_data`]), with the types of other crates
+    /// that it shows as written, which the list keeps if it shows it (decided in M4b).
+    pub(super) fn listed_item(&mut self, id: Id, parent: Option<Id>) -> Option<ItemData<'a>> {
+        let (data, met) = self.entry(|query| query.item_data(id, parent));
+        let mut data = data?;
+        data.met = met;
+        Some(data)
+    }
+
+    /// What `render` makes of an entry of a list, with the types of other crates that it shows
+    /// as written, which the list keeps if it shows the entry; the others are always kept
+    /// ([`Self::always_met`], decided in M4b). An entry within another takes what it shows out
+    /// of the other's.
+    pub(super) fn entry<R>(
+        &mut self,
+        render: impl FnOnce(&mut Self) -> R,
+    ) -> (R, Box<[crate::query::external::Key]>) {
+        let mark = self.renderer.met();
+        let rendered = render(self);
+        let met = self.renderer.met_since(mark);
+        self.renderer.forget_met(mark);
+        (rendered, met)
+    }
+
+    /// The types of other crates shown as written outside the entries of a list
+    /// ([`Self::entry`]): of what a list always shows, as the trait's signature.
+    pub(super) fn always_met(&self) -> Box<[crate::query::external::Key]> {
+        self.renderer.met_since(0)
+    }
+
     /// What `render` makes with the items of other crates written as rustdoc gives them, when
     /// they are shown otherwise; `None` when they are not: for an order that does not change with
     /// what the cache has (requirement R-OUT-3, decided in M4b).
@@ -1186,6 +1274,7 @@ impl<'a> Query<'a> {
             warnings,
             hints,
             not_canonical,
+            ..
         } = self.finish_untold();
         let (mut warnings, mut hints) = (warnings.into_vec(), hints.into_vec());
         told_not_canonical(&not_canonical, &mut warnings, &mut hints);
@@ -1193,12 +1282,14 @@ impl<'a> Query<'a> {
             warnings: warnings.into(),
             hints: hints.into(),
             not_canonical,
+            always: Box::default(),
         }
     }
 
     /// [`Self::finish`], without telling of the types shown as written, for a caller that tells
     /// of those of several queries at once.
     pub(super) fn finish_untold(self) -> Notes {
+        let always = self.always_met();
         let mut warnings = self.warnings;
         let not_canonical = self.renderer.not_canonical();
         warnings.extend(self.renderer.into_warnings());
@@ -1206,6 +1297,7 @@ impl<'a> Query<'a> {
             warnings: warnings.into(),
             hints: self.hints.into(),
             not_canonical: not_canonical.into(),
+            always,
         }
     }
 
@@ -1361,8 +1453,10 @@ impl<'a> Query<'a> {
                 .map(PublicPath::joined)
                 .collect();
         }
-        data.fields = self.fields(item);
-        data.variants = self.variants(item);
+        // Kept apart, as a list leaves them out (decided in M4b).
+        let ((fields, variants), met) =
+            self.entry(|query| (query.fields(item), query.variants(item)));
+        (data.fields, data.variants, data.met_fields) = (fields, variants, met);
         if let Some(docs) = item.docs.as_deref() {
             let split = docs::split(docs);
             let full = detail == Detail::Full;
@@ -2410,6 +2504,40 @@ pub(super) mod tests {
             assert_eq!((warnings.len(), hints.len()), (1, 0), "{reason:?}");
             assert!(warnings[0].starts_with("1 type of"), "{warnings:?}");
         }
+    }
+
+    /// Of the types shown as written, those of what a list shows are kept and told of, once
+    /// its page is cut to its size (decided in M4b, decision 20).
+    #[test]
+    fn the_types_shown_as_written_are_those_of_what_is_shown() {
+        use crate::query::external::{NotCanonical, Reason};
+        let told = |lookup: &str| NotCanonical {
+            ty: "T".into(),
+            krate: "c".into(),
+            version: Some("1.0.0".into()),
+            lookup: lookup.into(),
+            reason: Reason::NotCached,
+        };
+        let mut not_canonical: Box<[NotCanonical]> = Box::from([told("c::A"), told("c::B")]);
+        let mut warnings: Box<[Cow<'static, str>]> = Box::default();
+        let mut hints: Box<[Box<str>]> = Box::default();
+        let shown = told("c::B").key();
+        keep_not_canonical(&mut not_canonical, [&shown], &mut warnings, &mut hints);
+        assert_eq!(
+            not_canonical
+                .iter()
+                .map(|told| &*told.lookup)
+                .collect::<Vec<_>>(),
+            ["c::B"]
+        );
+        assert!(warnings[0].starts_with("1 type of"), "{warnings:?}");
+        assert_eq!(hints.len(), 1);
+        // None shown, none told.
+        let mut not_canonical: Box<[NotCanonical]> = Box::from([told("c::A")]);
+        let mut warnings: Box<[Cow<'static, str>]> = Box::default();
+        let mut hints: Box<[Box<str>]> = Box::default();
+        keep_not_canonical(&mut not_canonical, [], &mut warnings, &mut hints);
+        assert!(not_canonical.is_empty() && warnings.is_empty() && hints.is_empty());
     }
 
     #[test]

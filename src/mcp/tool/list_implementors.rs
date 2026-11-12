@@ -274,12 +274,12 @@ pub(super) fn parse_arguments(arguments: Option<&JsonObject>) -> Result<Request,
         request_digest: format!("{CURSOR_FORM}.{request_digest}").into(),
         cursor_data,
     };
-    // The trait's crate for what the trait is, its first implementor only; the page is of the
+    // The trait's crate for what the trait is, none of its implementors; the page is of the
     // graph's (decided in M4b).
     #[cfg(feature = "local")]
     if graph {
         let first = Paging {
-            limit: 1,
+            limit: 0,
             offset: 0,
             request_digest: paging.request_digest.clone(),
             cursor_data: None,

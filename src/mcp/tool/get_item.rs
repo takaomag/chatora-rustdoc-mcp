@@ -6185,6 +6185,8 @@ mod tests {
                 attrs: many(),
                 truncated: true,
                 not_canonical: Box::from([not_canonical()]),
+                met: Box::default(),
+                met_fields: Box::default(),
                 made: Made::default(),
             },
             hints: many(),
