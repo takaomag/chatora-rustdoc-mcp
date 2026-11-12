@@ -782,67 +782,25 @@ struct EntryCrate<'a> {
     view: &'a CrateView<'a>,
     /// The other crates, as code writes their names.
     others: Vec<&'a str>,
-    /// The path in another crate of each item it re-exports (`alloc::vec`), and the shortest
-    /// public path at which it does (`std::vec`).
-    reexported: HashMap<Box<str>, Box<str>>,
+    /// Its paths for the items of the others that it re-exports.
+    reexported: Reexports,
 }
 
 impl<'a> EntryCrate<'a> {
     fn new(searched: &[Searched<'a>], source: usize) -> Option<Self> {
         let view = searched.get(source)?.view;
-        let others: Vec<&str> = searched
+        let others: Vec<(&str, &CrateView<'_>)> = searched
             .iter()
             .enumerate()
             .filter(|&(at, _)| at != source)
-            .map(|(_, other)| other.request.name.as_str())
+            .map(|(_, other)| (other.request.name.as_str(), other.view))
             .collect();
-        let mut entry = Self {
+        Some(Self {
             source,
             view,
-            others,
-            reexported: HashMap::new(),
-        };
-        for reexport in view.index().external_reexports() {
-            if let Some(definition) = &reexport.definition
-                && is_of(view, reexport.target, &entry.others)
-            {
-                entry.add(definition.joined(), reexport.path.joined());
-            }
-        }
-        // The others' re-exports of each other's items, at this crate's paths for them: std
-        // re-exports `alloc::borrow`, which re-exports `core::borrow::Borrow`. Glob re-exports of
-        // other crates' modules (`std::hash` of `core::hash`) are left out, as `get_item` does not
-        // follow them (requirement R-PR-3): those items keep the paths of their crates.
-        let mut reexported = Vec::new();
-        for (at, other) in searched.iter().enumerate() {
-            if at == source {
-                continue;
-            }
-            for reexport in other.view.index().external_reexports() {
-                if let Some(definition) = &reexport.definition
-                    && is_of(other.view, reexport.target, &entry.others)
-                    && let Some(path) = entry.path_of(&reexport.path.joined())
-                {
-                    reexported.push((definition.joined(), path));
-                }
-            }
-        }
-        for (definition, path) in reexported {
-            entry.add(definition, path);
-        }
-        Some(entry)
-    }
-
-    /// Records that this crate re-exports the item at `definition` in another crate at `path`,
-    /// unless it does at a shorter one.
-    fn add(&mut self, definition: Box<str>, path: Box<str>) {
-        if self
-            .reexported
-            .get(&definition)
-            .is_none_or(|shortest| shorter(&path, shortest))
-        {
-            self.reexported.insert(definition, path);
-        }
+            reexported: Reexports::new(view, &others),
+            others: others.into_iter().map(|(name, _)| name).collect(),
+        })
     }
 
     /// `hit` is this crate's re-export of an item of the others, which is found there.
@@ -857,10 +815,7 @@ impl<'a> EntryCrate<'a> {
     }
 
     /// Shows `item` (`id`, a member of `parent` if it has one) of the crate of `view`, another
-    /// one, at this crate's path for it. This crate re-exports items by their definition paths
-    /// (`alloc::collections::vec_deque::VecDeque`), which may differ from the canonical paths
-    /// there (`alloc::collections::VecDeque`), so both are tried: the path that is shortest once
-    /// the rest is added wins, then the first in lexicographic order.
+    /// one, at this crate's path for it ([`Reexports::shown_at`]).
     fn show(&self, item: &mut ItemData<'_>, view: &CrateView<'_>, id: Id, parent: Option<Id>) {
         let definition = |id| view.summary(id).map(|summary| summary.path.join("::"));
         let name = item.path.rsplit("::").next().unwrap_or_default();
@@ -868,18 +823,81 @@ impl<'a> EntryCrate<'a> {
             || definition(id),
             |parent| definition(parent).map(|parent| format!("{parent}::{name}")),
         );
-        if let Some(path) = self.shown_at(&item.path, defined.as_deref()) {
+        if let Some(path) = self.reexported.shown_at(&item.path, defined.as_deref()) {
             item.path = path;
         }
         if let Some(shown) = &mut item.parent
-            && let Some(path) = self.shown_at(shown, parent.and_then(definition).as_deref())
+            && let Some(path) = self
+                .reexported
+                .shown_at(shown, parent.and_then(definition).as_deref())
         {
             *shown = path;
         }
     }
+}
 
-    /// This crate's path for the item at `canonical` (and `defined`) in another crate.
-    fn shown_at(&self, canonical: &str, defined: Option<&str>) -> Option<Box<str>> {
+/// A crate's paths for the items of others that it re-exports, as std's for those of alloc and
+/// core (requirement R-PR-2).
+#[derive(Debug, Default)]
+pub struct Reexports {
+    /// The path in another crate of each item it re-exports (`alloc::vec`), and the shortest
+    /// public path at which it does (`std::vec`).
+    reexported: HashMap<Box<str>, Box<str>>,
+}
+
+impl Reexports {
+    /// The paths of `entry` for what it re-exports of `others`, by their names as code writes
+    /// them, and for what they re-export of each other, at its paths for them: std re-exports
+    /// `alloc::borrow`, which re-exports `core::borrow::Borrow`. Glob re-exports of other crates'
+    /// modules (`std::hash` of `core::hash`) are left out, as `get_item` does not follow them
+    /// (requirement R-PR-3): those items keep the paths of their crates.
+    #[must_use]
+    pub fn new(entry: &CrateView<'_>, others: &[(&str, &CrateView<'_>)]) -> Self {
+        let names: Vec<&str> = others.iter().map(|&(name, _)| name).collect();
+        let mut table = Self::default();
+        for reexport in entry.index().external_reexports() {
+            if let Some(definition) = &reexport.definition
+                && is_of(entry, reexport.target, &names)
+            {
+                table.add(definition.joined(), reexport.path.joined());
+            }
+        }
+        let mut reexported = Vec::new();
+        for &(_, other) in others {
+            for reexport in other.index().external_reexports() {
+                if let Some(definition) = &reexport.definition
+                    && is_of(other, reexport.target, &names)
+                    && let Some(path) = table.path_of(&reexport.path.joined())
+                {
+                    reexported.push((definition.joined(), path));
+                }
+            }
+        }
+        for (definition, path) in reexported {
+            table.add(definition, path);
+        }
+        table
+    }
+
+    /// Records that the crate re-exports the item at `definition` in another crate at `path`,
+    /// unless it does at a shorter one.
+    fn add(&mut self, definition: Box<str>, path: Box<str>) {
+        if self
+            .reexported
+            .get(&definition)
+            .is_none_or(|shortest| shorter(&path, shortest))
+        {
+            self.reexported.insert(definition, path);
+        }
+    }
+
+    /// The crate's path for the item at `canonical` (and `defined`) in another crate. The crate
+    /// re-exports items by their definition paths (`alloc::collections::vec_deque::VecDeque`),
+    /// which may differ from the canonical paths there (`alloc::collections::VecDeque`), so both
+    /// are tried: the path that is shortest once the rest is added wins, then the first in
+    /// lexicographic order.
+    #[must_use]
+    pub fn shown_at(&self, canonical: &str, defined: Option<&str>) -> Option<Box<str>> {
         let by_definition = defined.and_then(|defined| self.path_of(defined));
         match (self.path_of(canonical), by_definition) {
             (Some(a), Some(b)) => Some(if shorter(&b, &a) { b } else { a }),
@@ -887,7 +905,7 @@ impl<'a> EntryCrate<'a> {
         }
     }
 
-    /// `path`, of another crate, at this crate's path for it, if it re-exports a prefix of it.
+    /// `path`, of another crate, at the crate's path for it, if it re-exports a prefix of it.
     fn path_of(&self, path: &str) -> Option<Box<str>> {
         let mut best: Option<String> = None;
         let mut end = path.len();

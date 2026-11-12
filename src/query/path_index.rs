@@ -699,6 +699,20 @@ impl ArchivedPathIndex {
             .map(Resolution::ExternalReexport)
     }
 
+    /// The item of this crate whose definition path is `path` (`core::fmt::Formatter`), as its
+    /// own and other crates' JSON give it, if one is (decided in M4b).
+    #[must_use]
+    pub fn at_definition_path(&self, path: &str) -> Option<Id> {
+        match self.lookup_definition(path)? {
+            Resolution::Item(id) => Some(id),
+            Resolution::Member { .. }
+            | Resolution::AmbiguousMembers { .. }
+            | Resolution::ExternalReexport(_)
+            | Resolution::Ambiguous(_)
+            | Resolution::NotFound => None,
+        }
+    }
+
     /// Looks `key` up as a definition path of this crate.
     fn lookup_definition(&self, key: &str) -> Option<Resolution> {
         self.by_definition_path

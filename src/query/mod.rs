@@ -22,4 +22,5 @@ pub mod path_index;
 pub mod render;
 pub mod reverse;
 pub mod search;
+pub mod std_paths;
 pub mod view;
