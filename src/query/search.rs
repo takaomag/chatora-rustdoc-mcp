@@ -1115,8 +1115,7 @@ fn tiers(index: &ArchivedSearchIndex, options: SearchOptions<'_>) -> HashMap<u32
         index
             .names
             .get(name)
-            .map(|entries| entries.iter().map(|entry| entry.to_native()).collect())
-            .unwrap_or_default()
+            .map_or_default(|entries| entries.iter().map(|entry| entry.to_native()).collect())
     };
     let mut tiers: HashMap<u32, Tier> = HashMap::new();
     let mut set = |entries: Vec<u32>, tier: Tier| {
@@ -1155,8 +1154,7 @@ fn tiers(index: &ArchivedSearchIndex, options: SearchOptions<'_>) -> HashMap<u32
         let aliases = index
             .aliases
             .get(lower.as_str())
-            .map(|entries| entries.iter().map(|entry| entry.to_native()).collect())
-            .unwrap_or_default();
+            .map_or_default(|entries| entries.iter().map(|entry| entry.to_native()).collect());
         set(aliases, Tier::Alias);
     }
     tiers
@@ -1549,13 +1547,12 @@ mod tests {
         let response = serde_json::to_value(response).expect("serializes");
         let paths = response["data"]["items"]
             .as_array()
-            .map(|items| {
+            .map_or_default(|items| {
                 items
                     .iter()
                     .filter_map(|item| item["path"].as_str().map(str::to_owned))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         (paths, response["data"]["did_you_mean"].clone())
     }
 

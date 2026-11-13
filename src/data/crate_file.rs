@@ -484,8 +484,7 @@ fn build_of(table: &toml::Table) -> DocsRsBuild {
         metadata
             .and_then(|metadata| metadata.get(key))
             .and_then(toml::Value::as_array)
-            .map(|values| values.iter().filter_map(toml::Value::as_str).collect())
-            .unwrap_or_default()
+            .map_or_default(|values| values.iter().filter_map(toml::Value::as_str).collect())
     };
     let tree = FeatureTree::from_manifest(table);
     let all_features = flag("all-features");
@@ -608,7 +607,7 @@ pub fn manifest_declaration(manifest: &Path) -> io::Result<(Declaration, Vec<Box
     let inherited = table
         .get("package")
         .and_then(toml::Value::as_table)
-        .map(|package| {
+        .map_or_default(|package| {
             package
                 .iter()
                 .filter(|(_, value)| {
@@ -620,8 +619,7 @@ pub fn manifest_declaration(manifest: &Path) -> io::Result<(Declaration, Vec<Box
                 .filter(|(key, _)| DECLARED_FIELDS.contains(&key.as_str()))
                 .map(|(key, _)| Box::from(key.replace('-', "_")))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     Ok((declaration_of(&table), inherited))
 }
 

@@ -692,14 +692,13 @@ fn notes(
     if let Some(missing) = not_in_docs.filter(|missing| !missing.is_empty()) {
         let enabled: Vec<&str> = in_project
             .and_then(|in_project| in_project.normal.as_ref())
-            .map(|normal| {
+            .map_or_default(|normal| {
                 missing
                     .iter()
                     .map(AsRef::as_ref)
                     .filter(|feature| normal.contains(*feature))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         if !enabled.is_empty() {
             warnings.push(
                 format!(
@@ -1502,8 +1501,7 @@ fn feature_of(
             "enabled_by",
             enabled_by
                 .get(name)
-                .map(|by| by.iter().copied().collect())
-                .unwrap_or_default(),
+                .map_or_default(|by| by.iter().copied().collect()),
         ),
     ];
     for (key, list) in lists {

@@ -11,11 +11,6 @@
 //! and the archive is opened five times: mapped, its header compared and its bytes checked. The
 //! reverse index (decided in M4a) is built and archived alone too, for its share.
 
-#![expect(
-    unused_crate_dependencies,
-    reason = "an example uses only some of the package's dependencies"
-)]
-
 use std::{
     env,
     fs,

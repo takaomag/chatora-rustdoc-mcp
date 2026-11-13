@@ -1290,8 +1290,7 @@ mod tests {
             tool.input_schema
                 .get("properties")
                 .and_then(Value::as_object)
-                .map(|properties| properties.keys().cloned().collect())
-                .unwrap_or_default()
+                .map_or_default(|properties| properties.keys().cloned().collect())
         };
         // `project` is in the middle of its arguments.
         let tool = list_module::definition();

@@ -6,10 +6,6 @@
 //! Run them with `cargo test --release --test std_dist -- --ignored --nocapture`.
 
 #![cfg(test)]
-#![expect(
-    unused_crate_dependencies,
-    reason = "an integration test uses only some of the package's dependencies"
-)]
 
 use std::{collections::HashMap, sync::Arc, time::Instant};
 

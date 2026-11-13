@@ -186,25 +186,22 @@ impl ArchivedReverseIndex {
     /// The impls of this crate for the type keyed `key` ([`type_key`]), in the order of their ids.
     #[must_use]
     pub fn impls_for(&self, key: &str) -> Vec<TypeImpl> {
-        self.impls_by_type
-            .get(key)
-            .map(|impls| {
-                impls
-                    .iter()
-                    .map(|found| TypeImpl {
-                        id: view::native(&found.id),
-                        kind: match found.kind {
-                            ArchivedImplKind::Inherent => ImplKind::Inherent,
-                            ArchivedImplKind::Trait => ImplKind::Trait,
-                            ArchivedImplKind::Blanket => ImplKind::Blanket,
-                            ArchivedImplKind::Synthetic => ImplKind::Synthetic,
-                        },
-                        by_ref: found.by_ref,
-                        inlined: found.inlined,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.impls_by_type.get(key).map_or_default(|impls| {
+            impls
+                .iter()
+                .map(|found| TypeImpl {
+                    id: view::native(&found.id),
+                    kind: match found.kind {
+                        ArchivedImplKind::Inherent => ImplKind::Inherent,
+                        ArchivedImplKind::Trait => ImplKind::Trait,
+                        ArchivedImplKind::Blanket => ImplKind::Blanket,
+                        ArchivedImplKind::Synthetic => ImplKind::Synthetic,
+                    },
+                    by_ref: found.by_ref,
+                    inlined: found.inlined,
+                })
+                .collect()
+        })
     }
 
     /// The impls of this crate of the trait at the definition path `trait_path`
@@ -213,7 +210,7 @@ impl ArchivedReverseIndex {
     pub fn implementations_of(&self, trait_path: &str) -> Vec<TraitImpl> {
         self.implementations_of
             .get(trait_path)
-            .map(|impls| {
+            .map_or_default(|impls| {
                 impls
                     .iter()
                     .map(|found| TraitImpl {
@@ -222,7 +219,6 @@ impl ArchivedReverseIndex {
                     })
                     .collect()
             })
-            .unwrap_or_default()
     }
 
     /// The impl, trait, enum, struct, union or variant that has `id`, if it is an associated

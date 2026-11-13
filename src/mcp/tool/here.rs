@@ -150,8 +150,7 @@ pub(super) async fn of_project(
     let dir = listed
         .manifest_path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
+        .map_or_default(Path::to_path_buf);
     let root = match &found.package.source {
         Source::Local => HereRoot::Package {
             workspace: dir

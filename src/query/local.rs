@@ -740,8 +740,7 @@ impl Builder<'_> {
         // What the dep-info of the build before and its build scripts told: its key has them.
         let deps = before
             .as_ref()
-            .map(|before| before.record.deps.clone())
-            .unwrap_or_default();
+            .map_or_default(|before| before.record.deps.clone());
         let mut package_dirs: Vec<PathBuf> = self
             .input_packages
             .iter()
@@ -873,11 +872,7 @@ async fn follow(
         now.key.as_deref() == Some(&*key) && !now.dep_info && now.planned == planned
     };
     // Not had meanwhile, by this server or another.
-    let dir = built
-        .json
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
+    let dir = built.json.parent().map_or_default(Path::to_path_buf);
     let now = crate::task::spawn_blocking(move || build::published(&dir)).await;
     if !now.ok().flatten().is_some_and(|now| still(&now.record)) {
         return true;
@@ -902,11 +897,7 @@ async fn follow(
     let (ready_still, ready_seen, ready_dir) = (
         still.clone(),
         fresh.seen.clone(),
-        built
-            .json
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default(),
+        built.json.parent().map_or_default(Path::to_path_buf),
     );
     let ready = move || {
         build::published(&ready_dir).is_some_and(|now| ready_still(&now.record))

@@ -313,8 +313,7 @@ fn next_to(set: &Path, kind: Kind, wanted: Kind) -> Result<PathBuf, ProgramsErro
     let extension = std::env::consts::EXE_SUFFIX;
     let stem = set
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|name| name.to_string_lossy().into_owned());
     let stem = stem.strip_suffix(extension).unwrap_or(&stem);
     let suffix = stem.strip_prefix(kind.name()).unwrap_or_default();
     let mut looked = Vec::new();

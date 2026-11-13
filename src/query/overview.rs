@@ -464,8 +464,7 @@ mod tests {
         assert_eq!(data["modules"][0]["path"], "my_crate::sync");
         let items: Vec<&serde_json::Value> = data["items"]
             .as_array()
-            .map(|items| items.iter().map(|item| &item["path"]).collect())
-            .unwrap_or_default();
+            .map_or_default(|items| items.iter().map(|item| &item["path"]).collect());
         assert_eq!(items, ["my_crate::E", "my_crate::Mutex", "my_crate::Thing"]);
         assert_eq!(data["items_total"], 3);
     }

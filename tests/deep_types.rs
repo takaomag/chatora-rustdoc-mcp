@@ -1,11 +1,6 @@
 //! Archiving, rendering and freeing a crate whose types nest as deep as parsing allows (R-PR-8,
 //! doc/m1-plan.md A3). A stack overflow aborts the process, so this test fails by crashing.
 
-#![expect(
-    unused_crate_dependencies,
-    reason = "a test uses only some of the package's dependencies"
-)]
-
 use std::collections::HashMap;
 
 use chatora_rustdoc_mcp::{

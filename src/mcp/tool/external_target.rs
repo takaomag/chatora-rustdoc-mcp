@@ -882,8 +882,7 @@ pub(super) fn conditions(metadata: &Metadata, dependency: &ProjectPackage) -> Ve
                 && Source::parse(package.source.as_deref()) == dependency.source
                 && !metadata.workspace_members.contains(&package.id)
         })
-        .map(|package| metadata.platform_conditions(&package.id))
-        .unwrap_or_default()
+        .map_or_default(|package| metadata.platform_conditions(&package.id))
 }
 
 #[cfg(test)]

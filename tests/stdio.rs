@@ -6,10 +6,6 @@
 // Lets clippy treat the helpers below as test code, like the `#[test]` functions
 // (`allow-expect-in-tests` and the other settings in clippy.toml).
 #![cfg(test)]
-#![expect(
-    unused_crate_dependencies,
-    reason = "an integration test uses only some of the package's dependencies"
-)]
 
 #[cfg(feature = "local")]
 #[path = "common/registry.rs"]
@@ -6012,8 +6008,7 @@ fn build_external_docs_documents_a_workspace_outside_the_default_project() {
         data[list]
             .as_array()
             .and_then(|entries| entries.iter().find(|entry| entry["crate"] == name))
-            .map(|entry| entry["status"].clone())
-            .unwrap_or_default()
+            .map_or_default(|entry| entry["status"].clone())
     };
     // For the first target that it builds for, the host's: no dependency for wasm.
     let result = built_by_external(
@@ -6283,8 +6278,7 @@ fn looked_up_outside_for_another_target(server: &mut Server, project: &str) {
         sources
             .iter()
             .find(|source| source["crate"] == krate)
-            .map(|source| source["target"].clone())
-            .unwrap_or_default()
+            .map_or_default(|source| source["target"].clone())
     };
     assert_eq!(target_of("macros"), host_triple(), "{result}");
     assert_eq!(target_of("wasmonly"), OTHER_TARGET, "{result}");

@@ -939,7 +939,7 @@ pub fn examples_of(
     // The last part, without any generics (`Mutex<T>`).
     let last = |path: &str| {
         let path = path.split('<').next().unwrap_or(path);
-        path.rsplit("::").next().map(Box::from).unwrap_or_default()
+        path.rsplit("::").next().map_or_default(Box::from)
     };
     Ok(Some(ExamplesOf {
         id,
@@ -2856,8 +2856,7 @@ pub(super) mod tests {
         let keys = |value: &serde_json::Value| -> Vec<String> {
             value
                 .as_object()
-                .map(|object| object.keys().cloned().collect())
-                .unwrap_or_default()
+                .map_or_default(|object| object.keys().cloned().collect())
         };
         assert_eq!(keys(&response), ["provenance", "data"]);
         assert_eq!(keys(&response["data"]), [

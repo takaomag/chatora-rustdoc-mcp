@@ -93,8 +93,7 @@ impl Call {
         let sources = result
             .structured_content
             .as_ref()
-            .map(|structured| sources(&structured["provenance"]))
-            .unwrap_or_default();
+            .map_or_default(|structured| sources(&structured["provenance"]));
         // `building`, when the answer is still to come (requirement R-OUT-9).
         let status = result
             .structured_content

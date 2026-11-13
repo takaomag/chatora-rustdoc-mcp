@@ -17,10 +17,6 @@
 //! and the last the beta toolchain, which CI runs in a job of its own, without a nightly.
 
 #![cfg(test)]
-#![expect(
-    unused_crate_dependencies,
-    reason = "an integration test uses only some of the package's dependencies"
-)]
 
 #[path = "real_data/client.rs"]
 mod client;

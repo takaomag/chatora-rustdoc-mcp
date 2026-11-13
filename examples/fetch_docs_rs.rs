@@ -10,11 +10,6 @@
 //! cache path. With `CHATORA_RUSTDOC_MCP_LOG__FILTER=debug`, the log also shows how many zstd
 //! layers a download had.
 
-#![expect(
-    unused_crate_dependencies,
-    reason = "an example uses only some of the package's dependencies"
-)]
-
 use std::{
     error::Error,
     fmt::Write as _,

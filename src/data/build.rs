@@ -313,8 +313,7 @@ impl TargetDir {
     fn name(&self) -> String {
         self.0
             .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default()
+            .map_or_default(|name| name.to_string_lossy().into_owned())
     }
 
     /// cargo's target directory (`CARGO_TARGET_DIR`).
@@ -1316,7 +1315,7 @@ pub async fn build(
         inputs: fresh.map(|fresh| fresh.inputs.clone()),
         warnings: Vec::new(),
         // Until the dep-info of this build tells them.
-        deps: fresh.map(|fresh| fresh.deps.clone()).unwrap_or_default(),
+        deps: fresh.map_or_default(|fresh| fresh.deps.clone()),
         dep_info: false,
         source_files: Vec::new(),
         planned: None,
@@ -1409,7 +1408,7 @@ pub async fn dep_info(
                 && &*reason == "build-script-executed"
                 && let Some(dir) = out_dir.parent()
             {
-                scripts.push((package_id, dir.join("output")));
+                scripts.push((package_id, dir.to_path_buf()));
             }
         },
     )
@@ -1427,7 +1426,7 @@ pub async fn dep_info(
         // What a build script told cargo to watch is not lost unnoticed.
         let scripts = scripts
             .into_iter()
-            .map(|(id, output)| Ok((id, fs::read_to_string(output)?)))
+            .map(|(id, dir)| Ok((id, script_output(&dir)?)))
             .collect::<io::Result<Vec<_>>>();
         drop(writing);
         drop(using);
@@ -1450,6 +1449,17 @@ pub async fn dep_info(
         });
     }
     read.map(Some).map_err(BuildError::Io)
+}
+
+/// What the run of a build script whose `OUT_DIR` is in `dir` printed: in `dir/output`, or, in
+/// the layout of the build directory of cargo 1.100, in `dir/run/stdout`.
+fn script_output(dir: &Path) -> io::Result<String> {
+    match fs::read_to_string(dir.join("output")) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::read_to_string(dir.join("run").join("stdout"))
+        },
+        read => read,
+    }
 }
 
 /// A `build-script-executed` message of cargo, as far as it is read.

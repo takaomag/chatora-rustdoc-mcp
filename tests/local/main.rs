@@ -4,10 +4,6 @@
 //! test crates under `tests/fixtures/` or in the test itself.
 
 #![cfg(test)]
-#![expect(
-    unused_crate_dependencies,
-    reason = "an integration test uses only some of the package's dependencies"
-)]
 
 #[cfg(feature = "local")]
 mod build_scope;

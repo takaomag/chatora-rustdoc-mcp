@@ -342,7 +342,7 @@ impl Metadata {
         let mut seen = HashSet::from([package]);
         let mut next = vec![package];
         while let Some(id) = next.pop() {
-            for &(dependent, kinds) in dependents.get(id).map(Vec::as_slice).unwrap_or_default() {
+            for &(dependent, kinds) in dependents.get(id).map_or_default(Vec::as_slice) {
                 let mut unlimited = false;
                 for kind in kinds {
                     match &kind.target {

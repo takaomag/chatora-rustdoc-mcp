@@ -1210,8 +1210,7 @@ mod tests {
                 .content
                 .first()
                 .and_then(|content| content.as_text())
-                .map(|text| text.text.clone())
-                .unwrap_or_default();
+                .map_or_default(|text| text.text.clone());
             serde_json::from_str(&text).expect("JSON")
         };
         let hidden = body(Failure::NoReadme(NoReadme::Hidden(

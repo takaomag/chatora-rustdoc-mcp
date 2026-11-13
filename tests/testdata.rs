@@ -6,10 +6,6 @@
 
 // Lets clippy treat the helpers below as test code, like the `#[test]` functions.
 #![cfg(test)]
-#![expect(
-    unused_crate_dependencies,
-    reason = "an integration test uses only some of the package's dependencies"
-)]
 
 use std::{fmt::Write as _, time::Instant};
 

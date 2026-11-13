@@ -1063,14 +1063,13 @@ mod tests {
 
     /// The names in the place of the test's `.crate`, its temporaries among them.
     fn names_in(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(dir.join("demo/0.1.0"))
-            .map(|entries| {
+        let mut names: Vec<String> =
+            fs::read_dir(dir.join("demo/0.1.0")).map_or_default(|entries| {
                 entries
                     .filter_map(Result::ok)
                     .map(|entry| entry.file_name().to_string_lossy().into_owned())
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         names.sort();
         names
     }

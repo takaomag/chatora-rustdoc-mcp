@@ -5,10 +5,6 @@
 //! promised question has a case are not ignored.
 
 #![cfg(test)]
-#![expect(
-    unused_crate_dependencies,
-    reason = "an integration test uses only some of the package's dependencies"
-)]
 
 mod arguments;
 mod budgets;

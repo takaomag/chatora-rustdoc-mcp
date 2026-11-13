@@ -584,15 +584,15 @@ mod tests {
             Ok(response) => serde_json::to_value(response).expect("serializes"),
             Err(error) => return Listed::Err(error),
         };
-        let items: Vec<serde_json::Value> = response["data"]["items"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| json!([item["path"], item["kind"], item["canonical"]]))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let items: Vec<serde_json::Value> =
+            response["data"]["items"]
+                .as_array()
+                .map_or_default(|items| {
+                    items
+                        .iter()
+                        .map(|item| json!([item["path"], item["kind"], item["canonical"]]))
+                        .collect()
+                });
         Listed::Ok(json!(items), response["page"].clone())
     }
 

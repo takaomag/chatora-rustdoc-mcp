@@ -341,8 +341,7 @@ fn find_workspace(path: &Path, boundary: Option<&Path>) -> Result<Workspace, Pro
     }
     let dir = manifest
         .parent()
-        .map(|dir| dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
-        .unwrap_or_default();
+        .map_or_default(|dir| dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
     let parsed = read_manifest(&manifest)?;
     if parsed.workspace.is_some() {
         return Ok(Workspace { root: dir });

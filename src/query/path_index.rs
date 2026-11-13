@@ -483,8 +483,7 @@ impl ArchivedPathIndex {
         };
         self.children
             .get(key.as_ref())
-            .map(|children| children.iter().map(|child| Box::from(&**child)).collect())
-            .unwrap_or_default()
+            .map_or_default(|children| children.iter().map(|child| Box::from(&**child)).collect())
     }
 
     /// Every item that has a public path, in no particular order.
@@ -597,13 +596,12 @@ impl ArchivedPathIndex {
         let ids: Vec<Id> = self
             .by_definition_path
             .get(key.as_ref())
-            .map(|ids| {
+            .map_or_default(|ids| {
                 ids.iter()
                     .map(view::native)
                     .filter(|&id| has_path(id))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         match ids.as_slice() {
             [] => Resolution::NotFound,
             [id] => Resolution::Item(*id),
@@ -954,8 +952,7 @@ fn canonical_first(
     paths.dedup_by(|a, b| a.path == b.path);
     let via = paths
         .first()
-        .map(|place| place.via.clone().into_boxed_slice())
-        .unwrap_or_default();
+        .map_or_default(|place| place.via.clone().into_boxed_slice());
     (
         paths
             .iter()

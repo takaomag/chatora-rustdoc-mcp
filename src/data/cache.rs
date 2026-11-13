@@ -818,7 +818,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// `path` with `suffix` added to its file name.
 pub(super) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().map(OsString::from).unwrap_or_default();
+    let mut name = path.file_name().map_or_default(OsString::from);
     name.push(suffix);
     path.with_file_name(name)
 }

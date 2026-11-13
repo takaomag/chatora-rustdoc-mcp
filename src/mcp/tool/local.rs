@@ -1164,8 +1164,7 @@ mod tests {
                 .content
                 .first()
                 .and_then(|block| block.as_text())
-                .map(|text| text.text.clone())
-                .unwrap_or_default()
+                .map_or_default(|text| text.text.clone())
         };
         let git = failed(Failure::GitFetch(
             crate::data::cargo::GitFetchFailure::NoRepository,
@@ -1188,8 +1187,7 @@ mod tests {
                 .content
                 .first()
                 .and_then(|block| block.as_text())
-                .map(|text| text.text.clone())
-                .unwrap_or_default()
+                .map_or_default(|text| text.text.clone())
         };
         assert!(told(true).contains("unsupported_format"));
         assert!(told(true).contains("with rustup"));

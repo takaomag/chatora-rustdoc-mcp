@@ -500,7 +500,7 @@ async fn project_with<T: From<Member> + Send + 'static>(
         if let Ok(name) = package.name.parse::<CrateName>() {
             finished.push(T::from(Member {
                 name,
-                version: package.version.clone(),
+                version: package.version,
                 outcome: Outcome::Failed(json!({
                     "code": "docs_unavailable",
                     "reason": "too_many",

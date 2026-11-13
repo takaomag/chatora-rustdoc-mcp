@@ -77,14 +77,13 @@ pub fn of_package<'f>(
         let required_features = entry
             .get("required-features")
             .and_then(toml::Value::as_array)
-            .map(|features| {
+            .map_or_default(|features| {
                 features
                     .iter()
                     .filter_map(toml::Value::as_str)
                     .map(Box::from)
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         found.insert(name.into(), Example {
             name: name.into(),
             file: file.into(),
