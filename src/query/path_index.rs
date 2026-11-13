@@ -697,18 +697,14 @@ impl ArchivedPathIndex {
             .map(Resolution::ExternalReexport)
     }
 
-    /// The item of this crate whose definition path is `path` (`core::fmt::Formatter`), as its
-    /// own and other crates' JSON give it, if one is (decided in M4b).
+    /// The items of this crate whose definition path is `path` (`core::fmt::Formatter`), as its
+    /// own and other crates' JSON give it: more than one when items of other kinds share it, as
+    /// the trait `core::clone::Clone` and its derive macro do (decided in M4b).
     #[must_use]
-    pub fn at_definition_path(&self, path: &str) -> Option<Id> {
-        match self.lookup_definition(path)? {
-            Resolution::Item(id) => Some(id),
-            Resolution::Member { .. }
-            | Resolution::AmbiguousMembers { .. }
-            | Resolution::ExternalReexport(_)
-            | Resolution::Ambiguous(_)
-            | Resolution::NotFound => None,
-        }
+    pub fn at_definition_path(&self, path: &str) -> Box<[Id]> {
+        self.by_definition_path
+            .get(path)
+            .map_or_default(|ids| ids.iter().map(view::native).collect())
     }
 
     /// Looks `key` up as a definition path of this crate.

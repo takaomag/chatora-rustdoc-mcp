@@ -11,7 +11,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::Mutex;
-use rustdoc_types::{Id, ItemSummary};
+use rustdoc_types::{Id, ItemKind, ItemSummary};
 
 use super::{
     across::Indexed,
@@ -56,6 +56,9 @@ const PRELUDE: &[&str] = &[
     "std::marker::Sized",
     "std::marker::Sync",
     "std::marker::Unpin",
+    "std::ops::AsyncFn",
+    "std::ops::AsyncFnMut",
+    "std::ops::AsyncFnOnce",
     "std::ops::Drop",
     "std::ops::Fn",
     "std::ops::FnMut",
@@ -76,8 +79,8 @@ pub struct StdPaths {
     found: Mutex<HashMap<Found, Shown>>,
 }
 
-/// An item of std's crates looked up: its crate and its definition path.
-type Found = (Box<str>, Box<str>);
+/// An item of std's crates looked up: its crate, its definition path and its kind.
+type Found = (Box<str>, Box<str>, ItemKind);
 
 impl std::fmt::Debug for StdPaths {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -108,8 +111,9 @@ impl StdPaths {
         }
     }
 
-    /// How the item at `definition` in `krate`, one of std's, is shown.
-    fn look_up(&self, krate: &'static str, definition: &str) -> Shown {
+    /// How the item at `definition` in `krate`, one of std's, is shown: the one of `kind` there,
+    /// as a trait and its derive macro share their definition path.
+    fn look_up(&self, krate: &'static str, definition: &str, kind: ItemKind) -> Shown {
         let told = |reason| {
             Shown::NotCanonical(NotCanonical {
                 ty: Box::default(),
@@ -124,9 +128,16 @@ impl StdPaths {
         };
         let there = CrateView::new(mapped.get());
         let index = there.index();
-        let Some(id) = index.at_definition_path(definition) else {
+        let of_kind: Vec<Id> = index
+            .at_definition_path(definition)
+            .iter()
+            .copied()
+            .filter(|&id| there.summary(id).is_none_or(|summary| summary.kind == kind))
+            .collect();
+        let [id] = of_kind.as_slice() else {
             return told(Reason::NotFound);
         };
+        let id = *id;
         let Some(canonical) = index
             .canonical_path(id)
             .filter(|_| !index.is_hidden(id))
@@ -154,22 +165,26 @@ impl StdPaths {
 impl ExternalPaths for StdPaths {
     fn shown(&self, view: &CrateView<'_>, _id: Id, summary: &ItemSummary) -> Option<Shown> {
         // Of the crate of the view itself only when it is alloc or core, shown through std.
-        let krate = if summary.crate_id == 0 {
-            view.item(view.root())
-                .and_then(|root| root.name.clone())
-                .filter(|name| name != "std")?
-        } else {
-            view.external_crate(summary.crate_id)?.name.clone()
+        let named = |name: Option<&str>| {
+            ["std", "alloc", "core"]
+                .into_iter()
+                .find(|krate| Some(*krate) == name)
         };
-        let krate: &'static str = ["std", "alloc", "core"]
-            .into_iter()
-            .find(|name| *name == krate)?;
-        let definition: Box<str> = summary.path.join("::").into();
-        let key = (Box::from(krate), definition);
+        let krate = if summary.crate_id == 0 {
+            named(view.item(view.root()).and_then(|root| root.name.as_deref()))
+                .filter(|krate| *krate != "std")?
+        } else {
+            named(Some(view.external_crate(summary.crate_id)?.name.as_str()))?
+        };
+        let key = (
+            Box::from(krate),
+            summary.path.join("::").into_boxed_str(),
+            summary.kind,
+        );
         if let Some(shown) = self.found.lock().get(&key) {
             return Some(shown.clone());
         }
-        let shown = self.look_up(krate, &key.1);
+        let shown = self.look_up(krate, &key.1, summary.kind);
         self.found.lock().insert(key, shown.clone());
         Some(shown)
     }
@@ -183,7 +198,6 @@ mod tests {
         Generics,
         Item,
         ItemEnum,
-        ItemKind,
         Module,
         Struct,
         StructKind,
@@ -276,36 +290,86 @@ mod tests {
         Arc::new(Mapped::in_memory(&indexed).expect("archived"))
     }
 
-    /// core with `option::Option`, `fmt::Formatter` and `hash::Hash`.
-    fn core() -> Crate {
-        let unit = || {
+    fn unit(id: u32, name: &str) -> Item {
+        item(
+            id,
+            name,
             ItemEnum::Struct(Struct {
                 kind: StructKind::Unit,
                 generics: generics(),
                 impls: Vec::new(),
-            })
+            }),
+        )
+    }
+
+    fn a_trait(id: u32, name: &str) -> Item {
+        item(
+            id,
+            name,
+            ItemEnum::Trait(Trait {
+                is_auto: false,
+                is_unsafe: false,
+                is_dyn_compatible: true,
+                items: Vec::new(),
+                generics: generics(),
+                bounds: Vec::new(),
+                implementations: Vec::new(),
+            }),
+        )
+    }
+
+    fn hidden(item: Item) -> Item {
+        Item {
+            attrs: vec![rustdoc_types::Attribute::Other("#[doc(hidden)]".to_owned())],
+            ..item
+        }
+    }
+
+    fn reexport(id: u32, source: &str, target: u32, is_glob: bool) -> Item {
+        let name = source.rsplit("::").next().unwrap_or_default();
+        item(
+            id,
+            "",
+            ItemEnum::Use(Use {
+                source: source.to_owned(),
+                name: name.to_owned(),
+                id: Some(Id(target)),
+                is_glob,
+            }),
+        )
+    }
+
+    /// core with `option::Option`, `fmt::Formatter`, `hash::Hash`, the trait `clone::Clone` with
+    /// its derive macro at the same definition path, the hidden `fmt::Hidden`, and `Secret` in a
+    /// private module.
+    fn core() -> Crate {
+        let derive = item(
+            9,
+            "Clone",
+            ItemEnum::ProcMacro(rustdoc_types::ProcMacro {
+                kind: rustdoc_types::MacroKind::Derive,
+                helpers: Vec::new(),
+            }),
+        );
+        let private = Item {
+            visibility: Visibility::Default,
+            ..module(14, "private", &[15], false)
         };
         krate(
             vec![
-                module(0, "core", &[1, 3, 5], true),
+                module(0, "core", &[1, 3, 5, 7, 14], true),
                 module(1, "option", &[2], false),
-                item(2, "Option", unit()),
-                module(3, "fmt", &[4], false),
-                item(4, "Formatter", unit()),
+                unit(2, "Option"),
+                module(3, "fmt", &[4, 13], false),
+                unit(4, "Formatter"),
+                hidden(unit(13, "Hidden")),
                 module(5, "hash", &[6], false),
-                item(
-                    6,
-                    "Hash",
-                    ItemEnum::Trait(Trait {
-                        is_auto: false,
-                        is_unsafe: false,
-                        is_dyn_compatible: true,
-                        items: Vec::new(),
-                        generics: generics(),
-                        bounds: Vec::new(),
-                        implementations: Vec::new(),
-                    }),
-                ),
+                a_trait(6, "Hash"),
+                module(7, "clone", &[8, 9], false),
+                a_trait(8, "Clone"),
+                derive,
+                private,
+                unit(15, "Secret"),
             ],
             vec![
                 (
@@ -317,70 +381,98 @@ mod tests {
                     summary(0, &["core", "fmt", "Formatter"], ItemKind::Struct),
                 ),
                 (6, summary(0, &["core", "hash", "Hash"], ItemKind::Trait)),
+                (8, summary(0, &["core", "clone", "Clone"], ItemKind::Trait)),
+                (
+                    9,
+                    summary(0, &["core", "clone", "Clone"], ItemKind::ProcDerive),
+                ),
+                (13, summary(0, &["core", "fmt", "Hidden"], ItemKind::Struct)),
+                (
+                    15,
+                    summary(0, &["core", "private", "Secret"], ItemKind::Struct),
+                ),
             ],
             &[],
         )
     }
 
-    /// std, which re-exports core's `fmt` and `option`, not `hash` (by a glob, in the real one).
-    fn std() -> Crate {
-        let reexport = |id, name: &str, target| {
-            item(
-                id,
-                "",
-                ItemEnum::Use(Use {
-                    source: format!("core::{name}"),
-                    name: name.to_owned(),
-                    id: Some(Id(target)),
-                    is_glob: false,
-                }),
-            )
-        };
+    /// alloc with `vec::Vec`.
+    fn alloc() -> Crate {
         krate(
             vec![
-                module(0, "std", &[1, 2], true),
-                reexport(1, "fmt", 10),
-                reexport(2, "option", 11),
+                module(0, "alloc", &[1], true),
+                module(1, "vec", &[2], false),
+                unit(2, "Vec"),
+            ],
+            vec![(2, summary(0, &["alloc", "vec", "Vec"], ItemKind::Struct))],
+            &[],
+        )
+    }
+
+    /// std, which re-exports core's `fmt`, `option` and `clone` and alloc's `vec`, core's `hash` by
+    /// a glob, and `core::fmt::Formatter` in a hidden module `aaa`, whose path would win by its
+    /// letters; with an `io::Error` of its own.
+    fn std() -> Crate {
+        krate(
+            vec![
+                module(0, "std", &[1, 2, 3, 4, 5, 7, 8], true),
+                reexport(1, "core::fmt", 10, false),
+                reexport(2, "core::option", 11, false),
+                reexport(3, "core::clone", 12, false),
+                reexport(4, "core::hash", 14, true),
+                hidden(module(5, "aaa", &[6], false)),
+                reexport(6, "core::fmt::Formatter", 16, false),
+                reexport(7, "alloc::vec", 20, false),
+                module(8, "io", &[9], false),
+                unit(9, "Error"),
             ],
             vec![
+                (9, summary(0, &["std", "io", "Error"], ItemKind::Struct)),
                 (10, summary(1, &["core", "fmt"], ItemKind::Module)),
                 (11, summary(1, &["core", "option"], ItemKind::Module)),
+                (12, summary(1, &["core", "clone"], ItemKind::Module)),
+                (14, summary(1, &["core", "hash"], ItemKind::Module)),
+                (
+                    16,
+                    summary(1, &["core", "fmt", "Formatter"], ItemKind::Struct),
+                ),
+                (20, summary(2, &["alloc", "vec"], ItemKind::Module)),
             ],
-            &[(1, "core")],
+            &[(1, "core"), (2, "alloc")],
         )
     }
 
     fn paths() -> StdPaths {
-        let alloc = krate(vec![module(0, "alloc", &[], true)], Vec::new(), &[]);
         StdPaths::new(
-            [mapped(std()), mapped(alloc), mapped(core())],
+            [mapped(std()), mapped(alloc()), mapped(core())],
             Some("1.101.0".into()),
         )
     }
 
-    /// The items of std's crates are shown at std's paths, those of its prelude by their names,
-    /// those that std does not re-export by name at core's, and those that core does not have as
-    /// not found; the items of other crates are not looked at (decided in M4b, decisions 18 and
-    /// 31).
+    /// The items of std's crates are shown at std's paths, but under a hidden module; those of its
+    /// prelude by their names, a trait apart from its derive macro; those that std re-exports by a
+    /// glob or not at all at core's; those that core does not have as not found, and those without
+    /// a public path that is not hidden as unnameable; the items of other crates are not looked at
+    /// (decided in M4b, decisions 18, 21 and 31).
     #[test]
     fn the_items_of_std_are_shown_at_its_paths() {
         let paths = paths();
+        let of_core = |id, path: &[&str], kind| (id, summary(1, path, kind));
         let user = krate(
             vec![module(0, "user", &[], true)],
             vec![
-                (
-                    50,
-                    summary(1, &["core", "option", "Option"], ItemKind::Struct),
-                ),
-                (
-                    51,
-                    summary(1, &["core", "fmt", "Formatter"], ItemKind::Struct),
-                ),
-                (52, summary(1, &["core", "hash", "Hash"], ItemKind::Trait)),
-                (53, summary(1, &["core", "nope", "Nope"], ItemKind::Struct)),
-                (54, summary(2, &["serde", "Serialize"], ItemKind::Trait)),
+                of_core(50, &["core", "option", "Option"], ItemKind::Struct),
+                of_core(51, &["core", "fmt", "Formatter"], ItemKind::Struct),
+                of_core(52, &["core", "hash", "Hash"], ItemKind::Trait),
+                of_core(53, &["core", "nope", "Nope"], ItemKind::Struct),
+                (54, summary(4, &["serde", "Serialize"], ItemKind::Trait)),
+                of_core(55, &["core", "clone", "Clone"], ItemKind::Trait),
+                (56, summary(2, &["alloc", "vec", "Vec"], ItemKind::Struct)),
+                of_core(57, &["core", "fmt", "Hidden"], ItemKind::Struct),
+                of_core(58, &["core", "private", "Secret"], ItemKind::Struct),
+                (59, summary(3, &["std", "io", "Error"], ItemKind::Struct)),
             ],
-            &[(1, "core"), (2, "serde")],
+            &[(1, "core"), (2, "alloc"), (3, "std"), (4, "serde")],
         );
         let user = mapped(user);
         let view = CrateView::new(user.get());
@@ -388,29 +480,37 @@ mod tests {
             let summary = view.summary(Id(id)).expect("a summary").clone();
             paths.shown(&view, Id(id), &summary)
         };
-        assert_eq!(shown(50), Some(Shown::Path("Option".into())));
-        assert_eq!(shown(51), Some(Shown::Path("std::fmt::Formatter".into())));
-        assert_eq!(shown(52), Some(Shown::Path("core::hash::Hash".into())));
-        assert!(
-            matches!(
-                shown(53),
-                Some(Shown::NotCanonical(NotCanonical {
-                    reason: Reason::NotFound,
-                    ref lookup,
-                    ..
-                })) if &**lookup == "core::nope::Nope"
-            ),
-            "{:?}",
-            shown(53)
-        );
+        let path = |path: &str| Some(Shown::Path(path.into()));
+        let reason = |id| match shown(id) {
+            Some(Shown::NotCanonical(told)) => Some(told.reason),
+            Some(Shown::Path(_)) | None => None,
+        };
+        assert_eq!(shown(50), path("Option"));
+        assert_eq!(shown(51), path("std::fmt::Formatter"));
+        assert_eq!(shown(52), path("core::hash::Hash"));
+        assert_eq!(reason(53), Some(Reason::NotFound));
         assert_eq!(shown(54), None);
-        // From core itself, its own items are shown through std too.
+        assert_eq!(shown(55), path("Clone"));
+        assert_eq!(shown(56), path("Vec"));
+        assert_eq!(reason(57), Some(Reason::Unnameable));
+        assert_eq!(reason(58), Some(Reason::Unnameable));
+        assert_eq!(shown(59), path("std::io::Error"));
+        // Found once, then remembered.
+        let found = paths.found.lock().len();
+        assert_eq!(shown(51), path("std::fmt::Formatter"));
+        assert_eq!(paths.found.lock().len(), found);
+        // From core itself, its own items are shown through std too; from std, its own as they
+        // are.
         let core = mapped(core());
         let view = CrateView::new(core.get());
         let summary = view.summary(Id(4)).expect("a summary").clone();
         assert_eq!(
             paths.shown(&view, Id(4), &summary),
-            Some(Shown::Path("std::fmt::Formatter".into()))
+            path("std::fmt::Formatter")
         );
+        let std = mapped(std());
+        let view = CrateView::new(std.get());
+        let summary = view.summary(Id(9)).expect("a summary").clone();
+        assert_eq!(paths.shown(&view, Id(9), &summary), None);
     }
 }

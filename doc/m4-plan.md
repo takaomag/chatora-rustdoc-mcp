@@ -246,6 +246,10 @@ M4 は、1 つの crate の中だけでは答えられない問い (依存グラ
 - B2a-2a のレビュー (サブエージェント、読むだけ。手元のキャッシュの nightly の std・alloc・core の JSON を読んで確かめた) で、本番に付ける前 (B2a-2b) に直すもの: (高) 実際の core では `Clone`・`Copy`・`PartialEq`・`Eq`・`PartialOrd`・`Ord`・`Default` (と `Reborrow`・`CoerceShared`) が trait と derive マクロで同じ定義パスを持ち、`at_definition_path` が曖昧として `None` を返すので、prelude の名前にならず `not_found` になる。名指した側の kind で絞り、マクロを除く。(中) 再公開の表が `#[doc(hidden)]` の再公開も使い、`core::ops::Bound` が `std::collections::Bound` で描かれる (search_items の付け替えにも前からある)。hidden の再公開を飛ばす (search にも効かせるかを決める)。(低) prelude の一覧に `AsyncFn`・`AsyncFnMut`・`AsyncFnOnce` が無い (std の prelude から集める案も)。テストの穴 (glob の再公開、alloc の item と 2 周目、unnameable の 2 つの経路、std 自身の item、覚えた結果)。crate_id 0 の item ごとに root の名前を clone している
 - B2a-2a のレビューで残したもの (設計上のリスク): nightly の std と stable でビルドした crate で定義パスがずれる (この nightly では `std::io::Error` の定義が `core::io::error::Error` に移っており、stable の JSON が名指す `std::io::error::Error` は `not_found` になる)。決定 30 どおりの振る舞いだが、`io::Error`・`io::Result` は多く出るので、`not_found` のときに std の公開パスとして引き直す案を B2a-2b で検討する
 
+**B2a-2a のレビューの対応 (2026-11-13、B2a-2b の最初)**: (高) `PathIndex::at_definition_path` は当たった id をすべて返し、`StdPaths` が名指した側の種類 (`ItemKind`) で 1 つに絞る (trait と derive マクロが同じ定義パスを持つため。覚える鍵にも種類を入れた)。(中) 再公開の表は `#[doc(hidden)]` の再公開を使わない (`std::collections::Bound` などで描かれていた。同じ表を使う search_items の付け替えも同じく直る)。(低) prelude の一覧に `AsyncFn`・`AsyncFnMut`・`AsyncFnOnce` を足し、crate の名前を clone せずに比べる。テストを広げた (derive マクロとの重なり、glob の再公開、hidden の再公開、alloc の item、unnameable の 2 つの経路、std 自身の item、覚えた結果)。設計上のリスク (nightly と stable で定義パスがずれる) は B2a-2b で検討する
+
+**toolchain 1.100 への追随 (2026-11-13、ffc64da)**: stable が 1.100.0 になり、cargo の build dir の配置が変わって、build script の出力が `<hash>/output` から `<hash>/run/stdout` に移った。ローカルビルドの dep-info を取る処理がそれを読めずに失敗し、dep-info が記録されなくなっていた (tests/local の 5 件で分かった)。両方の置き場を読むようにした。ほかに clippy の新しい `map_unwrap_or` (`map_or_default` へ。1.98 で安定) と、tests・examples で満たされなくなった `unused_crate_dependencies` の expect を外した
+
 ### 6.3 M4c
 
 ### 6.4 M4d

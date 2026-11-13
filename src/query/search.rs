@@ -850,7 +850,8 @@ impl Reexports {
     /// them, and for what they re-export of each other, at its paths for them: std re-exports
     /// `alloc::borrow`, which re-exports `core::borrow::Borrow`. Glob re-exports of other crates'
     /// modules (`std::hash` of `core::hash`) are left out, as `get_item` does not follow them
-    /// (requirement R-PR-3): those items keep the paths of their crates.
+    /// (requirement R-PR-3): those items keep the paths of their crates. So are those under
+    /// `#[doc(hidden)]` (`std::collections::Bound`), which are not canonical.
     #[must_use]
     pub fn new(entry: &CrateView<'_>, others: &[(&str, &CrateView<'_>)]) -> Self {
         let names: Vec<&str> = others.iter().map(|&(name, _)| name).collect();
@@ -858,6 +859,7 @@ impl Reexports {
         for reexport in entry.index().external_reexports() {
             if let Some(definition) = &reexport.definition
                 && is_of(entry, reexport.target, &names)
+                && !entry.index().is_hidden_reexport(&reexport.path.joined())
             {
                 table.add(definition.joined(), reexport.path.joined());
             }
@@ -867,6 +869,7 @@ impl Reexports {
             for reexport in other.index().external_reexports() {
                 if let Some(definition) = &reexport.definition
                     && is_of(other, reexport.target, &names)
+                    && !other.index().is_hidden_reexport(&reexport.path.joined())
                     && let Some(path) = table.path_of(&reexport.path.joined())
                 {
                     reexported.push((definition.joined(), path));
