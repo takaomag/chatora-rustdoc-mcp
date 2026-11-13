@@ -3202,6 +3202,7 @@ async fn look_up_git(arguments: Arguments, git: &GitSpec, state: Arc<ToolState>)
         &arguments.path,
         &found.built.record.crate_name,
     );
+    let shown = std_paths(&state, &target).await;
     let request = Request {
         name: found.package,
         version: found.version,
@@ -3214,7 +3215,7 @@ async fn look_up_git(arguments: Arguments, git: &GitSpec, state: Arc<ToolState>)
         build: None,
         in_build: InBuild::default(),
         hops: 0,
-        shown: None,
+        shown: Some(shown),
         index_fetched_at: None,
         until,
         here: Here {
@@ -3879,6 +3880,33 @@ async fn std_paths_recorded(
         .flatten()?;
     // Used, as for a lookup of std, so that the removal of the unused keeps it.
     std_json::note_recorded_use(&state.cache, &record);
+    std_paths_by(state, target, record).await
+}
+
+/// How std's items are shown from std's own crates while `chosen` is looked up for `target`: by
+/// `chosen` itself, which the lookup reads, not by the record, which may be of another; else as
+/// [`std_paths`] (decided in M4b).
+pub(super) async fn std_paths_of(
+    state: &ToolState,
+    target: &TargetTriple,
+    chosen: &Chosen,
+) -> Arc<crate::query::std_paths::StdPaths> {
+    let paths = match std_json::ChosenRecord::of(&state.cache, chosen) {
+        Ok(record) => std_paths_by(state, target, record).await,
+        Err(_) => None,
+    };
+    match paths {
+        Some(paths) => paths,
+        None => std_paths(state, target).await,
+    }
+}
+
+/// The paths of the std of `record`, kept as the latest for `target`, if its archives are there.
+async fn std_paths_by(
+    state: &ToolState,
+    target: &TargetTriple,
+    record: std_json::ChosenRecord,
+) -> Option<Arc<crate::query::std_paths::StdPaths>> {
     if let Some((kept, paths)) = state.std_paths.lock().get(target)
         && *kept == record
     {
@@ -5132,7 +5160,7 @@ async fn execute_std(
         },
     };
     warnings.extend(chosen.warnings.iter().cloned());
-    let request = Request {
+    let mut request = Request {
         name: arguments.name,
         version: chosen
             .json
@@ -5155,25 +5183,7 @@ async fn execute_std(
     };
     // The archives that the lookup opens, made here: the lookup, on a blocking thread, then only
     // opens them, waiting there for no lock nor place. One that cannot be made, it tells.
-    let mut opened = vec![krate];
-    for other in [StdCrate::Std, StdCrate::Alloc, StdCrate::Core] {
-        if !opened.contains(&other) {
-            opened.push(other);
-        }
-    }
-    // Until the call's deadline: another process may hold an archive's lock, and making one
-    // takes long. What is being made goes on, and the next call opens it.
-    let preparing = async {
-        for krate in opened {
-            if load::archive_std_crate(&state.cache, &chosen, krate)
-                .await
-                .is_none()
-            {
-                return false;
-            }
-        }
-        true
-    };
+    let preparing = archive_std_crates(&state.cache, &chosen, krate);
     match tokio::time::timeout_at(until, preparing).await {
         Ok(true) => {},
         Ok(false) => return stopped(),
@@ -5186,6 +5196,7 @@ async fn execute_std(
             );
         },
     }
+    request.shown = Some(std_paths_of(&state, &request.target, &chosen).await);
     let (cache, kept) = (state.cache.clone(), Arc::clone(&chosen));
     let task = crate::task::spawn_blocking(move || {
         let looked_up = look_up_std(&cache, &chosen, &request, at_least.as_ref());
@@ -5248,6 +5259,28 @@ pub(super) async fn project_toolchain(
     None
 }
 
+/// Makes the archives of `krate` of `chosen`, then of the others of std, alloc and core, which the
+/// lookup opens: on a blocking thread, it then waits for no lock nor place. False when the work
+/// stopped. The caller waits until its deadline: another process may hold an archive's lock, and
+/// making one takes long; what is being made goes on, and the next call opens it.
+async fn archive_std_crates(cache: &Cache, chosen: &Arc<Chosen>, krate: StdCrate) -> bool {
+    let mut opened = vec![krate];
+    for other in [StdCrate::Std, StdCrate::Alloc, StdCrate::Core] {
+        if !opened.contains(&other) {
+            opened.push(other);
+        }
+    }
+    for krate in opened {
+        if load::archive_std_crate(cache, chosen, krate)
+            .await
+            .is_none()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Follows `request.path` through the crates of std in `chosen`, archiving each the first time,
 /// and looks the item up where it is. Returns the result and the paths it went through.
 fn look_up_std(
@@ -5294,7 +5327,7 @@ fn look_up_std(
         };
         return (Err(failure), Vec::new());
     };
-    let view = CrateView::new(followed.krate.get());
+    let view = view_with(&followed.krate, request.shown.as_deref());
     // The crate where the item is (alloc for `std::vec::Vec`), at the version its JSON says.
     let name = view
         .item(view.root())
@@ -5526,8 +5559,17 @@ fn docs_rs_origin(arguments: &Request) -> Origin<'_> {
     }
 }
 
+/// A view of `mapped` that shows std's items as `shown` tells, if given: how the tools make the
+/// views that they render (decided in M4b).
+pub(super) fn view_with<'a>(
+    mapped: &'a Mapped<Indexed>,
+    shown: Option<&'a crate::query::std_paths::StdPaths>,
+) -> CrateView<'a> {
+    CrateView::new(mapped.get()).shown_with(shown.map(as_external))
+}
+
 /// `paths` as an [`ExternalPaths`](crate::query::external::ExternalPaths), for a view.
-fn as_external(
+pub(super) fn as_external(
     paths: &crate::query::std_paths::StdPaths,
 ) -> &dyn crate::query::external::ExternalPaths {
     paths
@@ -5540,8 +5582,7 @@ fn look_up_in(
     arguments: &Request,
     origin: Origin<'_>,
 ) -> Result<Value, Failure> {
-    let shown = arguments.shown.as_deref().map(as_external);
-    let view = CrateView::new(mapped.get()).shown_with(shown);
+    let view = view_with(mapped, arguments.shown.as_deref());
     let item_request = ItemRequest {
         name: &arguments.name,
         version: &arguments.version,

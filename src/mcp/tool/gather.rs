@@ -367,9 +367,10 @@ pub(super) async fn project_each<R: Send + 'static>(
     at: (&TargetTriple, Option<&TargetTriple>),
     until: Instant,
     warnings: &mut Vec<Box<str>>,
-    per_crate: PerCrate<R>,
+    (per_crate, shown): (PerCrate<R>, Arc<crate::query::std_paths::StdPaths>),
 ) -> Vec<Gathered<R>> {
     let finish: Finish<Gathered<R>> = Arc::new(move |member: Member| {
+        // std's items as `shown` tells (decided in M4b, decisions 18 and 34).
         let how = match &member.outcome {
             Outcome::Loaded(_) => How::Release,
             Outcome::Built(built) => How::Built { stale: built.stale },
@@ -378,9 +379,12 @@ pub(super) async fn project_each<R: Send + 'static>(
             Outcome::Failed(_) | Outcome::Going(_) => return Gathered::Unread(member),
         };
         let result = match &member.outcome {
-            Outcome::Loaded(mapped) => per_crate(&member, &CrateView::new(mapped.get())),
+            Outcome::Loaded(mapped) => {
+                per_crate(&member, &get_item::view_with(mapped, Some(&shown)))
+            },
             Outcome::Built(built) | Outcome::Cached(built) | Outcome::Recorded(built, _) => {
-                per_crate(&member, &CrateView::new(built.archived.mapped.get()))
+                let view = get_item::view_with(&built.archived.mapped, Some(&shown));
+                per_crate(&member, &view)
             },
             Outcome::Failed(_) | Outcome::Going(_) => return Gathered::Unread(member),
         };

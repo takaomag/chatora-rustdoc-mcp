@@ -226,7 +226,10 @@ pub(super) async fn execute(
             (&triple, docs_rs.as_ref()),
             until,
             &mut warnings,
-            per_crate(&state, the_trait.definition.clone()),
+            (
+                per_crate(&state, the_trait.definition.clone()),
+                get_item::std_paths(&state, &triple).await,
+            ),
         )
         .await,
     );
@@ -495,6 +498,8 @@ async fn read_std(
         .json
         .release()
         .unwrap_or_else(|| Version::new(0, 0, 0));
+    // alloc's and core's own items through std (decided in M4b, decision 18).
+    let shown = get_item::std_paths_of(state, target, &chosen).await;
     let mut gathered = Vec::new();
     for &krate in std_crates_of(definition) {
         let Ok(name) = krate.as_str().parse::<CrateName>() else {
@@ -533,8 +538,10 @@ async fn read_std(
             at_least.clone(),
             Box::<str>::from(definition),
         );
+        let shown = Arc::clone(&shown);
         let looked = crate::task::spawn_blocking(move || {
-            look_at_std(&CrateView::new(mapped.get()), looking)
+            let view = get_item::view_with(&mapped, Some(&shown));
+            look_at_std(&view, looking)
         })
         .await;
         gathered.push(match looked {

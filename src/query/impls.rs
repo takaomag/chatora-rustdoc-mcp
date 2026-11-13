@@ -112,7 +112,8 @@ pub struct Impls {
 pub struct ImplEntry {
     /// `inherent`, `trait`, `derive`, `blanket` or `negative`.
     pub kind: &'static str,
-    /// The trait, by the path of its definition.
+    /// The trait, at its canonical path where it is known, else at the path of its definition
+    /// (decided in M4b, decision 28).
     #[serde(rename = "trait", skip_serializing_if = "Option::is_none")]
     pub trait_path: Option<Box<str>>,
     /// The crate of the trait, when it is another.
@@ -369,25 +370,8 @@ fn classify(view: &CrateView<'_>, query: &mut Query<'_>, item: &Item, ty: Id) ->
             Some(_) if of_std => 2,
             Some(_) => 1,
         };
-        let (header, met) = query.entry(|query| query.impl_text(impl_item));
-        // Ordered by the header as rustdoc writes the types of other crates, whatever the cache
-        // has (requirement R-OUT-3, decided in M4b).
-        let key = query
-            .literally(|query| query.impl_text(impl_item))
-            .unwrap_or_else(|| header.clone());
-        entries.push((
-            rank,
-            how,
-            (trait_path.clone().unwrap_or_default(), key),
-            ImplEntry {
-                kind: how.name(),
-                trait_path,
-                trait_crate,
-                header,
-                conditions: query.own_conditions(impl_id),
-                met,
-            },
-        ));
+        let (key, entry) = impl_entry(query, impl_item, (trait_id, trait_path, trait_crate), how);
+        entries.push((rank, how, key, entry));
     }
     Classified {
         auto_traits,
@@ -569,6 +553,39 @@ pub(super) fn trait_origin(view: &CrateView<'_>, id: Id, member: bool) -> Option
     })
 }
 
+/// The entry of the impl `impl_item` of the trait `trait_id` at `trait_path` (of `trait_crate`),
+/// made as `how` says, with what it is ordered by: the path of the trait's definition and the
+/// header as rustdoc writes the types of other crates, whatever the cache has (requirement
+/// R-OUT-3, decided in M4b). The trait is shown at its canonical path where it is known (decided in
+/// M4b, decision 28).
+fn impl_entry(
+    query: &mut Query<'_>,
+    impl_item: &Item,
+    (trait_id, trait_path, trait_crate): (Option<Id>, Option<Box<str>>, Option<Box<str>>),
+    how: How,
+) -> ((Box<str>, Box<str>), ImplEntry) {
+    // The header first, whose way of writing a type is told where it is first met.
+    let ((header, shown), met) = query.entry(|query| {
+        let header = query.impl_text(impl_item);
+        let shown = trait_id
+            .zip(trait_path.as_deref())
+            .map(|(id, path)| query.trait_shown(id, path));
+        (header, shown)
+    });
+    let key = query
+        .literally(|query| query.impl_text(impl_item))
+        .unwrap_or_else(|| header.clone());
+    let entry = ImplEntry {
+        kind: how.name(),
+        trait_path: shown,
+        trait_crate,
+        header,
+        conditions: query.own_conditions(impl_item.id),
+        met,
+    };
+    ((trait_path.unwrap_or_default(), key), entry)
+}
+
 /// Whether the type is `#[non_exhaustive]`, and whether it has fields that are not public: that
 /// rustdoc stripped, or, in a build with private items, that are not `pub` (decided in M2's D6).
 fn shape_of(view: &CrateView<'_>, item: &Item) -> (bool, bool) {
@@ -690,6 +707,178 @@ mod tests {
             list_impls(&view, request("my_crate::sync"), options),
             Err(GetItemError::NotAType { kind: "module" })
         ));
+    }
+
+    /// Shows the items of other crates at `std::` and their names.
+    #[derive(Debug)]
+    struct AtStd;
+
+    impl crate::query::external::ExternalPaths for AtStd {
+        fn shown(
+            &self,
+            _view: &CrateView<'_>,
+            _id: Id,
+            summary: &rustdoc_types::ItemSummary,
+        ) -> Option<crate::query::external::Shown> {
+            (summary.crate_id != 0).then(|| {
+                let name = summary.path.last().map_or("", String::as_str);
+                crate::query::external::Shown::Path(format!("std::fmt::{name}").into())
+            })
+        }
+    }
+
+    /// [`parsed`], with an `impl fmt::Display for Mutex` of core's `Display` (90).
+    fn with_display() -> rustdoc_types::Crate {
+        let mut krate = parsed().krate;
+        let mut display = krate.index.get(&Id(5)).expect("the impl").clone();
+        display.id = Id(95);
+        if let ItemEnum::Impl(implementation) = &mut display.inner {
+            implementation.trait_ = Some(rustdoc_types::Path {
+                path: "fmt::Display".to_owned(),
+                id: Id(90),
+                args: None,
+            });
+        }
+        krate.index.insert(Id(95), display);
+        if let Some(ItemEnum::Struct(mutex)) =
+            krate.index.get_mut(&Id(3)).map(|item| &mut item.inner)
+        {
+            mutex.impls.push(Id(95));
+        }
+        krate.paths.insert(Id(90), rustdoc_types::ItemSummary {
+            crate_id: 1,
+            path: ["core", "fmt", "Display"].map(str::to_owned).to_vec(),
+            kind: rustdoc_types::ItemKind::Trait,
+        });
+        krate
+            .external_crates
+            .insert(1, rustdoc_types::ExternalCrate {
+                name: "core".to_owned(),
+                html_root_url: None,
+                path: "core".into(),
+            });
+        krate
+    }
+
+    /// The trait of an impl from another crate is shown at its canonical path where the view
+    /// knows it, and at the path of its definition otherwise (decided in M4b, decision 28).
+    #[test]
+    fn the_trait_of_an_impl_is_shown_at_its_canonical_path() {
+        let krate = with_display();
+        let bytes = archive(krate);
+        let (name, version) = (
+            "my-crate".parse::<CrateName>().expect("a name"),
+            Version::new(1, 2, 3),
+        );
+        let traits = |view: &CrateView<'_>| {
+            let request = ItemRequest {
+                name: &name,
+                version: &version,
+                path: "my_crate::Mutex",
+                origin: Origin::DocsRs {
+                    resolved_from: ResolvedFrom::Explicit,
+                    project_from: None,
+                    build: None,
+                },
+                detail: Detail::Normal,
+                project_features: None,
+                follow: false,
+                target: None,
+            };
+            let options = ImplOptions {
+                limit: 50,
+                offset: 0,
+                cursor_request: "c1.req",
+                cursor_data: None,
+            };
+            let response = list_impls(view, request, options).expect("listed");
+            response
+                .data
+                .entries
+                .iter()
+                .filter_map(|entry| Some((entry.trait_path.clone()?, entry.header.clone())))
+                .collect::<Vec<_>>()
+        };
+        let plain = CrateView::new(archived(&bytes));
+        assert_eq!(traits(&plain), [(
+            Box::from("core::fmt::Display"),
+            Box::from("impl fmt::Display for my_crate::Mutex")
+        )]);
+        let shown = CrateView::new(archived(&bytes)).with_external(&AtStd);
+        assert_eq!(traits(&shown), [(
+            Box::from("std::fmt::Display"),
+            Box::from("impl std::fmt::Display for my_crate::Mutex")
+        )]);
+    }
+
+    /// Tells the items of other crates as not cached.
+    #[derive(Debug)]
+    struct NoneCached;
+
+    impl crate::query::external::ExternalPaths for NoneCached {
+        fn shown(
+            &self,
+            _view: &CrateView<'_>,
+            _id: Id,
+            summary: &rustdoc_types::ItemSummary,
+        ) -> Option<crate::query::external::Shown> {
+            (summary.crate_id != 0).then(|| {
+                crate::query::external::Shown::NotCanonical(crate::query::external::NotCanonical {
+                    ty: Box::default(),
+                    krate: "core".into(),
+                    version: None,
+                    lookup: summary.path.join("::").into(),
+                    reason: crate::query::external::Reason::NotCached,
+                })
+            })
+        }
+    }
+
+    /// The trait of an impl shown as written is told with the impl, as the header writes it, and
+    /// not when the impl is off the page (decided in M4b, decisions 20 and 28).
+    #[test]
+    fn the_trait_of_an_impl_off_the_page_is_not_told() {
+        let bytes = archive(with_display());
+        let view = CrateView::new(archived(&bytes)).with_external(&NoneCached);
+        let (name, version) = (
+            "my-crate".parse::<CrateName>().expect("a name"),
+            Version::new(1, 2, 3),
+        );
+        let told = |limit| {
+            let request = ItemRequest {
+                name: &name,
+                version: &version,
+                path: "my_crate::Mutex",
+                origin: Origin::DocsRs {
+                    resolved_from: ResolvedFrom::Explicit,
+                    project_from: None,
+                    build: None,
+                },
+                detail: Detail::Normal,
+                project_features: None,
+                follow: false,
+                target: None,
+            };
+            let options = ImplOptions {
+                limit,
+                offset: 0,
+                cursor_request: "c1.req",
+                cursor_data: None,
+            };
+            let response = list_impls(&view, request, options).expect("listed");
+            response
+                .data
+                .not_canonical
+                .iter()
+                .map(|told| (told.lookup.to_string(), told.ty.to_string()))
+                .collect::<Vec<_>>()
+        };
+        // The inherent impl comes first.
+        assert_eq!(told(1), []);
+        assert_eq!(told(50), [(
+            "core::fmt::Display".to_owned(),
+            "fmt::Display".to_owned()
+        )]);
     }
 
     #[test]

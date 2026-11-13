@@ -239,21 +239,7 @@ fn chosen_path(cache: &Cache, target: &TargetTriple) -> PathBuf {
 /// Returns an error when the places of its archives cannot be had, or the record cannot be
 /// written.
 pub fn record_chosen(cache: &Cache, target: &TargetTriple, chosen: &Chosen) -> io::Result<()> {
-    let mut archives = Vec::new();
-    for krate in [StdCrate::Std, StdCrate::Alloc, StdCrate::Core] {
-        let (dir, source) = chosen.json.archive_key(cache, krate)?;
-        let dir = dir
-            .strip_prefix(cache.dir())
-            .map_or_else(|_| dir.clone(), Path::to_path_buf);
-        archives.push((dir, source));
-    }
-    let record = ChosenRecord {
-        version: chosen
-            .json
-            .release()
-            .map(|release| release.to_string().into()),
-        archives,
-    };
+    let record = ChosenRecord::of(cache, chosen)?;
     let path = chosen_path(cache, target);
     // Under its lock, so that another server's record is not written half over this one, and only
     // when it changed, so that a reader does not meet it half written for nothing.
@@ -265,6 +251,31 @@ pub fn record_chosen(cache: &Cache, target: &TargetTriple, chosen: &Chosen) -> i
     let written = cache.write_verified(&path, &json);
     drop(held);
     written
+}
+
+impl ChosenRecord {
+    /// The record of `chosen`: the places of the archives of its std, alloc and core.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the places cannot be had.
+    pub fn of(cache: &Cache, chosen: &Chosen) -> io::Result<Self> {
+        let mut archives = Vec::new();
+        for krate in [StdCrate::Std, StdCrate::Alloc, StdCrate::Core] {
+            let (dir, source) = chosen.json.archive_key(cache, krate)?;
+            let dir = dir
+                .strip_prefix(cache.dir())
+                .map_or_else(|_| dir.clone(), Path::to_path_buf);
+            archives.push((dir, source));
+        }
+        Ok(Self {
+            version: chosen
+                .json
+                .release()
+                .map(|release| release.to_string().into()),
+            archives,
+        })
+    }
 }
 
 /// The std that `get_item` chose for `target` last, if it recorded one ([`record_chosen`]).

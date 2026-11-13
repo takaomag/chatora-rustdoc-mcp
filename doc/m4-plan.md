@@ -259,6 +259,11 @@ M4 は、1 つの crate の中だけでは答えられない問い (依存グラ
 
 - B2a-2b-1 と決定 34・35 のレビュー (サブエージェント、読むだけ) の対応: 上の段落の形にした (ここでビルドする経路への引き継ぎ、記録をロックの下で変わったときだけ書く、アーカイブがそろわない std は記録しない、hint の target、使った印、blocking のスレッドで作る、target ごとに最新の 1 つ、記録の中身の検査と形式の版、prelude は std があっても先に名前で)。残り (B2a-2b-2): search_items の横断・dependency_graph・std 自身の照会・git の crate (`look_up_git`) の view にも付ける、決定 28 の `trait` の欄、テストの穴 (手元の nightly の経路、follow とここでビルドする経路、壊れた記録・消えたアーカイブ)
 
+**B2a-2b-2 の実装 (2026-11-13)**: std の描き方を残りの view にも付けた: search_items の横断 (`Context::shown`)、dependency_graph の crate ごとの view (`gather::project_each` に渡す) と std の crate の view、get_item の std・alloc・core 自身の照会 (alloc・core の自分の item も std を通して描く。決定 18)、`build_external_docs` が記録した git の crate。決定 28: list_impls・list_methods の `trait` の欄を、view の描き方で正準パスにする (`Query::trait_shown`、`Renderer::path_of_item`)。並べる鍵は定義パスのまま。list_impls の欄は impl の項目の控えに入り、list_methods の欄は一覧が常に出すものの控えに入る (trait のメソッドがすべてページの外でも、その trait の `not_canonical` は残る)。ほかに `execute_std` の archive の準備を関数に出した。テスト: list_impls の単体テスト (口が無ければ定義パス、あれば正準パス、見出しも)、正準パスで書けない trait は impl がページにあるときだけ `not_canonical` に出て、書いた形は見出しのもの)
+
+- B2a-2b-2 のレビュー (サブエージェント、読むだけ) の対応: list_methods の `trait` の欄を一覧の項目の控えに入れた (blanket impl の trait だけ常に出すものの控えに残す)。std・alloc・core 自身の照会は、照会で選んだ std の記録 (`ChosenRecord::of`) から描き方を引く (`std_paths_of`。記録が無い・読めないときは target の記録に戻る)。view の作り方を `get_item::view_with` の 1 つにまとめた。list_impls は見出しを先に描いて trait の欄はその後 (同じ型の控えが見出しの書いた形になる)。list_impls.md・list_methods.md の `trait` の説明を直した
+- 残り (後の段で): std 自身の list_impls で、std が `#[doc(hidden)]` にした trait が「名前で書けない」と出る (利用者の判断が要る)。alloc・core を名指しした照会も std を通して描く (決定 18 のとおり。説明に書くかは後で)。テストの穴: list_methods の欄を NotCanonical の偽物で、手元の nightly の経路、follow とここでビルドする経路、壊れた記録・消えたアーカイブ、search_items の横断・dependency_graph・std 自身・git の結合テスト
+
 ### 6.3 M4c
 
 ### 6.4 M4d

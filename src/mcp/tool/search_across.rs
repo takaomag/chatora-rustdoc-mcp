@@ -119,7 +119,9 @@ pub(super) async fn dependencies(
     let gone = outside
         && recorded_workspace::since_recorded(&state, &workspace).await
             == Some(recorded_workspace::Since::Missing);
+    let shown = get_item::std_paths(&state, &target).await;
     let context = Context {
+        shown,
         recorded: (outside && !gone)
             .then(|| recorded_workspace::again(&workspace.root, Some(&target))),
         target: target.clone(),
@@ -244,7 +246,10 @@ pub(super) async fn std(
             })
         })
         .collect();
+    // std's own crates by the std looked up (decided in M4b).
+    let shown = get_item::std_paths_of(&state, &target, &chosen).await;
     let context = Context {
+        shown,
         recorded: None,
         target,
         docs_rs_default: false,
@@ -288,6 +293,9 @@ struct Context {
     #[cfg(feature = "local")]
     dependencies: Option<crate::data::source_root::Dependencies>,
     std: Option<StdContext>,
+    /// How the items of std, alloc and core are shown from the crates searched (decided in M4b,
+    /// decisions 18, 34 and 35).
+    shown: Arc<crate::query::std_paths::StdPaths>,
     detail: Detail,
     searching: Searching,
 }
@@ -307,6 +315,14 @@ async fn respond(
     })
 }
 
+/// A view of `mapped`, showing std's items as `context` tells.
+fn view_of<'a>(
+    mapped: &'a crate::data::archive::Mapped<crate::query::across::Indexed>,
+    context: &'a Context,
+) -> CrateView<'a> {
+    get_item::view_with(mapped, Some(&context.shown))
+}
+
 /// The response of the search of `members`.
 fn search_members(
     members: &[Member],
@@ -316,10 +332,10 @@ fn search_members(
     let loaded: Vec<(&Member, CrateView<'_>)> = members
         .iter()
         .filter_map(|member| match &member.outcome {
-            Outcome::Loaded(mapped) => Some((member, CrateView::new(mapped.get()))),
+            Outcome::Loaded(mapped) => Some((member, view_of(mapped, context))),
             #[cfg(feature = "local")]
             Outcome::Built(built) | Outcome::Cached(built) | Outcome::Recorded(built, _) => {
-                Some((member, CrateView::new(built.archived.mapped.get())))
+                Some((member, view_of(&built.archived.mapped, context)))
             },
             Outcome::Failed(_) | Outcome::Going(_) => None,
         })

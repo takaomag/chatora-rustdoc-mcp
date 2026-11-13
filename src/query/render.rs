@@ -106,6 +106,11 @@ impl<'a> Renderer<'a> {
         met.into()
     }
 
+    /// Notes that the items shown as written of `met` were met again, outside an entry.
+    pub fn meet(&mut self, met: &[Key]) {
+        self.met.extend(met.iter().cloned());
+    }
+
     /// Forgets that the items shown as written since `mark` were met, as their entry keeps them.
     pub fn forget_met(&mut self, mark: usize) {
         self.met.truncate(mark);
@@ -796,6 +801,19 @@ impl<'a> Renderer<'a> {
         } else {
             self.push_type(out, ty);
         }
+    }
+
+    /// The item `id`, written `written` where it is named, as a path is rendered
+    /// (`push_path`): for what names it apart from a signature, as the trait of an impl.
+    pub fn path_of_item(&mut self, id: Id, written: &str) -> String {
+        let mut out = String::new();
+        let path = Path {
+            path: written.to_owned(),
+            id,
+            args: None,
+        };
+        self.push_path(&mut out, &path);
+        out
     }
 
     /// A path, by what the [`ExternalPaths`] tells if it tells a path, else by its canonical path

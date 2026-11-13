@@ -468,9 +468,15 @@ fn collect<'a>(
             collected.std_blanket.extend(names);
             continue;
         }
+        let trait_path = trait_path.unwrap_or_else(|| trait_ref.path.as_str().into());
+        // At its canonical path (decided in M4b, decision 28): kept with each method shown, but
+        // with what the list always shows for a blanket impl, whose methods it names.
+        let (trait_shown, trait_met) =
+            query.entry(|query| query.trait_shown(trait_ref.id, &trait_path));
         if contents.blanket_impl.is_some() && !expand_blanket {
+            query.keep_met(&trait_met);
             collected.blanket.push(BlanketTrait {
-                trait_path: trait_path.unwrap_or_else(|| trait_ref.path.as_str().into()),
+                trait_path: trait_shown,
                 trait_crate,
                 methods: names.into(),
             });
@@ -482,7 +488,6 @@ fn collect<'a>(
             From::Trait
         };
         let needs_use = !(of_std && PRELUDE.contains(&trait_name));
-        let trait_path = trait_path.unwrap_or_else(|| trait_ref.path.as_str().into());
         trait_methods(
             view,
             query,
@@ -494,6 +499,8 @@ fn collect<'a>(
             &Origin {
                 from,
                 trait_path: &trait_path,
+                trait_shown: &trait_shown,
+                trait_met: &trait_met,
                 needs_use,
             },
         );
@@ -504,7 +511,12 @@ fn collect<'a>(
 /// Where the methods of a trait impl come from.
 struct Origin<'p> {
     from: From,
+    /// The path of the trait's definition, which the methods are ordered by.
     trait_path: &'p str,
+    /// The trait as shown: at its canonical path where it is known (decided in M4b, decision 28).
+    trait_shown: &'p str,
+    /// The types of other crates shown as written in `trait_shown`, kept with each method shown.
+    trait_met: &'p [crate::query::external::Key],
     needs_use: bool,
 }
 
@@ -541,10 +553,15 @@ fn trait_methods<'a>(
             (item.name.as_deref() == Some(name)).then_some(function.has_body)
         })
     };
-    let method = |data: ItemData<'a>, provided: Option<bool>| Method {
-        data,
+    let method = |mut data: ItemData<'a>, provided: Option<bool>| Method {
+        data: {
+            let mut met = std::mem::take(&mut data.met).into_vec();
+            met.extend(origin.trait_met.iter().cloned());
+            data.met = met.into();
+            data
+        },
         from: origin.from.name(),
-        trait_path: Some(origin.trait_path.into()),
+        trait_path: Some(origin.trait_shown.into()),
         trait_key: Some(origin.trait_path.into()),
         needs_use: origin.needs_use,
         provided,

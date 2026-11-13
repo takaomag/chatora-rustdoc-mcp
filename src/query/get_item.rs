@@ -1214,6 +1214,16 @@ impl<'a> Query<'a> {
         self.paths = false;
     }
 
+    /// The trait `id`, at `path` as it is named without the view's `ExternalPaths`
+    /// (`core::iter::traits::collect::IntoIterator`), as the view shows it: at its canonical path
+    /// where it knows it (decided in M4b, decision 28).
+    pub(super) fn trait_shown(&mut self, id: Id, path: &str) -> Box<str> {
+        if self.view.external().is_none() {
+            return path.into();
+        }
+        self.renderer.path_of_item(id, path).into()
+    }
+
     /// The item `id` as an entry of a list ([`Self::item_data`]), with the types of other crates
     /// that it shows as written, which the list keeps if it shows it (decided in M4b).
     pub(super) fn listed_item(&mut self, id: Id, parent: Option<Id>) -> Option<ItemData<'a>> {
@@ -1236,6 +1246,11 @@ impl<'a> Query<'a> {
         let met = self.renderer.met_since(mark);
         self.renderer.forget_met(mark);
         (rendered, met)
+    }
+
+    /// Keeps `met`, of an entry ([`Self::entry`]), with what the list always shows.
+    pub(super) fn keep_met(&mut self, met: &[crate::query::external::Key]) {
+        self.renderer.meet(met);
     }
 
     /// The types of other crates shown as written outside the entries of a list
