@@ -72,6 +72,23 @@ impl<'a> CrateView<'a> {
         self.external
     }
 
+    /// What a cursor of a list checks: the first 16 of [`Self::source_digest`]; or, when its
+    /// entries depend on how the items of other crates are shown, `shown`, and they are shown as
+    /// an [`ExternalPaths`](crate::query::external::ExternalPaths) tells, of the SHA-256 of that
+    /// and of its identity, so that a cursor made before what it tells changed is refused
+    /// (decided in M4b, decision 37).
+    #[must_use]
+    pub fn paged_digest(&self, shown: bool) -> std::borrow::Cow<'a, str> {
+        let source = self.source_digest();
+        let Some(external) = self.external.filter(|_| shown) else {
+            return std::borrow::Cow::Borrowed(source.get(..16).unwrap_or(source));
+        };
+        let mut digest =
+            crate::data::cache::sha256_hex(format!("{source}\0{}", external.identity()).as_bytes());
+        digest.truncate(16);
+        std::borrow::Cow::Owned(digest)
+    }
+
     /// The public path index.
     #[must_use]
     pub const fn index(&self) -> &'a ArchivedPathIndex {
@@ -221,6 +238,11 @@ pub(super) mod tests {
 
     /// `krate` and its index, archived as the cache keeps them.
     pub(in crate::query) fn archive(krate: Crate) -> AlignedVec {
+        archive_of(krate, &"ab".repeat(32))
+    }
+
+    /// The same, made from JSON of the digest `source`.
+    pub(in crate::query) fn archive_of(krate: Crate, source: &str) -> AlignedVec {
         let indexed = Indexed {
             index: PathIndex::build(&krate),
             reverse: ReverseIndex::build(&krate),
@@ -228,7 +250,7 @@ pub(super) mod tests {
                 krate,
                 newer_than_supported: false,
             },
-            source: "ab".repeat(32).into(),
+            source: source.into(),
             search: SearchIndex::default(),
         };
         rkyv::to_bytes::<rancor::Error>(&indexed).expect("archived")

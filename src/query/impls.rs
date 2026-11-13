@@ -180,9 +180,11 @@ pub fn list_impls<'a>(
     request: ItemRequest<'a>,
     options: ImplOptions<'_>,
 ) -> Result<ImplsResponse<'a>, GetItemError> {
-    let digest = view.source_digest();
-    let data_digest = digest.get(..16).unwrap_or(digest);
     let mut query = Query::new(view, request);
+    // Their entries depend on how other crates' traits are shown, but in a workspace member
+    // (decided in M4b, decisions 36 and 37).
+    let digest = view.paged_digest(!query.is_member());
+    let data_digest = &*digest;
     let provenance = query.provenance();
     let with_root = with_root_name(view, request.name, request.path);
     let path = with_root.as_deref().unwrap_or(request.path);
@@ -678,7 +680,7 @@ pub(super) mod tests {
                 ResolvedFrom,
                 tests::{parsed, with_cfgs},
             },
-            view::tests::{archive, archived},
+            view::tests::{archive, archive_of, archived},
         },
     };
 
@@ -730,6 +732,10 @@ pub(super) mod tests {
     struct AtStd;
 
     impl crate::query::external::ExternalPaths for AtStd {
+        fn identity(&self) -> &'static str {
+            "at std"
+        }
+
         fn shown(
             &self,
             _view: &CrateView<'_>,
@@ -827,6 +833,99 @@ pub(super) mod tests {
         )]);
     }
 
+    /// A cursor is refused once the data or how other crates' traits are shown changed, which
+    /// decides the impls listed, and taken while neither has; in a workspace member, whose impls
+    /// do not depend on it, only the data's digest is checked (decided in M4b, decision 37).
+    #[test]
+    fn a_cursor_is_refused_once_the_paths_changed() {
+        fn paths(told: &Told) -> &dyn crate::query::external::ExternalPaths {
+            told
+        }
+        let (bytes, changed) = (
+            archive(with_display()),
+            archive_of(with_display(), &"cd".repeat(32)),
+        );
+        let (name, version) = (
+            "my-crate".parse::<CrateName>().expect("a name"),
+            Version::new(1, 2, 3),
+        );
+        let docs_rs = Origin::DocsRs {
+            resolved_from: ResolvedFrom::Explicit,
+            project_from: None,
+            build: None,
+        };
+        let page = |bytes, told: Option<&Told>, origin, cursor_data: Option<&str>| {
+            let view = CrateView::new(archived(bytes)).shown_with(told.map(paths));
+            let request = ItemRequest {
+                name: &name,
+                version: &version,
+                path: "my_crate::Mutex",
+                origin,
+                detail: Detail::Normal,
+                project_features: None,
+                follow: false,
+                target: None,
+            };
+            let options = ImplOptions {
+                limit: 1,
+                offset: usize::from(cursor_data.is_some()),
+                cursor_request: "c1.req",
+                cursor_data,
+            };
+            list_impls(&view, request, options).map(|response| {
+                response
+                    .page
+                    .next_cursor
+                    .and_then(|cursor| Some(cursor.split('.').nth(2)?.to_owned()))
+            })
+        };
+        let not_found = Told(Reason::NotFound);
+        let cursor = page(&bytes, Some(&not_found), docs_rs, None)
+            .expect("listed")
+            .expect("a next page");
+        // The last page.
+        assert_eq!(
+            page(&bytes, Some(&not_found), docs_rs, Some(&cursor)).expect("taken"),
+            None
+        );
+        for (bytes, other) in [
+            (&bytes, None),
+            (&bytes, Some(&Told(Reason::NotCached))),
+            (&changed, Some(&not_found)),
+        ] {
+            assert!(matches!(
+                page(bytes, other, docs_rs, Some(&cursor)),
+                Err(GetItemError::BadCursor(_))
+            ));
+        }
+        // Without the paths, the data's digest as before.
+        let plain = page(&bytes, None, docs_rs, None)
+            .expect("listed")
+            .expect("a next page");
+        assert_eq!(plain, "ab".repeat(8));
+        #[cfg(feature = "local")]
+        {
+            let member = Origin::Local {
+                private: true,
+                package_source: None,
+                resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
+                toolchain: None,
+                built_at: "2026-11-13T00:00:00Z",
+                features_requested: None,
+                features_effective: None,
+                recorded_by: None,
+                roots: None,
+                source_files: &[],
+                dependencies: None,
+            };
+            let cursor = page(&bytes, Some(&not_found), member, None)
+                .expect("listed")
+                .expect("a next page");
+            assert_eq!(cursor, plain);
+        }
+    }
+
     /// The impls of another crate's trait that it hides or has no public path for are not
     /// listed, as the crate's own, but in a workspace member (decided in M4b, decision 36).
     #[test]
@@ -912,6 +1011,14 @@ pub(super) mod tests {
     pub(in crate::query) struct Told(pub(in crate::query) Reason);
 
     impl crate::query::external::ExternalPaths for Told {
+        fn identity(&self) -> &'static str {
+            match self.0 {
+                Reason::NotCached => "not cached",
+                Reason::NotFound => "not found",
+                Reason::Unnameable => "unnameable",
+            }
+        }
+
         fn shown(
             &self,
             _view: &CrateView<'_>,

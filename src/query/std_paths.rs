@@ -122,6 +122,9 @@ pub struct StdPaths {
     reexports: Reexports,
     /// What was found of each item, by its crate and definition path.
     found: Mutex<HashMap<Found, Shown>>,
+    /// The digests of std's, alloc's and core's JSON, or that the cache has no std (decided in
+    /// M4b, decision 37).
+    identity: Box<str>,
 }
 
 /// An item of std's crates looked up: its crate, its definition path and its kind.
@@ -140,19 +143,29 @@ impl StdPaths {
     /// `version`.
     #[must_use]
     pub fn new([std, alloc, core]: [Arc<Mapped<Indexed>>; 3], version: Option<Box<str>>) -> Self {
-        let reexports = {
+        let (reexports, identity) = {
             let (std, alloc, core) = (
                 CrateView::new(std.get()),
                 CrateView::new(alloc.get()),
                 CrateView::new(core.get()),
             );
-            Reexports::new(&std, &[("alloc", &alloc), ("core", &core)])
+            let identity = format!(
+                "std {} alloc {} core {}",
+                std.source_digest(),
+                alloc.source_digest(),
+                core.source_digest()
+            );
+            (
+                Reexports::new(&std, &[("alloc", &alloc), ("core", &core)]),
+                identity.into_boxed_str(),
+            )
         };
         Self {
             crates: vec![("std", std), ("alloc", alloc), ("core", core)],
             version,
             reexports,
             found: Mutex::new(HashMap::new()),
+            identity,
         }
     }
 
@@ -165,6 +178,7 @@ impl StdPaths {
             version: None,
             reexports: Reexports::default(),
             found: Mutex::new(HashMap::new()),
+            identity: "no std".into(),
         }
     }
 
@@ -225,6 +239,10 @@ impl StdPaths {
 }
 
 impl ExternalPaths for StdPaths {
+    fn identity(&self) -> &str {
+        &self.identity
+    }
+
     fn shown(&self, view: &CrateView<'_>, _id: Id, summary: &ItemSummary) -> Option<Shown> {
         // Of the crate of the view itself only when it is alloc or core, shown through std.
         let named = |name: Option<&str>| {
@@ -345,10 +363,16 @@ mod tests {
     }
 
     fn mapped(krate: Crate) -> Arc<Mapped<Indexed>> {
+        mapped_of(krate, "")
+    }
+
+    /// The same, made from JSON of the digest `source`.
+    fn mapped_of(krate: Crate, source: &str) -> Arc<Mapped<Indexed>> {
         let indexed = Indexed::new(ParsedCrate {
             krate,
             newer_than_supported: false,
-        });
+        })
+        .with_source(source);
         Arc::new(Mapped::in_memory(&indexed).expect("archived"))
     }
 
@@ -509,6 +533,25 @@ mod tests {
             [mapped(std()), mapped(alloc()), mapped(core())],
             Some("1.101.0".into()),
         )
+    }
+
+    /// What tells the paths apart is the digests of std's, alloc's and core's JSON, or that the
+    /// cache has no std (decided in M4b, decision 37).
+    #[test]
+    fn the_paths_are_told_apart_by_their_crates_digests() {
+        let of = |core_source| {
+            StdPaths::new(
+                [
+                    mapped_of(std(), "s"),
+                    mapped_of(alloc(), "a"),
+                    mapped_of(core(), core_source),
+                ],
+                None,
+            )
+        };
+        assert_eq!(of("c").identity(), "std s alloc a core c");
+        assert_ne!(of("d").identity(), of("c").identity());
+        assert_ne!(StdPaths::not_cached().identity(), of("c").identity());
     }
 
     /// The items of std's crates are shown at std's paths, but under a hidden module; those of its

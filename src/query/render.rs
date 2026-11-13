@@ -1265,6 +1265,10 @@ mod tests {
     struct FakeExternal;
 
     impl ExternalPaths for FakeExternal {
+        fn identity(&self) -> &'static str {
+            "fake"
+        }
+
         fn shown(&self, _view: &CrateView<'_>, id: Id, summary: &ItemSummary) -> Option<Shown> {
             match id.0 {
                 99 => Some(Shown::Path("std::option::Option".into())),

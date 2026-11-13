@@ -207,9 +207,11 @@ pub fn list_methods<'a>(
     request: ItemRequest<'a>,
     options: MethodOptions<'_>,
 ) -> Result<MethodsResponse<'a>, GetItemError> {
-    let digest = view.source_digest();
-    let data_digest = digest.get(..16).unwrap_or(digest);
     let mut query = Query::new(view, request);
+    // Their entries depend on how other crates' traits are shown, but in a workspace member
+    // (decided in M4b, decisions 36 and 37).
+    let digest = view.paged_digest(!query.is_member());
+    let data_digest = &*digest;
     let provenance = query.provenance();
     let with_root = with_root_name(view, request.name, request.path);
     let path = with_root.as_deref().unwrap_or(request.path);
@@ -714,7 +716,7 @@ mod tests {
         data::crate_name::CrateName,
         query::{
             get_item::{Detail, Origin, ResolvedFrom, tests::parsed},
-            view::tests::{archive, archived},
+            view::tests::{archive, archive_of, archived},
         },
     };
 
@@ -826,5 +828,78 @@ mod tests {
         let (from, told) = listed(Reason::Unnameable);
         assert_eq!(from, [r#""inherent""#], "{told}");
         assert!(told.as_array().is_none_or(Vec::is_empty), "{told}");
+    }
+
+    /// A cursor is refused once the data or how other crates' traits are shown changed, which
+    /// decides the methods listed (decided in M4b, decision 37).
+    #[test]
+    fn a_cursor_is_refused_once_the_paths_changed() {
+        use crate::query::{
+            external::{ExternalPaths, Reason},
+            impls::tests::{Told, with_display},
+        };
+        fn paths(told: &Told) -> &dyn ExternalPaths {
+            told
+        }
+        let (bytes, changed) = (
+            archive(with_display()),
+            archive_of(with_display(), &"cd".repeat(32)),
+        );
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::new(1, 2, 3);
+        let page = |bytes, told: Option<&Told>, cursor_data: Option<&str>| {
+            let view = CrateView::new(archived(bytes)).shown_with(told.map(paths));
+            let request = ItemRequest {
+                name: &name,
+                version: &version,
+                path: "my_crate::Mutex",
+                origin: Origin::DocsRs {
+                    resolved_from: ResolvedFrom::Explicit,
+                    project_from: None,
+                    build: None,
+                },
+                detail: Detail::Brief,
+                project_features: None,
+                follow: false,
+                target: None,
+            };
+            let options = MethodOptions {
+                name: None,
+                from: &[],
+                expand_blanket: false,
+                limit: 1,
+                offset: usize::from(cursor_data.is_some()),
+                cursor_request: "c1.req",
+                cursor_data,
+            };
+            list_methods(&view, request, options).map(|response| {
+                response
+                    .page
+                    .next_cursor
+                    .and_then(|cursor| Some(cursor.split('.').nth(2)?.to_owned()))
+            })
+        };
+        let not_found = Told(Reason::NotFound);
+        let cursor = page(&bytes, Some(&not_found), None)
+            .expect("listed")
+            .expect("a next page");
+        assert_eq!(
+            page(&bytes, Some(&not_found), Some(&cursor)).expect("taken"),
+            None
+        );
+        for (bytes, other) in [
+            (&bytes, None),
+            (&bytes, Some(&Told(Reason::Unnameable))),
+            (&changed, Some(&not_found)),
+        ] {
+            assert!(matches!(
+                page(bytes, other, Some(&cursor)),
+                Err(GetItemError::BadCursor(_))
+            ));
+        }
+        let plain = page(&bytes, None, None)
+            .expect("listed")
+            .expect("a next page");
+        assert_eq!(plain, "ab".repeat(8));
     }
 }

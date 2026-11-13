@@ -21,6 +21,11 @@ pub trait ExternalPaths: std::fmt::Debug + Sync {
     /// the items of that crate too, as alloc's, which are shown through std (decided in M4b,
     /// decision 18).
     fn shown(&self, view: &CrateView<'_>, id: Id, summary: &ItemSummary) -> Option<Shown>;
+
+    /// What tells these paths from others, as the digests of the archives they are read from, so
+    /// that a cursor of a list whose entries they decide is refused once they change (decided in
+    /// M4b, decision 37).
+    fn identity(&self) -> &str;
 }
 
 /// How an item of another crate is shown.

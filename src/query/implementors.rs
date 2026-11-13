@@ -689,6 +689,10 @@ mod tests {
     struct NoneCached;
 
     impl crate::query::external::ExternalPaths for NoneCached {
+        fn identity(&self) -> &'static str {
+            "none cached"
+        }
+
         fn shown(
             &self,
             _view: &CrateView<'_>,
