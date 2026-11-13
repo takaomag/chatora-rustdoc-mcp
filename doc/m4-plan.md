@@ -254,7 +254,7 @@ M4 は、1 つの crate の中だけでは答えられない問い (依存グラ
 
 **B2a-2b-1 のレビューの後の判断 (2026-11-13、利用者が 1 件ずつ決めた。どちらも推した案)**:
 
-- 決定 34 (M4b) 他の crate の std の型を描く std は、サーバーが std を選んだとき (`shared_std` が成功し、アーカイブがそろったとき。get_item・search_items・list_implementors) に target ごとにキャッシュに記録した std・alloc・core のアーカイブの場所 (`std/chosen-<target>.json`) だけを読む (決定 30 の「同じ規則で選び直す」作りは、読めない形式の nightly・fetch 無効・host の代用・target や toolchain の違いで `get_item` と違う std を選び、hint どおり引いても直らなかった。記録はキャッシュの状態で決まり、プロセスの履歴には依らない)
+- 決定 34 (M4b) 他の crate の std の型を描く std は、サーバーが std を選んだとき (`shared_std` が成功し、アーカイブがそろったとき。get_item・search_items・list_implementors) に target ごとにキャッシュに記録した std・alloc・core のアーカイブの場所 (`std/chosen-v1-<target>.json`) だけを読む (決定 30 の「同じ規則で選び直す」作りは、読めない形式の nightly・fetch 無効・host の代用・target や toolchain の違いで `get_item` と違う std を選び、hint どおり引いても直らなかった。記録はキャッシュの状態で決まり、プロセスの履歴には依らない)
 - 決定 35 (M4b) std がキャッシュに無い間も、prelude の定義元に当たるもの (`core::option::Option`・`alloc::string::String` など。2026 年の nightly の定義パスの表) は名前で描き、`not_canonical` にしない (決定 30 の例外。全部を `not_cached` にすると、ほぼすべての応答に warning と hint が付いていた)
 
 - B2a-2b-1 と決定 34・35 のレビュー (サブエージェント、読むだけ) の対応: 上の段落の形にした (ここでビルドする経路への引き継ぎ、記録をロックの下で変わったときだけ書く、アーカイブがそろわない std は記録しない、hint の target、使った印、blocking のスレッドで作る、target ごとに最新の 1 つ、記録の中身の検査と形式の版、prelude は std があっても先に名前で)。残り (B2a-2b-2): search_items の横断・dependency_graph・std 自身の照会・git の crate (`look_up_git`) の view にも付ける、決定 28 の `trait` の欄、テストの穴 (手元の nightly の経路、follow とここでビルドする経路、壊れた記録・消えたアーカイブ)
@@ -273,6 +273,8 @@ M4 は、1 つの crate の中だけでは答えられない問い (依存グラ
 
 - 決定 37: list_impls・list_methods の cursor は、view に描き方があれば、元の JSON の digest と描き方の識別 (`ExternalPaths::identity`。`StdPaths` は std・alloc・core の digest、つまり JSON の SHA-256 (手元の nightly の std は鍵)、std がキャッシュに無ければその印) を合わせた SHA-256 の先頭 16 文字を持つ (`CrateView::paged_digest`)。workspace の member では一覧が描き方に依らないので混ぜない。描き方が変わると、その cursor は「一覧し直して」と断る。描き方が無ければ今と同じ値。ほかのページを持つツール (search_items・list_implementors・list_module など) は、並べる鍵も件数も描き方に依らないので混ぜない (std を取っただけで cursor が無効にならないように)。`identity` は必須のメソッドにして、B2b で口を足すときに忘れないようにした。単体テスト (list_impls・list_methods で、同じ描き方では通り、描き方が無い・違うとき・元の JSON が違うときは断り、描き方が無ければ元の digest のまま、member でも元の digest のまま。`StdPaths` の識別は 3 つの digest で、std が無いときと違う)
 - 決定 37 のレビュー (サブエージェント、読むだけ) の対応: 元の JSON が変わったら断ることを確かめるテスト (本番では描き方が必ず付くので、これまで list_impls・list_methods に無かった)、list_methods の cursor のテスト、`StdPaths` の識別のテスト、member では混ぜない (std を取っただけで member の cursor が無効にならない)、digest は `cache::sha256_hex` で作る、手元の std の digest は鍵である旨。残り: 要件 v0.22 で R-OUT-3 (doc/requirements.md の cursor の項。「データのダイジェストは元の JSON の SHA-256 の先頭 16 文字」「データは版ごとに固定なので飛びや重複は起きない」) に、list_impls・list_methods の例外 (件数がキャッシュの std に依り、digest に描き方の識別が入る) を足す
+
+**B2a-2b の結合テスト (2026-11-13)**: tests/stdio.rs に足した。偽の配布サーバーの std と docs.rs の偽の crate で、list_impls・list_methods の `trait` の欄が、std を取る前は定義パスで `not_canonical` (not_cached)、std を引いた後は std のパスになる。記録を壊すと not_cached に戻り、std を引けば同じ記録が書き直される。記録が名指すアーカイブ (core) を消すと、別のサーバーは作り直さずに not_cached とし、std を引けば作り直す。dependency_graph の list_implementors で、std の crate (alloc) と workspace の member の impl の見出しが core の trait を std のパスで描く。単体テスト: 記録は 3 つのアーカイブがキャッシュの中にあるときだけ読む (件数の違い・`..`・絶対パス・壊れた JSON・digest の不一致は読まない)。レビュー (サブエージェント、読むだけ) の対応: 別のサーバーがアーカイブを作り直さないこと・std を引けば作り直して記録は同じままであることを、ファイルで確かめる。記録の中身の検査の単体テストを足した。決定 34 の段落の記録のファイル名を `chosen-v1-<target>.json` に直した。残り: 偽の rustup と配布サーバーの組み立てが既存のテストと重なる (ヘルパーに出すかは後で)。残りのテストの穴: search_items の横断、get_item の std 自身の照会、git の crate、follow とここでビルドする経路、手元の nightly の経路
 
 ### 6.3 M4c
 

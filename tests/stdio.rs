@@ -5081,6 +5081,20 @@ fn list_implementors_looks_for_a_trait_of_std_in_the_whole_build() {
         implementors.contains("App") && implementors.contains(r#""crate":"app""#),
         "{told}"
     );
+    // core's trait at std's path, from std's crates and from the member, which std's lookup
+    // fetched (decided in M4b, decisions 18 and 34).
+    let headers = content["data"]["implementors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|implementor| implementor["header"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(
+        headers.contains(&"impl std::fmt::Display for str")
+            && headers.contains(&"impl std::fmt::Display for app::App"),
+        "{headers:?}"
+    );
+    assert!(content["data"].get("not_canonical").is_none(), "{told}");
     // One std, of one version.
     assert!(
         !content["hints"].to_string().contains("for those"),
@@ -5089,8 +5103,72 @@ fn list_implementors_looks_for_a_trait_of_std_in_the_whole_build() {
     assert!(server.finish().success());
 }
 
+/// Adds to `krate`, of [`add_shows`], `pub struct Shout` with an `impl fmt::Display`, of the
+/// trait `display`, with a function `fmt` without `self`, and returns its id.
+#[cfg(all(
+    debug_assertions,
+    feature = "local",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+fn add_shout(krate: &mut Crate, display: Id) -> Id {
+    let (shout, implementation, method) = (Id(97), Id(96), Id(95));
+    let mut fmt = krate.index.get(&Id(1)).expect("hello").clone();
+    fmt.id = method;
+    fmt.name = Some("fmt".to_owned());
+    fmt.docs = None;
+    fmt.visibility = Visibility::Default;
+    let mut the_struct = fmt.clone();
+    the_struct.id = shout;
+    the_struct.name = Some("Shout".to_owned());
+    the_struct.visibility = Visibility::Public;
+    the_struct.inner = ItemEnum::Struct(rustdoc_types::Struct {
+        kind: rustdoc_types::StructKind::Unit,
+        generics: Generics {
+            params: Vec::new(),
+            where_predicates: Vec::new(),
+        },
+        impls: vec![implementation],
+    });
+    let mut the_impl = fmt.clone();
+    the_impl.id = implementation;
+    the_impl.name = None;
+    the_impl.inner = ItemEnum::Impl(rustdoc_types::Impl {
+        is_unsafe: false,
+        generics: Generics {
+            params: Vec::new(),
+            where_predicates: Vec::new(),
+        },
+        provided_trait_methods: Vec::new(),
+        trait_: Some(rustdoc_types::Path {
+            path: "fmt::Display".to_owned(),
+            id: display,
+            args: None,
+        }),
+        for_: Type::ResolvedPath(rustdoc_types::Path {
+            path: "Shout".to_owned(),
+            id: shout,
+            args: None,
+        }),
+        items: vec![method],
+        is_negative: false,
+        is_synthetic: false,
+        blanket_impl: None,
+    });
+    for item in [fmt, the_struct, the_impl] {
+        krate.index.insert(item.id, item);
+    }
+    krate.paths.insert(shout, rustdoc_types::ItemSummary {
+        crate_id: 0,
+        path: ["shows", "Shout"].map(str::to_owned).to_vec(),
+        kind: rustdoc_types::ItemKind::Struct,
+    });
+    shout
+}
+
 /// Puts in the cache of `dir` the docs.rs JSON of `shows` 0.1.0, whose `pub fn show(value: &dyn
-/// fmt::Display, maybe: Option<u8>)` names core's `Display` and `Option`, and its `.crate`.
+/// fmt::Display, maybe: Option<u8>)` names core's `Display` and `Option`, and whose `pub struct
+/// Shout` has an `impl fmt::Display` ([`add_shout`]), and its `.crate`.
 #[cfg(all(
     debug_assertions,
     feature = "local",
@@ -5100,8 +5178,12 @@ fn list_implementors_looks_for_a_trait_of_std_in_the_whole_build() {
 fn add_shows(dir: &Path) {
     let mut krate = demo_crate();
     let (display, option) = (Id(99), Id(98));
+    let shout = add_shout(&mut krate, display);
     if let Some(root) = krate.index.get_mut(&Id(0)) {
         root.name = Some("shows".to_owned());
+        if let ItemEnum::Module(module) = &mut root.inner {
+            module.items.push(shout);
+        }
     }
     if let Some(hello) = krate.index.get_mut(&Id(1)) {
         hello.name = Some("show".to_owned());
@@ -5277,6 +5359,150 @@ fn a_type_of_std_is_shown_at_its_path_once_std_is_cached() {
         "{after}"
     );
     assert!(other.finish().success());
+    assert!(server.finish().success());
+}
+
+/// The archives of core in the cache `cache` where the record of the std chosen, `record`,
+/// names them.
+#[cfg(all(
+    debug_assertions,
+    feature = "local",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+fn core_archives(cache: &Path, record: &[u8]) -> Vec<PathBuf> {
+    // core's, the last of the record's.
+    let recorded: Value = serde_json::from_slice(record).expect("JSON");
+    let dir = cache.join(recorded["archives"][2][0].as_str().expect("a directory"));
+    std::fs::read_dir(&dir)
+        .expect("readable")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|archive| {
+            archive
+                .extension()
+                .is_some_and(|extension| extension == "rkyv")
+                && archive
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("core."))
+        })
+        .collect()
+}
+
+/// The trait of an impl of another crate's trait is shown at the path that the cached std writes
+/// it at, by `list_impls` and `list_methods`, and told as not cached until std is cached, or
+/// while the record of the std chosen is corrupt or an archive that it names is gone, until a
+/// lookup of std makes them again (decided in M4b, decisions 20, 28, 30 and 34). The nightly
+/// toolchain here is hidden, as for
+/// [`list_implementors_looks_for_a_trait_of_std_in_the_whole_build`].
+#[cfg(all(
+    debug_assertions,
+    feature = "local",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+#[test]
+fn the_trait_of_an_impl_is_shown_at_std_s_path_once_std_is_cached() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let cache = test_cache();
+    add_shows(cache.path());
+    let shared = cache.path().to_owned();
+    let bin = TempDir::new().expect("a temporary directory");
+    let rustup = bin.path().join("rustup");
+    std::fs::write(&rustup, "#!/bin/sh\nexit 1\n").expect("written");
+    std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755)).expect("runnable");
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let dist = fake_dist_with(false, true);
+    let environment = [
+        ("PATH", path.as_str()),
+        ("CHATORA_RUSTDOC_TEST_DIST_URL", dist.as_str()),
+    ];
+    let mut server = Server::start_with_cache(cache, None, &environment);
+    let shout = json!({ "crate": "shows@0.1.0", "path": "Shout", "target": TARGET });
+    // The trait of the impl and of the method, and what is told as not cached; each call tries
+    // again with the next ids while it is building, up to 89 times, in order.
+    let traits = |server: &mut Server, id: u64| {
+        let impls = called_until_done(server, id * 100, "list_impls", &shout);
+        let methods = called_until_done(server, id * 100 + 50, "list_methods", &shout);
+        let (impls, methods) = (&impls["structuredContent"], &methods["structuredContent"]);
+        let of = |listed: &Value| {
+            listed
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry["trait"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        let told = |content: &Value| {
+            content["data"]["not_canonical"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|told| format!("{} {}", told["lookup"], told["reason"]))
+                .collect::<Vec<_>>()
+        };
+        (
+            of(&impls["data"]["impls"]),
+            of(&methods["data"]["methods"]),
+            told(impls),
+            told(methods),
+            format!("{impls} {methods}"),
+        )
+    };
+    let not_cached = |server: &mut Server, id: u64| {
+        let (impls, methods, told_impls, told_methods, all) = traits(server, id);
+        assert_eq!(impls, ["core::fmt::Display"], "{all}");
+        assert_eq!(methods, ["core::fmt::Display"], "{all}");
+        let told = [r#""core::fmt::Display" "not_cached""#];
+        assert_eq!(told_impls, told, "{all}");
+        assert_eq!(told_methods, told, "{all}");
+    };
+    let at_std = |server: &mut Server, id: u64| {
+        let (impls, methods, told_impls, told_methods, all) = traits(server, id);
+        assert_eq!(impls, ["std::fmt::Display"], "{all}");
+        assert_eq!(methods, ["std::fmt::Display"], "{all}");
+        assert_eq!(told_impls, Vec::<String>::new(), "{all}");
+        assert_eq!(told_methods, Vec::<String>::new(), "{all}");
+    };
+    not_cached(&mut server, 1);
+    // Looking std up fetches it.
+    let display = json!({ "crate": "core", "path": "fmt::Display", "target": TARGET });
+    let found = called_until_done(&mut server, 200, "get_item", &display);
+    assert_eq!(found["isError"], false, "{found}");
+    at_std(&mut server, 3);
+    // A corrupt record is not read, and a lookup of std writes it again.
+    let record = shared.join("std").join(format!("chosen-v1-{TARGET}.json"));
+    let written = std::fs::read(&record).expect("recorded");
+    std::fs::write(&record, b"{").expect("written");
+    not_cached(&mut server, 4);
+    let found = called_until_done(&mut server, 500, "get_item", &display);
+    assert_eq!(found["isError"], false, "{found}");
+    assert_eq!(std::fs::read(&record).expect("recorded"), written);
+    at_std(&mut server, 6);
+    // An archive that the record names gone, another server does not make it, but a lookup of
+    // std does.
+    let core = core_archives(&shared, &written);
+    assert_eq!(core.len(), 1, "{core:?}");
+    for archive in &core {
+        std::fs::remove_file(archive).expect("removed");
+    }
+    // The first server, which keeps the paths that it read for the same record, would still show
+    // std's paths.
+    let mut other = Server::start_sharing(&shared, None, &environment);
+    not_cached(&mut other, 7);
+    assert_eq!(core_archives(&shared, &written).len(), 0, "made again");
+    let found = called_until_done(&mut other, 800, "get_item", &display);
+    assert_eq!(found["isError"], false, "{found}");
+    assert_eq!(core_archives(&shared, &written).len(), 1);
+    assert_eq!(std::fs::read(&record).expect("recorded"), written);
+    at_std(&mut other, 9);
+    assert!(other.finish().success());
+    // Last, as it holds the cache.
     assert!(server.finish().success());
 }
 

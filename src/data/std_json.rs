@@ -760,6 +760,46 @@ mod tests {
         test_http,
     };
 
+    /// The record of the std chosen is read only when it is whole, of three archives in the
+    /// cache (decided in M4b, decision 34).
+    #[test]
+    fn a_record_of_the_std_chosen_is_read_only_when_it_is_whole() {
+        let temp = tempfile::tempdir().expect("a temporary directory");
+        let cache = Cache::at(temp.path());
+        let target: TargetTriple = "x86_64-unknown-linux-gnu".parse().expect("a target");
+        let path = chosen_path(&cache, &target);
+        fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+        let read = |json: &str| {
+            cache
+                .write_verified(&path, json.as_bytes())
+                .expect("written");
+            recorded_chosen(&cache, &target)
+        };
+        let of = |dirs: &[&str]| {
+            let archives = dirs
+                .iter()
+                .map(|dir| serde_json::json!([dir, "k"]))
+                .collect::<Vec<_>>();
+            serde_json::json!({ "version": "1.101.0-nightly", "archives": archives }).to_string()
+        };
+        let whole = read(&of(&["std/a/t"; 3])).expect("read");
+        assert_eq!(whole.version.as_deref(), Some("1.101.0-nightly"));
+        assert_eq!(whole.archives.len(), 3);
+        for not_whole in [
+            of(&["std/a/t"; 2]),
+            of(&["std/a/t"; 4]),
+            of(&["std/a/t", "std/a/t", "../outside"]),
+            of(&["std/a/t", "/outside", "std/a/t"]),
+            "{".to_owned(),
+        ] {
+            assert_eq!(read(&not_whole), None, "{not_whole}");
+        }
+        // Nor when its digest does not match.
+        read(&of(&["std/a/t"; 3])).expect("read");
+        fs::write(&path, of(&["std/b/t"; 3])).expect("written");
+        assert_eq!(recorded_chosen(&cache, &target), None);
+    }
+
     #[test]
     fn the_std_of_nightlies_unused_for_a_week_goes() {
         let temp = tempfile::tempdir().expect("a temporary directory");
