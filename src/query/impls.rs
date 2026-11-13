@@ -10,6 +10,7 @@ use rustdoc_types::{Attribute, Id, Impl, Item, ItemEnum, StructKind, Type, Visib
 use serde::Serialize;
 
 use super::{
+    external::{NotCanonical, Reason, Shown},
     get_item::{
         Conditions,
         GetItemError,
@@ -104,7 +105,7 @@ pub struct Impls {
     /// The types of other crates in it that are shown as rustdoc writes them, not by their
     /// canonical paths (decided in M4b, decision 20).
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
-    pub not_canonical: Box<[crate::query::external::NotCanonical]>,
+    pub not_canonical: Box<[NotCanonical]>,
 }
 
 /// One `impl`.
@@ -526,7 +527,9 @@ pub(super) struct TraitOrigin {
 
 /// The trait `id` as a response names it. `None` for a trait of this crate without a public
 /// path, which is not public API (std's `SpecExtend`; requirement R-TI-2), or hidden, but in a
-/// workspace member, `member`, which shows them at their paths in the crate.
+/// workspace member, `member`, which shows them at their paths in the crate; and for another
+/// crate's trait that the view's paths tell as such there, as core's `SizedTypeProperties` to
+/// std (decided in M4b, decision 36).
 pub(super) fn trait_origin(view: &CrateView<'_>, id: Id, member: bool) -> Option<TraitOrigin> {
     let Some(summary) = view.summary(id) else {
         return Some(TraitOrigin::default());
@@ -544,6 +547,19 @@ pub(super) fn trait_origin(view: &CrateView<'_>, id: Id, member: bool) -> Option
             path: Some(path),
             krate: None,
         });
+    }
+    let unnameable = !member
+        && view.external().is_some_and(|external| {
+            matches!(
+                external.shown(view, id, summary),
+                Some(Shown::NotCanonical(NotCanonical {
+                    reason: Reason::Unnameable,
+                    ..
+                }))
+            )
+        });
+    if unnameable {
+        return None;
     }
     Some(TraitOrigin {
         path: Some(summary.path.join("::").into()),
@@ -648,7 +664,7 @@ fn fit(response: &mut ImplsResponse<'_>, mut impls: Vec<ImplEntry>, page: &impl 
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use semver::Version;
     use serde_json::json;
 
@@ -719,16 +735,16 @@ mod tests {
             _view: &CrateView<'_>,
             _id: Id,
             summary: &rustdoc_types::ItemSummary,
-        ) -> Option<crate::query::external::Shown> {
+        ) -> Option<Shown> {
             (summary.crate_id != 0).then(|| {
                 let name = summary.path.last().map_or("", String::as_str);
-                crate::query::external::Shown::Path(format!("std::fmt::{name}").into())
+                Shown::Path(format!("std::fmt::{name}").into())
             })
         }
     }
 
     /// [`parsed`], with an `impl fmt::Display for Mutex` of core's `Display` (90).
-    fn with_display() -> rustdoc_types::Crate {
+    pub(in crate::query) fn with_display() -> rustdoc_types::Crate {
         let mut krate = parsed().krate;
         let mut display = krate.index.get(&Id(5)).expect("the impl").clone();
         display.id = Id(95);
@@ -811,24 +827,104 @@ mod tests {
         )]);
     }
 
-    /// Tells the items of other crates as not cached.
-    #[derive(Debug)]
-    struct NoneCached;
+    /// The impls of another crate's trait that it hides or has no public path for are not
+    /// listed, as the crate's own, but in a workspace member (decided in M4b, decision 36).
+    #[test]
+    fn the_impls_of_a_trait_its_crate_hides_are_not_listed() {
+        let bytes = archive(with_display());
+        let (name, version) = (
+            "my-crate".parse::<CrateName>().expect("a name"),
+            Version::new(1, 2, 3),
+        );
+        let listed = |reason, origin| {
+            let told = Told(reason);
+            let view = CrateView::new(archived(&bytes)).with_external(&told);
+            let request = ItemRequest {
+                name: &name,
+                version: &version,
+                path: "my_crate::Mutex",
+                origin,
+                detail: Detail::Normal,
+                project_features: None,
+                follow: false,
+                target: None,
+            };
+            let options = ImplOptions {
+                limit: 50,
+                offset: 0,
+                cursor_request: "c1.req",
+                cursor_data: None,
+            };
+            let response = list_impls(&view, request, options).expect("listed");
+            let headers = response
+                .data
+                .entries
+                .iter()
+                .map(|entry| entry.header.to_string())
+                .collect::<Vec<_>>();
+            let told = response
+                .data
+                .not_canonical
+                .iter()
+                .map(|told| (told.lookup.to_string(), told.reason))
+                .collect::<Vec<_>>();
+            (headers, told)
+        };
+        let docs_rs = Origin::DocsRs {
+            resolved_from: ResolvedFrom::Explicit,
+            project_from: None,
+            build: None,
+        };
+        let (headers, told) = listed(Reason::Unnameable, docs_rs);
+        assert_eq!(headers, ["impl my_crate::Mutex"]);
+        assert_eq!(told, []);
+        // One not found is listed.
+        let (headers, told) = listed(Reason::NotFound, docs_rs);
+        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert_eq!(told, [("core::fmt::Display".to_owned(), Reason::NotFound)]);
+        #[cfg(feature = "local")]
+        {
+            let member = Origin::Local {
+                private: true,
+                package_source: None,
+                resolved_from: ResolvedFrom::Explicit,
+                project_from: None,
+                toolchain: None,
+                built_at: "2026-11-13T00:00:00Z",
+                features_requested: None,
+                features_effective: None,
+                recorded_by: None,
+                roots: None,
+                source_files: &[],
+                dependencies: None,
+            };
+            let (headers, told) = listed(Reason::Unnameable, member);
+            assert_eq!(headers.len(), 2, "{headers:?}");
+            assert_eq!(told, [(
+                "core::fmt::Display".to_owned(),
+                Reason::Unnameable
+            )]);
+        }
+    }
 
-    impl crate::query::external::ExternalPaths for NoneCached {
+    /// Tells the items of other crates as not canonical, for the reason it holds.
+    #[derive(Debug)]
+    pub(in crate::query) struct Told(pub(in crate::query) Reason);
+
+    impl crate::query::external::ExternalPaths for Told {
         fn shown(
             &self,
             _view: &CrateView<'_>,
             _id: Id,
             summary: &rustdoc_types::ItemSummary,
-        ) -> Option<crate::query::external::Shown> {
+        ) -> Option<Shown> {
             (summary.crate_id != 0).then(|| {
-                crate::query::external::Shown::NotCanonical(crate::query::external::NotCanonical {
+                Shown::NotCanonical(NotCanonical {
                     ty: Box::default(),
                     krate: "core".into(),
                     version: None,
                     lookup: summary.path.join("::").into(),
-                    reason: crate::query::external::Reason::NotCached,
+                    reason: self.0,
                 })
             })
         }
@@ -839,7 +935,7 @@ mod tests {
     #[test]
     fn the_trait_of_an_impl_off_the_page_is_not_told() {
         let bytes = archive(with_display());
-        let view = CrateView::new(archived(&bytes)).with_external(&NoneCached);
+        let view = CrateView::new(archived(&bytes)).with_external(&Told(Reason::NotCached));
         let (name, version) = (
             "my-crate".parse::<CrateName>().expect("a name"),
             Version::new(1, 2, 3),

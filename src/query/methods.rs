@@ -772,4 +772,59 @@ mod tests {
         let response = list_methods(&view, request, by_name).expect("listed");
         assert_eq!(response.page.total, 1);
     }
+
+    /// The methods of another crate's trait that it hides or has no public path for are not
+    /// listed, nor told of (decided in M4b, decision 36).
+    #[test]
+    fn the_methods_of_a_trait_its_crate_hides_are_not_listed() {
+        use crate::query::{
+            external::Reason,
+            impls::tests::{Told, with_display},
+        };
+        let bytes = archive(with_display());
+        let name: CrateName = "my-crate".parse().expect("a crate name");
+        let version = Version::new(1, 2, 3);
+        let listed = |reason| {
+            let told = Told(reason);
+            let view = CrateView::new(archived(&bytes)).with_external(&told);
+            let request = ItemRequest {
+                name: &name,
+                version: &version,
+                path: "my_crate::Mutex",
+                origin: Origin::DocsRs {
+                    resolved_from: ResolvedFrom::Explicit,
+                    project_from: None,
+                    build: None,
+                },
+                detail: Detail::Brief,
+                project_features: None,
+                follow: false,
+                target: None,
+            };
+            let options = MethodOptions {
+                name: None,
+                from: &[],
+                expand_blanket: false,
+                limit: 50,
+                offset: 0,
+                cursor_request: "c1.req",
+                cursor_data: None,
+            };
+            let response = list_methods(&view, request, options).expect("listed");
+            let data = serde_json::to_value(&response).expect("serializes")["data"].clone();
+            let from = data["methods"]
+                .as_array()
+                .expect("methods")
+                .iter()
+                .map(|method| method["from"].to_string())
+                .collect::<Vec<_>>();
+            (from, data["not_canonical"].clone())
+        };
+        let (from, told) = listed(Reason::NotFound);
+        assert_eq!(from.len(), 2, "{from:?}");
+        assert_eq!(told[0]["lookup"], json!("core::fmt::Display"), "{told}");
+        let (from, told) = listed(Reason::Unnameable);
+        assert_eq!(from, [r#""inherent""#], "{told}");
+        assert!(told.as_array().is_none_or(Vec::is_empty), "{told}");
+    }
 }
