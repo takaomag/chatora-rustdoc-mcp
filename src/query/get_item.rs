@@ -1150,8 +1150,9 @@ pub const NOT_CANONICAL_WARNING_END: &str = ", not by canonical paths (see data.
 
 /// The hint of [`told_not_canonical`].
 pub const NOT_CANONICAL_HINT: &str = "call get_item with the crate, version and lookup of a \
-                                      not_canonical entry: the calls after it show the types of \
-                                      that crate by their canonical paths";
+                                      not_canonical entry, and the target of provenance.target: \
+                                      the calls after it show the types of that crate by their \
+                                      canonical paths";
 
 /// One lookup, with what it has found to warn about so far.
 /// What a query says besides its data.

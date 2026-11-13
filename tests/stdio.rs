@@ -500,6 +500,9 @@ fn fake_dist_with(with_rust_src: bool, with_display: bool) -> String {
         if with_display && name == "alloc" {
             add_display_impl(&mut krate);
         }
+        if with_display && name == "std" {
+            reexport_fmt(&mut krate);
+        }
         serde_json::to_vec(&krate).expect("serializes")
     };
     let (std, core, alloc) = (json("std"), json("core"), json("alloc"));
@@ -638,6 +641,48 @@ fn add_display(krate: &mut Crate) {
             path: path.into_iter().map(str::to_owned).collect(),
             kind,
         });
+    }
+}
+
+/// Adds to `krate`, the std of [`fake_dist_with`], `pub use core::fmt;`, as the real one has it.
+#[cfg(debug_assertions)]
+fn reexport_fmt(krate: &mut Crate) {
+    let (reexport, fmt) = (Id(12), Id(13));
+    krate
+        .external_crates
+        .insert(1, rustdoc_types::ExternalCrate {
+            name: "core".to_owned(),
+            html_root_url: Some("https://doc.rust-lang.org/nightly/".to_owned()),
+            path: PathBuf::from("core.json"),
+        });
+    krate.paths.insert(fmt, rustdoc_types::ItemSummary {
+        crate_id: 1,
+        path: ["core", "fmt"].map(str::to_owned).to_vec(),
+        kind: rustdoc_types::ItemKind::Module,
+    });
+    krate.index.insert(reexport, Item {
+        id: reexport,
+        crate_id: 0,
+        name: None,
+        span: None,
+        visibility: Visibility::Public,
+        docs: None,
+        links: HashMap::new(),
+        attrs: Vec::new(),
+        deprecation: None,
+        stability: None,
+        const_stability: None,
+        inner: ItemEnum::Use(rustdoc_types::Use {
+            source: "core::fmt".to_owned(),
+            name: "fmt".to_owned(),
+            id: Some(fmt),
+            is_glob: false,
+        }),
+    });
+    if let Some(ItemEnum::Module(root)) =
+        krate.index.get_mut(&krate.root).map(|root| &mut root.inner)
+    {
+        root.items.push(reexport);
     }
 }
 
@@ -5041,6 +5086,197 @@ fn list_implementors_looks_for_a_trait_of_std_in_the_whole_build() {
         !content["hints"].to_string().contains("for those"),
         "{told}"
     );
+    assert!(server.finish().success());
+}
+
+/// Puts in the cache of `dir` the docs.rs JSON of `shows` 0.1.0, whose `pub fn show(value: &dyn
+/// fmt::Display, maybe: Option<u8>)` names core's `Display` and `Option`, and its `.crate`.
+#[cfg(all(
+    debug_assertions,
+    feature = "local",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+fn add_shows(dir: &Path) {
+    let mut krate = demo_crate();
+    let (display, option) = (Id(99), Id(98));
+    if let Some(root) = krate.index.get_mut(&Id(0)) {
+        root.name = Some("shows".to_owned());
+    }
+    if let Some(hello) = krate.index.get_mut(&Id(1)) {
+        hello.name = Some("show".to_owned());
+        hello.docs = None;
+        if let ItemEnum::Function(function) = &mut hello.inner {
+            function.sig.output = None;
+            function.sig.inputs = vec![
+                ("value".to_owned(), Type::BorrowedRef {
+                    lifetime: None,
+                    is_mutable: false,
+                    type_: Box::new(Type::DynTrait(rustdoc_types::DynTrait {
+                        traits: vec![rustdoc_types::PolyTrait {
+                            trait_: rustdoc_types::Path {
+                                path: "fmt::Display".to_owned(),
+                                id: display,
+                                args: None,
+                            },
+                            generic_params: Vec::new(),
+                        }],
+                        lifetime: None,
+                    })),
+                }),
+                (
+                    "maybe".to_owned(),
+                    Type::ResolvedPath(rustdoc_types::Path {
+                        path: "Option".to_owned(),
+                        id: option,
+                        args: Some(Box::new(rustdoc_types::GenericArgs::AngleBracketed {
+                            args: vec![rustdoc_types::GenericArg::Type(Type::Primitive(
+                                "u8".to_owned(),
+                            ))],
+                            constraints: Vec::new(),
+                        })),
+                    }),
+                ),
+            ];
+        }
+    }
+    krate.paths.insert(display, rustdoc_types::ItemSummary {
+        crate_id: 1,
+        path: ["core", "fmt", "Display"].map(str::to_owned).to_vec(),
+        kind: rustdoc_types::ItemKind::Trait,
+    });
+    krate.paths.insert(option, rustdoc_types::ItemSummary {
+        crate_id: 1,
+        path: ["core", "option", "Option"].map(str::to_owned).to_vec(),
+        kind: rustdoc_types::ItemKind::Enum,
+    });
+    krate
+        .external_crates
+        .insert(1, rustdoc_types::ExternalCrate {
+            name: "core".to_owned(),
+            html_root_url: Some("https://doc.rust-lang.org/nightly/".to_owned()),
+            path: PathBuf::from("core.json"),
+        });
+    let name: CrateName = "shows".parse().expect("a crate name");
+    let cache = Cache::at(dir);
+    cache
+        .write_docs_rs_json(
+            &cache.docs_rs_dir(
+                &name,
+                &Version::new(0, 1, 0),
+                Some(&TARGET.parse().expect("a target")),
+            ),
+            rustdoc_types::FORMAT_VERSION,
+            &serde_json::to_vec(&krate).expect("serializes"),
+        )
+        .expect("the cache is writable");
+    let manifest = "[package]\nname = \"shows\"\nversion = \"0.1.0\"\n";
+    let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest.len().try_into().expect("small"));
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "shows-0.1.0/Cargo.toml", manifest.as_bytes())
+        .expect("appended");
+    let contents = builder
+        .into_inner()
+        .and_then(GzEncoder::finish)
+        .expect("finished");
+    let path = cache.crate_file_path(&name, &Version::new(0, 1, 0));
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("made");
+    std::fs::write(&path, &contents).expect("written");
+    std::fs::write(path.with_extension("crate.sha256"), sha256_hex(&contents)).expect("written");
+}
+
+/// A type of std named by a crate's signature is shown as written and told as not cached until
+/// std is in the cache, but one of its prelude, shown by its name; once a lookup of std fetched
+/// it, it is shown at std's path, by another server on the cache too (decided in M4b, decisions
+/// 18, 20, 30, 34 and 35). The nightly toolchain here is hidden, as for
+/// [`list_implementors_looks_for_a_trait_of_std_in_the_whole_build`].
+#[cfg(all(
+    debug_assertions,
+    feature = "local",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+#[test]
+fn a_type_of_std_is_shown_at_its_path_once_std_is_cached() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let cache = test_cache();
+    add_shows(cache.path());
+    let shared = cache.path().to_owned();
+    let bin = TempDir::new().expect("a temporary directory");
+    let rustup = bin.path().join("rustup");
+    std::fs::write(&rustup, "#!/bin/sh\nexit 1\n").expect("written");
+    std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755)).expect("runnable");
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let dist = fake_dist_with(false, true);
+    let mut server = Server::start_with_cache(cache, None, &[
+        ("PATH", path.as_str()),
+        ("CHATORA_RUSTDOC_TEST_DIST_URL", dist.as_str()),
+    ]);
+    let show = json!({ "crate": "shows@0.1.0", "path": "show", "target": TARGET });
+    let call = |server: &mut Server, id: u64, arguments: &Value| {
+        called_until_done(server, id * 100, "get_item", arguments)
+    };
+    let first = call(&mut server, 1, &show);
+    let data = &first["structuredContent"]["data"];
+    assert!(
+        data["signature"].to_string().contains("&dyn fmt::Display"),
+        "{first}"
+    );
+    assert_eq!(data["not_canonical"][0]["reason"], "not_cached", "{first}");
+    assert_eq!(
+        data["not_canonical"][0]["lookup"], "core::fmt::Display",
+        "{first}"
+    );
+    // The prelude's by its name, not told.
+    assert!(
+        data["signature"].to_string().contains("maybe: Option<u8>"),
+        "{first}"
+    );
+    assert_eq!(
+        data["not_canonical"].as_array().map(Vec::len),
+        Some(1),
+        "{first}"
+    );
+    assert!(
+        first["structuredContent"]["hints"]
+            .to_string()
+            .contains("provenance.target"),
+        "{first}"
+    );
+    // Looking std up fetches it.
+    let display = json!({ "crate": "core", "path": "fmt::Display", "target": TARGET });
+    let found = call(&mut server, 2, &display);
+    assert_eq!(found["isError"], false, "{found}");
+    let again = call(&mut server, 3, &show);
+    let data = &again["structuredContent"]["data"];
+    assert!(
+        data["signature"]
+            .to_string()
+            .contains("&dyn std::fmt::Display"),
+        "{again}"
+    );
+    assert!(data.get("not_canonical").is_none(), "{again}");
+    // Another server on the cache reads the std recorded there, not one that it chose itself.
+    let mut other = Server::start_sharing(&shared, None, &[
+        ("PATH", path.as_str()),
+        ("CHATORA_RUSTDOC_TEST_DIST_URL", dist.as_str()),
+    ]);
+    let after = call(&mut other, 1, &show);
+    assert!(
+        after["structuredContent"]["data"]["signature"]
+            .to_string()
+            .contains("&dyn std::fmt::Display"),
+        "{after}"
+    );
+    assert!(other.finish().success());
     assert!(server.finish().success());
 }
 

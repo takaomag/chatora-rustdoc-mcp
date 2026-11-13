@@ -303,6 +303,7 @@ pub async fn serve(settings: &Settings) -> Result<(), ServeError> {
             archives: Flights::default(),
             crate_sources: Flights::default(),
             stds: Flights::default(),
+            std_paths: tool::StdPathsKept::default(),
             rust_srcs: Flights::default(),
             dist: tool::dist(&network, DistSettings::from_settings(settings))?,
             index: tool::sparse_index(cache.clone(), &network)?,

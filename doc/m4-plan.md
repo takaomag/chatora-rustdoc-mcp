@@ -250,6 +250,15 @@ M4 は、1 つの crate の中だけでは答えられない問い (依存グラ
 
 **toolchain 1.100 への追随 (2026-11-13、ffc64da)**: stable が 1.100.0 になり、cargo の build dir の配置が変わって、build script の出力が `<hash>/output` から `<hash>/run/stdout` に移った。ローカルビルドの dep-info を取る処理がそれを読めずに失敗し、dep-info が記録されなくなっていた (tests/local の 5 件で分かった)。両方の置き場を読むようにした。ほかに clippy の新しい `map_unwrap_or` (`map_or_default` へ。1.98 で安定) と、tests・examples で満たされなくなった `unused_crate_dependencies` の expect を外した
 
+**B2a-2b-1 の実装 (2026-11-13)**: std の描き方を get_item に付けた。最初は std をキャッシュだけで「`choose` と同じ規則で」選び直していたが、レビューで `get_item` と違う std を選ぶ場合が見つかり、決定 34・35 (下) の形に改めた: std を選ぶ処理 (`shared_std`。get_item・search_items・list_implementors が通る) が成功し、std・alloc・core のアーカイブがあるときに、target ごとにその場所をキャッシュに記録し (`std_json::record_chosen`、`std/chosen-v1-<target>.json`。ロックの下で、変わったときだけ書く)、描く側 (`std_paths`) はその記録だけを読み (相対パスで `..` などの無いものだけ)、target ごとに最新の 1 つをプロセスで覚え (`ToolState::std_paths`)、記録の std を「使った」と記録する (1 週間の片付けで消されない)。記録が無ければ `StdPaths::not_cached` (std の item は `not_cached`、prelude の定義元は名前で)。get_item は release を引く直前に `Request::shown` に入れ、`look_up_in` が view に付け (`CrateView::shown_with`)、re-export をたどった先と、docs.rs に JSON が無くここでビルドする経路にも引き継ぐ。hint は `provenance.target` の target で引くよう案内する。テスト: stdio に 1 件 (偽の配布サーバーの std に `pub use core::fmt;` を足し、std の無い間は `fmt::Display` のまま `not_cached` で `Option` は名前のまま伝えない、core を引いた後は `std::fmt::Display`、キャッシュを共有する別のサーバーも記録から `std::fmt::Display`)
+
+**B2a-2b-1 のレビューの後の判断 (2026-11-13、利用者が 1 件ずつ決めた。どちらも推した案)**:
+
+- 決定 34 (M4b) 他の crate の std の型を描く std は、サーバーが std を選んだとき (`shared_std` が成功し、アーカイブがそろったとき。get_item・search_items・list_implementors) に target ごとにキャッシュに記録した std・alloc・core のアーカイブの場所 (`std/chosen-<target>.json`) だけを読む (決定 30 の「同じ規則で選び直す」作りは、読めない形式の nightly・fetch 無効・host の代用・target や toolchain の違いで `get_item` と違う std を選び、hint どおり引いても直らなかった。記録はキャッシュの状態で決まり、プロセスの履歴には依らない)
+- 決定 35 (M4b) std がキャッシュに無い間も、prelude の定義元に当たるもの (`core::option::Option`・`alloc::string::String` など。2026 年の nightly の定義パスの表) は名前で描き、`not_canonical` にしない (決定 30 の例外。全部を `not_cached` にすると、ほぼすべての応答に warning と hint が付いていた)
+
+- B2a-2b-1 と決定 34・35 のレビュー (サブエージェント、読むだけ) の対応: 上の段落の形にした (ここでビルドする経路への引き継ぎ、記録をロックの下で変わったときだけ書く、アーカイブがそろわない std は記録しない、hint の target、使った印、blocking のスレッドで作る、target ごとに最新の 1 つ、記録の中身の検査と形式の版、prelude は std があっても先に名前で)。残り (B2a-2b-2): search_items の横断・dependency_graph・std 自身の照会・git の crate (`look_up_git`) の view にも付ける、決定 28 の `trait` の欄、テストの穴 (手元の nightly の経路、follow とここでビルドする経路、壊れた記録・消えたアーカイブ)
+
 ### 6.3 M4c
 
 ### 6.4 M4d

@@ -211,6 +211,88 @@ pub async fn choose(
     })
 }
 
+/// The std that `get_item` chose for a target last, by the places of the archives of std, alloc
+/// and core, in the cache, which what shows std's paths opens as they are (decided in M4b,
+/// decision 34).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ChosenRecord {
+    /// The toolchain's release.
+    pub version: Option<Box<str>>,
+    /// For std, alloc and core, in that order: the directory of the archive, from the cache's,
+    /// and what it is keyed by.
+    pub archives: Vec<(PathBuf, Box<str>)>,
+}
+
+/// Where the record of the std chosen for `target` is.
+fn chosen_path(cache: &Cache, target: &TargetTriple) -> PathBuf {
+    cache
+        .dir()
+        .join(super::layout::STD)
+        .join(format!("chosen-v1-{target}.json"))
+}
+
+/// Records `chosen` as the std that `get_item` chose for `target` last (decided in M4b, decision
+/// 34).
+///
+/// # Errors
+///
+/// Returns an error when the places of its archives cannot be had, or the record cannot be
+/// written.
+pub fn record_chosen(cache: &Cache, target: &TargetTriple, chosen: &Chosen) -> io::Result<()> {
+    let mut archives = Vec::new();
+    for krate in [StdCrate::Std, StdCrate::Alloc, StdCrate::Core] {
+        let (dir, source) = chosen.json.archive_key(cache, krate)?;
+        let dir = dir
+            .strip_prefix(cache.dir())
+            .map_or_else(|_| dir.clone(), Path::to_path_buf);
+        archives.push((dir, source));
+    }
+    let record = ChosenRecord {
+        version: chosen
+            .json
+            .release()
+            .map(|release| release.to_string().into()),
+        archives,
+    };
+    let path = chosen_path(cache, target);
+    // Under its lock, so that another server's record is not written half over this one, and only
+    // when it changed, so that a reader does not meet it half written for nothing.
+    let held = cache.lock_blocking(&path);
+    if recorded_chosen(cache, target).as_ref() == Some(&record) {
+        return Ok(());
+    }
+    let json = serde_json::to_vec(&record).map_err(io::Error::other)?;
+    let written = cache.write_verified(&path, &json);
+    drop(held);
+    written
+}
+
+/// The std that `get_item` chose for `target` last, if it recorded one ([`record_chosen`]).
+#[must_use]
+pub fn recorded_chosen(cache: &Cache, target: &TargetTriple) -> Option<ChosenRecord> {
+    let record: ChosenRecord = match cache.read_verified(&chosen_path(cache, target)).ok()? {
+        Verified::Found(json) => serde_json::from_slice(&json).ok()?,
+        Verified::Mismatch | Verified::None => return None,
+    };
+    // Places in the cache only, of std, alloc and core.
+    let inside = |dir: &Path| {
+        dir.components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    };
+    (record.archives.len() == 3 && record.archives.iter().all(|(dir, _)| inside(dir)))
+        .then_some(record)
+}
+
+/// Notes that the std of `record` is used, as [`choose`] does, so that the removal of the
+/// nightlies unused for a week keeps it.
+pub fn note_recorded_use(cache: &Cache, record: &ChosenRecord) {
+    let mut dirs: Vec<&PathBuf> = record.archives.iter().map(|(dir, _)| dir).collect();
+    dirs.dedup();
+    for dir in dirs {
+        note_use(cache, cache.dir().join(dir));
+    }
+}
+
 /// The sources of std of `json`, the JSON of std that was chosen (decisions 20 to 22).
 ///
 /// They are the nightly toolchain's here if they are of the JSON's commit, or else, for a JSON of

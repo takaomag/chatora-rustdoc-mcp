@@ -53,6 +53,18 @@ impl<'a> CrateView<'a> {
         self
     }
 
+    /// The same, showing the items of other crates as `external` tells, if given.
+    #[must_use]
+    pub fn shown_with(
+        self,
+        external: Option<&'a dyn crate::query::external::ExternalPaths>,
+    ) -> Self {
+        match external {
+            Some(external) => self.with_external(external),
+            None => self,
+        }
+    }
+
     /// How the items of other crates are shown from this crate, if known; as rustdoc writes them
     /// otherwise.
     #[must_use]

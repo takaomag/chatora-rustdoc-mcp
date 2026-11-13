@@ -113,6 +113,10 @@ pub(super) struct ToolState {
     /// The JSON of std being chosen and fetched, shared by the calls that want it at once
     /// (requirements R-STD-6 and R-WS-6).
     pub(super) stds: Flights<SharedStd>,
+    /// How std's items are shown from other crates, for each target: of the std recorded for it,
+    /// the latest one found (decided in M4b, decision 34). Not when none was found: a later call
+    /// may find it.
+    pub(super) std_paths: StdPathsKept,
     /// The sources of std being fetched and unpacked from the distribution server, shared by the
     /// calls that want them at once (decided in M3c, C3).
     pub(super) rust_srcs: Flights<get_source::SharedRustSrc>,
@@ -186,6 +190,17 @@ impl ToolState {
         now.checked_add(self.wait).unwrap_or(now)
     }
 }
+
+/// [`ToolState::std_paths`].
+pub(super) type StdPathsKept = parking_lot::Mutex<
+    std::collections::HashMap<
+        target::TargetTriple,
+        (
+            crate::data::std_json::ChosenRecord,
+            Arc<crate::query::std_paths::StdPaths>,
+        ),
+    >,
+>;
 
 /// `limits.request_timeout_secs` unless set (requirement R-ARCH-6).
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;

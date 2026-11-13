@@ -66,11 +66,56 @@ const PRELUDE: &[&str] = &[
     "std::string::ToString",
 ];
 
+/// The definition paths of the items of std's prelude, as a nightly of 2026 gives them, which are
+/// shown by their names with std's archives or without them (decided in M4b, decision 35). They
+/// move with the toolchain: one that moved is looked up in std's archives.
+const PRELUDE_DEFINED: &[&str] = &[
+    "core::option::Option",
+    "core::result::Result",
+    "alloc::vec::Vec",
+    "alloc::string::String",
+    "alloc::boxed::Box",
+    "alloc::borrow::ToOwned",
+    "alloc::string::ToString",
+    "core::clone::Clone",
+    "core::cmp::Eq",
+    "core::cmp::Ord",
+    "core::cmp::PartialEq",
+    "core::cmp::PartialOrd",
+    "core::convert::AsMut",
+    "core::convert::AsRef",
+    "core::convert::From",
+    "core::convert::Into",
+    "core::convert::TryFrom",
+    "core::convert::TryInto",
+    "core::default::Default",
+    "core::future::future::Future",
+    "core::future::into_future::IntoFuture",
+    "core::iter::traits::double_ended::DoubleEndedIterator",
+    "core::iter::traits::exact_size::ExactSizeIterator",
+    "core::iter::traits::collect::Extend",
+    "core::iter::traits::collect::FromIterator",
+    "core::iter::traits::collect::IntoIterator",
+    "core::iter::traits::iterator::Iterator",
+    "core::marker::Copy",
+    "core::marker::Send",
+    "core::marker::Sized",
+    "core::marker::Sync",
+    "core::marker::Unpin",
+    "core::ops::async_function::AsyncFn",
+    "core::ops::async_function::AsyncFnMut",
+    "core::ops::async_function::AsyncFnOnce",
+    "core::ops::drop::Drop",
+    "core::ops::function::Fn",
+    "core::ops::function::FnMut",
+    "core::ops::function::FnOnce",
+];
+
 /// The archives of std, alloc and core of one toolchain, and std's paths for what it re-exports
 /// of the others.
 pub struct StdPaths {
-    /// std's, alloc's and core's archives, by their names.
-    crates: [(&'static str, Arc<Mapped<Indexed>>); 3],
+    /// std's, alloc's and core's archives, by their names; none when the cache has no std.
+    crates: Vec<(&'static str, Arc<Mapped<Indexed>>)>,
     /// The toolchain's release, the version of the crates of std.
     version: Option<Box<str>>,
     /// std's paths for the items of alloc and core that it re-exports.
@@ -104,9 +149,21 @@ impl StdPaths {
             Reexports::new(&std, &[("alloc", &alloc), ("core", &core)])
         };
         Self {
-            crates: [("std", std), ("alloc", alloc), ("core", core)],
+            crates: vec![("std", std), ("alloc", alloc), ("core", core)],
             version,
             reexports,
+            found: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The paths of a std that the cache does not have: each item of std's crates is told as not
+    /// cached, so that looking one up has std fetched (decided in M4b, decision 30).
+    #[must_use]
+    pub fn not_cached() -> Self {
+        Self {
+            crates: Vec::new(),
+            version: None,
+            reexports: Reexports::default(),
             found: Mutex::new(HashMap::new()),
         }
     }
@@ -123,6 +180,11 @@ impl StdPaths {
                 reason,
             })
         };
+        // The prelude's by their names, with std or without (decided in M4b, decision 35).
+        if PRELUDE_DEFINED.contains(&definition) {
+            let name = definition.rsplit("::").next().unwrap_or_default();
+            return Shown::Path(name.into());
+        }
         let Some((_, mapped)) = self.crates.iter().find(|(name, _)| *name == krate) else {
             return told(Reason::NotCached);
         };
@@ -495,6 +557,26 @@ mod tests {
         assert_eq!(reason(57), Some(Reason::Unnameable));
         assert_eq!(reason(58), Some(Reason::Unnameable));
         assert_eq!(shown(59), path("std::io::Error"));
+        // Without std, its prelude by the names, the rest not cached (decided in M4b, decision
+        // 35).
+        let none = StdPaths::not_cached();
+        let without = |id: u32| {
+            let summary = view.summary(Id(id)).expect("a summary").clone();
+            none.shown(&view, Id(id), &summary)
+        };
+        assert_eq!(without(50), path("Option"));
+        assert_eq!(without(55), path("Clone"));
+        assert!(
+            matches!(
+                without(51),
+                Some(Shown::NotCanonical(NotCanonical {
+                    reason: Reason::NotCached,
+                    ..
+                }))
+            ),
+            "{:?}",
+            without(51)
+        );
         // Found once, then remembered.
         let found = paths.found.lock().len();
         assert_eq!(shown(51), path("std::fmt::Formatter"));

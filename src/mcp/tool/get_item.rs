@@ -57,7 +57,7 @@ use crate::{
         git_source::{self, GitRef, GitUrl},
         rustdoc_json::ParseError,
         sparse_index::{IndexEntry, IndexError, IndexVersion},
-        std_json::Chosen,
+        std_json::{self, Chosen},
         target::TargetTriple,
         version::{NoVersion, VersionSpec},
     },
@@ -464,6 +464,9 @@ struct Request {
     in_build: InBuild,
     /// How many crates the path was followed through to get here (requirement R-PR-4).
     hops: usize,
+    /// How the items of std, alloc and core are shown from the crate, by the std recorded for its
+    /// target (decided in M4b, decisions 30, 34 and 35).
+    shown: Option<Arc<crate::query::std_paths::StdPaths>>,
     /// When the crates.io index that decided the version was read, when it was older than its
     /// TTL (requirements R-CA-3 and R-CA-7), in RFC 3339.
     index_fetched_at: Option<Box<str>>,
@@ -1495,6 +1498,7 @@ async fn recorded_dependency(
             sets: None,
         },
         hops: 0,
+        shown: None,
         index_fetched_at: None,
         until,
         here: Here {
@@ -2198,6 +2202,7 @@ async fn request_of_record(
             sets: None,
         },
         hops: 0,
+        shown: None,
         index_fetched_at: None,
         until,
         here: Here {
@@ -2471,6 +2476,7 @@ fn member_request(
             sets: None,
         },
         hops: 0,
+        shown: None,
         index_fetched_at: None,
         until,
         here: Here {
@@ -2613,6 +2619,7 @@ fn release_request(
         until,
         #[cfg(feature = "local")]
         here: chosen.here,
+        shown: None,
     }
 }
 
@@ -2723,6 +2730,7 @@ fn cached_request(
         build: None,
         in_build: InBuild::default(),
         hops: 0,
+        shown: None,
         index_fetched_at: None,
         until,
         // Not the project's package, which a call for it checks later.
@@ -3206,6 +3214,7 @@ async fn look_up_git(arguments: Arguments, git: &GitSpec, state: Arc<ToolState>)
         build: None,
         in_build: InBuild::default(),
         hops: 0,
+        shown: None,
         index_fetched_at: None,
         until,
         here: Here {
@@ -3317,6 +3326,8 @@ async fn look_up(
         }
         refresh_release(&state, &mut arguments).await;
     }
+    // std's items by std's paths, as the cache has them (decided in M4b, decisions 18 and 30).
+    arguments.shown = Some(std_paths(&state, &arguments.target).await);
     look_up_release(&state, arguments, warnings).await
 }
 
@@ -3483,6 +3494,7 @@ async fn built_instead(
             Err(result) => return told_why(*result, why),
         };
     request.hops = arguments.hops;
+    request.shown.clone_from(&arguments.shown);
     let Some(mut source) = request.here.local.take() else {
         return told_why(stopped(), why);
     };
@@ -3842,6 +3854,69 @@ pub(super) enum StdUnready {
     Going(Doing),
 }
 
+/// How the items of std, alloc and core are shown from other crates, by the std that `get_item`
+/// chose for `target` last, as the cache records it, without fetching or archiving anything; found
+/// once for the process for that record (decided in M4b, decisions 30 and 34). When the cache has
+/// none, std's items are told as not cached, but those of its prelude.
+pub(super) async fn std_paths(
+    state: &ToolState,
+    target: &TargetTriple,
+) -> Arc<crate::query::std_paths::StdPaths> {
+    std_paths_recorded(state, target)
+        .await
+        .unwrap_or_else(|| Arc::new(crate::query::std_paths::StdPaths::not_cached()))
+}
+
+/// [`std_paths`] of a std that the cache records, whose archives are there.
+async fn std_paths_recorded(
+    state: &ToolState,
+    target: &TargetTriple,
+) -> Option<Arc<crate::query::std_paths::StdPaths>> {
+    let (cache, of) = (state.cache.clone(), target.clone());
+    let record = crate::task::spawn_blocking(move || std_json::recorded_chosen(&cache, &of))
+        .await
+        .ok()
+        .flatten()?;
+    // Used, as for a lookup of std, so that the removal of the unused keeps it.
+    std_json::note_recorded_use(&state.cache, &record);
+    if let Some((kept, paths)) = state.std_paths.lock().get(target)
+        && *kept == record
+    {
+        return Some(Arc::clone(paths));
+    }
+    let archives = std_archives(state, &record).await?;
+    let version = record.version.clone();
+    let paths = crate::task::spawn_blocking(move || {
+        Arc::new(crate::query::std_paths::StdPaths::new(archives, version))
+    })
+    .await
+    .ok()?;
+    // The latest only, for each target.
+    state
+        .std_paths
+        .lock()
+        .insert(target.clone(), (record, Arc::clone(&paths)));
+    Some(paths)
+}
+
+/// The archives of std, alloc and core that `record` places, if they are all there.
+async fn std_archives(
+    state: &ToolState,
+    record: &std_json::ChosenRecord,
+) -> Option<[Arc<Mapped<Indexed>>; 3]> {
+    let mut archives = Vec::new();
+    for ((dir, source), krate) in
+        record
+            .archives
+            .iter()
+            .zip([StdCrate::Std, StdCrate::Alloc, StdCrate::Core])
+    {
+        let dir = state.cache.dir().join(dir);
+        archives.push(load::archived(&state.cache, &dir, krate.as_str(), source).await?);
+    }
+    archives.try_into().ok()
+}
+
 /// The JSON of std for `target`, chosen, fetched and archived by work that the calls for it share,
 /// waiting for it until `until` (requirements R-STD-6, R-ARCH-6 and R-WS-6).
 pub(super) async fn shared_std(
@@ -3858,10 +3933,42 @@ pub(super) async fn shared_std(
         neutral_dir: state.cache.dir().to_owned(),
     };
     match load::std_json(&state.stds, &state.cache, &state.dist, wanted, until).await {
-        Joined::Done(Ok(chosen)) => Ok(chosen),
+        Joined::Done(Ok(chosen)) => {
+            // What shows std's paths uses this std for the target, once its archives are there
+            // (decided in M4b, decision 34).
+            record_chosen(state, target, &chosen).await;
+            Ok(chosen)
+        },
         Joined::Done(Err(error)) => Err(StdUnready::Failed(error)),
         Joined::Ended => Err(StdUnready::Stopped),
         Joined::Going(doing) => Err(StdUnready::Going(doing)),
+    }
+}
+
+/// Records `chosen` as the std for `target`, when the archives of its std, alloc and core are
+/// there: one that could not be archived does not take the place of one that was (decided in
+/// M4b, decision 34).
+async fn record_chosen(state: &ToolState, target: &TargetTriple, chosen: &Arc<Chosen>) {
+    let mut places = Vec::new();
+    for krate in [StdCrate::Std, StdCrate::Alloc, StdCrate::Core] {
+        let Ok((dir, source)) = chosen.json.archive_key(&state.cache, krate) else {
+            return;
+        };
+        places.push((dir, source, krate));
+    }
+    for (dir, source, krate) in &places {
+        if load::archived(&state.cache, dir, krate.as_str(), source)
+            .await
+            .is_none()
+        {
+            return;
+        }
+    }
+    let (cache, recorded, of) = (state.cache.clone(), Arc::clone(chosen), target.clone());
+    let written =
+        crate::task::spawn_blocking(move || std_json::record_chosen(&cache, &of, &recorded)).await;
+    if let Ok(Err(error)) = written {
+        tracing::warn!(%error, "the std chosen could not be recorded");
     }
 }
 
@@ -4211,12 +4318,14 @@ async fn follow_into(
         },
         Some(_) | None => {
             match destination_request(state, destination, origin, &mut followed).await {
-                Ok(request) => {
+                Ok(mut request) => {
                     followed.push(shown_from(
                         destination,
                         origin,
                         &format!("{} {}", request.name, request.version),
                     ));
+                    // Of the same target: std's items as where it was followed from.
+                    request.shown.clone_from(&origin.shown);
                     Box::pin(look_up_release(state, request, followed)).await
                 },
                 Err(result) => *result,
@@ -4450,6 +4559,7 @@ async fn destination_request(
         build: None,
         in_build: InBuild::default(),
         hops: origin.hops.saturating_add(1),
+        shown: None,
         index_fetched_at,
         until: origin.until,
         #[cfg(feature = "local")]
@@ -4659,6 +4769,7 @@ async fn in_project_build_of(
                 sets: None,
             },
             hops: origin.hops.saturating_add(1),
+            shown: None,
             // The version is the project's, not the index's.
             index_fetched_at: None,
             until: origin.until,
@@ -5040,6 +5151,7 @@ async fn execute_std(
         until,
         #[cfg(feature = "local")]
         here: Here::default(),
+        shown: None,
     };
     // The archives that the lookup opens, made here: the lookup, on a blocking thread, then only
     // opens them, waiting there for no lock nor place. One that cannot be made, it tells.
@@ -5414,6 +5526,13 @@ fn docs_rs_origin(arguments: &Request) -> Origin<'_> {
     }
 }
 
+/// `paths` as an [`ExternalPaths`](crate::query::external::ExternalPaths), for a view.
+fn as_external(
+    paths: &crate::query::std_paths::StdPaths,
+) -> &dyn crate::query::external::ExternalPaths {
+    paths
+}
+
 /// Looks the item up in the archive `mapped`, of the crate from `origin`, and serializes the
 /// response while the items it borrows from are still there.
 fn look_up_in(
@@ -5421,7 +5540,8 @@ fn look_up_in(
     arguments: &Request,
     origin: Origin<'_>,
 ) -> Result<Value, Failure> {
-    let view = CrateView::new(mapped.get());
+    let shown = arguments.shown.as_deref().map(as_external);
+    let view = CrateView::new(mapped.get()).shown_with(shown);
     let item_request = ItemRequest {
         name: &arguments.name,
         version: &arguments.version,
@@ -6008,6 +6128,7 @@ mod tests {
             until: Instant::now(),
             #[cfg(feature = "local")]
             here: Here::default(),
+            shown: None,
         };
         let candidates = (0..25).map(|n| format!("item {n}").into()).collect();
         let result = item_error(&request, &GetItemError::Ambiguous { candidates }, &[]);
